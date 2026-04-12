@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        emacs-version: ['27.1', '29.4']
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Emacs
+        uses: purcell/setup-emacs@master
+        with:
+          version: ${{ matrix.emacs-version }}
+
+      - name: Byte-compile
+        run: |
+          emacs --batch -L . \
+            -f batch-byte-compile \
+            anvil-server-metrics.el \
+            anvil-server.el \
+            anvil-server-commands.el \
+            anvil.el \
+            anvil-eval.el
+
+      - name: Run tests
+        run: |
+          emacs --batch -L . \
+            -l ert \
+            -l tests/anvil-test.el \
+            -f ert-run-tests-batch-and-exit
