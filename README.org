@@ -62,11 +62,37 @@ Then run =M-x anvil-describe-setup= for client configuration instructions.
 
 * Installation
 
+** async-installer
+
+#+begin_src emacs-lisp
+(async-installer-github-add "https://github.com/zawatton21/anvil.el.git"
+                            :branch "master"
+                            :main "anvil.el")
+#+end_src
+
 ** straight.el
 
 #+begin_src emacs-lisp
 (straight-use-package
  '(anvil :type git :host github :repo "zawatton21/anvil.el"))
+#+end_src
+
+** elpaca
+
+#+begin_src emacs-lisp
+(elpaca (anvil :host github :repo "zawatton21/anvil.el"))
+#+end_src
+
+** use-package (with straight or elpaca)
+
+#+begin_src emacs-lisp
+;; with straight
+(use-package anvil
+  :straight (anvil :type git :host github :repo "zawatton21/anvil.el"))
+
+;; with elpaca
+(use-package anvil
+  :ensure (:host github :repo "zawatton21/anvil.el"))
 #+end_src
 
 ** Manual
@@ -126,6 +152,19 @@ Issues, feature requests, and pull requests are welcome at
 [[https://github.com/zawatton21/anvil.el]].
 
 If you find Anvil useful, consider [[https://github.com/sponsors/zawatton21][sponsoring the project]].
+
+* Related Packages
+
+These packages are also developed by the same author:
+
+| Package | Description | Repo |
+|---------+-------------+------|
+| [[https://github.com/zawatton21/async-installer][async-installer]] | Non-blocking GitHub package installer with commit pinning | [[https://github.com/zawatton21/async-installer][GitHub]] |
+| [[https://github.com/zawatton21/eat-windows-pty][eat-windows-pty]] | ConPTY support for emacs-eat on native Windows | [[https://github.com/zawatton21/eat-windows-pty][GitHub]] |
+| [[https://github.com/zawatton21/org-draw][org-draw]] | Excalidraw and tldraw integration for org-mode | [[https://github.com/zawatton21/org-draw][GitHub]] |
+| [[https://github.com/zawatton21/catchall-box][catchall-box]] | UUID-based file management for org-mode | [[https://github.com/zawatton21/catchall-box][GitHub]] |
+| [[https://github.com/zawatton21/emacs-skkserv][emacs-skkserv]] | Pure Elisp skkserv for Japanese input (ddskk, Google IME, MeCab) | [[https://github.com/zawatton21/emacs-skkserv][GitHub]] |
+| [[https://github.com/zawatton21/my-locate-library][my-locate-library]] | Fast load-path index for accelerated require/load | [[https://github.com/zawatton21/my-locate-library][GitHub]] |
 
 * License
 
