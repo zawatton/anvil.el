@@ -5,38 +5,57 @@
 Your AI's workbench. Turn Emacs into a tool server for any LLM agent.
 #+end_quote
 
+[[https://github.com/zawatton21/anvil.el/actions][https://img.shields.io/github/actions/workflow/status/zawatton21/anvil.el/ci.yml?branch=master&style=flat-square]]
+[[https://github.com/sponsors/zawatton21][https://img.shields.io/badge/Sponsor-%E2%9D%A4-pink?style=flat-square]]
+
 * What is Anvil?
 
 Anvil exposes Emacs capabilities as [[https://modelcontextprotocol.io/][Model Context Protocol (MCP)]] tools
-that any AI coding assistant can call — Claude, GPT, local models via
-Ollama/llama.cpp, or anything that speaks MCP.
+that any AI coding assistant can call — Claude Code, Claude Desktop,
+GPT, local models via Ollama/llama.cpp, or anything that speaks MCP.
 
-* Features
+One ~(anvil-enable)~ and your Emacs becomes an AI-accessible workbench
+with 50+ tools: file editing, org-mode operations, git inspection,
+Elisp evaluation, and more — all through a safe, sandboxed interface.
 
-| Module     | Tools                                          | External Deps |
-|------------+------------------------------------------------+---------------|
-| =eval=     | Sync/async Elisp evaluation                    | —             |
-| =org=      | Read/write org headings, outlines, TODO states | org-mode      |
-| =file=     | Safe file ops (1.2MB+ without data loss)       | —             |
-| =host=     | OS info, shell abstraction                     | —             |
-| =git=      | Status, log, diff, blame                       | git           |
-| =proc=     | Process listing and inspection                 | —             |
-| =net=      | Port and network inspection                    | —             |
-| =fs=       | Directory trees, disk usage, recent files      | —             |
-| =emacs=    | Buffer state inspection                        | —             |
-| =text=     | URL extraction, text processing                | —             |
-| =clipboard= | OS clipboard read/write                      | —             |
-| =data=     | JSON/CSV read/write                            | —             |
-| =xlsx=     | Excel read/write (optional)                    | Python, openpyxl |
-| =pdf=      | PDF text extraction (optional)                 | Python, pymupdf  |
-| =agenda=   | Agenda with rokuyo calendar (optional)         | org-mode      |
-| =ide=      | xref, diagnostics, imenu, tree-sitter (opt.)   | project.el    |
+* Why Anvil?
+
+- *LLM-agnostic* — works with any MCP-compatible client
+- *Safe by design* — worker daemon pool isolates AI tool calls from your editor
+- *Org-mode native* — first-class org read/write/refactor support
+- *Large file safe* — handles 1.2MB+ files without data loss or truncation
+- *Cross-platform* — Linux, macOS, Windows, WSL
+- *Modular* — load only what you need, extend with your own modules
+
+* Modules
+
+| Module       | Tools                                          | External Deps    |
+|--------------+------------------------------------------------+------------------|
+| =worker=     | Isolated sub-Emacs daemon pool for AI calls    | —                |
+| =eval=       | Sync/async Elisp evaluation                    | —                |
+| =org=        | Read/write org headings, outlines, TODO states | org-mode         |
+| =file=       | Safe file ops, batch edits, replace/regexp     | —                |
+| =host=       | CPU, RAM, disk, GPU, network, OS info          | —                |
+| =git=        | Status, log, diff-stats with CJK path safety  | git              |
+| =proc=       | Process listing and inspection                 | —                |
+| =net=        | Port and network inspection                    | —                |
+| =fs=         | Directory trees, disk usage, recent files      | —                |
+| =emacs=      | Buffer state and disk sync diagnosis           | —                |
+| =text=       | URL extraction, link parsing                   | —                |
+| =clipboard=  | OS clipboard read/write                        | —                |
+| =data=       | JSON/CSV read/write with UTF-8 enforcement     | —                |
+| =xlsx=       | Excel read/write (optional)                    | Python, openpyxl |
+| =pdf=        | PDF text extraction (optional)                 | Python, pymupdf  |
+| =ide=        | xref, diagnostics, imenu, tree-sitter (opt.)   | project.el       |
+| =cron=       | Scheduled task runner with worker dispatch      | —                |
+| =elisp=      | Agentic Elisp development tools (optional)     | —                |
 
 * Quick Start
 
 #+begin_src emacs-lisp
 (require 'anvil)
 (anvil-enable)
+(anvil-server-start)
 #+end_src
 
 Then run =M-x anvil-describe-setup= for client configuration instructions.
@@ -63,14 +82,34 @@ Clone this repository and add it to your =load-path=:
 
 #+begin_src emacs-lisp
 ;; Choose which modules to load (defaults shown)
-(setq anvil-modules '(eval org file host git proc fs emacs text clipboard data net))
+(setq anvil-modules '(worker eval org file host git proc fs emacs text clipboard data net))
 
 ;; Enable optional modules
-(setq anvil-optional-modules '(xlsx pdf agenda ide))
+(setq anvil-optional-modules '(xlsx pdf ide cron))
 
 ;; Start anvil
 (anvil-enable)
+(anvil-server-start)
 #+end_src
+
+* Architecture
+
+#+begin_example
+  Claude / GPT / Local LLM
+         |
+    MCP (JSON-RPC via stdio)
+         |
+  emacs-mcp-stdio.sh (bridge)
+         |
+    emacsclient → Emacs daemon
+         |
+    anvil-server (dispatcher)
+         |
+    +---------+---------+
+    | main    | worker  |  (worker pool: heavy ops
+    | daemon  | daemons |   run in isolated sub-Emacs)
+    +---------+---------+
+#+end_example
 
 * Platform Support
 
@@ -80,6 +119,13 @@ Clone this repository and add it to your =load-path=:
 | macOS (native Emacs) | Supported |
 | Windows (native)     | Supported |
 | WSL                  | Supported |
+
+* Contributing
+
+Issues, feature requests, and pull requests are welcome at
+[[https://github.com/zawatton21/anvil.el]].
+
+If you find Anvil useful, consider [[https://github.com/sponsors/zawatton21][sponsoring the project]].
 
 * License
 

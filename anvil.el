@@ -5,7 +5,7 @@
 ;; Author: Fujisawa Electric Management Office
 ;; Keywords: comm, tools, ai, mcp
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "27.1"))
+;; Package-Requires: ((emacs "28.2"))
 ;; URL: https://github.com/zawatton21/anvil.el
 
 ;; This file is NOT part of GNU Emacs.
@@ -36,7 +36,7 @@
 ;; - System inspection: git, processes, network, filesystem
 ;; - Sync and async Elisp evaluation
 ;; - IDE tools: xref, diagnostics, imenu, tree-sitter
-;; - Optional modules: Excel (openpyxl), PDF (pymupdf), agenda with rokuyo
+;; - Optional modules: Excel (openpyxl), PDF (pymupdf), cron scheduler
 ;;
 ;; Quick start:
 ;;   (require 'anvil)
