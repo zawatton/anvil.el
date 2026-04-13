@@ -963,5 +963,169 @@ is unreliable in Emacs 30."
          (push sym results))))
     (sort results (lambda (a b) (string< (symbol-name a) (symbol-name b))))))
 
+;;;; --- MCP tool wrappers --------------------------------------------------
+;;
+;; These thin wrappers adapt anvil-file-* functions for direct MCP tool
+;; registration.  MCP JSON-RPC delivers all parameters as strings, so
+;; numeric arguments (line numbers, counts) need string-to-number
+;; conversion.  Registering these as dedicated MCP tools eliminates the
+;; shell + elisp-reader double-escaping problem that plagues emacs-eval
+;; calls with backslash-heavy content (Windows paths, org source blocks).
+;;
+;; The wrapper docstrings include "MCP Parameters:" sections so that
+;; anvil-server--generate-schema-from-function can extract descriptions.
+
+(defvar anvil-file--server-id "emacs-eval"
+  "Server ID under which anvil-file MCP tools are registered.")
+
+(defun anvil-file--tool-replace-string (path old-string new-string &optional max-count)
+  "Replace literal OLD-STRING with NEW-STRING in file at PATH.
+Returns the number of replacements made.  Errors if no match found.
+
+MCP Parameters:
+  path - Absolute path to the file to edit
+  old-string - The exact text to search for (literal, not regexp)
+  new-string - The replacement text
+  max-count - Maximum replacements to make (optional, e.g. \"1\" for single match)"
+  (anvil-server-with-error-handling
+    (let ((count (if (and max-count (not (string-empty-p max-count)))
+                     (string-to-number max-count)
+                   nil)))
+      (format "%S" (anvil-file-replace-string path old-string new-string count)))))
+
+(defun anvil-file--tool-replace-regexp (path pattern replacement &optional max-count)
+  "Replace PATTERN (regexp) with REPLACEMENT in file at PATH.
+REPLACEMENT may use \\\\1 \\\\2 etc. for capture groups.
+Returns the number of replacements made.  Errors if no match found.
+
+MCP Parameters:
+  path - Absolute path to the file to edit
+  pattern - Regular expression to search for
+  replacement - Replacement string (may use \\\\1 \\\\2 for capture groups)
+  max-count - Maximum replacements to make (optional)"
+  (anvil-server-with-error-handling
+    (let ((count (if (and max-count (not (string-empty-p max-count)))
+                     (string-to-number max-count)
+                   nil)))
+      (format "%S" (anvil-file-replace-regexp path pattern replacement count)))))
+
+(defun anvil-file--tool-insert-at-line (path line content)
+  "Insert CONTENT into file at PATH before LINE (1-indexed).
+A trailing newline is added if not present.
+
+MCP Parameters:
+  path - Absolute path to the file to edit
+  line - Line number to insert before (1-indexed, e.g. \"1\" for start of file)
+  content - Text to insert"
+  (anvil-server-with-error-handling
+    (format "%S" (anvil-file-insert-at-line path (string-to-number line) content))))
+
+(defun anvil-file--tool-delete-lines (path start-line end-line)
+  "Delete lines START-LINE through END-LINE (inclusive, 1-indexed) from PATH.
+
+MCP Parameters:
+  path - Absolute path to the file to edit
+  start-line - First line to delete (1-indexed)
+  end-line - Last line to delete (1-indexed, inclusive)"
+  (anvil-server-with-error-handling
+    (format "%S" (anvil-file-delete-lines path
+                                          (string-to-number start-line)
+                                          (string-to-number end-line)))))
+
+(defun anvil-file--tool-read (path &optional offset limit)
+  "Read file at PATH and return its content.
+Supports optional line-based pagination.
+
+MCP Parameters:
+  path - Absolute path to the file to read
+  offset - Lines to skip from start (optional, 0-indexed, e.g. \"100\")
+  limit - Maximum lines to return (optional, e.g. \"50\")"
+  (anvil-server-with-error-handling
+    (let ((off (if (and offset (not (string-empty-p offset)))
+                   (string-to-number offset)
+                 nil))
+          (lim (if (and limit (not (string-empty-p limit)))
+                   (string-to-number limit)
+                 nil)))
+      (anvil-file-read path off lim))))
+
+(defun anvil-file--tool-append (path content)
+  "Append CONTENT to end of file at PATH.
+
+MCP Parameters:
+  path - Absolute path to the file
+  content - Text to append"
+  (anvil-server-with-error-handling
+    (format "%S" (anvil-file-append path content))))
+
+;;;; --- module enable/disable -----------------------------------------------
+
+(defun anvil-file-enable ()
+  "Register anvil-file MCP tools for direct JSON-RPC access.
+This eliminates the need to call file operations through emacs-eval,
+avoiding shell + elisp-reader double-escaping of backslashes."
+  (anvil-server-register-tool
+   #'anvil-file--tool-replace-string
+   :id "file-replace-string"
+   :description
+   "Replace literal text in a file.  Operates on the raw file via
+temp-buffer + write-region (no mount-layer issues on Windows).
+Safe for files over 1.2MB.  Errors if the old text is not found.
+Pass max-count \"1\" to assert exactly one match."
+   :server-id anvil-file--server-id)
+
+  (anvil-server-register-tool
+   #'anvil-file--tool-replace-regexp
+   :id "file-replace-regexp"
+   :description
+   "Replace regexp matches in a file.  The replacement string may use
+\\\\1 \\\\2 for capture groups.  Errors if no match found.
+Safe for files over 1.2MB."
+   :server-id anvil-file--server-id)
+
+  (anvil-server-register-tool
+   #'anvil-file--tool-insert-at-line
+   :id "file-insert-at-line"
+   :description
+   "Insert text at a specific line number in a file (1-indexed).
+Line 1 inserts before the first line.  Safe for files over 1.2MB."
+   :server-id anvil-file--server-id)
+
+  (anvil-server-register-tool
+   #'anvil-file--tool-delete-lines
+   :id "file-delete-lines"
+   :description
+   "Delete a range of lines (inclusive, 1-indexed) from a file.
+Safe for files over 1.2MB."
+   :server-id anvil-file--server-id)
+
+  (anvil-server-register-tool
+   #'anvil-file--tool-read
+   :id "file-read"
+   :description
+   "Read file contents with optional line-based pagination.
+Returns the file content as a string.  For large files, use offset
+and limit to read specific sections."
+   :read-only t
+   :server-id anvil-file--server-id)
+
+  (anvil-server-register-tool
+   #'anvil-file--tool-append
+   :id "file-append"
+   :description
+   "Append text to the end of a file.  A leading newline is added
+if the file does not end with one.  Safe for files over 1.2MB."
+   :server-id anvil-file--server-id))
+
+(defun anvil-file-disable ()
+  "Unregister anvil-file MCP tools."
+  (anvil-server-unregister-tool "file-replace-string" anvil-file--server-id)
+  (anvil-server-unregister-tool "file-replace-regexp" anvil-file--server-id)
+  (anvil-server-unregister-tool "file-insert-at-line" anvil-file--server-id)
+  (anvil-server-unregister-tool "file-delete-lines" anvil-file--server-id)
+  (anvil-server-unregister-tool "file-read" anvil-file--server-id)
+  (anvil-server-unregister-tool "file-append" anvil-file--server-id))
+
 (provide 'anvil-helpers)
-;;; anvil-helpers.el ends here
+(provide 'anvil-file)
+;;; anvil-file.el ends here
