@@ -64,7 +64,7 @@ Then run =M-x anvil-describe-setup= for client configuration instructions.
 
 ** async-installer
 
-[[https://github.com/zawatton21/async-installer][async-installer]] — non-blocking GitHub package installer for Emacs.
+[[https://github.com/zawatton21/async-installer][async-installer]] — a small, non-blocking package manager for Emacs. Pure Elisp syntax — no macro DSL required.
 
 #+begin_src emacs-lisp
 (async-installer-github-add "https://github.com/zawatton21/anvil.el.git"
