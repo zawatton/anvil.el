@@ -1,0 +1,432 @@
+#+title: Anvil — Emacs MCP サーバ
+#+author: 藤澤電気管理事務所
+
+*言語:* [[file:README.org][English]] / 日本語
+
+#+begin_quote
+AI のための作業台。Emacs を、あらゆる LLM エージェントが使えるツールサーバに変える。
+#+end_quote
+
+#+html: <a href="https://github.com/zawatton21/anvil.el/actions"><img src="https://img.shields.io/github/actions/workflow/status/zawatton21/anvil.el/ci.yml?branch=master&style=flat-square" alt="CI"></a>
+#+html: <a href="https://github.com/sponsors/zawatton21"><img src="https://img.shields.io/badge/Sponsor_%E2%9D%A4_Support_this_project-pink?style=for-the-badge" alt="Sponsor"></a>
+
+* Anvil とは？
+
+Anvil は Emacs の機能を [[https://modelcontextprotocol.io/][Model Context Protocol (MCP)]] ツールとして公開し、
+あらゆる AI コーディングアシスタントから呼び出せるようにします。
+Claude Code、Claude Desktop、GPT、Ollama/llama.cpp 経由のローカルモデルなど、
+MCP を話すクライアントならどれでも対応しています。
+
+~(anvil-enable)~ の一行で、Emacs が 50 以上のツールを備えた AI 向け作業台に変わります。
+ファイル編集、org-mode 操作、git 参照、Elisp 評価など、すべて安全なサンドボックス
+インターフェース越しに利用できます。
+
+* なぜ Anvil か？
+
+- *LLM 非依存* — MCP 対応クライアントならどれとでも動作
+- *安全設計* — ワーカーデーモンプールが AI ツール呼び出しをエディタから分離
+- *org-mode ネイティブ* — org の読み書き・リファクタを一級サポート
+- *大容量ファイル対応* — 1.2 MB 超のファイルもデータ損失・切り捨てなしで処理
+- *クロスプラットフォーム* — Linux、macOS、Windows、WSL
+- *モジュラー* — 必要なものだけロード、独自モジュールで拡張可能
+
+* 効率性 — Anvil が AI トークンを節約する理由
+
+LLM エージェントはトークン課金です。Read/Edit のたびにバイトが飛び、
+オーケストレーションのオーバーヘッドが積み重なります。Anvil のツールは
+エージェントのコンテキスト予算を、書類整理ではなく推論に使えるよう設計されています。
+
+** ファイル全体ではなく、領域に操作する
+
+汎用ファイルツールは Read → Edit のパターンを強制し、そのたびにファイル全体を
+転送します。Anvil は差分だけを送る、ピンポイントな操作を提供します。
+
+| タスク | 汎用フロー | Anvil フロー |
+|--------+------------+--------------|
+| 1.2 MB の org ファイルで文字列を 1 件置換 | 1.2 MB を Read → Edit (旧文字列 + 新文字列を送信) | =anvil-file-replace-string= (パターンと置換文字列のみ) |
+| 3 万行の =init.org= から見出し 1 件を読む | Read してページネーション | =anvil-org-read-headline= (サブツリーのみ) |
+| 大きいファイルの末尾付近に挿入 | ファイル全体を Read → 書き直し | =anvil-file-insert-at-line= (差分のみ) |
+
+org-mode のリファクタ操作（セクション移動、refile、分割）に限れば、
+MCP 経由の操作は Read + Write 方式に比べて *トークンを 10〜20 倍節約* できます。
+
+** 複数の編集を 1 往復にまとめる
+
+エージェントが同じファイルに複数回編集を加えると、それぞれが独立したツール呼び出しに
+なり、リクエスト・スキーマ・レスポンスのオーバーヘッドが重複します。
+=anvil-file-batch= は編集ベクタを 1 回のトランザクションで適用し、
+個別に発行する場合に比べて *最大 ~90% のトークン削減* を実現します。
+
+** 重い処理は帯域外で実行
+
+低速な操作（大規模タングル、フルツリー org スキャン、バイトコンパイル）は
+ワーカーデーモンプールにディスパッチされるため、エージェントのメイン接続は
+常に応答可能な状態を保ちます。
+
+実測値: ~1 MB の =init.org= に対する =org-babel-tangle= はインプロセスで ~30 秒
+かかりますが、ワーカーディスパッチなら ~2 秒で完了します。*エンドツーエンドで
+~15 倍高速*、かつエージェントのメインセッションが一切ブロックされません。
+
+** 大規模 org データベースへのスケール
+
+テンプバッファをウォークする素朴なアプローチは、MCP リクエスト内で ~50 KB を超える
+org ファイルに対してタイムアウトします。Anvil の org ツールはストリーミング正規表現
+スキャナを使うため、マルチメガバイトの org ツリー（パワーユーザーが実際に運用している
+モノリシックな =init.org= やジャーナルファイル）でも見出し検索・アウトライン読み出しが
+高速に保たれます。
+
+** ケーススタディ: 大規模 TypeScript リファクタリング
+
+Anvil は理論だけの話ではなく、org-mode 専用でもありません。実際の大規模
+TypeScript 移行プロジェクト — [[https://github.com/zawatton21/newDTW.github.io][newDTW]] リポジトリ（デコンパイルされた HSP
+アプリケーションを TypeScript に移植）— で検証されています。
+
+- *1,400+* モジュールにわたる *16,000+* 行の TypeScript
+- 実装ファイルと密結合した巨大な型定義ファイル（数千行規模）
+- 同一ファイルへの多点編集が高頻度で発生
+
+org-mode で効果を発揮した Anvil ツールが、ここでも定量的な成果をもたらしました。
+
+*** =anvil-file-batch= — 1 ファイルへの複数同時編集
+
+TypeScript のリファクタリングでは、1 ファイルに対してインポート追加・型定義変更・
+実装置換・メソッドリネームを同時に行うことが日常的です。
+
+実測: 130 行のソースファイルへの 6 編集。
+
+| 方法                  | トークン | ラウンドトリップ |
+|-----------------------+----------+------------------|
+| 汎用 =Edit= ×6        | ~4,800   | 6                |
+| =anvil-file-batch=    | ~1,500   | 1                |
+| 削減率                | *~70%*   | *83%*            |
+
+*** =anvil-file-replace-regexp= — 型・識別子の一括リネーム
+
+=Promise<T>= → =AsyncResult<T>= へのコードベース全体の置換や、グローバル変数の
+リネームを *1 コマンド* で完結できます。従来フロー（数百ファイルに grep し、個別に
+read して edit）の機械的な繰り返しを一掃します。
+
+*** =anvil-file-insert-at-line= / =-delete-lines= — 大きいファイルへの局所操作
+
+ユースケース例: 4,000 行超の型定義ファイルへのフィールド 1 件追加、
+またはグローバルステートインターフェースへの追記。
+
+| 方法                         | トークン   |
+|------------------------------+------------|
+| ファイル全体を Read + Edit   | 数千       |
+| =anvil-file-insert-at-line=  | 数十       |
+| 削減率                       | *~90%+*    |
+
+*** TypeScript が特に恩恵を受ける理由
+
+| TypeScript の特性                         | Anvil が助ける理由                              |
+|-------------------------------------------+--------------------------------------------------|
+| 型定義と実装が同一ファイルに共存           | 1 ファイルへの多編集 → =file-batch= が輝く      |
+| 巨大な型定義ファイル                       | 局所操作でフルファイル read を回避              |
+| 頻繁なインポート追加                       | =file-insert-at-line= が定型追加に対応          |
+| グローバルステートインターフェース         | フィールド追加はパターン化しやすく、スクリプト化も容易 |
+
+newDTW の 1 リファクタリングセッションでの累積節約は *数千〜~10,000 トークン* に
+のぼりました。節約分はファイル転送ではなく、実際の推論に使われました。
+
+** Anvil を使うべき場面
+
+| シナリオ                                       | Anvil の効果                         |
+|------------------------------------------------+--------------------------------------|
+| 同一ファイルへの 3 回以上の編集               | ◎ 大幅なトークン削減                |
+| 大きいファイルへの局所的な追記                | ◎ フルファイル Read を回避          |
+| 型・識別子の一括リネーム                      | ◎ 1 コマンドで完結                  |
+| インポート追加 / 型フィールド追記             | ○ ラウンドトリップ削減              |
+| エージェント作業中の重い Emacs 操作           | ◎ ワーカーディスパッチ (~15× 高速)  |
+| 新規ファイルのスクラッチ作成                  | △ 汎用の =Write= で十分             |
+| ファイル・リポジトリの探索                    | × Glob / Grep の方が適切            |
+
+** 実際のところどうなるか
+
+大きな設定ファイルを触り、いくつかの org 見出しをリファクタし、タングルを走らせる
+典型的なエージェントセッションは、本来ファイル転送オーバーヘッドに支配されます。
+Anvil を使うと:
+
+- 各編集は *変更バイトだけ* を送る。ファイル全体ではない。
+- 多段階リファクタは *1 回* のバッチ呼び出しに折り畳まれる。
+- 低速な Emacs 操作はエージェントのスレッドではなく *ワーカー* で実行される。
+
+結果として、トークンあたりの有効仕事量が増えます — コンテキスト予算がコードの
+再読みではなく、コードについての推論に使われます。
+
+* モジュール
+
+| モジュール   | 提供ツール                                     | 外部依存         |
+|--------------+------------------------------------------------+------------------|
+| =worker=     | AI 呼び出し用の隔離サブ Emacs デーモンプール  | —                |
+| =eval=       | 同期・非同期 Elisp 評価                        | —                |
+| =org=        | org 見出し・アウトライン・TODO の読み書き      | org-mode         |
+| =file=       | 安全なファイル操作、バッチ編集、置換/regexp    | —                |
+| =host=       | CPU、RAM、ディスク、GPU、ネットワーク、OS 情報 | —                |
+| =git=        | ステータス、ログ、差分統計（CJK パス安全）    | git              |
+| =proc=       | プロセス一覧と検査                             | —                |
+| =net=        | ポートとネットワークの検査                     | —                |
+| =fs=         | ディレクトリツリー、ディスク使用量、最近のファイル | —             |
+| =emacs=      | バッファ状態とディスク同期の診断               | —                |
+| =text=       | URL 抽出、リンク解析                           | —                |
+| =clipboard=  | OS クリップボードの読み書き                    | —                |
+| =data=       | UTF-8 強制の JSON/CSV 読み書き                 | —                |
+| =xlsx=       | Excel 読み書き（オプション）                   | Python, openpyxl |
+| =pdf=        | PDF テキスト抽出（オプション）                 | Python, pymupdf  |
+| =ide=        | xref、診断、imenu、tree-sitter（オプション）   | project.el       |
+| =cron=       | ワーカーディスパッチ付きスケジュールタスクランナー | —            |
+| =elisp=      | エージェント向け Elisp 開発ツール（オプション）| —                |
+
+* クイックスタート
+
+#+begin_src emacs-lisp
+(require 'anvil)
+(anvil-enable)
+(anvil-server-start)
+#+end_src
+
+その後 =M-x anvil-describe-setup= を実行するとクライアント設定の手順が表示されます。
+
+* インストール
+
+** async-installer
+
+[[https://github.com/zawatton21/async-installer][async-installer]] — 純 Elisp 構文で書ける、軽量・非同期な Emacs パッケージマネージャ。
+マクロ DSL は不要です。
+
+#+begin_src emacs-lisp
+(async-installer-git-add "https://github.com/zawatton21/anvil.el.git"
+                            :branch "master"
+                            :main "anvil.el")
+#+end_src
+
+** straight.el
+
+#+begin_src emacs-lisp
+(straight-use-package
+ '(anvil :type git :host github :repo "zawatton21/anvil.el"))
+#+end_src
+
+** elpaca
+
+#+begin_src emacs-lisp
+(elpaca (anvil :host github :repo "zawatton21/anvil.el"))
+#+end_src
+
+** use-package (straight または elpaca と組み合わせて)
+
+#+begin_src emacs-lisp
+;; straight 利用時
+(use-package anvil
+  :straight (anvil :type git :host github :repo "zawatton21/anvil.el"))
+
+;; elpaca 利用時
+(use-package anvil
+  :ensure (:host github :repo "zawatton21/anvil.el"))
+#+end_src
+
+** 手動インストール
+
+リポジトリをクローンして =load-path= に追加するだけ:
+
+#+begin_src emacs-lisp
+(add-to-list 'load-path "/path/to/anvil")
+(require 'anvil)
+#+end_src
+
+* 設定
+
+#+begin_src emacs-lisp
+;; ロードするモジュールを選択（デフォルト値を示す）
+(setq anvil-modules '(worker eval org file host git proc fs emacs text clipboard data net))
+
+;; オプションモジュールを有効化
+(setq anvil-optional-modules '(xlsx pdf ide cron))
+
+;; Anvil を起動
+(anvil-enable)
+(anvil-server-start)
+#+end_src
+
+* クライアント設定 — AI を Anvil に接続する
+
+Anvil が Emacs 内で起動したら、AI クライアント（Claude Desktop、Claude Code CLI、
+その他 MCP 対応クライアント）に MCP サーバとして登録する必要があります。
+
+ブリッジは小さなシェルスクリプト (=anvil-stdio.sh=) で、stdio 上で JSON-RPC を話し、
+=emacsclient= 経由で動作中の Emacs デーモンに呼び出しを転送します。
+マシンごとに一度インストールします:
+
+#+begin_src
+M-x anvil-server-install
+#+end_src
+
+デフォルトでは =anvil-stdio.sh= を =user-emacs-directory=（通常 =~/.emacs.d/=）に配置します。
+配置先は =M-x customize-variable RET anvil-server-install-directory= で変更できます。
+
+*前提条件:* Emacs がデーモンとして起動していること
+(=server-start= または =emacs --daemon=)。Anvil は =emacsclient= 経由で接続します。
+
+** Claude Desktop
+
+設定ファイルの場所:
+
+| OS                | パス                                                                                        |
+|-------------------+---------------------------------------------------------------------------------------------|
+| macOS             | =~/Library/Application Support/Claude/claude_desktop_config.json=                           |
+| Linux             | =~/.config/Claude/claude_desktop_config.json=                                               |
+| Windows (通常)    | =%APPDATA%\Claude\claude_desktop_config.json=                                               |
+| Windows (UWP)     | =%LOCALAPPDATA%\Packages\Claude_<id>\LocalCache\Roaming\Claude\claude_desktop_config.json= |
+
+*** macOS / Linux
+
+#+begin_src json
+{
+  "mcpServers": {
+    "anvil": {
+      "command": "/path/to/.emacs.d/anvil-stdio.sh",
+      "args": [
+        "--server-id=anvil",
+        "--init-function=anvil-enable",
+        "--stop-function=anvil-disable"
+      ]
+    }
+  }
+}
+#+end_src
+
+Emacs デーモンがデフォルト以外のソケットディレクトリを使用している場合は、
+=args= 配列に =--socket=/path/to/server= を追加してください。
+
+*** Windows
+
+Windows では Git Bash がシェルスクリプトの実行に必要です:
+
+#+begin_src json
+{
+  "mcpServers": {
+    "anvil": {
+      "command": "C:\\Program Files\\Git\\bin\\bash.exe",
+      "args": [
+        "C:/Users/<you>/.emacs.d/anvil-stdio.sh",
+        "--server-id=anvil",
+        "--init-function=anvil-enable",
+        "--stop-function=anvil-disable"
+      ]
+    }
+  }
+}
+#+end_src
+
+設定編集後は Claude Desktop を再起動してください。
+
+** Claude Code (CLI)
+
+CLI の設定は =~/.claude.json= にチャット履歴などと混在して保存されています。
+*ファイル全体を上書きしないでください*。=claude mcp add= コマンドでサーバエントリだけを
+追加します:
+
+#+begin_src sh
+claude mcp add -s user -t stdio anvil -- \
+  ~/.emacs.d/anvil-stdio.sh \
+  --server-id=anvil \
+  --init-function=anvil-enable \
+  --stop-function=anvil-disable
+#+end_src
+
+Windows の場合は、スクリプトパスを上記の Git Bash 呼び出し形式に置き換えてください
+(=command= = bash.exe、最初の =arg= = スクリプトパス)。
+
+** オプション: ワーカープールも登録する
+
+帯域外実行が有効なワークロード（大規模タングル、マルチ MB org スキャン、
+バイトコンパイル）向けに、Anvil のワーカーモジュールはサブ Emacs デーモンを起動します。
+AI クライアントから直接アドレスできるよう、別の MCP サーバとして登録することもできます:
+
+#+begin_src json
+{
+  "mcpServers": {
+    "anvil": { ... メインデーモン ... },
+    "anvil-worker": {
+      "command": "/path/to/.emacs.d/anvil-stdio.sh",
+      "args": [
+        "--socket=/path/to/.emacs.d/server/anvil-worker",
+        "--server-id=anvil-worker"
+      ]
+    }
+  }
+}
+#+end_src
+
+ほとんどのユーザーはこれは不要です。Anvil の =worker= モジュールがメイン接続越しに
+重い操作を自動ディスパッチします。
+
+** 接続の確認
+
+Emacs 内で:
+
+| コマンド                      | 表示内容                                          |
+|-------------------------------+---------------------------------------------------|
+| =M-x anvil-describe-setup=    | ツール、リソース、クライアント設定例              |
+| =(anvil-server-status)=       | メイン MCP サーバの状態（起動中 / 停止中）       |
+| =(anvil-worker-status)=       | ワーカープールの状態                              |
+
+AI クライアント側: エージェントにツール一覧を要求するか、読み取り専用の
+=anvil-host-info= などを呼び出してみてください。呼び出しが返れば、ブリッジは
+正常に動作しています。
+
+* アーキテクチャ
+
+#+begin_example
+  Claude / GPT / ローカル LLM
+         |
+    MCP (JSON-RPC via stdio)
+         |
+    anvil-stdio.sh (ブリッジ)
+         |
+    emacsclient → Emacs デーモン
+         |
+    anvil-server (ディスパッチャ)
+         |
+    +---------+---------+
+    | main    | worker  |  (ワーカープール: 重い操作は
+    | daemon  | daemons |   隔離されたサブ Emacs で実行)
+    +---------+---------+
+#+end_example
+
+* プラットフォーム対応
+
+| プラットフォーム         | 状態       |
+|--------------------------+------------|
+| Linux (ネイティブ Emacs) | 対応済み   |
+| macOS (ネイティブ Emacs) | 対応済み   |
+| Windows (ネイティブ)     | 対応済み   |
+| WSL                      | 対応済み   |
+
+* コントリビューション
+
+Issue、機能リクエスト、プルリクエストは [[https://github.com/zawatton21/anvil.el]] で歓迎します。
+
+Anvil が役に立つと感じたら、[[https://github.com/sponsors/zawatton21][プロジェクトへのスポンサー]] をご検討ください。
+
+* 関連パッケージ
+
+同じ作者が開発しているパッケージです:
+
+| パッケージ | 説明 | リポジトリ |
+|------------+------+------------|
+| [[https://github.com/zawatton21/async-installer][async-installer]] | コミットピン対応の非ブロッキング GitHub パッケージインストーラ | [[https://github.com/zawatton21/async-installer][GitHub]] |
+| [[https://github.com/zawatton21/eat-windows-pty][eat-windows-pty]] | ネイティブ Windows の emacs-eat 向け ConPTY サポート | [[https://github.com/zawatton21/eat-windows-pty][GitHub]] |
+| [[https://github.com/zawatton21/org-draw][org-draw]] | org-mode 向け Excalidraw・tldraw 統合 | [[https://github.com/zawatton21/org-draw][GitHub]] |
+| [[https://github.com/zawatton21/catchall-box][catchall-box]] | org-mode 用 UUID ベースファイル管理 | [[https://github.com/zawatton21/catchall-box][GitHub]] |
+| [[https://github.com/zawatton21/emacs-skkserv][emacs-skkserv]] | 純 Elisp の skkserv（ddskk、Google IME、MeCab 対応） | [[https://github.com/zawatton21/emacs-skkserv][GitHub]] |
+| [[https://github.com/zawatton21/my-locate-library][my-locate-library]] | require/load 高速化のための load-path インデックス | [[https://github.com/zawatton21/my-locate-library][GitHub]] |
+
+* ライセンス
+
+GPL-3.0。[[file:LICENSE][LICENSE]] を参照してください。
+
+* 謝辞
+
+- [[https://github.com/laurynas-biveinis/mcp-server-lib.el][mcp-server-lib.el]] by Laurynas Biveinis — MCP プロトコルの基盤
+- [[https://github.com/manzaltu/claude-code-ide.el][claude-code-ide.el]] by Manzaltu — IDE 統合のインスピレーション

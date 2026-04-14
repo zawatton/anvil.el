@@ -1,6 +1,8 @@
 #+title: Anvil — An Emacs MCP Server
 #+author: Fujisawa Electric Management Office
 
+*Languages:* English / [[file:README.ja.org][日本語]]
+
 #+begin_quote
 Your AI's workbench. Turn Emacs into a tool server for any LLM agent.
 #+end_quote
