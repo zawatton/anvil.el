@@ -27,6 +27,141 @@ Elisp evaluation, and more — all through a safe, sandboxed interface.
 - *Cross-platform* — Linux, macOS, Windows, WSL
 - *Modular* — load only what you need, extend with your own modules
 
+* Efficiency — why Anvil saves AI tokens
+
+LLM agents pay per token, and every Read/Edit round trip costs
+both bytes on the wire and orchestration overhead. Anvil's tools
+are designed to keep the agent's context budget free for reasoning,
+not bookkeeping.
+
+** Operate on regions, not whole files
+
+Generic file tools force a Read-then-Edit pattern that ships the
+whole file each time. Anvil exposes targeted operations that send
+only the delta:
+
+| Task | Generic flow | Anvil flow |
+|------+--------------+------------|
+| Replace one string in a 1.2 MB org file | Read 1.2 MB → Edit (sends old + new) | =anvil-file-replace-string= (pattern + replacement only) |
+| Read one heading from a 30k-line =init.org= | Read & paginate | =anvil-org-read-headline= (subtree only) |
+| Insert near the end of a large file | Read whole file → rewrite | =anvil-file-insert-at-line= (delta only) |
+
+For org-mode refactors specifically, MCP-backed operations
+(section move, refile, split) run *10–20× cheaper in tokens* than
+their Read + Write equivalents.
+
+** Batch edits into one round trip
+
+When an agent makes several edits to the same file, each becomes a
+separate tool call with its own request/schema/response overhead.
+=anvil-file-batch= applies a vector of edits in a single
+transaction — *up to ~90% token reduction* versus issuing the
+edits one at a time.
+
+** Heavy work runs out of band
+
+Slow operations (large tangles, full-tree org scans, byte-compile)
+are dispatched to a worker daemon pool so the agent's main
+connection stays responsive.
+
+Measured impact: =org-babel-tangle= on a ~1 MB =init.org= runs
+~30 s in-process but ~2 s when worker-dispatched — *~15× faster
+end-to-end*, and the agent's main session is never blocked.
+
+** Scales to large org databases
+
+Naïve approaches that walk a temp buffer time out on org files
+past ~50 KB inside an MCP request. Anvil's org tools use streaming
+regex scanners, so heading lookups and outline reads stay fast on
+multi-megabyte org trees (the kind of monolithic =init.org= or
+journal file power users actually maintain).
+
+** Case study: TypeScript refactoring at scale
+
+Anvil isn't just theory, and it isn't org-mode-only. It was
+validated on a real large-scale TypeScript migration project —
+the [[https://github.com/zawatton21/newDTW][newDTW]] repository, which ports a decompiled HSP application
+to TypeScript:
+
+- *16,000+* lines of TypeScript across *1,400+* modules
+- Massive type-definition files (thousands of lines) tightly
+  coupled with implementation files
+- High frequency of multi-point edits within the same file
+
+The same Anvil tools that help with org-mode delivered
+measurable wins here too.
+
+*** =anvil-file-batch= — multiple edits to one file
+
+TypeScript refactoring routinely means several simultaneous
+edits to one file: adding imports, modifying type defs,
+replacing implementation, renaming methods.
+
+Measured: 6 edits to a 130-line source file.
+
+| Method                | Tokens   | Round trips |
+|-----------------------+----------+-------------|
+| Generic =Edit= ×6     | ~4,800   | 6           |
+| =anvil-file-batch=    | ~1,500   | 1           |
+| Reduction             | *~70%*   | *83%*       |
+
+*** =anvil-file-replace-regexp= — bulk type/identifier renames
+
+Tasks like changing =Promise<T>= → =AsyncResult<T>= across the
+codebase, or renaming a globally-used variable, finish in *one
+command*. The conventional flow (grep across hundreds of files,
+read each, edit individually) is many round trips of the same
+mechanical work.
+
+*** =anvil-file-insert-at-line= / =-delete-lines= — localized ops on large files
+
+Use case: adding a single field to a 4,000+ line type-definition
+file, or to a global state interface.
+
+| Method                       | Tokens     |
+|------------------------------+------------|
+| Read full file + Edit        | thousands  |
+| =anvil-file-insert-at-line=  | tens       |
+| Reduction                    | *~90%+*    |
+
+*** Why TypeScript benefits especially
+
+| TypeScript characteristic                       | Why Anvil helps                                  |
+|-------------------------------------------------+--------------------------------------------------|
+| Type defs + implementations coexist in one file | Many edits per file → =file-batch= shines        |
+| Massive type-definition files                   | Localized ops avoid full-file reads              |
+| Frequent import additions                       | =file-insert-at-line= handles routine insertion  |
+| Global state interfaces                         | Field additions follow patterns, easy to script  |
+
+Per refactoring session in newDTW, the cumulative saving was
+*several thousand to ~10,000 tokens* — context the agent then
+spent on actual reasoning instead of file-shuttling.
+
+** When to reach for Anvil
+
+| Scenario                                      | Anvil benefit                       |
+|-----------------------------------------------+-------------------------------------|
+| 3+ edits within the same file                 | ◎ Major token reduction             |
+| Localized additions to large files            | ◎ Avoids full-file Read             |
+| Bulk renames (types, identifiers)             | ◎ Completes in one command          |
+| Adding imports / type fields                  | ○ Fewer round trips                 |
+| Heavy Emacs ops during agent work             | ◎ Worker dispatch (~15× faster)     |
+| Creating new files from scratch               | △ Generic =Write= is fine           |
+| File or repository exploration                | × Glob / Grep are better fits       |
+
+** What this looks like in practice
+
+A typical agent session that touches a large config file, refactors
+a few org headings, and runs a tangle would otherwise be dominated
+by file-shuttling overhead. With Anvil:
+
+- Each edit ships only the *changed bytes*, not the file.
+- Multi-step refactors collapse into *one* batched call.
+- Slow Emacs ops execute in a *worker*, not the agent's thread.
+
+The result is more useful work per token — the agent's context
+budget goes to reasoning about your code, not re-reading it.
+
 * Modules
 
 | Module       | Tools                                          | External Deps    |
