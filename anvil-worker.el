@@ -69,6 +69,17 @@ If nil, anvil generates a minimal init that registers the eval tool."
   :type 'integer
   :group 'anvil-worker)
 
+(defcustom anvil-worker-alive-check-timeout 2.0
+  "Seconds to wait for the `emacsclient -e t' liveness probe.
+If the probe does not return within this window, the worker is
+treated as dead and the probe process is killed.  This guards
+against stale server files whose TCP port has been reused by a
+process that accepts the connection but never replies to the
+Emacs server auth protocol — which would otherwise hang the
+probing daemon indefinitely."
+  :type 'number
+  :group 'anvil-worker)
+
 (defcustom anvil-worker-call-timeout 60
   "Default timeout in seconds for normal worker calls."
   :type 'integer
@@ -185,14 +196,44 @@ Each entry: (:name STRING :server-file STRING :busy BOOLEAN :last-state SYMBOL)"
 
 ;;; Worker lifecycle
 
+(defun anvil-worker--probe-emacsclient (server-file)
+  "Return non-nil if `emacsclient -f SERVER-FILE -e t' exits 0 in time.
+The probe is run asynchronously via `make-process' and hard-killed
+after `anvil-worker-alive-check-timeout' seconds.  This prevents a
+stale SERVER-FILE pointing at a reused TCP port from blocking the
+caller indefinitely."
+  (let* ((buf (generate-new-buffer " *anvil-worker-probe*"))
+         (proc (make-process
+                :name "anvil-worker-probe"
+                :buffer buf
+                :command (list "emacsclient" "-f" server-file "-e" "t")
+                :noquery t
+                :connection-type 'pipe))
+         (deadline (+ (float-time) anvil-worker-alive-check-timeout))
+         (alive nil))
+    (unwind-protect
+        (progn
+          (while (and (process-live-p proc)
+                      (< (float-time) deadline))
+            (accept-process-output proc 0.1 nil t))
+          (if (process-live-p proc)
+              (progn
+                (delete-process proc)
+                (anvil-worker--log
+                 'probe-timeout
+                 (format "%s >%.1fs"
+                         (file-name-nondirectory server-file)
+                         anvil-worker-alive-check-timeout)))
+            (setq alive (= 0 (process-exit-status proc)))))
+      (when (buffer-live-p buf) (kill-buffer buf)))
+    alive))
+
 (defun anvil-worker-alive-p (&optional index)
   "Return non-nil if worker at INDEX (default 0) is reachable."
   (let* ((idx (or index 0))
          (server-file (anvil-worker--server-file idx)))
     (and (file-exists-p server-file)
-         (= 0 (call-process "emacsclient" nil nil nil
-                            "-f" server-file
-                            "-e" "t")))))
+         (anvil-worker--probe-emacsclient server-file))))
 
 (defun anvil-worker--spawn-one (index)
   "Spawn worker at INDEX if not already running."
