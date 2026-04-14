@@ -80,7 +80,7 @@ journal file power users actually maintain).
 
 Anvil isn't just theory, and it isn't org-mode-only. It was
 validated on a real large-scale TypeScript migration project —
-the [[https://github.com/zawatton21/newDTW][newDTW]] repository, which ports a decompiled HSP application
+the [[https://github.com/zawatton21/newDTW.github.io][newDTW]] repository, which ports a decompiled HSP application
 to TypeScript:
 
 - *16,000+* lines of TypeScript across *1,400+* modules
