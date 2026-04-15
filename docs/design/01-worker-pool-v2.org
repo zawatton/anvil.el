@@ -1,0 +1,231 @@
+#+title: Worker Pool v2 — Read/Write Routing, File Affinity, Batch Sub-Pool
+#+date: 2026-04-15
+#+property: status DRAFT
+
+* STATUS
+~DRAFT~ — レビュー前
+
+* Goal
+
+現行 ~anvil-worker.el~ の round-robin + heavy-op detection を拡張し、以下を達成する:
+
+1. *Read/Write 分離* — 読み取り tool call は read replica に流し、書き込みは主系に集約して整合性を保つ。
+2. *File affinity* — 同一ファイルへの書き込みは同一 worker に routing し、buffer cache を再利用。
+3. *Pre-warmed batch pool* — 短時間で完結する "fire-and-forget" 系 call は ~emacs --batch~ プール (~30MB × N) に
+   分離し、long-lived daemon を占有させない。
+4. *Connection reuse* — ~emacsclient~ spawn cost (~50〜100ms on Windows) を削減。
+5. *可観測性* — dispatch の routing 判断、待ち時間、busy 時間を metric として取得可能にする。
+
+* Problem
+
+** 現状の制約
+
+~anvil-worker.el~ は既に以下を提供:
+- N worker daemon (default 2)
+- round-robin + busy tracking
+- heavy-op regex detection (byte-compile, insert-file-contents 等)
+- auto-respawn via health timer
+- stale server-file 検出 (PID attr check)
+
+しかし以下は未対応:
+
+- *全 call が均等に扱われる*。read-heavy/write-heavy の区別なし。
+- *File affinity なし*。同じ org ファイルを 2 worker が同時に開くと buffer が衝突する可能性。
+- *cold start 未償却*。重い tool call 毎に ~emacs --batch~ を起動する pattern があり、Windows で 500ms〜1s 浪費。
+- *routing decision が black box*。なぜ worker-1 に行ったかが log を見ても分からない。
+
+** 想定シナリオ
+
+- Claude Code が並列で 5 tool call 投げる (3 read + 2 write)
+  → 現状: 2 worker を round-robin で消費、3 つ目以降は待機。read も write も同じ lane。
+  → v2: read 3 つは read replica にぶつけ、write 2 つは write lane で file affinity 判定。実質 2〜3 倍のスループット。
+
+* Current State
+
+- File: ~anvil-worker.el~ (497 行)
+- Exports: ~anvil-worker-enable~, ~anvil-worker-call~, ~anvil-worker-spawn~, ~anvil-worker-kill~, ~anvil-worker-status~
+- Health timer: ~anvil-worker--health-check~ (30s interval)
+
+* Proposed Design
+
+** Lane 構造
+
+ワーカーを 3 つの lane に分ける:
+
+#+begin_src text
+┌─ read lane (N=2, default)  ─ read-only tool call 向け
+│   ├── worker-read-1
+│   └── worker-read-2
+│
+├─ write lane (N=1, default) ─ write tool call 向け (file affinity)
+│   └── worker-write-1
+│
+└─ batch pool (N=2, default) ─ emacs --batch の pre-warmed プール
+    ├── batch-1 (idle, ready for fire-and-forget eval)
+    └── batch-2
+#+end_src
+
+- *read lane*: read replica daemon。~(setq buffer-read-only t)~ の制限はなく "書き込み禁止の convention" のみ。
+  tool call 内で ~save-buffer~ 等を実行した場合は assert で fail させる。
+- *write lane*: 書き込みを処理。N=1 から開始 (serialize で安全)。将来、file path で shard して N>1 に拡張可能。
+- *batch pool*: ~emacs --fg-daemon=anvil-batch-N -Q~ で pre-warm 済。~emacsclient~ 経由で eval 投入。
+  現行 worker pool と同じ仕組みだが、用途を「短時間 task」に限定し、初期化コストを事前償却する。
+
+** Routing policy
+
+新 API:
+
+#+begin_src elisp
+(anvil-worker-call EXPRESSION
+                   &key
+                   (kind 'auto)    ; 'read | 'write | 'batch | 'auto
+                   (file nil)       ; write 時の affinity key
+                   (timeout nil)    ; nil → kind / heavy 検出から決定
+                   (priority 0))    ; 高いほど優先 (将来拡張)
+#+end_src
+
+- ~kind=auto~ の時は expression を解析して推定:
+  - ~(org-read-*)~, ~(file-read)~, ~(anvil-file-read ...)~ → read
+  - ~(anvil-file-replace-* ...)~, ~(org-edit-body ...)~, ~save-buffer~ → write
+  - 重い既知 pattern (tangle, byte-compile) かつ副作用軽微 → batch
+  - 判別不能 → write (安全側倒し)
+
+- 推定根拠は lifecycle log に ~routed~ event として記録。
+
+** File affinity (write lane)
+
+write lane が N>1 になった時の shard 関数:
+
+#+begin_src elisp
+(defun anvil-worker--write-shard (file)
+  (mod (sxhash file) anvil-worker-write-pool-size))
+#+end_src
+
+- 同一 FILE は常に同じ worker に行くので、buffer cache が温まる。
+- FILE が nil (infer 不能) の write は worker-write-1 に固定。
+
+** Connection reuse
+
+現状、tool call ごとに ~emacsclient~ を新規起動しているが、Windows では起動オーバーヘッドが大きい。
+
+案 A: *emacsclient persistent channel*
+- 各 worker に対して長期保持する ~emacsclient~ プロセスを 1 本持ち、stdin に S-expression を送って stdout で受ける。
+- 実装難度: 中。Emacs server の protocol に乗って生で書くか、~emacsclient --eval --tty~ のセッションモードを使う。
+
+案 B: *worker 側の persistent connection listener*
+- worker daemon が ~anvil-server~ を load しているので、MCP tool "eval-on-worker" を main daemon 経由で投げるのではなく、
+  直接 worker の ~anvil-stdio.sh~ を叩く (stdio または TCP)。
+- 案 A より健全。main daemon の負荷も減る。
+
+*採択*: 案 B。main daemon を routing table だけ持つ薄い dispatcher にする。
+
+** Dispatch metrics
+
+新変数 ~anvil-worker--metrics~ (alist):
+
+| key                     | 意味                              |
+|-------------------------+-----------------------------------|
+| ~:dispatch-count~       | 通算 dispatch 数 (全 lane)        |
+| ~:dispatch-by-lane~     | lane 別 dispatch count            |
+| ~:wait-ms-sum~          | 待機時間合計 (ms)                 |
+| ~:busy-ms-sum~          | 実行時間合計 (ms)                 |
+| ~:heavy-detect-count~   | heavy pattern match 回数          |
+| ~:respawn-count~        | 通算 respawn 回数                 |
+| ~:kind-inference-table~ | (auto-kind . 実 lane) ヒストグラム |
+
+~M-x anvil-worker-metrics~ で表示、~M-x anvil-worker-metrics-reset~ で初期化。
+
+* API
+
+** User-facing
+
+#+begin_src elisp
+(anvil-worker-enable &key
+                     (read-pool-size 2)
+                     (write-pool-size 1)
+                     (batch-pool-size 2)
+                     (reuse-connections t))
+  ;; 全 lane を起動、health timer スタート
+
+(anvil-worker-call EXPRESSION
+                   &key
+                   (kind 'auto)
+                   (file nil)
+                   (timeout nil))
+
+(anvil-worker-status)      ; 現状の 3 lane ダンプ
+(anvil-worker-metrics)     ; metrics 表示
+#+end_src
+
+** Internal
+
+- ~anvil-worker--classify~ (expr) → ~'read~ | ~'write~ | ~'batch~
+- ~anvil-worker--pick-lane~ (kind) → lane symbol
+- ~anvil-worker--pick-worker-in-lane~ (lane, file) → worker name
+- ~anvil-worker--send~ (worker, expr) → result (connection reuse 対応)
+
+* Implementation Plan
+
+1. *Phase 1 — Lane split のみ* (~1 週間)
+   - ~anvil-worker--pool~ を lane 別構造に移行
+   - ~anvil-worker-call~ に ~:kind~ keyword 追加、既存呼び出しは ~'auto~ で互換
+   - lifecycle log に lane 情報追加
+   - *既存 test が全 pass することを gate にする*
+
+2. *Phase 2 — Classification rules* (~3 日)
+   - ~anvil-worker--classify~ 実装、regex ベース + 既知 function 名 allow-list
+   - inference が write に誤爆するケースを metric で観測、誤爆率 < 5% を目標
+
+3. *Phase 3 — Batch pool* (~1 週間)
+   - ~anvil-batch-1~, ~anvil-batch-2~ daemon を pre-warm
+   - 既存 ~start-process anvil-worker--spawn-one~ を lane-aware に改修
+
+4. *Phase 4 — Connection reuse* (~1〜2 週間)
+   - 案 B 実装。worker 側で stdio persistent listener を起動
+   - 既存 ~emacsclient~ 経路は fallback として残す (feature flag ~anvil-worker-reuse-connections~)
+
+5. *Phase 5 — Metrics + status UI* (~3 日)
+
+* Migration
+
+- 既存 ~(anvil-worker-enable)~ 呼び出しは動作継続 (デフォルト引数で v1 と同じ pool 構成になるよう初期値を選ぶか、
+  明示的に v2 に切り替えるかは init.org で選択可能にする)。
+- 既存 ~anvil-worker-pool-size~ は deprecation warning を出しつつ ~anvil-worker-read-pool-size~ にエイリアス。
+- ~anvil-worker-call~ の old signature ~(anvil-worker-call expr &optional timeout)~ は互換維持。
+
+* Risks
+
+- *read/write classification の誤爆*。write を read と判定すると書き込みが read replica に行き stale になる。
+  → 採択ルール: ~'auto~ で判別不能時は write に倒す (安全側)。classification は allow-list 主体。
+- *batch pool の冷間期*。pre-warm 済だが、初回 require に時間がかかる処理が含まれると遅い。
+  → pool 初期化時に warmup expression (~(require 'org)~ 等) を流す。
+- *file affinity の skew*。大きな org ファイル 1 本に集中すると shard しても 1 worker に偏る。
+  → Phase 1 では N=1 固定なので Phase 2 まで保留。Phase 2 で metrics を見てから決定。
+- *connection reuse の protocol bug*。persistent listener を自前実装するとデバッグが難しい。
+  → Phase 4 は最後。Phase 1〜3 が安定してから。
+
+* Platform notes
+
+** Windows
+
+- ~emacsclient~ spawn cost が 50〜100ms。connection reuse の ROI は Linux より大きい。
+- worker の ~start-process~ は既に ~set-process-query-on-exit-flag~ を nil にしているので OK。
+- batch pool の cold start は Linux 比 5〜10 倍。pre-warm 効果が特に大きい。
+
+** macOS / Linux
+
+- connection reuse の ROI は小さい (spawn ~20ms)。Phase 4 は Windows 優先で実装し、他 OS は opt-in でも可。
+
+* Success Metrics
+
+- 並列 5 tool call (3 read + 2 write) の完了時間: v1 比 50% 削減
+- cold start 含む "tangle init.org" tool call: v1 比 80% 削減 (batch pool 効果)
+- routing 誤爆率: < 5% (auto kind)
+- respawn 頻度: v1 と同等以下 (退行しない)
+
+* References
+
+- [[file:../../anvil-worker.el][anvil-worker.el (現行)]]
+- memory: ~feedback_emacs_server_concurrency_model.md~
+- memory: ~feedback_emacs_accept_process_output_no_server_yield.md~
+- memory: ~project_mcp_layer2_design.md~

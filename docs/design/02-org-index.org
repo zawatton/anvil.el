@@ -1,0 +1,293 @@
+#+title: Persistent Org Index — SQLite-backed Headline/Tag/ID Cache
+#+date: 2026-04-15
+#+property: status DRAFT
+
+* STATUS
+~APPROVED~ (2026-04-15) — Phase 1 実装着手可
+
+** Decisions
+
+1. *Emacs 要件*: 29+ 推奨 (内蔵 ~sqlite-*~ API)。28.2 は ~emacsql~ がインストール済みの場合のみ可。
+   起動時に backend を動的選択し、どちらも利用不可なら明示エラー。
+2. *DB 位置*: ~~/.emacs.d/anvil-org-index.db~ (user-emacs-directory 直下)。
+   org-roam / vulpea 等の先行慣例に合わせる。
+3. *Phase 1 範囲*: schema 作成 + ~anvil-org-index-rebuild~ (手動全件再構築) + 最低限の status command。
+   watcher / incremental / MCP tool 差し替えは Phase 2 以降。
+
+* Goal
+
+全 org ファイルの headline / tag / ID / property / mtime を *永続 SQLite index* に保持し、
+MCP read tool (特に ~org-read-by-id~, ~org-read-headline~, tag search) が index を先に引くことで、
+以下を達成する:
+
+1. *並列 read の高速化* — parse 不要でほぼ DB クエリのみ。~org-map-entries~ の 30s timeout 問題を回避。
+2. *cold start のコスト償却* — daemon 再起動後も index は disk にあるので再 parse 不要。
+3. *cross-file search* — 複数 org を跨ぐ検索が grep + parse でなく SQL で書ける。
+4. *検索 API の追加* — tag / property / TODO 状態での絞り込みを安価に提供。
+
+* Problem
+
+** 現状の具体的痛み (memory 記載済)
+
+- ~org-map-entries~ が 47KB org ファイルで MCP 30s timeout (~feedback_org_map_entries_timeout.md~)
+- temp-buffer + org-mode パターンは大きいファイルで timeout。pure regexp scanner で回避中。
+- ~my-cc-helpers~ で ~insert-file-contents~ の auto-detect が raw bytes 化する罠 (~feedback_my_cc_helpers_utf8_journals.md~)
+- ~org-read-headline~ 等は毎回ファイル全体を parse するので、同じファイルへの連続 read が無駄。
+
+** 根本原因
+
+- org-element cache は buffer 内のみ、かつ init 時に ~nil~ binding すると 2x 遅くなる罠あり
+  (~feedback_org_element_cache_during_init.md~)
+- buffer が visited でないと cache が効かない。MCP tool で毎回 temp buffer 作るなら効果ゼロ。
+
+** 想定シナリオ
+
+- Claude が "2026-04 の journal から DONE タスクを全部列挙" と頼む
+  → 現状: ~journals-2026.org~ (数 MB) を parse、30s timeout 寸前。
+  → v2: SQLite に ~(file, headline, todo, scheduled)~ が入ってるので
+    ~SELECT ... WHERE file = 'journals-2026.org' AND todo = 'DONE' AND scheduled LIKE '2026-04%'~ で ms オーダー。
+
+* Current State
+
+- 該当なし。anvil には永続 index は存在しない。毎回 parse。
+
+* Proposed Design
+
+** Storage
+
+- SQLite。backend は起動時に動的選択:
+  1. Emacs 29+ で ~(sqlite-available-p)~ が non-nil → 内蔵 ~sqlite-*~ API
+  2. ~(require 'emacsql nil t)~ が成功 → emacsql 経由
+  3. どちらも不可 → ~user-error~ で明示的に失敗
+- Index DB 位置: ~~/.emacs.d/anvil-org-index.db~ (~user-emacs-directory~ 直下)。
+- ~Package-Requires~ は ~emacs 28.2~ のまま維持 (emacsql は optional dep)。
+
+** Schema (v1)
+
+#+begin_src sql
+CREATE TABLE file (
+  id           INTEGER PRIMARY KEY,
+  path         TEXT UNIQUE NOT NULL,
+  mtime        INTEGER NOT NULL,       -- file attribute mtime
+  size         INTEGER NOT NULL,
+  indexed_at   INTEGER NOT NULL,       -- index 生成時刻
+  schema_ver   INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE headline (
+  id           INTEGER PRIMARY KEY,
+  file_id      INTEGER NOT NULL REFERENCES file(id) ON DELETE CASCADE,
+  parent_id    INTEGER,                -- 親 headline.id (top-level は NULL)
+  level        INTEGER NOT NULL,
+  title        TEXT NOT NULL,
+  todo         TEXT,                   -- TODO/DONE/NOTE/MEMO など、または NULL
+  priority     TEXT,                   -- [#A] [#B] [#C] または NULL
+  scheduled    TEXT,                   -- ISO8601 または org timestamp
+  deadline     TEXT,
+  closed       TEXT,
+  org_id       TEXT,                   -- :ID: property
+  position     INTEGER NOT NULL,       -- buffer position (point)
+  line_start   INTEGER NOT NULL,
+  line_end     INTEGER                 -- 次 headline 直前または EOF
+);
+
+CREATE INDEX idx_headline_file   ON headline(file_id);
+CREATE INDEX idx_headline_todo   ON headline(todo);
+CREATE INDEX idx_headline_id     ON headline(org_id) WHERE org_id IS NOT NULL;
+CREATE INDEX idx_headline_sched  ON headline(scheduled) WHERE scheduled IS NOT NULL;
+
+CREATE TABLE tag (
+  headline_id  INTEGER NOT NULL REFERENCES headline(id) ON DELETE CASCADE,
+  tag          TEXT NOT NULL,
+  PRIMARY KEY (headline_id, tag)
+);
+
+CREATE INDEX idx_tag_tag ON tag(tag);
+
+CREATE TABLE property (
+  headline_id  INTEGER NOT NULL REFERENCES headline(id) ON DELETE CASCADE,
+  key          TEXT NOT NULL,
+  value        TEXT NOT NULL,
+  PRIMARY KEY (headline_id, key)
+);
+
+CREATE INDEX idx_property_key ON property(key);
+#+end_src
+
+*非正規化の判断*: tag と property は別テーブルに切るが、検索頻度の高い ~org-id~ だけは headline にも入れる
+(JOIN 回避)。
+
+** Indexer
+
+実装: ~anvil-org-index.el~
+
+*** Entry points
+
+#+begin_src elisp
+(anvil-org-index-rebuild &optional files)
+  ;; FILES が nil なら `anvil-org-index-paths' 全部を再 index。
+  ;; 既存 entry は DELETE → INSERT。atomic (transaction)。
+
+(anvil-org-index-refresh-if-stale &optional file)
+  ;; mtime 比較、変更があれば再 index。
+  ;; MCP tool 呼び出し前に呼ぶ (lazy refresh)。
+
+(anvil-org-index-watch)
+  ;; filesystem watcher 起動。file change event で refresh schedule。
+  ;; Windows: w32-notify、macOS: kqueue、Linux: inotify (Emacs built-in filenotify)
+
+(anvil-org-index-stop)
+#+end_src
+
+*** Parser
+
+- *pure regexp scanner* を採用 (~org-map-entries~ の timeout 回避が memory に記録済)
+- org-mode を load せず、~insert-file-contents~ (coding 強制 utf-8-unix) + regexp で headline 抽出
+- ~org-element~ より桁違いに速い (memory 経験: 47KB で 30s → ms オーダー)
+- 実装: ~anvil-org-index--scan-buffer~ が 1 pass で headline / tag / property / ID / timestamp を抽出
+
+*** Transaction 粒度
+
+- ファイル 1 本 = 1 transaction。途中で crash しても partial state にならない。
+- rebuild 全体では ~BEGIN IMMEDIATE~ で始め、ファイル毎に savepoint。
+
+** Read API (MCP tool 用)
+
+既存 MCP tool の実装を *index 先引き* に切り替える:
+
+| MCP tool              | v1                   | v2 (index 経由)                       |
+|-----------------------+----------------------+---------------------------------------|
+| ~org-read-by-id~      | grep + org parse     | ~SELECT file, position FROM headline WHERE org_id = ?~ で file:position を得てから当該行のみ読む |
+| ~org-read-headline~   | full-file parse      | headline 位置を index で引き、line_start〜line_end を部分読み取り |
+| ~org-read-outline~    | full-file parse      | ~SELECT ... ORDER BY position~ で headline tree を DB 構築 (本文なし) |
+| (新) ~org-search~     | なし                 | tag / todo / property / date range 等を組み合わせた SQL クエリ |
+| (新) ~org-tag-list~   | なし                 | ~SELECT DISTINCT tag FROM tag~ |
+
+本文取得は常に「index で position を引く → 該当範囲のみ ~insert-file-contents~」にすることで、
+ファイル全体を読み込まない。
+
+** Invalidation strategy
+
+3 段階:
+
+1. *mtime check on read* (opportunistic)
+   - read tool 呼び出し時に ~file-attribute-modification-time~ と index の ~mtime~ を比較。
+   - diff あり → 同期的に refresh してから読む。
+2. *filesystem watcher* (proactive)
+   - filenotify で change event を受けたら ~run-with-idle-timer 2~ で refresh schedule。
+   - 連続変更を debounce。
+3. *periodic full scan* (safety net)
+   - 1 時間に 1 回、全 ~anvil-org-index-paths~ を mtime 比較。変更あれば refresh。
+
+** Paths configuration
+
+#+begin_src elisp
+(defcustom anvil-org-index-paths
+  '("~/Cowork/Notes/capture/"
+    "~/Cowork/Notes/node/"
+    "~/Cowork/Reports/")
+  "Directories to index.  Recursively scanned for *.org files.")
+
+(defcustom anvil-org-index-exclude
+  '("\\.git/" "archive/")
+  "Regex patterns excluded from indexing.")
+#+end_src
+
+* API
+
+** User-facing
+
+#+begin_src elisp
+(anvil-org-index-enable)   ; 初回 rebuild + watcher 起動
+(anvil-org-index-disable)  ; watcher 停止 (DB は残す)
+
+(anvil-org-index-rebuild)
+(anvil-org-index-status)   ; ファイル数/headline 数/最終更新/DB サイズ表示
+
+(anvil-org-index-query SQL &rest ARGS)  ; debug 用 raw query
+(anvil-org-index-find-by-id ID)
+(anvil-org-index-find-by-tag TAG)
+(anvil-org-index-search &key tag todo scheduled-from scheduled-to title-match)
+#+end_src
+
+** MCP tools (新規)
+
+- ~org-search~ — 上記 ~anvil-org-index-search~ の MCP wrapper
+- ~org-tag-list~ — 全 tag 列挙
+- ~org-todo-list~ — 指定条件の TODO 列挙 (agenda 代替)
+
+** MCP tools (改修)
+
+- ~org-read-by-id~, ~org-read-headline~, ~org-read-outline~ — 内部で index 利用に切り替え。
+  API は不変。
+
+* Implementation Plan
+
+1. *Phase 1 — Schema + rebuild* (~1 週間)
+   - ~anvil-org-index.el~ 新規作成
+   - schema 作成、~anvil-org-index-rebuild~ 実装 (全 path scan → 全件 DELETE + INSERT)
+   - CI test: 既知 org ファイル → 期待 row 数
+
+2. *Phase 2 — Incremental update* (~3 日)
+   - ~anvil-org-index-refresh-if-stale~ 実装
+   - mtime 比較、ファイル単位で更新
+
+3. *Phase 3 — Filesystem watcher* (~3 日)
+   - ~filenotify-add-watch~ 使用
+   - Windows/macOS/Linux で動作確認
+   - debounce ロジック
+
+4. *Phase 4 — MCP tool 差し替え* (~1 週間)
+   - 既存 ~org-read-*~ tool の内部を index 経由に。API は不変。
+   - 既存 tests 全 pass を gate
+
+5. *Phase 5 — 新 MCP tool* (~3 日)
+   - ~org-search~, ~org-tag-list~, ~org-todo-list~
+
+6. *Phase 6 — Observability* (~2 日)
+   - ~anvil-org-index-status~, metrics (hit rate 等)
+
+* Migration
+
+- ~anvil-enable~ の一部として ~(anvil-org-index-enable)~ を opt-in で提供。
+- 初回起動時の rebuild は時間がかかる可能性があるので、~M-x anvil-org-index-rebuild~ を手動実行する option を案内。
+- 既存 MCP tool は index disabled 時も動作継続 (fallback to v1 parse 経路)。
+
+* Risks
+
+- *parser の org 文法追随漏れ*。org の syntax は柔軟で edge case が多い。
+  → pure regexp で 100% 合わせるのは無理。index には "よく使う属性" のみ入れ、本文は必ず position から
+    実ファイルを読み直す設計にすることで、index 誤りが最終結果に波及しない。
+- *watcher の event loss*。filenotify はバックエンド毎に挙動が違う。
+  → Phase 3 で periodic full scan を併用 (safety net)。
+- *Emacs 29+ 依存*。~Package-Requires~ を引き上げることの影響。
+  → ~emacsql~ 依存にして 28.2 互換を維持する選択肢も。Phase 1 で方針確定。
+- *large repo の初回 rebuild コスト*。数千ファイルの scan は長い。
+  → 初回は background で rebuild、完了まで fallback 経路を使う (段階的 cutover)。
+- *SQL injection*。user input を直接 SQL に入れない。placeholder API 必須。
+
+* Platform notes
+
+** Windows
+
+- filenotify の ~w32-notify~ backend は移動/削除/作成を取りこぼすことが稀にあるので periodic scan を必須に。
+- SQLite DB file lock は POSIX と異なる。~sqlite-open~ の排他設定を要確認。
+
+** macOS / Linux
+
+- kqueue / inotify の watcher はほぼ素直に動く。ただし kqueue は file descriptor 上限に注意。
+
+* Success Metrics
+
+- ~org-read-by-id~ 平均 latency: v1 比 90% 削減 (parse 不要)
+- 30s timeout 事例の消滅
+- 初回 rebuild 所要時間: 1000 ファイルで < 60s
+- watcher-to-index-ready 時間: < 3s (典型)
+
+* References
+
+- memory: ~feedback_org_map_entries_timeout.md~ (pure regexp scanner の必要性)
+- memory: ~feedback_my_cc_helpers_utf8_journals.md~ (~insert-file-contents~ coding 強制の知見)
+- memory: ~feedback_org_element_cache_during_init.md~ (org-element cache の罠)
+- ~anvil-org.el~ (既存 org tool)
+- Emacs 29+ ~sqlite.el~ API

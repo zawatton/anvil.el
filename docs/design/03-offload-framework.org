@@ -1,0 +1,246 @@
+#+title: Offload Framework — Futures, Coalescing, Preemption
+#+date: 2026-04-15
+#+property: status DRAFT
+
+* STATUS
+~DRAFT~ — レビュー前。Doc 01 (worker pool v2) の batch pool を前提とする。
+
+* Goal
+
+重い / 長時間 / 冗長な tool call を透過的に扱う共通基盤を提供する:
+
+1. *Offload macro* — ~(anvil-offload FORM)~ で任意の elisp を batch subprocess に投げ、future を返す。
+   個別に ~start-process~ を書かずに済むようにする。
+2. *Call coalescing* — 短時間内の同一ファイルへの複数 edit call を 1 回の buffer open にまとめる。
+3. *Preemption* — wall-time cap を超えた tool call を safely kill し、partial result + resume cursor を返す。
+
+現状、~init.org~ tangle の subprocess pattern 等が個別に書かれており、再利用できていない。
+
+* Problem
+
+** 現状の具体例 (memory)
+
+- init.org tangle: in-process 30s → subprocess 2s (~15x speedup)、~feedback_subprocess_tangle_pattern.md~ に経験則。
+- ~run-with-timer~ は重い op には無効。fire-and-forget + sentinel log が正解パターン。
+- ~org-map-entries~ が 30s timeout する (doc 02 で index 化するが、それでも subprocess 必要な op はある)。
+
+** coalescing の動機
+
+- Claude がしばしば「read → edit → re-read → edit」と短時間内に同じファイルに複数 call する。
+- 各 call で ~find-file~ / ~save-buffer~ が走ると Windows では disk I/O + mtime 更新が重なる。
+- batch 化で 1 buffer open に集約すれば合計 latency が数倍改善。
+
+** preemption の動機
+
+- 1 つの bad call (regex の catastrophic backtracking、巨大ファイルの誤処理) で daemon が詰まる。
+- 現状 ~anvil-worker-call~ は timeout で process kill するが、その時点で partial result が捨てられる。
+- 設計上「25s で一旦返して、続きはクライアントが決める」方が AI agent との相性が良い (再開可能なら retry)。
+
+* Current State
+
+- ~anvil-worker.el~ の heavy-op detection: 静的 regex でパターン検出、timeout を 300s に延長するのみ。
+- ~anvil-proc.el~: 汎用プロセス起動ラッパー (詳細未確認)
+- offload 相当の再利用可能 macro: *なし*
+- coalescing: *なし*
+- preemption: process kill のみ、resume 不可
+
+* Proposed Design
+
+** ~anvil-offload~ macro
+
+#+begin_src elisp
+(anvil-offload FORM &key (timeout 300) (env nil) (require nil))
+  ;; FORM を batch subprocess で eval し future (plist) を返す
+  ;; :require は (require 'X) を事前に走らせる library list
+  ;;
+  ;; 返り値: (:future PROC :promise-fn FN :status 'running ...)
+#+end_src
+
+*** 実装方針
+
+1. *batch pool (Doc 01) を使う*
+   - pre-warmed ~emacs --batch~ プロセスに対して ~print1~ 経由で expression を送り、結果を ~read~ で受ける。
+   - pool が busy の時は新規に ~start-process~ で fallback。
+
+2. *stdin/stdout 通信*
+   - batch Emacs 側で ~(while t (let ((expr (read (current-buffer)))) (prin1 (eval expr))))~ のような REPL ループを持つ。
+   - 1 request = 1 S-expression。Result も 1 S-expression で返す。
+
+3. *future API*
+   #+begin_src elisp
+   (anvil-future-done-p FUTURE)
+   (anvil-future-await FUTURE &optional timeout) ; 同期待機
+   (anvil-future-value FUTURE)                    ; 完了後の値
+   (anvil-future-error FUTURE)                    ; エラー
+   (anvil-future-cancel FUTURE)                   ; 取り消し (kill)
+   #+end_src
+
+4. *エラー伝播*
+   - batch 側で ~condition-case~ で全 error を捕捉し ~(:error (type . message))~ として返す。
+   - future-value 時に再 signal するか、~future-error~ で取得。
+
+** Call coalescing
+
+*** 対象
+
+同一 ~file-path~ への edit call (~file-batch~, ~file-replace-string~, ~file-replace-regexp~, etc.) を
+短時間窓 (例 50ms) にまとめ、1 回の buffer open で処理。
+
+*** 実装
+
+- dispatcher (Doc 01 の main daemon router) に coalescing queue を追加。
+- request 到着時に queue を参照し、同じ file の既存 request があれば *そのまま追記* して batch 化。
+- 最初の request が worker に dispatch される時点で queue snapshot を取り、~file-batch~ と等価な操作に変換。
+
+*** Semantics
+
+- coalescing は *順序保存* (FIFO) で行う。
+- ただし read と write は混ぜない。read は index 経由 (Doc 02) なので coalesce しない。
+- 境界条件: 同一 request 内で "edit → read → edit" と来た場合、read の時点で queue を flush。
+
+*** Trade-off
+
+- worst case: 51ms 待たされる。
+- best case: 5 edit call が 1 file open にまとまり合計時間 1/5。
+- デフォルトは OFF (~anvil-coalesce-window-ms 0~)。opt-in で有効化。
+
+** Preemption
+
+*** 基本戦略
+
+- wall-time cap (デフォルト 25s) を超えたら worker 内で ~signal~ を投げ、tool call を abort。
+- abort 時点までの部分結果 (read なら読めた範囲、map 系なら処理済 entry 数) を返す。
+
+*** 実装
+
+1. worker 側に ~anvil-preempt-start~ で itimer 登録。
+2. 期限切れで ~(throw 'anvil-preempt :deadline-reached)~。
+3. ラッパー macro ~(anvil-with-preemption (:budget-sec 25) BODY)~ が:
+   - BODY 前に ~anvil-preempt-start~
+   - BODY 後に ~anvil-preempt-cancel~
+   - ~catch 'anvil-preempt~ で partial result を整形して返す
+4. 返却形式: ~(:status 'partial :value PARTIAL :cursor CURSOR :consumed-sec N)~
+
+*** Resume cursor
+
+- 対応可能な op のみで実装。例えば ~org-search~ は ~(limit, offset)~ を cursor に保存可能。
+- file scan 系は byte-offset を cursor に。
+- 非 resumable な op (byte-compile 等) は preempt されたら単に失敗として扱う。
+
+*** API
+
+#+begin_src elisp
+(anvil-call-preemptible EXPRESSION &key (budget 25) (cursor nil))
+  ;; → (:status 'complete :value V)
+  ;;   (:status 'partial :value V :cursor C :consumed 25.1)
+  ;;   (:status 'error :error E)
+#+end_src
+
+- AI client 側で ~:partial~ を見たら ~cursor~ を使って継続 call できる。
+- MCP tool 定義には ~:resumable~ flag を追加し、client に "partial 対応" を宣言。
+
+* API
+
+** macro / user-facing
+
+#+begin_src elisp
+;; offload
+(anvil-offload FORM &key timeout env require)
+(anvil-future-await FUTURE &optional timeout)
+(anvil-future-value FUTURE)
+(anvil-future-cancel FUTURE)
+
+;; coalescing
+(setq anvil-coalesce-window-ms 50)  ; 0 = 無効
+
+;; preemption
+(anvil-call-preemptible EXPR &key budget cursor)
+(anvil-with-preemption (:budget-sec 25) BODY...)
+#+end_src
+
+** MCP tool integration
+
+- anvil の tool register マクロに ~:resumable~ / ~:offload~ keyword を追加:
+
+#+begin_src elisp
+(anvil-server-register-tool #'my-big-scan
+  :id "big-scan"
+  :description "..."
+  :offload t
+  :resumable t
+  :budget-sec 25)
+#+end_src
+
+- ~:offload t~ → 自動で batch subprocess で実行
+- ~:resumable t~ → preemption 有効、cursor 引数を取る
+
+* Implementation Plan
+
+1. *Phase 1 — Future API + batch REPL* (~1 週間)
+   - ~anvil-offload.el~ 新規。
+   - batch Emacs 用 REPL (~anvil-batch-repl.el~) を用意、stdin から S-expression を受け eval して stdout に出す。
+   - ~anvil-future-*~ 実装。
+   - tests: 単純な ~(+ 1 2)~ の offload、error 伝播、cancel。
+
+2. *Phase 2 — anvil-worker との統合* (~3 日)
+   - batch pool (Doc 01 Phase 3) の worker を offload にも使う。
+   - ~:offload t~ tool が自動で batch lane に routing される。
+
+3. *Phase 3 — Preemption* (~1 週間)
+   - ~anvil-preempt.el~ 新規。
+   - itimer ベースの budget enforcement。
+   - ~anvil-call-preemptible~ 実装、partial/cursor semantics 定義。
+   - 代表 tool (~org-search~ 等) を resumable 化。
+
+4. *Phase 4 — Coalescing* (~1 週間)
+   - dispatcher (Doc 01 側) に queue を追加。
+   - 50ms 窓での batch 化、FIFO 保存。
+   - feature flag で opt-in。
+   - tests: 5 連続 edit が 1 file open に収まることを確認。
+
+5. *Phase 5 — Tool 側 retrofit* (~3 日)
+   - 既存 heavy tool (init.org tangle 相当) を ~:offload t~ に切り替え。
+
+* Migration
+
+- ~anvil-offload~ は新 API。既存 tool の挙動変更なし。
+- coalescing はデフォルト OFF。opt-in 推奨。
+- preemption は ~:resumable t~ 宣言した tool のみ。既存 tool は挙動不変。
+
+* Risks
+
+- *batch Emacs の state 非共有*。offload した form は main daemon の global state に触れない。
+  → offload は明確に pure 寄り op に限定。副作用あるものは worker lane 経由に誘導。
+  docstring で明示し、lint で検出可能に。
+- *preemption の破損*。抽象化が漏れると mid-state で abort して disk 破損の可能性。
+  → disk write 系は preempt 対象外。read / compute 系のみ。
+- *coalescing の semantics bug*。順序を誤ると壊れる。
+  → FIFO 厳守、read 境界で flush、write conflict は sequential。
+  形式仕様を doc 化してから実装。
+- *future leak*。取得されない future がずっと pool の slot を食う。
+  → WEAK reference + timeout で GC。
+
+* Platform notes
+
+** Windows
+
+- batch Emacs cold start が遅い → batch pool (Doc 01) の pre-warm に強く依存。
+- stdin/stdout の encoding は ~utf-8-unix~ に強制 (memory: ~feedback_msys_python_japanese_path.md~)。
+
+** macOS / Linux
+
+- 特記なし。batch cold start が速いので pre-warm の ROI は小さい。
+
+* Success Metrics
+
+- ~init.org tangle~ 相当の heavy op: daemon 体感 freeze 時間 → 0 (offload)
+- coalesce 有効時の 5 連続 edit 合計 wall-time: 50% 削減
+- preempt 発火時の AI-client retry 成功率: > 90% (resume cursor が正しく効く)
+- future API 利用箇所数: Phase 5 完了時点で 5 以上
+
+* References
+
+- memory: ~feedback_subprocess_tangle_pattern.md~ (in-process 30s → subprocess 2s)
+- memory: ~feedback_emacs_server_concurrency_model.md~ (yield point の前提)
+- Doc 01 (worker pool v2) — batch pool infrastructure
+- Doc 02 (org index) — 一部 heavy op を不要にするが、依然必要なケースもある

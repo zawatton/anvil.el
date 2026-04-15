@@ -1,0 +1,264 @@
+#+title: PTY Broker + Headless UI — Get Emacs Out of the PTY Path
+#+date: 2026-04-15
+#+property: status DRAFT
+
+* STATUS
+~DRAFT~ — レビュー前。~ccih-pty-broker~ (2026-04-12 MVP 済) の知見を正式設計に昇格。
+
+* Goal
+
+「Emacs 内で AI TUI (~claude~, 将来の ~gemini-cli~ 等) を動かす」ために発生している PTY 系の痛み
+(ConPTY 片方向 stdin、~eat~ filter starvation、wide-char 無限ループ) を *構造的に* 解消する。
+
+2 本立てのアプローチ:
+
+1. *PTY Broker* — Node.js の node-pty を仲介プロセスに置き、Emacs は TCP/Unix socket 経由で
+   plain byte stream として読む。Emacs から PTY 層を完全に切り離す。
+2. *Headless Renderer* — そもそも TUI を render する必要があるか再考。~claude~ は JSONL stream mode で
+   動かし、org buffer に自前で render する方が安定する。TUI 回避が最善。
+
+* Problem
+
+** memory に記録された具体的痛み
+
+- ConPTY headless mode の stdin pipe は片方向 (TUI raw input 不可)。~feedback_conpty_headless_stdin_unidirectional.md~
+- ~eat~ の process filter は daemon server loop を starvation させる。timer-only filter で解決。
+- ~eat--t-write~ wide-char 無限ループ。per-buffer char-width clamp で bypass。
+- claude-code-ide の ~eat~ backend は main daemon で wedge。~'none~ backend + ccih-pty-broker で回避中。
+
+** 根本原因
+
+- Emacs の process filter は同期で走る。TUI output は高頻度で filter を呼ぶので、
+  1 chunk あたり数 ms でも積もると daemon 全体が止まる。
+- ConPTY は Windows で raw input を提供しない (TUI key handling は cooked mode のみ)。
+- eat は「Emacs 内で本格 vt100」を目指しているが、AI CLI の用途にはオーバースペック。
+
+** 分離設計の動機
+
+- node-pty は TUI 駆動の成熟した実装。Emacs 側で PTY を再実装する必要がない。
+- Emacs は render 層だけに専念すれば、filter starvation は timer + chunk size 制限で避けられる。
+
+* Current State
+
+- ~my-claude-code-ide-broker.el~ (MVP 完成、memory: ~project_ccih_pty_broker_status.md~)
+- ~eat-windows-pty~ project (探索中、現状は eat fork 込み)
+- ~ssh -tt~ 経由で claude が動く知見 (~reference_eat_claude_ssh_tt_solution.md~)
+
+* Proposed Design
+
+** Two-part architecture
+
+#+begin_src text
+┌───────────────────────────┐
+│  User's Emacs (main)       │
+│  ┌─────────────────────┐   │
+│  │ anvil-pty-client.el │◄──┼──── TCP:localhost:NNNN
+│  └─────────────────────┘   │      ASCII framed protocol
+│     (timer-based reader,   │
+│      no process filter)    │
+└───────────────────────────┘
+                 ▲
+                 │ JSON frames
+                 │
+┌────────────────┴──────────┐
+│  anvil-pty-broker (Node)   │
+│  ┌─────────────────────┐   │
+│  │ node-pty             │   │
+│  │   ├── claude (pty1)  │   │
+│  │   ├── bash  (pty2)   │   │
+│  │   └── ...            │   │
+│  └─────────────────────┘   │
+└───────────────────────────┘
+#+end_src
+
+** Part 1: node-pty broker (~anvil-pty-broker~)
+
+Node.js package を anvil の submodule (または npm-installable sibling) として提供。
+
+*** 起動
+
+#+begin_src bash
+node anvil-pty-broker.js --port 7641 --auth-token FOO
+# または Emacs 側から:
+#   (anvil-pty-enable)
+#   → Node を start-process で起動、port を動的割当
+#+end_src
+
+*** Protocol (JSON lines over TCP)
+
+Request (Emacs → broker):
+
+#+begin_src json
+{"op": "spawn", "id": "claude-1", "cmd": "claude", "args": ["chat"], "cwd": "/path", "cols": 120, "rows": 40}
+{"op": "input", "id": "claude-1", "data": "hello\r"}
+{"op": "resize", "id": "claude-1", "cols": 200, "rows": 50}
+{"op": "kill", "id": "claude-1", "signal": "SIGTERM"}
+{"op": "list"}
+#+end_src
+
+Response (broker → Emacs):
+
+#+begin_src json
+{"ev": "spawned", "id": "claude-1", "pid": 12345}
+{"ev": "output", "id": "claude-1", "data": "…base64-encoded bytes…"}
+{"ev": "exit", "id": "claude-1", "code": 0}
+{"ev": "error", "id": "claude-1", "message": "…"}
+#+end_src
+
+- 出力は base64 encode (ASCII safe、Emacs 側 decode 楽)。
+- frame delimiter は LF (1 行 1 JSON)。
+
+*** Emacs 側 (~anvil-pty-client.el~)
+
+- ~make-network-process~ で TCP 接続、~:filter~ は *使わない*。
+- 代わりに ~run-at-time~ で定期的に ~process-send-string~ と受信バッファを drain。
+  - *timer-only I/O* にすることで daemon のメインループを starvation させない
+    (memory: ~feedback_eat_daemon_filter_starvation.md~ で確立した pattern)。
+- 受信側: 内部バッファに貯めて LF 区切りで JSON parse、op ごとに buffer に render。
+
+*** Render layer
+
+- render 先は専用 mode ~anvil-pty-mode~。
+- output を ANSI-aware に解釈し、ANSI color + cursor movement を最低限サポート。
+- *full vt100 は目指さない*。AI CLI の典型出力 (色、cursor-up、clear-line 程度) だけ扱う。
+- 書き込み chunk は 1 tick = 最大 4KB に制限 (soft cap)。
+
+** Part 2: Headless renderer (~anvil-headless-claude.el~)
+
+*** 動機
+
+~claude~ は ~--output-format stream-json~ 等の非 TUI mode を持つ (同等機能を提供)。
+これを使えば PTY すら不要。
+
+*** 流れ
+
+1. ~(anvil-headless-claude-start)~ で ~claude --output-format stream-json~ を start-process。
+2. stdout は JSON lines。filter で parse、message を buffer に org 風に format。
+3. 入力は buffer 底行から ~C-c C-c~ で送信、stdin に JSON で投入。
+
+*** 利点
+
+- PTY 完全不要。ConPTY / winpty / eat の全問題が蒸発。
+- render layer は自前なので、org heading / src block に auto-format 可能。
+- token usage, tool call 等の metadata も JSON で取れるので、side pane に表示できる。
+
+*** 制約
+
+- ~claude~ が提供する JSONL mode の機能範囲に従う (raw TTY コントロールは不可)。
+- REPL 的なリアルタイム stream は同じ仕組みで流せる。
+
+** 選択基準
+
+| ユースケース                       | 採用              |
+|-----------------------------------+-------------------|
+| claude を Emacs 内で対話          | *Part 2* (headless) |
+| 汎用 TUI (vim, less, htop)        | *Part 1* (broker)   |
+| claude の file edit を Emacs で見る| Part 2 + anvil-file |
+| ssh -tt 経由の対話                 | Part 1 のみ         |
+
+Part 2 が主戦略。Part 1 は「どうしても TUI が必要な場合」の fallback。
+
+* API
+
+** Part 1: broker
+
+#+begin_src elisp
+(anvil-pty-enable &key port auth-token)
+(anvil-pty-disable)
+
+(anvil-pty-spawn CMD &key args cwd cols rows name)
+  ;; → pty-id string
+(anvil-pty-send PTY-ID STRING)
+(anvil-pty-resize PTY-ID COLS ROWS)
+(anvil-pty-kill PTY-ID &optional signal)
+(anvil-pty-list)
+
+(anvil-pty-open-buffer PTY-ID)
+  ;; → buffer (anvil-pty-mode)
+#+end_src
+
+** Part 2: headless claude
+
+#+begin_src elisp
+(anvil-headless-claude)                 ; interactive: session 開始
+(anvil-headless-claude-send STRING)
+(anvil-headless-claude-history)
+(anvil-headless-claude-export-org FILE) ; ログを org に export
+#+end_src
+
+* Implementation Plan
+
+1. *Phase 1 — Broker MVP 正式化* (~1 週間)
+   - 既存 ~my-claude-code-ide-broker.el~ の知見を ~anvil-pty-broker~ (Node + Elisp client) に移植
+   - protocol 固定、auth token、単一 pty セッション
+   - tests: bash を spawn、"echo hello" → "hello\n" 受信
+
+2. *Phase 2 — Multi-pty + resize + kill* (~3 日)
+   - 複数 pty を同時管理
+   - SIGWINCH 相当の resize
+   - clean shutdown
+
+3. *Phase 3 — Render layer* (~1 週間)
+   - ~anvil-pty-mode~ 実装
+   - ANSI color + cursor movement の最小サポート
+   - chunk size cap
+
+4. *Phase 4 — Headless claude* (~1 週間)
+   - ~claude --output-format stream-json~ integration
+   - org-style render
+   - 入力送信 UI
+
+5. *Phase 5 — claude-code-ide bridge* (~3 日)
+   - claude-code-ide の ~'none~ backend を anvil-headless-claude に置き換え
+   - 既存 ~my-claude-code-ide-headless~ ユーザの移行 path
+
+6. *Phase 6 — Security hardening* (~3 日)
+   - auth token 必須、localhost only default
+   - process isolation、許可 command allowlist
+
+* Migration
+
+- 既存 ~ccih-pty-broker~ ユーザは ~anvil-pty-broker~ に renameで移行。breaking change (config 名変更)
+  は CHANGELOG で告知。
+- ~anvil-headless-claude~ は新機能。既存 ~my-claude-code-ide-headless~ と並立、段階的移行。
+
+* Risks
+
+- *Node.js 依存の増加*。anvil コアは Emacs 28.2 以上のみで動作していたが、PTY Broker は Node が必要。
+  → optional feature とし、~(anvil-pty-enable)~ を呼ばない限り Node は不要。
+- *Windows での Node インストール UX*。
+  → README に ~winget install OpenJS.NodeJS~ を明記。~anvil-pty-enable~ が Node 未検出時に丁寧に誘導。
+- *claude JSONL mode の将来変更*。API が変わると render 層を追従する必要がある。
+  → 最小限の field のみ依存、未知 field は ignore。
+- *ANSI parser の完成度*。"最小限の vt100" が曖昧。
+  → 既知 AI CLI (claude, aider, gemini-cli) が出す sequence を allowlist 化、それ以外は literal 表示。
+- *security*。broker が external program を起動可能なので、allowlist 必須。
+  → ~anvil-pty-allowed-commands~ で restrict。デフォルト空で自己保護。
+
+* Platform notes
+
+** Windows
+
+- node-pty は ConPTY backend を自動選択。winpty fallback も組み込み済。
+- Emacs 側は TCP のみ使用 (Windows の Unix socket 対応は壊れ気味)。
+
+** macOS / Linux
+
+- Unix socket を使う (performance + auth 面で有利)。
+
+* Success Metrics
+
+- daemon starvation による Emacs 固まり事例: 0
+- headless claude での 10 分連続対話の安定性: 100%
+- eat に比べた render layer コード行数: 1/5 以下
+- Windows / macOS / Linux の動作一致率: 100% (headless 側)
+
+* References
+
+- memory: ~feedback_conpty_headless_stdin_unidirectional.md~
+- memory: ~feedback_eat_daemon_filter_starvation.md~
+- memory: ~feedback_eat_t_write_wide_char_loop.md~
+- memory: ~reference_windows_native_pty_options.md~
+- memory: ~reference_eat_claude_ssh_tt_solution.md~
+- memory: ~project_ccih_pty_broker_status.md~ (MVP 経験)
+- memory: ~project_my_ccih_status.md~ (headless backend wrapper)
