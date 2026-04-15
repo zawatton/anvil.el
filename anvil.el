@@ -71,10 +71,12 @@ so AI tool calls never freeze the human's editor."
 (defcustom anvil-optional-modules nil
   "Optional anvil modules requiring external dependencies.
 These are not loaded by default.  Available modules:
-- `xlsx' — Excel read/write (requires Python + openpyxl)
-- `pdf'  — PDF extraction (requires Python + pymupdf)
-- `ide'  — IDE tools: xref, diagnostics (requires project.el)
-- `cron' — Scheduled task runner with worker dispatch"
+- `xlsx'   — Excel read/write (requires Python + openpyxl)
+- `pdf'    — PDF extraction (requires Python + pymupdf)
+- `ide'    — IDE tools: xref, diagnostics (requires project.el)
+- `cron'   — Scheduled task runner with worker dispatch
+- `sqlite' — Read-only SQLite query tool (requires Emacs 29+)
+- `elisp'  — Elisp development tools: ERT runner, byte-compile, describe"
   :type '(repeat symbol)
   :group 'anvil)
 
