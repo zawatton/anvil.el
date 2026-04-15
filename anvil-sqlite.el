@@ -35,8 +35,11 @@
   :group 'anvil
   :prefix "anvil-sqlite-")
 
-(defconst anvil-sqlite--server-id "anvil-sqlite"
-  "Server ID for this module's MCP tools.")
+(defconst anvil-sqlite--server-id "emacs-eval"
+  "Server ID for this module's MCP tools.
+Matches the id passed to `anvil-server-process-jsonrpc' by the
+stdio shim (--server-id=emacs-eval) so the tool is visible to the
+shared MCP connection alongside anvil-file, anvil-org, etc.")
 
 (defcustom anvil-sqlite-max-rows 1000
   "Maximum number of rows returned by `anvil-sqlite-query'.

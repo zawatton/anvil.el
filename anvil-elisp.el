@@ -47,8 +47,11 @@
   "System Lisp directory for Emacs installation.
 Computed once at package load time from `data-directory'.")
 
-(defconst anvil-elisp--server-id "anvil-elisp"
-  "Server ID for this MCP server.")
+(defconst anvil-elisp--server-id "emacs-eval"
+  "Server ID for this MCP server.
+Matches the id passed to `anvil-server-process-jsonrpc' by the
+stdio shim (--server-id=emacs-eval) so tools are visible to the
+shared MCP connection alongside anvil-file, anvil-org, etc.")
 
 (defgroup anvil-elisp nil
   "MCP server for agentic Elisp development."
