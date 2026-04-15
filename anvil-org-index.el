@@ -856,6 +856,54 @@ re-parsing with org-element for large files that rarely change."
                  :line  (nth 4 row))))
        rows))))
 
+(defun anvil-org-index--outline-build-tree (flat)
+  "Build a hierarchical alist tree from FLAT outline list.
+FLAT is the list returned by `anvil-org-index-read-outline', each
+element a plist with :level and :title.  Returns a vector of alists
+with keys title, level, children (full depth, populated)."
+  (let* ((root (list (cons :level 0) (cons :children nil)))
+         (stack (list root)))
+    (dolist (node flat)
+      (let* ((lv (plist-get node :level))
+             (entry (list (cons :level lv)
+                          (cons :title (plist-get node :title))
+                          (cons :children nil))))
+        ;; Pop deeper/equal-level frames so the top is a strict parent.
+        (while (and (cdr stack)
+                    (>= (alist-get :level (car stack)) lv))
+          (pop stack))
+        (let ((children-cell (assq :children (car stack))))
+          (setcdr children-cell
+                  (append (cdr children-cell) (list entry))))
+        (push entry stack)))
+    (anvil-org-index--outline-nodes-to-json
+     (alist-get :children root))))
+
+(defun anvil-org-index--outline-nodes-to-json (nodes)
+  "Convert internal NODES list to a JSON-ready vector of alists.
+Uses symbol keys (title, level, children) compatible with
+`anvil-org--generate-outline' output."
+  (vconcat
+   (mapcar
+    (lambda (node)
+      `((title    . ,(alist-get :title node))
+        (level    . ,(alist-get :level node))
+        (children . ,(anvil-org-index--outline-nodes-to-json
+                      (alist-get :children node)))))
+    nodes)))
+
+;;;###autoload
+(defun anvil-org-index-read-outline-json (file)
+  "Return a hierarchical outline of FILE as a JSON string.
+Shape matches `anvil-org--generate-outline':
+  {\"headings\": [{\"title\":..,\"level\":..,\"children\":[..]}..]}
+but populates children at full depth instead of only two levels.
+Cheap fast-path for large files already in the index."
+  (require 'json)
+  (let* ((flat (anvil-org-index-read-outline file))
+         (tree (anvil-org-index--outline-build-tree flat)))
+    (json-encode `((headings . ,tree)))))
+
 ;;;###autoload
 (defun anvil-org-index-status ()
   "Show a summary of the current index state."

@@ -1226,10 +1226,12 @@ FILE is the absolute path to an Org file.
 
 MCP Parameters:
   file - Absolute path to an Org file"
-  (anvil-org--handle-outline-resource `(("filename" . ,file))))
+  (or (anvil-org--try-index-read-outline file)
+      (anvil-org--handle-outline-resource `(("filename" . ,file)))))
 
-(declare-function anvil-org-index-read-by-id    "anvil-org-index" (org-id))
-(declare-function anvil-org-index-read-headline  "anvil-org-index" (file path))
+(declare-function anvil-org-index-read-by-id       "anvil-org-index" (org-id))
+(declare-function anvil-org-index-read-headline    "anvil-org-index" (file path))
+(declare-function anvil-org-index-read-outline-json "anvil-org-index" (file))
 
 (defun anvil-org--index-available-p ()
   "Return non-nil when the `anvil-org-index' fast-path can be tried.
@@ -1253,6 +1255,13 @@ A nil return means fall back to the org-element handler."
   (when (anvil-org--index-available-p)
     (condition-case _err
         (anvil-org-index-read-headline file headline-path)
+      (error nil))))
+
+(defun anvil-org--try-index-read-outline (file)
+  "Try `anvil-org-index-read-outline-json'; return JSON string or nil."
+  (when (anvil-org--index-available-p)
+    (condition-case _err
+        (anvil-org-index-read-outline-json file)
       (error nil))))
 
 (defun anvil-org--tool-read-headline (file headline_path)

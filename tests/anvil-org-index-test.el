@@ -9,6 +9,7 @@
 ;;; Code:
 
 (require 'ert)
+(require 'json)
 (require 'anvil-org-index)
 
 ;;;; Scanner unit tests
@@ -525,5 +526,72 @@ Gamma body line
     (should-error
      (anvil-org-index-read-outline
       (expand-file-name "never-indexed.org" temporary-file-directory)))))
+
+;;;; Phase 4c: outline -> JSON tree builder
+
+(defun anvil-org-index-test--flat (&rest entries)
+  "Build a flat plist list from ENTRIES of (LEVEL TITLE)."
+  (mapcar (lambda (e) (list :level (nth 0 e) :title (nth 1 e))) entries))
+
+(ert-deftest anvil-org-index-test-outline-tree-empty ()
+  "An empty flat list produces an empty children vector."
+  (let ((tree (anvil-org-index--outline-build-tree nil)))
+    (should (vectorp tree))
+    (should (= 0 (length tree)))))
+
+(ert-deftest anvil-org-index-test-outline-tree-siblings ()
+  "Same-level siblings land under the same parent."
+  (let* ((flat (anvil-org-index-test--flat '(1 "A") '(1 "B") '(1 "C")))
+         (tree (anvil-org-index--outline-build-tree flat)))
+    (should (= 3 (length tree)))
+    (should (equal "A" (alist-get 'title (aref tree 0))))
+    (should (equal "C" (alist-get 'title (aref tree 2))))
+    (should (= 0 (length (alist-get 'children (aref tree 1)))))))
+
+(ert-deftest anvil-org-index-test-outline-tree-full-depth ()
+  "Nesting is populated at full depth, not clipped to two levels."
+  (let* ((flat (anvil-org-index-test--flat
+                '(1 "A") '(2 "A1") '(3 "A1a") '(3 "A1b") '(2 "A2")))
+         (tree (anvil-org-index--outline-build-tree flat))
+         (a  (aref tree 0))
+         (a1 (aref (alist-get 'children a) 0))
+         (a2 (aref (alist-get 'children a) 1)))
+    (should (equal "A"  (alist-get 'title a)))
+    (should (equal "A1" (alist-get 'title a1)))
+    (should (equal "A2" (alist-get 'title a2)))
+    (should (= 2 (length (alist-get 'children a1))))
+    (should (equal "A1a"
+                   (alist-get 'title
+                              (aref (alist-get 'children a1) 0))))))
+
+(ert-deftest anvil-org-index-test-outline-tree-skip-levels ()
+  "Jumping from level 1 to level 3 still nests under level 1."
+  (let* ((flat (anvil-org-index-test--flat '(1 "A") '(3 "deep") '(1 "B")))
+         (tree (anvil-org-index--outline-build-tree flat))
+         (a (aref tree 0)))
+    (should (= 2 (length tree)))
+    (should (= 1 (length (alist-get 'children a))))
+    (should (equal "deep"
+                   (alist-get 'title
+                              (aref (alist-get 'children a) 0))))))
+
+(ert-deftest anvil-org-index-test-read-outline-json-shape ()
+  "read-outline-json returns a JSON object with a headings vector."
+  (skip-unless (anvil-org-index-test--have-sqlite))
+  (anvil-org-index-test--with-seeded f
+    (let* ((json-object-type 'alist)
+           (json-array-type  'vector)
+           (obj  (json-read-from-string
+                  (anvil-org-index-read-outline-json f)))
+           (hds  (alist-get 'headings obj))
+           (alpha (aref hds 0))
+           (gamma (aref hds 1)))
+      (should (= 2 (length hds)))
+      (should (equal "Alpha" (alist-get 'title alpha)))
+      (should (equal "Gamma" (alist-get 'title gamma)))
+      (should (= 2 (length (alist-get 'children alpha))))
+      (should (equal "Beta"
+                     (alist-get 'title
+                                (aref (alist-get 'children alpha) 0)))))))
 
 ;;; anvil-org-index-test.el ends here
