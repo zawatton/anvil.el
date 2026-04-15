@@ -75,8 +75,9 @@ These are not loaded by default.  Available modules:
 - `pdf'    — PDF extraction (requires Python + pymupdf)
 - `ide'    — IDE tools: xref, diagnostics (requires project.el)
 - `cron'   — Scheduled task runner with worker dispatch
-- `sqlite' — Read-only SQLite query tool (requires Emacs 29+)
-- `elisp'  — Elisp development tools: ERT runner, byte-compile, describe"
+- `sqlite'    — Read-only SQLite query tool (requires Emacs 29+)
+- `elisp'     — Elisp development tools: ERT runner, byte-compile, describe
+- `org-index' — Persistent SQLite index of org files (requires Emacs 29+)"
   :type '(repeat symbol)
   :group 'anvil)
 
