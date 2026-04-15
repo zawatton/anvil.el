@@ -1220,18 +1220,29 @@ MCP Parameters:
   file - Absolute path to an Org file"
   (anvil-org--handle-file-resource `(("filename" . ,file))))
 
-(defun anvil-org--tool-read-outline (file)
+(defun anvil-org--tool-read-outline (file &optional max_depth)
   "Tool wrapper for org-outline://{filename} resource template.
-FILE is the absolute path to an Org file.
+FILE is the absolute path to an Org file.  When MAX_DEPTH is a
+string that parses as a positive integer, only headlines at that
+level or shallower are returned (index fast-path side); the
+org-element fallback ignores MAX_DEPTH and continues to return
+its historical 2-level structure.
 
 MCP Parameters:
-  file - Absolute path to an Org file"
-  (or (anvil-org--try-index-read-outline file)
-      (anvil-org--handle-outline-resource `(("filename" . ,file)))))
+  file      - Absolute path to an Org file
+  max_depth - Optional integer string (e.g. \"1\", \"3\") capping
+              the outline depth; omit for full depth."
+  (let ((depth (and max_depth
+                    (stringp max_depth)
+                    (not (string-empty-p (string-trim max_depth)))
+                    (string-to-number max_depth))))
+    (when (and depth (<= depth 0)) (setq depth nil))
+    (or (anvil-org--try-index-read-outline file depth)
+        (anvil-org--handle-outline-resource `(("filename" . ,file))))))
 
 (declare-function anvil-org-index-read-by-id       "anvil-org-index" (org-id))
 (declare-function anvil-org-index-read-headline    "anvil-org-index" (file path))
-(declare-function anvil-org-index-read-outline-json "anvil-org-index" (file))
+(declare-function anvil-org-index-read-outline-json "anvil-org-index" (file &optional max-depth))
 
 (defun anvil-org--index-available-p ()
   "Return non-nil when the `anvil-org-index' fast-path can be tried.
@@ -1257,11 +1268,12 @@ A nil return means fall back to the org-element handler."
         (anvil-org-index-read-headline file headline-path)
       (error nil))))
 
-(defun anvil-org--try-index-read-outline (file)
-  "Try `anvil-org-index-read-outline-json'; return JSON string or nil."
+(defun anvil-org--try-index-read-outline (file &optional max-depth)
+  "Try `anvil-org-index-read-outline-json'; return JSON string or nil.
+MAX-DEPTH, when non-nil, caps the outline at that heading level."
   (when (anvil-org--index-available-p)
     (condition-case _err
-        (anvil-org-index-read-outline-json file)
+        (anvil-org-index-read-outline-json file max-depth)
       (error nil))))
 
 (defun anvil-org--tool-read-headline (file headline_path)

@@ -594,4 +594,36 @@ Gamma body line
                      (alist-get 'title
                                 (aref (alist-get 'children alpha) 0)))))))
 
+;;;; Phase 4c extension: max-depth filter
+
+(ert-deftest anvil-org-index-test-read-outline-max-depth-1 ()
+  "max-depth=1 drops level-2 headlines from the flat list."
+  (skip-unless (anvil-org-index-test--have-sqlite))
+  (anvil-org-index-test--with-seeded f
+    (let* ((rows   (anvil-org-index-read-outline f 1))
+           (levels (mapcar (lambda (p) (plist-get p :level)) rows)))
+      (should (cl-every (lambda (l) (<= l 1)) levels))
+      (should (equal '(1 1) levels)))))
+
+(ert-deftest anvil-org-index-test-read-outline-max-depth-2-matches-default ()
+  "max-depth=2 equals the unfiltered read for the seeded fixture."
+  (skip-unless (anvil-org-index-test--have-sqlite))
+  (anvil-org-index-test--with-seeded f
+    (should (equal (anvil-org-index-read-outline f)
+                   (anvil-org-index-read-outline f 2)))))
+
+(ert-deftest anvil-org-index-test-read-outline-json-max-depth-1 ()
+  "max-depth=1 JSON outline has no children even for Alpha."
+  (skip-unless (anvil-org-index-test--have-sqlite))
+  (anvil-org-index-test--with-seeded f
+    (let* ((json-object-type 'alist)
+           (json-array-type  'vector)
+           (obj  (json-read-from-string
+                  (anvil-org-index-read-outline-json f 1)))
+           (hds  (alist-get 'headings obj))
+           (alpha (aref hds 0)))
+      (should (= 2 (length hds)))
+      (should (equal "Alpha" (alist-get 'title alpha)))
+      (should (= 0 (length (alist-get 'children alpha)))))))
+
 ;;; anvil-org-index-test.el ends here

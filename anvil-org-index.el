@@ -825,23 +825,33 @@ is not indexed or the path is ambiguous."
       (apply #'anvil-org-index--read-file-region range))))
 
 ;;;###autoload
-(defun anvil-org-index-read-outline (file)
+(defun anvil-org-index-read-outline (file &optional max-depth)
   "Return an outline list of FILE straight from the index.
 Each entry is a plist: (:level :title :todo :tags :line).  Order
-follows the on-disk position of the headlines.  Much cheaper than
-re-parsing with org-element for large files that rarely change."
+follows the on-disk position of the headlines.  When MAX-DEPTH is
+a positive integer the SQL side filters `WHERE level <= ?' so only
+headlines at that depth or shallower are returned.  Much cheaper
+than re-parsing with org-element for large files that rarely change."
   (unless anvil-org-index--db (anvil-org-index-enable))
   (let ((file-id (anvil-org-index--file-id anvil-org-index--db file)))
     (unless file-id
       (user-error "anvil-org-index: %s is not indexed" file))
     (let ((rows
-           (anvil-org-index--select
-            anvil-org-index--db
-            "SELECT id, level, title, todo, line_start
-               FROM headline
-               WHERE file_id = ?
-               ORDER BY position"
-            (list file-id))))
+           (if (and max-depth (integerp max-depth) (> max-depth 0))
+               (anvil-org-index--select
+                anvil-org-index--db
+                "SELECT id, level, title, todo, line_start
+                   FROM headline
+                   WHERE file_id = ? AND level <= ?
+                   ORDER BY position"
+                (list file-id max-depth))
+             (anvil-org-index--select
+              anvil-org-index--db
+              "SELECT id, level, title, todo, line_start
+                 FROM headline
+                 WHERE file_id = ?
+                 ORDER BY position"
+              (list file-id)))))
       (mapcar
        (lambda (row)
          (let* ((hid   (nth 0 row))
@@ -893,14 +903,17 @@ Uses symbol keys (title, level, children) compatible with
     nodes)))
 
 ;;;###autoload
-(defun anvil-org-index-read-outline-json (file)
+(defun anvil-org-index-read-outline-json (file &optional max-depth)
   "Return a hierarchical outline of FILE as a JSON string.
 Shape matches `anvil-org--generate-outline':
   {\"headings\": [{\"title\":..,\"level\":..,\"children\":[..]}..]}
 but populates children at full depth instead of only two levels.
-Cheap fast-path for large files already in the index."
+When MAX-DEPTH is a positive integer, only headlines at that level
+or shallower are included; the tree is built from the filtered
+flat list so no dangling children remain.  Cheap fast-path for
+large files already in the index."
   (require 'json)
-  (let* ((flat (anvil-org-index-read-outline file))
+  (let* ((flat (anvil-org-index-read-outline file max-depth))
          (tree (anvil-org-index--outline-build-tree flat)))
     (json-encode `((headings . ,tree)))))
 
