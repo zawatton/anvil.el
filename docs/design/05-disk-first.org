@@ -3,10 +3,10 @@
 #+property: status DRAFT
 
 * STATUS
-~Phase 1 SHIPPED~ (2026-04-16) — helper (~anvil-disk-buffer-divergence~,
-~anvil-file-safe-write~, ~anvil-file-warn-if-diverged~,
-~anvil-file-require-in-sync~) + 13 ERT tests を ~anvil-disk.el~ に投入。
-MCP tool 側の契約見直し (Phase 2) と ~buffer-*~ 系新規 (Phase 3) は未着手。
+~Phase 1+2(tight) SHIPPED~ (2026-04-16) — Phase 1 helpers に加え、
+~anvil-file-read~ / ~anvil-file-replace-string~ の返り値に ~:warnings~ を組込。
+他 ~file-*~ tool (insert/delete/append/batch/replace-regexp) への展開と、
+~buffer-*~ 系 MCP tool (Phase 3) は未着手。
 
 * Goal
 

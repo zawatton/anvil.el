@@ -228,4 +228,61 @@
       (when (file-exists-p p1) (delete-file p1))
       (when (file-exists-p p2) (delete-file p2)))))
 
+;;;; --- :warnings integration (Doc 05 Phase 2) -----------------------------
+
+(ert-deftest anvil-file-test-read-warnings-empty-without-buffer ()
+  "anvil-file-read returns :warnings nil when no buffer visits the file."
+  (anvil-file-test--with-tmp
+   "hello\n"
+   (lambda (path)
+     (let ((res (anvil-file-read path)))
+       (should (null (plist-get res :warnings)))
+       (should (equal "hello\n" (plist-get res :content)))))))
+
+(ert-deftest anvil-file-test-read-warnings-flag-buffer-newer ()
+  "anvil-file-read surfaces a warning when a visited buffer is dirty."
+  (anvil-file-test--with-tmp
+   "hello\n"
+   (lambda (path)
+     (let ((buf (find-file-noselect path)))
+       (unwind-protect
+           (progn
+             (with-current-buffer buf (insert "UNSAVED"))
+             (let* ((res (anvil-file-read path))
+                    (ws  (plist-get res :warnings)))
+               (should (= 1 (length ws)))
+               (should (string-match-p "buffer-newer" (car ws)))
+               ;; Disk content unchanged.
+               (should (equal "hello\n" (plist-get res :content)))))
+         (when (buffer-live-p buf) (kill-buffer buf)))))))
+
+(ert-deftest anvil-file-test-replace-string-warnings-empty ()
+  "anvil-file-replace-string returns :warnings nil when no buffer visits."
+  (anvil-file-test--with-tmp
+   "alpha beta gamma\n"
+   (lambda (path)
+     (let ((res (anvil-file-replace-string path "beta" "BETA")))
+       (should (= 1 (plist-get res :replaced)))
+       (should (null (plist-get res :warnings)))
+       (should (equal "alpha BETA gamma\n"
+                      (anvil-file-test--read path)))))))
+
+(ert-deftest anvil-file-test-replace-string-warnings-flag-buffer-newer ()
+  "anvil-file-replace-string surfaces divergence but still writes disk."
+  (anvil-file-test--with-tmp
+   "alpha beta gamma\n"
+   (lambda (path)
+     (let ((buf (find-file-noselect path)))
+       (unwind-protect
+           (progn
+             (with-current-buffer buf (insert "UNSAVED"))
+             (let* ((res (anvil-file-replace-string path "beta" "BETA"))
+                    (ws  (plist-get res :warnings)))
+               (should (= 1 (plist-get res :replaced)))
+               (should (= 1 (length ws)))
+               (should (string-match-p "buffer-newer" (car ws)))
+               (should (equal "alpha BETA gamma\n"
+                              (anvil-file-test--read path)))))
+         (when (buffer-live-p buf) (kill-buffer buf)))))))
+
 ;;; anvil-file-test.el ends here

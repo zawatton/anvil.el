@@ -38,6 +38,7 @@
 (require 'cl-lib)
 (require 'subr-x)
 (require 'json)
+(require 'anvil-disk)
 
 ;;;; --- internal -----------------------------------------------------------
 
@@ -73,8 +74,13 @@ all anvil-file-* and anvil-org-* helpers."
   "Read file PATH and return its content as a string.
 OFFSET is the 0-based line offset to start from (default 0).
 LIMIT is the maximum number of lines to return (default all).
-Returns (:file PATH :content STR :total-lines N :offset OFFSET :lines-returned N)."
-  (let ((abs (anvil--prepare-path path)))
+Returns (:file PATH :content STR :total-lines N :offset OFFSET
+         :lines-returned N :warnings LIST).
+:warnings is nil when the file has no visited buffer or is in-sync;
+otherwise a list of human-readable strings flagging divergence
+(see `anvil-file-warn-if-diverged')."
+  (let* ((abs (anvil--prepare-path path))
+         (warnings (anvil-file-warn-if-diverged abs)))
     (with-temp-buffer
       (anvil--insert-file abs)
       (let ((total (count-lines (point-min) (point-max)))
@@ -90,7 +96,8 @@ Returns (:file PATH :content STR :total-lines N :offset OFFSET :lines-returned N
                (lines-returned (count-lines beg end)))
           (list :file abs :content content
                 :total-lines total :offset off
-                :lines-returned lines-returned))))))
+                :lines-returned lines-returned
+                :warnings warnings))))))
 
 (defun anvil-file-read-region (path start-line end-line)
   "Read PATH from START-LINE to END-LINE inclusive (1-indexed).
@@ -166,10 +173,18 @@ Returns (:replaced N :file PATH). Errors if 0 replacements were made."
 (defun anvil-file-replace-string (path old-string new-string &optional max-count)
   "In PATH, replace literal OLD-STRING with NEW-STRING.
 If MAX-COUNT is non-nil, stop after that many replacements.
-Returns (:replaced N :file PATH). Errors if 0 replacements were made.
-Pass MAX-COUNT 1 to assert exactly-one match (will still error on 0)."
-  (let ((abs (anvil--prepare-path path))
-        (count 0))
+Returns (:replaced N :file PATH :warnings LIST).  Errors if 0
+replacements were made.  Pass MAX-COUNT 1 to assert exactly-one
+match (will still error on 0).
+
+:warnings is computed *before* the disk write from
+`anvil-file-warn-if-diverged'.  It flags the case where a visited
+buffer has unsaved edits, so the caller can choose to refresh the
+buffer or abort a follow-up action; the disk write itself is not
+refused (disk-first contract)."
+  (let* ((abs (anvil--prepare-path path))
+         (warnings (anvil-file-warn-if-diverged abs))
+         (count 0))
     (with-temp-buffer
       (anvil--insert-file abs)
       (goto-char (point-min))
@@ -180,7 +195,7 @@ Pass MAX-COUNT 1 to assert exactly-one match (will still error on 0)."
       (when (zerop count)
         (error "my-cc: string not found in %s: %s" abs old-string))
       (anvil--write-current-buffer-to abs))
-    (list :replaced count :file abs)))
+    (list :replaced count :file abs :warnings warnings)))
 
 (defun anvil-file-insert-at-line (path line content)
   "Insert CONTENT into PATH at LINE (1-indexed). LINE 1 = before first line.
