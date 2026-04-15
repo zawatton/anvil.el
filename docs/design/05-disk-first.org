@@ -1,0 +1,211 @@
+#+title: Disk-First Policy — Buffer Divergence Guard
+#+date: 2026-04-15
+#+property: status DRAFT
+
+* STATUS
+~DRAFT~ — レビュー前。コンパクトな変更だが、AI による silent data corruption を防ぐ柱。
+
+* Goal
+
+anvil の全 file-* MCP tool において、以下を *契約 (contract)* として確立する:
+
+1. *Disk is source of truth*. tool は明示指定がない限り disk I/O を行い、visited buffer は参照しない。
+2. *Buffer divergence は fail-loud*. visited buffer と on-disk mtime/size が不一致なら silent に stale を
+   返さず、明示的にエラーまたは警告を返す。
+3. *Buffer 操作は opt-in*. ~buffer-*~ prefix の専用 variant を用意し、意図がある時だけ使う。
+
+* Problem
+
+** 記録された事故
+
+- memory: ~feedback_init_org_buffer_divergence.md~
+  - ~init.org~ buffer は ~visited-file-modtime = 0~ / ~undo 無効~ / ~size 不一致~ で *意図的に* stale。
+  - うっかり ~save-buffer~ を呼ぶと disk の新しい内容が上書きされる。
+- memory: ~feedback_journal_org_edit_body_timeout.md~
+  - ~org-edit-body~ timeout、Edit tool が buffer auto-revert で消失。
+  - ~find-file~ + ~insert~ + ~save~ を明示的に書く必要があった。
+- memory: ~feedback_my_cc_helpers_utf8_journals.md~
+  - ~insert-file-contents~ の coding auto-detect で raw bytes 化。
+  - temp buffer に読んだ内容が silent に壊れる。
+
+** 根本原因
+
+- Emacs は「buffer が最新」という前提で作られている。visited buffer があればそちらが優先。
+- MCP tool が「ファイルを読む」と言った時、Emacs は buffer を返すか disk を返すか曖昧。
+- auto-revert や find-file の副作用が背景で走り、silent に state を変える。
+
+** AI-specific な問題
+
+- AI client は "ファイルを読み書きしている" と思っている。buffer 経由だと:
+  - 人間が編集中の unsaved buffer を読んでしまう (privacy / integrity)
+  - 書き込みが buffer のみに入り、他ツールから見えない
+  - buffer と disk の mtime ズレで "さっき書いた内容" が次回読む時に消える
+
+* Current State
+
+- anvil の多くの ~file-*~ tool は既に disk I/O を行う (良い)。
+- しかし ~insert-file-contents~ / ~find-file-noselect~ が混在しており契約が曖昧。
+- ~visited-file-modtime~ チェックを行う場所は限定的。
+
+* Proposed Design
+
+** Naming convention
+
+| Prefix       | 意味                                    | 例                               |
+|--------------+-----------------------------------------+----------------------------------|
+| ~file-*~     | disk に対する操作、buffer は触らない    | ~file-read~, ~file-replace-string~ |
+| ~buffer-*~   | visited buffer に対する操作 (明示 opt-in)| ~buffer-read~, ~buffer-save~     |
+| (既存互換)    | 既存名の tool は disk に固定             | ~org-read-by-id~ (disk 経由)     |
+
+~file-*~ を呼んだ時:
+- 当該 path が visited buffer を持っていても *buffer を無視して disk を読む*
+- buffer が modified (unsaved) で on-disk と diverge している場合は *警告を返す* (でも disk を読む)
+
+~buffer-*~ を呼んだ時:
+- visited buffer が存在しない場合は *error* (自動で find-file しない)
+- buffer と disk の mtime を比較し、diverge していれば *警告を添付* して返す
+
+** Divergence detection
+
+新 helper:
+
+#+begin_src elisp
+(defun anvil-disk-buffer-divergence (file)
+  "Return divergence info plist for FILE, or nil if no visited buffer.
+
+Returns:
+  (:buffer BUF
+   :disk-mtime TIME
+   :buffer-mtime TIME
+   :disk-size N
+   :buffer-size N
+   :status 'in-sync | 'buffer-newer | 'disk-newer | 'both-modified | 'unknown)"
+  ...)
+#+end_src
+
+判定ロジック:
+
+- ~visited-file-modtime~ が ~(0 0 0 0)~ または 0 → ~'unknown~ (意図的 stale、init.org 型)
+- ~buffer-modified-p~ かつ disk の mtime > buffer の last visited mtime → ~'both-modified~
+- ~buffer-modified-p~ のみ → ~'buffer-newer~
+- disk の mtime > visited-file-modtime → ~'disk-newer~
+- 一致 → ~'in-sync~
+
+** Default policy per tool class
+
+| Tool class               | default behavior                                               |
+|--------------------------+---------------------------------------------------------------|
+| ~file-read~              | disk から読む。divergence があれば ~:warnings [...]~ 添付    |
+| ~file-replace-string~    | disk を書く。buffer がある場合は修正後に auto-revert をトリガー or 警告 |
+| ~file-insert-at-line~    | 同上                                                         |
+| ~buffer-read~            | buffer から読む。buffer なければ error                       |
+| ~buffer-save~            | buffer を disk に書く。divergence ~'disk-newer~ なら refuse (明示 ~:force~ で上書き可) |
+
+** Write-after-buffer-edit の扱い
+
+disk に書いた後、visited buffer があれば:
+
+- ~revert-buffer-preserve-modes t~ で自動 revert
+- *ただし* buffer が modified なら *revert を拒否* (データ保護)、警告を返す
+
+AI が同じ file を立て続けに編集する時、人間が buffer で編集していれば AI 編集が拒否される仕組み。
+衝突が起きないことを AI 側が知れる。
+
+** Force-buffer opt-in
+
+どうしても buffer 経由にしたい ~:force-buffer t~ keyword を file-* 系全部に追加可能にする:
+
+#+begin_src elisp
+(file-read "foo.org" :force-buffer t)
+  ;; → visited buffer があればそれを返す、なければ find-file してから返す
+  ;; 契約を破っている自覚付きの opt-in
+#+end_src
+
+使い道: 人間が編集中のバッファを AI が見る debug 用途、init.org 型の意図的 stale buffer 操作。
+
+* API
+
+** Helper
+
+#+begin_src elisp
+(anvil-disk-buffer-divergence FILE)           ; 判定 plist
+(anvil-file-require-in-sync FILE)              ; diverge なら error
+(anvil-file-warn-if-diverged FILE)             ; warn list を返す
+(anvil-file-safe-write FILE CONTENT &key force); buffer conflict 時 refuse
+#+end_src
+
+** Tool registration
+
+anvil-server-register-tool マクロに新 keyword:
+
+#+begin_src elisp
+(anvil-server-register-tool #'my-tool
+  :id "..."
+  :buffer-policy 'disk            ; 'disk | 'buffer | 'either
+  :on-divergence 'warn)           ; 'warn | 'error | 'ignore
+#+end_src
+
+~:buffer-policy~ が明示されていない tool は 'disk default とし、~:on-divergence~ は 'warn default。
+
+* Implementation Plan
+
+1. *Phase 1 — Helper 整備* (~2 日)
+   - ~anvil-disk-buffer-divergence~ 実装
+   - ~anvil-file-safe-write~ 実装
+   - tests: 5 パターンの divergence 判定
+
+2. *Phase 2 — file-* tool 契約見直し* (~1 週間)
+   - 全 ~file-*~ tool を ~:buffer-policy 'disk~ で audit
+   - 意図せず ~find-file-noselect~ を呼んでいる箇所を ~insert-file-contents~ + coding 強制に
+   - divergence 時に ~:warnings~ を返すよう return format 拡張
+
+3. *Phase 3 — buffer-* 系新規追加* (~3 日)
+   - ~buffer-read~, ~buffer-save~, ~buffer-list-modified~ 追加
+   - MCP tool として登録、~:buffer-policy 'buffer~
+
+4. *Phase 4 — Documentation + migration* (~2 日)
+   - README に契約追記
+   - 既存 tool の docstring に ~buffer-policy~ 明記
+   - CHANGELOG で behavior 明確化 (silent stale が無くなる点)
+
+* Migration
+
+- 既存 tool の戻り値が ~:warnings~ を持つようになる可能性 → schema の optional key。
+- 既存 tool の *挙動* は不変 (disk 経由が既に多数派)。
+- 新 ~buffer-*~ は完全新規。
+
+* Risks
+
+- *警告ノイズ*. 人間が editor で編集中の buffer があるだけで毎回 warn が出ると煩い。
+  → ~:on-divergence 'warn~ は opt-in。デフォルトは 'ignore でも良い。Phase 2 で決定。
+- *auto-revert の副作用*. disk 書き込み後の auto-revert が mode hook を発火し副作用を生む。
+  → ~revert-buffer-preserve-modes t~ を徹底、preserve するか明示制御。
+- *force-buffer の濫用*. AI が面倒を避けて ~:force-buffer t~ を付けて buffer stale を読んでしまう。
+  → docstring で "人間 debug 用、AI は使うな" を明記、~anvil-server~ で AI tool call からは除外する option。
+
+* Platform notes
+
+** Windows
+
+- mtime 精度は NTFS でおおむね 1s、FAT で 2s。div 判定は ~>~ でなく ~>=~ 相当にマージン。
+- symlink/junction 経由のファイルで ~file-attribute-modification-time~ が stale を返すケースに注意
+  (memory: ~feedback_windows_junction_not_symlink.md~ 参照)。
+
+** macOS / Linux
+
+- 特記なし。
+
+* Success Metrics
+
+- silent stale read 事故報告: 0 (運用期間中)
+- AI-caused buffer corruption 事故: 0
+- ~:warnings~ を含む応答の割合: 監視、異常値なら閾値調整
+- Migration 後の既存 test pass 率: 100%
+
+* References
+
+- memory: ~feedback_init_org_buffer_divergence.md~
+- memory: ~feedback_journal_org_edit_body_timeout.md~
+- memory: ~feedback_my_cc_helpers_utf8_journals.md~
+- memory: ~feedback_windows_junction_not_symlink.md~
+- Emacs ~visited-file-modtime~ / ~verify-visited-file-modtime~ / ~revert-buffer~

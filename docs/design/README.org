@@ -1,0 +1,80 @@
+#+title: Anvil — Next Architecture Design Docs
+#+author: Fujisawa Electric Management Office
+#+startup: overview
+
+* Background
+
+Anvil の現行アーキテクチャ (Architecture B) は、purpose 別に 4 層の Emacs プロセスを分離することで
+「人間の Emacs が AI に詰まらされる」問題を解消した。しかし運用する中で、Emacs を MCP server にする上で
+残る根本的な制約がいくつか明らかになった:
+
+- *単一プロセス内シリアライズ* — 各 daemon 内では tool call が直列化する。
+  ~make-mutex~ は cross-session で意味をなさず、~accept-process-output~ も server eval には yield しない。
+- *重い org 処理の伝播* — 47KB org の ~org-map-entries~ が 30s timeout、init.org tangle が 30s ブロックする等、
+  1 本の重い tool call が daemon 全体を止める。
+- *TUI/PTY 問題* — Windows 上で ConPTY の stdin 片方向、~eat~ filter が daemon loop を starvation させる、
+  ~eat--t-write~ の wide-char 無限ループ等、TUI を Emacs 内に埋め込む試み自体の脆さ。
+- *buffer と disk の divergence* — visited buffer と on-disk の不整合が silent に stale なデータを返す。
+  ~init.org~ buffer は意図的に disk と divergence している等、単純な Read/Write では解けない。
+
+これらは個別に場当たりで凌いできたが、次段として *設計上* で解きたい。本ディレクトリはその設計 doc を集約する。
+
+* Design Principles
+
+1. *Emacs は人間の道具が第一*。AI tool call は editor をブロックしてはならない。
+2. *単一プロセス前提を捨てる*。並列性は process 分離と永続化層で獲得する。
+3. *既存 my-cc-helpers / anvil-* を壊さない*。新機能は opt-in で、既存 tool は互換を維持。
+4. *disk を真実の源 (source of truth) とする*。buffer は派生物として扱い、divergence は fail-loud。
+5. *Windows を first-class に扱う*。~~/Unix-only~~ な前提を設計段階で排除する。
+
+* Order of Work
+
+順序は依存関係で決めている。~01~ と ~02~ は並列着手可能。~03~ は ~01~ の worker pool を使う。
+~04~ と ~05~ は独立。
+
+| #  | Doc                         | 依存        | 想定工数 | 優先度 |
+|----+-----------------------------+-------------+----------+--------|
+| 01 | [[file:01-worker-pool-v2.org][Worker Pool v2]]              | なし        | 中       | 高     |
+| 02 | [[file:02-org-index.org][Persistent Org Index]]        | なし        | 大       | 高     |
+| 03 | [[file:03-offload-framework.org][Offload Framework]]           | 01          | 中       | 中     |
+| 04 | [[file:04-pty-broker.org][PTY Broker + Headless UI]]    | なし        | 大       | 中     |
+| 05 | [[file:05-disk-first.org][Disk-First Policy]]           | なし        | 小       | 高     |
+
+* Status Legend
+
+各 doc 冒頭の =STATUS= に以下のいずれかを記す:
+
+- ~DRAFT~ — 設計中、レビュー前
+- ~APPROVED~ — 設計確定、実装着手可
+- ~IN-PROGRESS~ — 実装中 (commit hash 記載)
+- ~SHIPPED~ — master に merge 済
+- ~REVISED~ — 別 doc で置き換え済 (リンク必須)
+
+* Cross-cutting Concerns
+
+** Backward compatibility
+
+既存の MCP tool 名 (~file-read~, ~org-read-headline~ 等) は維持する。内部実装が index 経由に変わっても
+API は同じ。新機能は ~anvil-v2-*~ または ~--v2~ suffix の opt-in とする。
+
+** Observability
+
+全設計で以下を必須とする:
+
+- lifecycle log (append-only、既存の ~anvil-worker.log~ 形式を踏襲)
+- metric counter (dispatch 回数、heavy detect 数、cache hit rate 等)
+- ~M-x anvil-*-status~ の interactive command
+
+** Windows 対応
+
+各 doc の =Platform notes= セクションで Windows 固有の落とし穴を明示する:
+- emacs --batch の cold start が Linux の 5〜10 倍遅い (~500ms〜1s)
+- ~emacsclient~ TCP socket auth は stale file + reused port で hang する (anvil-worker.el で既に対処済)
+- msys bash ↔ native Windows Python の coding-system
+- ConPTY/winpty の制約
+
+* References
+
+- 現行実装: [[file:../../anvil-worker.el][anvil-worker.el]]
+- 現行 README: [[file:../../README.org][README.org]]
+- 初期ダイアログ: (session 2026-04-15, "Emacs の限界を改善する方法を考えてください")

@@ -1523,6 +1523,88 @@ MCP Parameters:
                                       :array-type 'list)))
      (format "%S" (anvil-file-batch-across file-ops)))))
 
+;;;; --- outline --------------------------------------------------------------
+
+(defun anvil-file--outline-elisp ()
+  "Scan the current buffer as Elisp; return a list of outline entries."
+  (let ((items nil))
+    (goto-char (point-min))
+    (while (re-search-forward
+            "^(\\(cl-def\\(?:un\\|method\\|generic\\|macro\\|struct\\)\\|def\\(?:un\\|macro\\|var\\|const\\|custom\\|group\\|subst\\|alias\\|face\\|theme\\|advice-add\\)\\)[ \t\n]+\\([^ \t\n()]+\\)"
+            nil t)
+      (push (list :kind (match-string-no-properties 1)
+                  :name (match-string-no-properties 2)
+                  :line (line-number-at-pos (match-beginning 0)))
+            items))
+    (nreverse items)))
+
+(defun anvil-file--outline-org ()
+  "Scan the current buffer as org; return headline outline entries."
+  (let ((items nil))
+    (goto-char (point-min))
+    (while (re-search-forward "^\\(\\*+\\)[ \t]+\\(.*\\)$" nil t)
+      (push (list :kind (format "h%d" (length (match-string-no-properties 1)))
+                  :name (string-trim (match-string-no-properties 2))
+                  :line (line-number-at-pos (match-beginning 0)))
+            items))
+    (nreverse items)))
+
+(defun anvil-file--outline-markdown ()
+  "Scan the current buffer as Markdown; return heading outline entries."
+  (let ((items nil))
+    (goto-char (point-min))
+    (while (re-search-forward "^\\(#+\\)[ \t]+\\(.*\\)$" nil t)
+      (push (list :kind (format "h%d" (length (match-string-no-properties 1)))
+                  :name (string-trim (match-string-no-properties 2))
+                  :line (line-number-at-pos (match-beginning 0)))
+            items))
+    (nreverse items)))
+
+(defun anvil-file--tool-outline (path &optional format)
+  "Return a compact outline of PATH without sending the whole file.
+
+MCP Parameters:
+  path   - Path to the file to scan (string).
+  format - Optional format override: \"elisp\", \"org\", \"markdown\".
+           When omitted the format is inferred from the file extension
+           (.el / .org / .md|.markdown).
+
+Returns a printed plist:
+  (:path P :format F :count N :items ((:kind K :name N :line L) ...))
+
+Kinds:
+  elisp   : defun, defmacro, defvar, defcustom, defconst, defgroup,
+            defsubst, defalias, defface, deftheme, defmethod, defgeneric,
+            defstruct, advice-add
+  org     : h1 .. h6 (star count)
+  md      : h1 .. h6 (hash count)
+
+Ideal for orienting in large files before any Read call — saves
+the full body from the response."
+  (anvil-server-with-error-handling
+   (let* ((abs (expand-file-name path))
+          (fmt (or (and format (not (string-empty-p format))
+                        (downcase format))
+                   (pcase (downcase (or (file-name-extension abs) ""))
+                     ((or "el" "elc") "elisp")
+                     ("org" "org")
+                     ((or "md" "markdown") "markdown")
+                     (_ nil))))
+          (items
+           (with-temp-buffer
+             (let ((coding-system-for-read 'utf-8-unix))
+               (insert-file-contents abs))
+             (pcase fmt
+               ("elisp"    (anvil-file--outline-elisp))
+               ("org"      (anvil-file--outline-org))
+               ("markdown" (anvil-file--outline-markdown))
+               (_ (error "Unknown format for %s (pass format= to override)"
+                         abs))))))
+     (format "%S" (list :path abs
+                        :format fmt
+                        :count (length items)
+                        :items items)))))
+
 ;;;; --- module enable/disable -----------------------------------------------
 
 (defun anvil-file-enable ()
@@ -1632,6 +1714,18 @@ operations array: [{\"path\":\"/a.el\",\"operations\":[...]},...].
 Failures in one file do not abort the rest; per-file results are
 returned.  Use this for bulk docstring updates, import additions, or
 coordinated multi-file refactors."
+   :server-id anvil-file--server-id)
+
+  (anvil-server-register-tool
+   #'anvil-file--tool-outline
+   :id "file-outline"
+   :description
+   "Return a compact structural outline of a file without reading
+its body.  Infers format from extension (.el / .org / .md) or accepts
+a format= override.  Emits (:kind :name :line) entries for Elisp
+def-forms, org headlines, or Markdown headings.  Use this to orient
+in large files before deciding what to Read."
+   :read-only t
    :server-id anvil-file--server-id))
 
 (defun anvil-file-disable ()
@@ -1641,6 +1735,7 @@ coordinated multi-file refactors."
   (anvil-server-unregister-tool "file-insert-at-line" anvil-file--server-id)
   (anvil-server-unregister-tool "file-delete-lines" anvil-file--server-id)
   (anvil-server-unregister-tool "file-read" anvil-file--server-id)
+  (anvil-server-unregister-tool "file-outline" anvil-file--server-id)
   (anvil-server-unregister-tool "file-append" anvil-file--server-id)
   (anvil-server-unregister-tool "file-batch" anvil-file--server-id)
   (anvil-server-unregister-tool "json-object-add" anvil-file--server-id)

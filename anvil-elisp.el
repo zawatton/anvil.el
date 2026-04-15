@@ -19,7 +19,7 @@
 ;; Version: 1.2.0
 ;; Package-Requires: ((emacs "27.1"))
 ;; Keywords: tools, development
-;; URL: https://github.com/zawatton21/anvil.el
+;; URL: https://github.com/zawatton/anvil.el
 
 ;;; Commentary:
 
@@ -32,6 +32,8 @@
 (require 'pp)
 (require 'info-look)
 (require 'cl-lib)
+(require 'ert)
+(require 'bytecomp)
 
 
 ;;; System Directory Setup
@@ -45,8 +47,11 @@
   "System Lisp directory for Emacs installation.
 Computed once at package load time from `data-directory'.")
 
-(defconst anvil-elisp--server-id "anvil-elisp"
-  "Server ID for this MCP server.")
+(defconst anvil-elisp--server-id "emacs-eval"
+  "Server ID for this MCP server.
+Matches the id passed to `anvil-server-process-jsonrpc' by the
+stdio shim (--server-id=emacs-eval) so tools are visible to the
+shared MCP connection alongside anvil-file, anvil-org, etc.")
 
 (defgroup anvil-elisp nil
   "MCP server for agentic Elisp development."
@@ -770,9 +775,164 @@ MCP Parameters:
            (insert-file-contents true-path)
            (buffer-string)))))))
 
+;;; ERT test runner — compact result for LLM consumption
+
+(defun anvil-elisp--ert-registered-names ()
+  "Return a list of every symbol currently holding an ERT test."
+  (let (acc)
+    (mapatoms
+     (lambda (sym)
+       (when (get sym 'ert--test)
+         (push sym acc))))
+    acc))
+
+(defun anvil-elisp--ert-run (file &optional selector)
+  "Run ERT tests from FILE and return a compact result plist.
+
+MCP Parameters:
+  file     - Path to an .el file that defines ERT tests (string).
+             The file is `load'ed into the current Emacs session so
+             its `ert-deftest' forms register with the global test
+             registry.
+  selector - Optional ERT selector as an Elisp-readable string
+             (e.g. \"t\" for all, \"\\\"my-test-name\\\"\" for one,
+             or \"(tag :integration)\" for tagged).  Defaults to t.
+
+Returns a printed plist:
+  (:passed N :failed M :skipped S :elapsed-sec T :failures F)
+where F is a list of (:name STR :condition STR :backtrace STR).
+Backtraces are truncated to keep the response small.
+
+Runs tests synchronously in the current process, so side effects
+from the test file persist after the call.  Intended for tight
+feedback loops during development — use a batch subprocess when
+isolation matters."
+  (let* ((path (expand-file-name file))
+         (sel  (cond
+                ((null selector) t)
+                ((and (stringp selector) (string-empty-p selector)) t)
+                ((and (stringp selector) (string= selector "t")) t)
+                ((stringp selector)
+                 (condition-case nil (read selector) (error t)))
+                (t t)))
+         (start (float-time))
+         (passed 0) (failed 0) (skipped 0)
+         (failures nil)
+         (before (anvil-elisp--ert-registered-names)))
+    (load path nil t)
+    (let* ((after   (anvil-elisp--ert-registered-names))
+           (added   (cl-remove-if (lambda (n) (memq n before)) after))
+           (tests
+            (cond
+             ((or (eq sel t) (null sel))
+              (mapcar (lambda (n) (get n 'ert--test)) added))
+             ((stringp sel)
+              (mapcar (lambda (n) (get n 'ert--test))
+                      (cl-remove-if-not
+                       (lambda (n) (string-match-p sel (symbol-name n)))
+                       added)))
+             ((symbolp sel)
+              (when (memq sel added) (list (get sel 'ert--test))))
+             (t (mapcar (lambda (n) (get n 'ert--test)) added)))))
+      (dolist (test tests)
+        (let ((result (ert-run-test test)))
+          (cond
+           ((ert-test-passed-p result) (cl-incf passed))
+           ((ert-test-skipped-p result) (cl-incf skipped))
+           (t
+            (cl-incf failed)
+            (let* ((cond-obj (and (ert-test-result-with-condition-p result)
+                                  (ert-test-result-with-condition-condition
+                                   result)))
+                   (cond-str (if cond-obj
+                                 (let ((s (prin1-to-string cond-obj)))
+                                   (if (> (length s) 400)
+                                       (concat (substring s 0 400) " …")
+                                     s))
+                               "unknown failure"))
+                   (bt-obj   (and (ert-test-result-with-condition-p result)
+                                  (ert-test-result-with-condition-backtrace
+                                   result)))
+                   (bt-str   (if bt-obj
+                                 (let ((raw (prin1-to-string bt-obj)))
+                                   (if (> (length raw) 800)
+                                       (concat (substring raw 0 800) " …")
+                                     raw))
+                               "")))
+              (push (list :name      (symbol-name (ert-test-name test))
+                          :condition cond-str
+                          :backtrace bt-str)
+                    failures)))))))
+    (format "%S" (list :passed passed
+                       :failed failed
+                       :skipped skipped
+                       :elapsed-sec (- (float-time) start)
+                       :failures (nreverse failures)))))
+
+;;; Byte-compile — compact result
+
+(defun anvil-elisp--byte-compile-file (file)
+  "Byte-compile FILE and return a compact result plist.
+
+MCP Parameters:
+  file - Path to an .el file to byte-compile (string).
+
+Returns a printed plist:
+  (:ok BOOL :output PATH :warnings (...) :errors (...))
+Warnings and errors are parsed out of the byte-compile log so the
+caller does not have to scan it."
+  (let* ((path (expand-file-name file))
+         (log-buf (get-buffer-create " *anvil-bc-log*"))
+         (byte-compile-log-buffer (buffer-name log-buf))
+         (warnings nil)
+         (errors nil)
+         (result nil))
+    (with-current-buffer log-buf
+      (let ((inhibit-read-only t)) (erase-buffer)))
+    (condition-case err
+        (setq result (byte-compile-file path))
+      (error (push (error-message-string err) errors)))
+    (with-current-buffer log-buf
+      (goto-char (point-min))
+      (while (re-search-forward
+              "^\\(?:.*?:\\)?\\(?:[0-9]+:[0-9]+: ?\\)?\\(Warning\\|Error\\): \\(.*\\)$"
+              nil t)
+        (let ((kind (match-string 1))
+              (msg  (match-string 2)))
+          (if (equal kind "Warning")
+              (push msg warnings)
+            (push msg errors)))))
+    (format "%S" (list :ok (and result (null errors))
+                       :output (concat (file-name-sans-extension path) ".elc")
+                       :warnings (nreverse warnings)
+                       :errors (nreverse errors)))))
+
 ;;;###autoload
 (defun anvil-elisp-enable ()
   "Enable the Elisp development MCP tools."
+  (anvil-server-register-tool
+   #'anvil-elisp--ert-run
+   :id "elisp-ert-run"
+   :server-id anvil-elisp--server-id
+   :description
+   "Run ERT tests from a file and return a compact plist instead of
+the chatty output `emacs --batch ... ert-run-tests-batch-and-exit'
+produces.  Returns :passed :failed :skipped :elapsed-sec :failures,
+with each failure carrying a truncated condition and backtrace.
+Intended for tight test/fix loops during development — far cheaper
+in tokens than shelling out and parsing stdout."
+   :read-only t)
+  (anvil-server-register-tool
+   #'anvil-elisp--byte-compile-file
+   :id "elisp-byte-compile-file"
+   :server-id anvil-elisp--server-id
+   :description
+   "Byte-compile a single .el file and return a plist:
+\(:ok BOOL :output PATH :warnings (...) :errors (...)).  Replaces
+shelling out to `emacs --batch -f batch-byte-compile' when you
+just need a clean yes/no plus the list of diagnostics.  Errors
+and warnings are parsed out of the log buffer for you."
+   :read-only nil)
   (anvil-server-register-tool
    #'anvil-elisp--describe-function
    :id "elisp-describe-function"
@@ -969,6 +1129,10 @@ Error cases:
 ;;;###autoload
 (defun anvil-elisp-disable ()
   "Disable the Elisp development MCP tools."
+  (anvil-server-unregister-tool
+   "elisp-ert-run" anvil-elisp--server-id)
+  (anvil-server-unregister-tool
+   "elisp-byte-compile-file" anvil-elisp--server-id)
   (anvil-server-unregister-tool
    "elisp-describe-function" anvil-elisp--server-id)
   (anvil-server-unregister-tool
