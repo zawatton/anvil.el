@@ -88,13 +88,13 @@ Disable health timer + spawning so no real subprocesses start."
     (let ((w (anvil-worker--pick-worker :write)))
       (should (eq :write (plist-get w :lane))))))
 
-(ert-deftest anvil-worker-test-pick-auto-prefers-read ()
-  ":kind :auto walks lanes in `anvil-worker--lanes' order, read first."
+(ert-deftest anvil-worker-test-pick-auto-without-expression-uses-fallback ()
+  ":kind :auto with no expression hits the classifier fallback (default :write)."
   (anvil-worker-test--with-pool
       '(:read 1 :write 1)
       '("anvil-worker-read-1" "anvil-worker-write-1")
     (let ((w (anvil-worker--pick-worker :auto)))
-      (should (eq :read (plist-get w :lane))))))
+      (should (eq :write (plist-get w :lane))))))
 
 (ert-deftest anvil-worker-test-pick-auto-falls-through ()
   "When :read has no alive workers :auto descends to :write."
@@ -172,5 +172,129 @@ Disable health timer + spawning so no real subprocesses start."
     (should (= 99 anvil-worker-pool-size))
     (setq anvil-worker-pool-size 7)
     (should (= 7 anvil-worker-read-pool-size))))
+
+;;;; --- classifier (Doc 01 Phase 2) -----------------------------------------
+
+(defmacro anvil-worker-test--with-fresh-classifier-metrics (&rest body)
+  "Reset classifier metrics around BODY so each test starts at zero."
+  (declare (indent 0))
+  `(let ((anvil-worker--metrics-classify
+          (list :read 0 :write 0 :batch 0 :unknown-fallback 0)))
+     ,@body))
+
+(ert-deftest anvil-worker-test-classify-read-patterns ()
+  "Read-only org/file/buffer/index calls land on :read."
+  (anvil-worker-test--with-fresh-classifier-metrics
+    (should (eq :read (anvil-worker--classify "(org-read-file \"x.org\")")))
+    (should (eq :read (anvil-worker--classify "(file-read \"x.el\")")))
+    (should (eq :read (anvil-worker--classify "(buffer-read \"buf\")")))
+    (should (eq :read (anvil-worker--classify "(org-index-search :tag \"x\")")))
+    (should (eq :read (anvil-worker--classify "(sqlite-query \"SELECT 1\")")))))
+
+(ert-deftest anvil-worker-test-classify-write-patterns ()
+  "Mutating file-* / buffer-save / write-region land on :write."
+  (anvil-worker-test--with-fresh-classifier-metrics
+    (should (eq :write (anvil-worker--classify
+                        "(file-replace-string \"x\" \"a\" \"b\")")))
+    (should (eq :write (anvil-worker--classify "(file-batch \"x\" '(...))")))
+    (should (eq :write (anvil-worker--classify "(buffer-save \"buf\")")))
+    (should (eq :write (anvil-worker--classify "(save-buffer)")))
+    (should (eq :write (anvil-worker--classify
+                        "(write-region 1 2 \"x\" nil 'silent)")))))
+
+(ert-deftest anvil-worker-test-classify-batch-needs-pool ()
+  "Batch patterns route to :batch only when batch-pool-size > 0."
+  (anvil-worker-test--with-fresh-classifier-metrics
+    (let ((anvil-worker-batch-pool-size 0))
+      (should (eq :write
+                  (anvil-worker--classify "(byte-compile-file \"x.el\")"))))
+    (let ((anvil-worker-batch-pool-size 2))
+      (should (eq :batch
+                  (anvil-worker--classify "(byte-compile-file \"x.el\")"))))))
+
+(ert-deftest anvil-worker-test-classify-write-beats-read ()
+  "An expression mixing read+write keywords is escalated to :write."
+  (anvil-worker-test--with-fresh-classifier-metrics
+    ;; Contains both file-read and file-replace-string.
+    (let ((expr "(progn (file-read \"x\") (file-replace-string \"x\" \"a\" \"b\"))"))
+      (should (eq :write (anvil-worker--classify expr))))))
+
+(ert-deftest anvil-worker-test-classify-unknown-falls-back-to-write ()
+  "Unrecognised expressions hit the safe-side `:write' fallback."
+  (anvil-worker-test--with-fresh-classifier-metrics
+    (should (eq :write (anvil-worker--classify "(my-mystery-fn 1 2 3)")))
+    (should (= 1 (plist-get anvil-worker--metrics-classify :unknown-fallback)))
+    (should (= 1 (plist-get anvil-worker--metrics-classify :write)))))
+
+(ert-deftest anvil-worker-test-classify-fallback-customisable ()
+  "Changing the fallback custom moves unknown expressions elsewhere."
+  (anvil-worker-test--with-fresh-classifier-metrics
+    (let ((anvil-worker-classify-unknown-fallback :read))
+      (should (eq :read (anvil-worker--classify "(unknown-call)"))))))
+
+(ert-deftest anvil-worker-test-classify-anvil-prefix-accepted ()
+  "Patterns accept the `anvil-' prefix as well as the bare name."
+  (anvil-worker-test--with-fresh-classifier-metrics
+    (should (eq :read  (anvil-worker--classify "(anvil-file-read \"x\")")))
+    (should (eq :write (anvil-worker--classify
+                        "(anvil-file-replace-string \"x\" \"a\" \"b\")")))))
+
+(ert-deftest anvil-worker-test-classify-non-string-returns-fallback ()
+  "Non-string EXPRESSION (nil, list) hits the fallback bucket."
+  (anvil-worker-test--with-fresh-classifier-metrics
+    (should (eq :write (anvil-worker--classify nil)))
+    (should (= 1 (plist-get anvil-worker--metrics-classify :unknown-fallback)))))
+
+(ert-deftest anvil-worker-test-metrics-bump-counts-each-call ()
+  "Every classify call bumps exactly one bucket (plus fallback when miss)."
+  (anvil-worker-test--with-fresh-classifier-metrics
+    (anvil-worker--classify "(file-read \"x\")")
+    (anvil-worker--classify "(file-replace-string \"x\" \"a\" \"b\")")
+    (anvil-worker--classify "(unknown-thing)")
+    (should (= 1 (plist-get anvil-worker--metrics-classify :read)))
+    (should (= 2 (plist-get anvil-worker--metrics-classify :write)))
+    (should (= 1 (plist-get anvil-worker--metrics-classify :unknown-fallback)))))
+
+;;;; --- pick-worker integration with classifier ----------------------------
+
+(ert-deftest anvil-worker-test-pick-auto-uses-classifier-read ()
+  ":kind :auto on a read expression picks the :read lane."
+  (anvil-worker-test--with-pool
+      '(:read 1 :write 1)
+      '("anvil-worker-read-1" "anvil-worker-write-1")
+    (anvil-worker-test--with-fresh-classifier-metrics
+      (let ((w (anvil-worker--pick-worker :auto "(file-read \"x\")")))
+        (should (eq :read (plist-get w :lane)))))))
+
+(ert-deftest anvil-worker-test-pick-auto-uses-classifier-write ()
+  ":kind :auto on a write expression picks the :write lane."
+  (anvil-worker-test--with-pool
+      '(:read 1 :write 1)
+      '("anvil-worker-read-1" "anvil-worker-write-1")
+    (anvil-worker-test--with-fresh-classifier-metrics
+      (let ((w (anvil-worker--pick-worker
+                :auto "(file-replace-string \"x\" \"a\" \"b\")")))
+        (should (eq :write (plist-get w :lane)))))))
+
+(ert-deftest anvil-worker-test-pick-explicit-kind-overrides-classifier ()
+  ":kind :read forces the read lane even for an obvious write expression."
+  (anvil-worker-test--with-pool
+      '(:read 1 :write 1)
+      '("anvil-worker-read-1" "anvil-worker-write-1")
+    (anvil-worker-test--with-fresh-classifier-metrics
+      (let ((w (anvil-worker--pick-worker
+                :read "(file-replace-string \"x\" \"a\" \"b\")")))
+        (should (eq :read (plist-get w :lane)))
+        ;; Explicit kind must NOT touch classifier metrics.
+        (should (= 0 (plist-get anvil-worker--metrics-classify :write)))))))
+
+(ert-deftest anvil-worker-test-pick-auto-falls-through-to-write ()
+  "When classifier picks :read but the read lane is dead, fall back to :write."
+  (anvil-worker-test--with-pool
+      '(:read 1 :write 1)
+      '("anvil-worker-write-1")  ; only write alive
+    (anvil-worker-test--with-fresh-classifier-metrics
+      (let ((w (anvil-worker--pick-worker :auto "(file-read \"x\")")))
+        (should (eq :write (plist-get w :lane)))))))
 
 ;;; anvil-worker-test.el ends here

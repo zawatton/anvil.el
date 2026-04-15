@@ -146,6 +146,130 @@ Expressions matching these patterns get routed with longer timeout."
   :type '(alist :key-type string :value-type string)
   :group 'anvil-worker)
 
+;;; Classifier (Doc 01 Phase 2)
+
+(defcustom anvil-worker-classify-read-patterns
+  '("(\\(?:anvil-\\)?org-read-\\(?:by-id\\|file\\|outline\\|headline\\)\\b"
+    "(\\(?:anvil-\\)?org-index-search\\b"
+    "(\\(?:anvil-\\)?file-read\\b"
+    "(\\(?:anvil-\\)?file-outline\\b"
+    "(\\(?:anvil-\\)?buffer-read\\b"
+    "(\\(?:anvil-\\)?buffer-list-modified\\b"
+    "(\\(?:anvil-\\)?elisp-describe-\\(?:function\\|variable\\)\\b"
+    "(\\(?:anvil-\\)?elisp-info-lookup-symbol\\b"
+    "(\\(?:anvil-\\)?elisp-read-source-file\\b"
+    "(\\(?:anvil-\\)?elisp-get-function-definition\\b"
+    "(\\(?:anvil-\\)?sqlite-query\\b"
+    "(\\(?:anvil-\\)?org-get-\\(?:allowed-files\\|tag-config\\|todo-config\\)\\b")
+  "Regexes that flag EXPRESSION as a read-only `:read'-lane call.
+Matched in document order; the first matching pattern wins.  When
+no pattern matches the classifier falls back to the write lane —
+see `anvil-worker-classify-unknown-fallback'."
+  :type '(repeat regexp)
+  :group 'anvil-worker)
+
+(defcustom anvil-worker-classify-write-patterns
+  '("(\\(?:anvil-\\)?file-replace-\\(?:string\\|regexp\\)\\b"
+    "(\\(?:anvil-\\)?file-insert-at-line\\b"
+    "(\\(?:anvil-\\)?file-delete-lines\\b"
+    "(\\(?:anvil-\\)?file-append\\b"
+    "(\\(?:anvil-\\)?file-prepend\\b"
+    "(\\(?:anvil-\\)?file-batch\\(?:-across\\)?\\b"
+    "(\\(?:anvil-\\)?file-ensure-import\\b"
+    "(\\(?:anvil-\\)?json-object-add\\b"
+    "(\\(?:anvil-\\)?buffer-save\\b"
+    "(\\(?:anvil-\\)?org-edit-body\\b"
+    "(\\(?:anvil-\\)?org-add-todo\\b"
+    "(\\(?:anvil-\\)?org-rename-headline\\b"
+    "(\\(?:anvil-\\)?org-update-todo-state\\b"
+    "(save-buffer\\b"
+    "(write-region\\b"
+    "(write-file\\b"
+    "(delete-file\\b"
+    "(rename-file\\b"
+    "(make-directory\\b")
+  "Regexes that flag EXPRESSION as a mutating `:write'-lane call.
+Tested *before* the read patterns so an expression that mixes
+read+write operations is still routed to write."
+  :type '(repeat regexp)
+  :group 'anvil-worker)
+
+(defcustom anvil-worker-classify-batch-patterns
+  '("(byte-compile\\(?:-file\\)?\\b"
+    "(org-babel-tangle\\b"
+    "(\\(?:anvil-\\)?elisp-byte-compile-file\\b")
+  "Regexes that flag EXPRESSION as a batch-pool candidate.
+Routed to `:batch' only when `anvil-worker-batch-pool-size' > 0;
+otherwise the classifier silently downgrades to `:write'."
+  :type '(repeat regexp)
+  :group 'anvil-worker)
+
+(defcustom anvil-worker-classify-unknown-fallback :write
+  "Lane chosen by `anvil-worker--classify' when no pattern matches.
+Defaults to `:write' (the safe side per Doc 01) so an
+unrecognised expression that happens to mutate state never sneaks
+into a read replica."
+  :type '(choice (const :read) (const :write) (const :batch))
+  :group 'anvil-worker)
+
+(defvar anvil-worker--metrics-classify
+  (list :read 0 :write 0 :batch 0 :unknown-fallback 0)
+  "Histogram of classifier decisions made by `anvil-worker--classify'.
+The `:unknown-fallback' bucket counts only the no-match cases; a
+positive match for the same lane goes to that lane's bucket.
+Reset with `anvil-worker-classify-metrics-reset'.")
+
+(defun anvil-worker-classify-metrics-reset ()
+  "Zero out `anvil-worker--metrics-classify'."
+  (interactive)
+  (setq anvil-worker--metrics-classify
+        (list :read 0 :write 0 :batch 0 :unknown-fallback 0)))
+
+(defun anvil-worker-classify-metrics-show ()
+  "Echo the classifier histogram."
+  (interactive)
+  (message "Anvil classifier metrics: %S" anvil-worker--metrics-classify))
+
+(defun anvil-worker--metrics-bump (key)
+  "Increment KEY in `anvil-worker--metrics-classify'."
+  (setq anvil-worker--metrics-classify
+        (plist-put anvil-worker--metrics-classify key
+                   (1+ (or (plist-get anvil-worker--metrics-classify key) 0)))))
+
+(defun anvil-worker--match-any (expression patterns)
+  "Return non-nil if EXPRESSION matches any regex in PATTERNS."
+  (and (stringp expression)
+       (cl-some (lambda (re) (string-match-p re expression)) patterns)))
+
+(defun anvil-worker--classify (expression)
+  "Return the lane symbol that should handle EXPRESSION.
+
+Resolution order (first match wins):
+  1. `anvil-worker-classify-write-patterns' → `:write'
+  2. `anvil-worker-classify-batch-patterns' → `:batch'
+     (downgraded to `:write' when batch lane is empty)
+  3. `anvil-worker-classify-read-patterns'  → `:read'
+  4. otherwise → `anvil-worker-classify-unknown-fallback'
+
+Increments `anvil-worker--metrics-classify' so callers can audit
+how often the classifier hits each bucket vs. falls back."
+  (let* ((decision
+          (cond
+           ((anvil-worker--match-any
+             expression anvil-worker-classify-write-patterns)
+            :write)
+           ((anvil-worker--match-any
+             expression anvil-worker-classify-batch-patterns)
+            (if (> anvil-worker-batch-pool-size 0) :batch :write))
+           ((anvil-worker--match-any
+             expression anvil-worker-classify-read-patterns)
+            :read)
+           (t
+            (anvil-worker--metrics-bump :unknown-fallback)
+            anvil-worker-classify-unknown-fallback))))
+    (anvil-worker--metrics-bump decision)
+    decision))
+
 ;;; Lane plumbing
 
 (defconst anvil-worker--lanes '(:read :write :batch)
@@ -444,22 +568,23 @@ Returns the worker plist if it came alive, else nil."
           (sit-for 0.1)))
       (and (anvil-worker--worker-alive-p worker) worker))))
 
-(defun anvil-worker--pick-worker (&optional kind)
+(defun anvil-worker--pick-worker (&optional kind expression)
   "Pick a worker for a tool call.
 KIND is `:read' / `:write' / `:batch' / `:auto' (default `:auto').
-For `:auto' lanes are tried in `anvil-worker--lanes' order (read,
-write, batch); a regex/intent classifier is Phase 2 work."
+When KIND is `:auto', EXPRESSION (a string) is fed to
+`anvil-worker--classify' to choose the effective lane; the chosen
+lane is tried first and the remaining lanes act as fallbacks."
   (unless anvil-worker--pool
     (anvil-worker--init-pool))
-  (let ((kind (or kind :auto)))
-    (cond
-     ((eq kind :auto)
-      (or (cl-some #'anvil-worker--pick-in-lane anvil-worker--lanes)
-          (cl-some #'anvil-worker--pick-fallback-in-lane
-                   anvil-worker--lanes)))
-     (t
-      (or (anvil-worker--pick-in-lane kind)
-          (anvil-worker--pick-fallback-in-lane kind))))))
+  (let* ((kind (or kind :auto))
+         (effective (if (eq kind :auto)
+                        (anvil-worker--classify expression)
+                      kind))
+         ;; Try effective lane first, then the rest in canonical order.
+         (try-order (cons effective
+                          (cl-remove effective anvil-worker--lanes))))
+    (or (cl-some #'anvil-worker--pick-in-lane try-order)
+        (cl-some #'anvil-worker--pick-fallback-in-lane try-order))))
 
 ;;; Heavy-op detection
 
@@ -515,7 +640,7 @@ the requested lane is reachable within `anvil-worker-spawn-wait'."
          (timeout (or timeout
                       (if heavy anvil-worker-heavy-timeout
                         anvil-worker-call-timeout)))
-         (worker  (anvil-worker--pick-worker kind)))
+         (worker  (anvil-worker--pick-worker kind expression)))
     (unless worker
       (error "Anvil: no worker available for kind=%S (read=%d write=%d batch=%d)"
              kind
@@ -534,6 +659,10 @@ the requested lane is reachable within `anvil-worker-spawn-wait'."
                (anvil-worker--lane-name kind)
                (if heavy (mapconcat #'identity heavy ",") "no")
                timeout))
+      (when (eq kind :auto)
+        (anvil-worker--log
+         'classified
+         (format "%s → lane=%s" name (anvil-worker--lane-name lane))))
       (unwind-protect
           (let ((buf (get-buffer-create (format " *anvil-worker-call-%s*" name))))
             (with-current-buffer buf (erase-buffer))
