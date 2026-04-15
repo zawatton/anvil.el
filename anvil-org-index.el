@@ -988,6 +988,7 @@ Accepts a string (singleton), a list, or a comma-separated string."
 ;;;###autoload
 (cl-defun anvil-org-index-search
     (&key title-like file-like todo tag
+          property-key property-value
           scheduled-before scheduled-after
           deadline-before  deadline-after
           limit offset)
@@ -1001,6 +1002,13 @@ Keyword arguments (all optional, combined with AND):
                      TODO keywords (IN clause).
   :tag               string or list/CSV; *every* tag listed must be
                      attached to the headline (AND of EXISTS).
+  :property-key      exact match on PROPERTIES drawer key (case
+                     preserved from the org source — typically
+                     UPPERCASE like \"ID\", \"CATEGORY\").
+  :property-value    SQL LIKE pattern on property value; auto-
+                     wrapped with `%...%' when bare.  Combines
+                     with :property-key as \"key = ? AND value LIKE ?\"
+                     on the SAME row; on its own it matches any key.
   :scheduled-before  ISO date \"YYYY-MM-DD\"; keeps headlines whose
                      SCHEDULED date is <= this value.
   :scheduled-after   same but >=.
@@ -1037,6 +1045,25 @@ whole query runs as a single indexed SQL statement."
       (push "EXISTS (SELECT 1 FROM tag t WHERE t.headline_id = h.id AND t.tag = ?)"
             where)
       (push tg args))
+    (let ((pval (anvil-org-index--search-like-wrap property-value)))
+      (cond
+       ((and property-key pval)
+        (push (concat "EXISTS (SELECT 1 FROM property p "
+                      "WHERE p.headline_id = h.id "
+                      "AND p.key = ? AND p.value LIKE ?)")
+              where)
+        (push property-key args)
+        (push pval args))
+       (property-key
+        (push (concat "EXISTS (SELECT 1 FROM property p "
+                      "WHERE p.headline_id = h.id AND p.key = ?)")
+              where)
+        (push property-key args))
+       (pval
+        (push (concat "EXISTS (SELECT 1 FROM property p "
+                      "WHERE p.headline_id = h.id AND p.value LIKE ?)")
+              where)
+        (push pval args))))
     (when scheduled-before
       (push (anvil-org-index--search-ts-substr "h.scheduled" "<=") where)
       (push scheduled-before args))
@@ -1090,6 +1117,7 @@ whole query runs as a single indexed SQL statement."
 
 (defun anvil-org-index--tool-search
     (&optional title-like file-like todo tag
+               property-key property-value
                scheduled-before scheduled-after
                deadline-before  deadline-after
                limit offset)
@@ -1103,6 +1131,10 @@ MCP Parameters:
   file-like        - SQL LIKE pattern on absolute file path.
   todo             - TODO keyword or comma-separated list (OR).
   tag              - Tag or comma-separated list (AND).
+  property-key     - Exact match on PROPERTIES drawer key (case
+                     preserved — typically UPPERCASE).
+  property-value   - SQL LIKE pattern on property value; combines
+                     with property-key on the same row.
   scheduled-before - ISO \"YYYY-MM-DD\" — SCHEDULED <= date.
   scheduled-after  - ISO \"YYYY-MM-DD\" — SCHEDULED >= date.
   deadline-before  - ISO \"YYYY-MM-DD\" — DEADLINE  <= date.
@@ -1126,6 +1158,8 @@ MCP Parameters:
               :file-like        (funcall none-empty file-like)
               :todo             (funcall none-empty todo)
               :tag              (funcall none-empty tag)
+              :property-key     (funcall none-empty property-key)
+              :property-value   (funcall none-empty property-value)
               :scheduled-before (funcall none-empty scheduled-before)
               :scheduled-after  (funcall none-empty scheduled-after)
               :deadline-before  (funcall none-empty deadline-before)

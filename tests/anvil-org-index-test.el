@@ -764,3 +764,110 @@ DEADLINE: <2026-04-10 Fri>
       (should-not (plist-get res :truncated)))))
 
 ;;; anvil-org-index-test.el ends here
+
+;;;; Phase 4c++: property-key / property-value search
+
+(defun anvil-org-index-test--seed-property-search (root)
+  "Seed a fixture with :PROPERTIES: drawers and return its path."
+  (let ((f (expand-file-name "prop.org" root)))
+    (anvil-org-index-test--write
+     f
+     "* Alpha task
+:PROPERTIES:
+:CATEGORY: finance
+:OWNER: alice
+:END:
+Body alpha.
+* Bravo task
+:PROPERTIES:
+:CATEGORY: finance
+:OWNER: bob
+:END:
+Body bravo.
+* Charlie task
+:PROPERTIES:
+:CATEGORY: ops
+:OWNER: carol
+:END:
+Body charlie.
+* Delta task
+Body delta (no drawer).
+")
+    f))
+
+(defmacro anvil-org-index-test--with-property-seed (body-var &rest body)
+  "Seed the property fixture and run BODY with BODY-VAR bound to its path."
+  (declare (indent 1))
+  `(let* ((tmpdir (make-temp-file "anvil-idx-pr-" t))
+          (db (expand-file-name "i.db" tmpdir))
+          (,body-var nil)
+          (anvil-org-index-db-path db)
+          (anvil-org-index-paths (list tmpdir))
+          (anvil-org-index--backend nil)
+          (anvil-org-index--db nil))
+     (unwind-protect
+         (progn
+           (setq ,body-var (anvil-org-index-test--seed-property-search tmpdir))
+           (anvil-org-index-enable)
+           (anvil-org-index-rebuild)
+           ,@body)
+       (ignore-errors (anvil-org-index-disable))
+       (ignore-errors (delete-directory tmpdir t)))))
+
+(ert-deftest anvil-org-index-test-search-property-key-only ()
+  "Filtering by :property-key returns every headline that has that key."
+  (skip-unless (anvil-org-index-test--have-sqlite))
+  (anvil-org-index-test--with-property-seed _f
+    (let* ((res   (anvil-org-index-search :property-key "CATEGORY"))
+           (rows  (plist-get res :rows))
+           (names (mapcar (lambda (r) (plist-get r :title)) rows)))
+      (should (= 3 (plist-get res :count)))
+      (should (member "Alpha task"   names))
+      (should (member "Bravo task"   names))
+      (should (member "Charlie task" names))
+      (should-not (member "Delta task" names)))))
+
+(ert-deftest anvil-org-index-test-search-property-key-and-value ()
+  "Combining :property-key and :property-value matches the same drawer row."
+  (skip-unless (anvil-org-index-test--have-sqlite))
+  (anvil-org-index-test--with-property-seed _f
+    (let* ((res  (anvil-org-index-search
+                  :property-key   "CATEGORY"
+                  :property-value "finance"))
+           (rows (plist-get res :rows))
+           (names (mapcar (lambda (r) (plist-get r :title)) rows)))
+      (should (= 2 (plist-get res :count)))
+      (should (member "Alpha task" names))
+      (should (member "Bravo task" names))
+      (should-not (member "Charlie task" names)))))
+
+(ert-deftest anvil-org-index-test-search-property-key-mismatched-value ()
+  "Key+value must live on the SAME row: OWNER=alice + CATEGORY key fails."
+  (skip-unless (anvil-org-index-test--have-sqlite))
+  (anvil-org-index-test--with-property-seed _f
+    ;; The value "alice" exists on the OWNER row, not on CATEGORY.
+    (let* ((res (anvil-org-index-search
+                 :property-key "CATEGORY" :property-value "alice")))
+      (should (= 0 (plist-get res :count)))
+      (should (null (plist-get res :rows))))))
+
+(ert-deftest anvil-org-index-test-search-property-value-only ()
+  "Bare :property-value matches any key with the given value."
+  (skip-unless (anvil-org-index-test--have-sqlite))
+  (anvil-org-index-test--with-property-seed _f
+    (let* ((res   (anvil-org-index-search :property-value "bob"))
+           (rows  (plist-get res :rows))
+           (names (mapcar (lambda (r) (plist-get r :title)) rows)))
+      (should (= 1 (plist-get res :count)))
+      (should (equal "Bravo task" (car names))))))
+
+(ert-deftest anvil-org-index-test-search-property-combines-with-tag ()
+  "Property filters AND together with other predicates like :title-like."
+  (skip-unless (anvil-org-index-test--have-sqlite))
+  (anvil-org-index-test--with-property-seed _f
+    (let* ((res (anvil-org-index-search
+                 :title-like   "Bravo"
+                 :property-key "OWNER"))
+           (rows (plist-get res :rows)))
+      (should (= 1 (plist-get res :count)))
+      (should (equal "Bravo task" (plist-get (car rows) :title))))))
