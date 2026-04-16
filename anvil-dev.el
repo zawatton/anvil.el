@@ -19,12 +19,6 @@
 ;;       and optionally compare it to a separate dev checkout so the
 ;;       "installed tree silently diverged from the dev tree" bug
 ;;       (2026-04-16) is caught in one MCP call.
-;;   - `anvil-journal-append'
-;;     — idempotently append a `*** MEMO AI: ...' entry under the
-;;       day's `** NOTE 作業ログ' section of an org journal, creating
-;;       the section if missing.  Encodes the CLAUDE.md convention
-;;       for session-log entries so future sessions do not have to
-;;       re-implement the find-or-create logic.
 ;;
 ;; Enable via `(add-to-list 'anvil-optional-modules 'dev)' in init.
 
@@ -144,161 +138,6 @@ installed anvil clone's git HEAD with `anvil-dev-source-path'."
   (anvil-server-with-error-handling
    (format "%S" (anvil-self-sync-check))))
 
-;;;; --- anvil-journal-append -----------------------------------------------
-
-(defcustom anvil-journal-worklog-heading "作業ログ"
-  "Heading text used to identify the day's worklog section.
-Combined with the date (e.g. \"作業ログ <2026-04-16 Thu>\") and a
-NOTE TODO-state prefix to form the full level-2 heading."
-  :type 'string
-  :group 'anvil-dev)
-
-(defconst anvil-dev--weekday-abbrevs
-  ["Sun" "Mon" "Tue" "Wed" "Thu" "Fri" "Sat"]
-  "English 3-letter weekday abbreviations, indexed by `decode-time' dow.")
-
-(defconst anvil-dev--weekday-full-names
-  ["Sunday" "Monday" "Tuesday" "Wednesday" "Thursday" "Friday" "Saturday"]
-  "English full weekday names.  Matches org's timestamp + day-heading style.")
-
-(defun anvil-dev--weekday-abbrev (date)
-  "Return English 3-letter weekday abbreviation for ISO DATE (\"YYYY-MM-DD\").
-Independent of `system-time-locale' — Windows daemons with CP932
-locale return 1-byte Japanese weekday chars from `format-time-string',
-which is why we ship a fixed lookup table."
-  (let* ((time (date-to-time (concat date " 00:00:00")))
-         (dow  (nth 6 (decode-time time))))
-    (aref anvil-dev--weekday-abbrevs dow)))
-
-(defun anvil-dev--date-day-heading (date)
-  "Return the level-1 day heading text for DATE (\"YYYY-MM-DD\").
-Example: \"2026-04-16-Thursday\"."
-  (let* ((time (date-to-time (concat date " 00:00:00")))
-         (dow  (nth 6 (decode-time time))))
-    (concat date "-" (aref anvil-dev--weekday-full-names dow))))
-
-(defun anvil-dev--org-day-bounds (date)
-  "Return cons (START . END) of the level-1 subtree for DATE.
-Assumes the current buffer holds an org journal where each day
-is a level-1 heading like `* 2026-04-16-Thursday'.  Returns nil
-when no such heading exists."
-  (save-excursion
-    (goto-char (point-min))
-    (let ((day-heading
-           (concat "^\\* " (regexp-quote (anvil-dev--date-day-heading date))
-                   "\\(?:[ \t]\\|$\\)")))
-      (when (re-search-forward day-heading nil t)
-        (let ((start (match-beginning 0))
-              (end (or (save-excursion
-                         (forward-line 1)
-                         (and (re-search-forward "^\\* " nil t)
-                              (match-beginning 0)))
-                       (point-max))))
-          (cons start end))))))
-
-(defun anvil-dev--ensure-worklog-section (date)
-  "Find (or create) the `** NOTE 作業ログ <DATE ...>' section for DATE.
-Must be called with the org journal buffer current and narrowed
-nothing.  Returns cons (SECTION-START . SECTION-END).  When the
-section is freshly inserted SECTION-END is the same as SECTION-START."
-  (let* ((bounds (or (anvil-dev--org-day-bounds date)
-                     (error "anvil-dev: no `* %s' day heading in journal"
-                            (anvil-dev--date-day-heading date))))
-         (day-end (cdr bounds))
-         (section-re
-          (concat "^\\*\\* NOTE "
-                  (regexp-quote anvil-journal-worklog-heading)
-                  " <" (regexp-quote date))))
-    (save-excursion
-      (goto-char (car bounds))
-      (if (re-search-forward section-re day-end t)
-          (let ((sect-start (match-beginning 0))
-                (sect-end (or (save-excursion
-                                (forward-line 1)
-                                (and (re-search-forward
-                                      "^\\*\\{1,2\\} " day-end t)
-                                     (match-beginning 0)))
-                              day-end)))
-            (cons sect-start sect-end))
-        ;; Not found — insert at day-end.
-        (goto-char day-end)
-        (let ((start (point))
-              (wday (anvil-dev--weekday-abbrev date)))
-          (insert (format "** NOTE %s <%s %s>\n"
-                          anvil-journal-worklog-heading date wday))
-          (cons start (point)))))))
-
-;;;###autoload
-(defun anvil-journal-append (file date title body)
-  "Append a `*** MEMO AI: TITLE <DATE WDAY>' entry to FILE's worklog.
-
-FILE is the path to an org journal.  DATE is \"YYYY-MM-DD\".  TITLE
-is the memo's short name.  BODY is the org-mode text inserted
-under the MEMO heading (a blank trailing newline is added if
-missing).
-
-Creates the day's `** NOTE 作業ログ <DATE WDAY>' section when
-absent, then inserts the MEMO at the section's end.  Saves the
-buffer afterwards.  Returns a plist describing what happened:
-  (:file FILE :date DATE :title TITLE :section-created BOOL
-   :bytes-inserted N)
-
-Does *not* touch any other existing NOTE / MEMO / DONE / CANCEL
-entries — only appends.  Fails with `user-error' when the day's
-level-1 heading (e.g. `* 2026-04-16-Thursday') is missing."
-  (let* ((coding-system-for-read 'utf-8)
-         (buf (find-file-noselect file))
-         (wday (anvil-dev--weekday-abbrev date))
-         (memo-header (format "*** MEMO AI: %s <%s %s>\n" title date wday))
-         (body (if (and (stringp body) (> (length body) 0)
-                        (not (string-suffix-p "\n" body)))
-                   (concat body "\n")
-                 body))
-         (memo-text (concat memo-header
-                            (or body "")
-                            "\n"))
-         section-created
-         inserted)
-    (with-current-buffer buf
-      ;; Org journals are UTF-8 by convention; pin the coding here so
-      ;; Windows CP932 daemons don't silently re-save as Shift-JIS.
-      (set-buffer-file-coding-system 'utf-8-unix)
-      (save-excursion
-        (let* ((pre-exists
-                (save-excursion
-                  (goto-char (point-min))
-                  (and (re-search-forward
-                        (concat "^\\*\\* NOTE "
-                                (regexp-quote anvil-journal-worklog-heading)
-                                " <" (regexp-quote date))
-                        nil t)
-                       t)))
-               (bounds (anvil-dev--ensure-worklog-section date))
-               (section-end (cdr bounds)))
-          (setq section-created (not pre-exists))
-          (goto-char section-end)
-          (let ((ins-start (point)))
-            (insert memo-text)
-            (setq inserted (- (point) ins-start)))))
-      (let ((coding-system-for-write 'utf-8-unix))
-        (save-buffer)))
-    (list :file file :date date :title title
-          :section-created (and section-created t)
-          :bytes-inserted inserted)))
-
-(defun anvil-dev--tool-journal-append (file date title body)
-  "MCP wrapper for `anvil-journal-append'.
-
-MCP Parameters:
-  file  - Path to the org journal (string, required).
-  date  - ISO date \"YYYY-MM-DD\" for the day to append under.
-  title - Short title used in the `*** MEMO AI: TITLE' heading.
-  body  - Org-mode body text placed under the MEMO heading.
-          Include blank lines as needed; a trailing newline is
-          added automatically."
-  (anvil-server-with-error-handling
-   (format "%S" (anvil-journal-append file date title body))))
-
 ;;;; --- module lifecycle ----------------------------------------------------
 
 ;;;###autoload
@@ -314,23 +153,12 @@ count, and (when `anvil-dev-source-path' is set) compare against
 the dev checkout to flag unpushed / unpulled divergence before it
 causes a silent \"old code loaded\" bug after a daemon restart."
    :read-only t)
-  (anvil-server-register-tool
-   #'anvil-dev--tool-journal-append
-   :id "anvil-journal-append"
-   :server-id anvil-dev--server-id
-   :description
-   "Append a `*** MEMO AI: TITLE <DATE WDAY>' entry to an org
-journal.  Finds (or creates) the day's `** NOTE 作業ログ' section
-under `* YYYY-MM-DD-Weekday' and inserts the MEMO at the end.
-Never touches existing entries — append only.  Returns a plist
-(:section-created BOOL :bytes-inserted N).  Encodes the CLAUDE.md
-work-log convention so callers skip the ~30 lines of find-or-
-create elisp."))
+)
 
 (defun anvil-dev-disable ()
   "Unregister the dev-* MCP tools."
-  (dolist (id '("anvil-self-sync-check" "anvil-journal-append"))
-    (anvil-server-unregister-tool id anvil-dev--server-id)))
+  (anvil-server-unregister-tool "anvil-self-sync-check"
+                                anvil-dev--server-id))
 
 (provide 'anvil-dev)
 ;;; anvil-dev.el ends here
