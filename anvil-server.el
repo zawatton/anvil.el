@@ -1036,9 +1036,23 @@ Overridden per-tool by `:offload-timeout' on `anvil-server-register-tool'."
   :type 'integer
   :group 'anvil-server)
 
+(defun anvil-server--offload-auto-derive (handler)
+  "Return (FEATURE . (DIR)) derived from HANDLER's `symbol-file', or nil.
+Used by `anvil-server--offload-apply' as a fallback when the tool
+was registered without `:offload-require' / `:offload-load-path'.
+The feature name is the basename of the source file, matching
+the anvil convention (`anvil-X.el' provides `anvil-X')."
+  (when-let* ((file (ignore-errors (symbol-file handler 'defun)))
+              (dir (file-name-directory file))
+              (base (file-name-base file)))
+    (cons (intern base) (list dir))))
+
 (defun anvil-server--offload-apply (tool handler args)
   "Run HANDLER with ARGS in the offload REPL, return its value.
 TOOL is the registered tool plist (for :offload-require etc.).
+When the tool omits both :offload-require and :offload-load-path,
+auto-derive them from the handler's source file so the common case
+\(pure tool in an anvil-* module) works with just `:offload t'.
 Signals `anvil-server-tool-error' on timeout or remote error."
   (require 'anvil-offload)
   (unless (symbolp handler)
@@ -1046,8 +1060,12 @@ Signals `anvil-server-tool-error' on timeout or remote error."
             (list (format "Offload requires a symbol handler, got %S"
                           handler))))
   (let* ((form `(apply #',handler ',args))
-         (requires (plist-get tool :offload-require))
-         (extra-load-path (plist-get tool :offload-load-path))
+         (explicit-req (plist-get tool :offload-require))
+         (explicit-lp  (plist-get tool :offload-load-path))
+         (auto (unless (or explicit-req explicit-lp)
+                 (anvil-server--offload-auto-derive handler)))
+         (requires (or explicit-req (car auto)))
+         (extra-load-path (or explicit-lp (cdr auto)))
          (timeout (or (plist-get tool :offload-timeout)
                       anvil-server-offload-default-timeout))
          (future (anvil-offload form

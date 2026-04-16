@@ -237,6 +237,48 @@ The PID returned must differ from the main daemon's PID."
     (anvil-server-unregister-tool "anvil-test-offload-boom" "anvil-test")
     (ignore-errors (anvil-offload-stop-repl))))
 
+(ert-deftest anvil-test-offload-auto-derive-from-symbol-file ()
+  "With only `:offload t' the dispatcher derives :require / :load-path.
+The stub handler lives in tests/anvil-offload-stub.el which provides
+`anvil-offload-stub' — `symbol-file' gets us both the feature name
+\(basename) and its directory."
+  (require 'anvil-offload)
+  (unwind-protect
+      (progn
+        (anvil-server-register-tool
+         #'anvil-offload-stub-pid-tool
+         :id "anvil-test-offload-auto"
+         :description "auto-derive test"
+         :server-id "anvil-test"
+         :offload t
+         :offload-timeout 30)
+        (let* ((params '((name . "anvil-test-offload-auto")
+                         (arguments . ((tag . "auto")))))
+               (resp (anvil-server--handle-tools-call
+                      "t-auto" params
+                      (make-anvil-server-metrics) "anvil-test"))
+               (decoded (json-read-from-string resp))
+               (result (alist-get 'result decoded))
+               (content (alist-get 'content result))
+               (text (alist-get 'text (aref content 0))))
+          (should (string-match "\\`pid:\\([0-9]+\\) tag:auto\\'" text))
+          (let ((remote-pid (string-to-number (match-string 1 text))))
+            (should-not (= remote-pid (emacs-pid))))))
+    (anvil-server-unregister-tool "anvil-test-offload-auto" "anvil-test")
+    (ignore-errors (anvil-offload-stop-repl))))
+
+(ert-deftest anvil-test-offload-auto-derive-helper ()
+  "`anvil-server--offload-auto-derive' returns (FEATURE . (DIR)) for a loaded fn."
+  (let ((pair (anvil-server--offload-auto-derive
+               'anvil-offload-stub-pid-tool)))
+    (should (consp pair))
+    (should (eq 'anvil-offload-stub (car pair)))
+    (should (stringp (car (cdr pair))))
+    (should (file-directory-p (car (cdr pair)))))
+  ;; Undefined / fresh symbol has no source file → returns nil.
+  (let ((sym (make-symbol "anvil-test--never-defined")))
+    (should-not (anvil-server--offload-auto-derive sym))))
+
 (ert-deftest anvil-test-offload-timeout-surfaces-as-tool-error ()
   "A tool that exceeds `:offload-timeout' signals an MCP tool error."
   (require 'anvil-offload)

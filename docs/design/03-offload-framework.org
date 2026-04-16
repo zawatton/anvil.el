@@ -43,7 +43,19 @@
     pre-existing Windows batch 固有の supersession flake)
 - Phase 2c (anvil-worker との関係整理): ~DRAFT~ — daemon / pipe の
   意味論を分けるか統合するかの設計判断が必要
-- Phase 3–5: ~DRAFT~ — レビュー前。
+- Phase 3–4: ~DRAFT~ — レビュー前。
+- Phase 5 (heavy tool retrofit, 初期ターゲット): ~SHIPPED~ (2026-04-17)
+  - ~anvil-server--offload-auto-derive~ 追加 — ~:offload t~ だけ書けば
+    handler の ~symbol-file~ から feature 名 (basename) と dir を
+    推定して ~:offload-require~ / ~:offload-load-path~ を自動補完
+  - retrofit: ~file-outline~ (大 file 構造 dump), ~code-extract-pattern~
+    (regexp block 抽出)。どちらも pure / read-only / regex scan 中心で
+    subprocess 実行の安全性が高い
+  - 拡張候補 (未 retrofit): ~elisp-byte-compile-file~ は load-path を
+    subprocess 側で組む必要があり、ユーザーの外部 .el では
+    依存解決が壊れうる → 保留
+  - tests: auto-derive helper 単体 / ~:offload t~ alone の dispatch 成功
+    (subprocess PID 確認) 2 件追加。全 242/242 green
 
 * Goal
 

@@ -2370,6 +2370,7 @@ a format= override.  Emits (:kind :name :line) entries for Elisp
 def-forms, org headlines, or Markdown headings.  Use this to orient
 in large files before deciding what to Read."
    :read-only t
+   :offload t
    :server-id anvil-file--server-id)
 
   (anvil-server-register-tool
@@ -2385,6 +2386,7 @@ with :matches (each :id :start-line :end-line :fields) :total :returned
 :skipped.  Targets legacy code migration / data extraction where reading
 the entire file would be wasteful.  Brace-balance skips strings."
    :read-only t
+   :offload t
    :server-id anvil-file--server-id)
 
   (anvil-server-register-tool
