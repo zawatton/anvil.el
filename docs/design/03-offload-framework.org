@@ -26,7 +26,21 @@
   - 新公開 API: ~anvil-offload-pool-status~
   - tests/anvil-offload-test.el: 11/11 pass (既存 8 + pool spreads /
     round-robin / dead slot respawn)
-- Phase 2b (tool registration ~:offload t~ flag): ~DRAFT~
+- Phase 2b (tool registration ~:offload t~ flag): ~SHIPPED~ (2026-04-17)
+  - ~anvil-server-register-tool~ に ~:offload~ / ~:offload-require~ /
+    ~:offload-load-path~ / ~:offload-timeout~ プロパティ追加
+  - ~anvil-server--handle-tools-call~ が ~:offload t~ tool を検出すると
+    ~anvil-server--offload-apply~ 経由で ~anvil-offload~ に routing、
+    future を同期 await して値を返す
+  - ~anvil-offload~ 本体にも ~:require~ / ~:load-path~ keyword 対応を
+    追加 (subprocess で feature を load してから FORM eval)
+  - ~anvil-future-status~ public accessor 追加
+  - timeout / remote error → ~anvil-server-tool-error~ に正規化されて
+    MCP ~isError: t~ で client に到達
+  - tests: anvil-offload-test に require/load-path 3 件、anvil-test に
+    dispatch / remote-error / timeout 3 件、total 240/240 via direct
+    ~emacs --batch~ (make test-all は 238/240 — disk-newer 系 2 件は
+    pre-existing Windows batch 固有の supersession flake)
 - Phase 2c (anvil-worker との関係整理): ~DRAFT~ — daemon / pipe の
   意味論を分けるか統合するかの設計判断が必要
 - Phase 3–5: ~DRAFT~ — レビュー前。

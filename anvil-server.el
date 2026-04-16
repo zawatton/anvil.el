@@ -50,6 +50,15 @@
 (require 'json)
 (require 'anvil-server-metrics)
 
+;; `anvil-offload' is an optional module — loaded on demand in
+;; `anvil-server--offload-apply'.  Declare to silence byte-compile warnings.
+(declare-function anvil-offload "anvil-offload" (form &rest keys))
+(declare-function anvil-future-await "anvil-offload" (future &optional timeout))
+(declare-function anvil-future-cancel "anvil-offload" (future))
+(declare-function anvil-future-status "anvil-offload" (future))
+(declare-function anvil-future-value "anvil-offload" (future))
+(declare-function anvil-future-error "anvil-offload" (future))
+
 ;;; Customization variables
 
 (defgroup anvil-server nil
@@ -954,7 +963,11 @@ METHOD-METRICS is used to track errors for this method."
                                      (alist-get
                                       (intern param-name) tool-args))))
                               (push value arg-values)))))
-                      (apply handler (nreverse arg-values))))
+                      (let ((final-args (nreverse arg-values)))
+                        (if (plist-get tool :offload)
+                            (anvil-server--offload-apply
+                             tool handler final-args)
+                          (apply handler final-args)))))
                    ;; Ensure result is string or nil, error on other types
                    (result-text
                     (cond
@@ -1014,6 +1027,44 @@ METHOD-METRICS is used to track errors for this method."
        id
        anvil-server-jsonrpc-error-invalid-request
        (format "Tool not found: %s" tool-name)))))
+
+;;; Offload dispatch (Doc 03 Phase 2b)
+
+(defcustom anvil-server-offload-default-timeout 60
+  "Default wall-clock timeout (seconds) for offloaded tool calls.
+Overridden per-tool by `:offload-timeout' on `anvil-server-register-tool'."
+  :type 'integer
+  :group 'anvil-server)
+
+(defun anvil-server--offload-apply (tool handler args)
+  "Run HANDLER with ARGS in the offload REPL, return its value.
+TOOL is the registered tool plist (for :offload-require etc.).
+Signals `anvil-server-tool-error' on timeout or remote error."
+  (require 'anvil-offload)
+  (unless (symbolp handler)
+    (signal 'anvil-server-tool-error
+            (list (format "Offload requires a symbol handler, got %S"
+                          handler))))
+  (let* ((form `(apply #',handler ',args))
+         (requires (plist-get tool :offload-require))
+         (extra-load-path (plist-get tool :offload-load-path))
+         (timeout (or (plist-get tool :offload-timeout)
+                      anvil-server-offload-default-timeout))
+         (future (anvil-offload form
+                                :require requires
+                                :load-path extra-load-path)))
+    (unless (anvil-future-await future timeout)
+      (anvil-future-cancel future)
+      (signal 'anvil-server-tool-error
+              (list (format "Offload timeout after %ss" timeout))))
+    (pcase (anvil-future-status future)
+      ('done (anvil-future-value future))
+      ('error (signal 'anvil-server-tool-error
+                      (list (format "Offload error: %s"
+                                    (anvil-future-error future)))))
+      (status (signal 'anvil-server-tool-error
+                      (list (format "Offload unexpected status: %s"
+                                    status)))))))
 
 ;;; Error handling helpers
 
@@ -1249,6 +1300,15 @@ See also:
         ;; Always include :read-only if it was specified, even if nil
         (when (plist-member properties :read-only)
           (setq tool (plist-put tool :read-only read-only)))
+        ;; Offload routing (Doc 03 Phase 2b).  :offload t routes the
+        ;; handler call through `anvil-offload' so it runs in a batch
+        ;; subprocess instead of the main daemon.  The handler must be a
+        ;; symbol (not a lambda) because the subprocess identifies it by
+        ;; name after loading the features listed in :offload-require.
+        (dolist (k '(:offload :offload-require :offload-load-path
+                              :offload-timeout))
+          (when (plist-member properties k)
+            (setq tool (plist-put tool k (plist-get properties k)))))
         ;; Register the tool
         (anvil-server--ref-counted-register id tool tools-table)))))
 

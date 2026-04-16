@@ -11,6 +11,11 @@
 (require 'anvil)
 (require 'anvil-server)
 (require 'anvil-server-metrics)
+;; `anvil-offload-stub' provides tiny fixture handlers (pid / boom) so
+;; the `:offload' dispatch tests can load them into the subprocess by
+;; feature name.  Optional: if the stub is absent the `:offload' tests
+;; simply fail their registration step and everyone else keeps working.
+(require 'anvil-offload-stub nil 'noerror)
 
 (ert-deftest anvil-test-feature-provided ()
   "Verify that anvil feature is provided."
@@ -166,5 +171,99 @@ MCP Parameters:
          (required (alist-get 'required schema)))
     (should (assoc "task_id" props))
     (should (equal ["task_id"] required))))
+
+;;; :offload dispatch (Doc 03 Phase 2b) ------------------------------
+
+(defun anvil-test--offload-stub-dir ()
+  "Return the tests/ directory so the subprocess can load the stub."
+  (file-name-directory
+   (or load-file-name buffer-file-name (expand-file-name "tests/"))))
+
+(ert-deftest anvil-test-offload-dispatch-runs-in-subprocess ()
+  "A tool registered with `:offload t' executes in a batch subprocess.
+The PID returned must differ from the main daemon's PID."
+  (require 'anvil-offload)
+  (unwind-protect
+      (progn
+        (anvil-server-register-tool
+         #'anvil-offload-stub-pid-tool
+         :id "anvil-test-offload"
+         :description "test offload"
+         :server-id "anvil-test"
+         :offload t
+         :offload-load-path (list (anvil-test--offload-stub-dir))
+         :offload-require 'anvil-offload-stub
+         :offload-timeout 30)
+        (let* ((params '((name . "anvil-test-offload")
+                         (arguments . ((tag . "hi")))))
+               (resp (anvil-server--handle-tools-call
+                      "t-offload" params
+                      (make-anvil-server-metrics) "anvil-test"))
+               (decoded (json-read-from-string resp))
+               (result (alist-get 'result decoded))
+               (content (alist-get 'content result))
+               (first (aref content 0))
+               (text (alist-get 'text first)))
+          (should (string-match "\\`pid:\\([0-9]+\\) tag:hi\\'" text))
+          (let ((remote-pid (string-to-number (match-string 1 text))))
+            (should (integerp remote-pid))
+            (should-not (= remote-pid (emacs-pid))))))
+    (anvil-server-unregister-tool "anvil-test-offload" "anvil-test")
+    (ignore-errors (anvil-offload-stop-repl))))
+
+(ert-deftest anvil-test-offload-remote-error-becomes-tool-error ()
+  "Remote errors from the offload REPL surface as `isError': t."
+  (require 'anvil-offload)
+  (unwind-protect
+      (progn
+        (anvil-server-register-tool
+         #'anvil-offload-stub-boom
+         :id "anvil-test-offload-boom"
+         :description "boom"
+         :server-id "anvil-test"
+         :offload t
+         :offload-load-path (list (anvil-test--offload-stub-dir))
+         :offload-require 'anvil-offload-stub
+         :offload-timeout 30)
+        (let* ((params '((name . "anvil-test-offload-boom")
+                         (arguments . ((_ignored . "x")))))
+               (resp (anvil-server--handle-tools-call
+                      "t-boom" params
+                      (make-anvil-server-metrics) "anvil-test"))
+               (decoded (json-read-from-string resp))
+               (result (alist-get 'result decoded))
+               (is-error (alist-get 'isError result)))
+          (should (eq t is-error))))
+    (anvil-server-unregister-tool "anvil-test-offload-boom" "anvil-test")
+    (ignore-errors (anvil-offload-stop-repl))))
+
+(ert-deftest anvil-test-offload-timeout-surfaces-as-tool-error ()
+  "A tool that exceeds `:offload-timeout' signals an MCP tool error."
+  (require 'anvil-offload)
+  (unwind-protect
+      (progn
+        (anvil-server-register-tool
+         #'anvil-offload-stub-sleep
+         :id "anvil-test-offload-slow"
+         :description "slow"
+         :server-id "anvil-test"
+         :offload t
+         :offload-load-path (list (anvil-test--offload-stub-dir))
+         :offload-require 'anvil-offload-stub
+         :offload-timeout 0.5)
+        (let* ((params '((name . "anvil-test-offload-slow")
+                         (arguments . ((_ignored . "x")))))
+               (resp (anvil-server--handle-tools-call
+                      "t-slow" params
+                      (make-anvil-server-metrics) "anvil-test"))
+               (decoded (json-read-from-string resp))
+               (result (alist-get 'result decoded))
+               (is-error (alist-get 'isError result))
+               (content (alist-get 'content result))
+               (text (alist-get 'text (aref content 0))))
+          (should (eq t is-error))
+          (should (string-match-p "timeout" text))))
+    (anvil-server-unregister-tool "anvil-test-offload-slow" "anvil-test")
+    (ignore-errors (anvil-offload-stop-repl))))
 
 ;;; anvil-test.el ends here

@@ -166,5 +166,48 @@
       (should (anvil-future-await f 30))
       (should (= 18 (anvil-future-value f))))))
 
+(ert-deftest anvil-offload-test-require-preamble ()
+  "`:require' loads the feature in the subprocess before FORM runs."
+  (anvil-offload-test--with-clean-repl
+    ;; `subr-x' is bundled with Emacs but not auto-loaded in --batch —
+    ;; a bare (hash-table-keys ...) without (require 'subr-x) would error.
+    (let ((future (anvil-offload
+                   '(progn (puthash 'a 1 (setq ht (make-hash-table)))
+                           (length (hash-table-keys ht)))
+                   :require 'subr-x)))
+      (should (anvil-future-await future 30))
+      (should (eq 'done (anvil-future-status future)))
+      (should (= 1 (anvil-future-value future))))))
+
+(ert-deftest anvil-offload-test-require-list ()
+  "`:require' accepts a list of symbols; all are loaded in order."
+  (anvil-offload-test--with-clean-repl
+    (let ((future (anvil-offload
+                   '(and (featurep 'cl-lib) (featurep 'subr-x) 'both-loaded)
+                   :require '(cl-lib subr-x))))
+      (should (anvil-future-await future 30))
+      (should (eq 'both-loaded (anvil-future-value future))))))
+
+(ert-deftest anvil-offload-test-load-path-extra ()
+  "`:load-path' prepends directories so (require 'X) can find them."
+  (anvil-offload-test--with-clean-repl
+    (let* ((tmp (make-temp-file "anvil-offload-lp-" t))
+           (stub-feat (intern (format "anvil-offload-stub-%s"
+                                      (format-time-string "%s%N"))))
+           (stub-file (expand-file-name (format "%s.el" stub-feat) tmp)))
+      (unwind-protect
+          (progn
+            (with-temp-file stub-file
+              (insert (format ";;; %s.el\n" stub-feat))
+              (insert (format "(defun %s-mul (x y) (* x y))\n" stub-feat))
+              (insert (format "(provide '%s)\n" stub-feat)))
+            (let ((future (anvil-offload
+                           `(,(intern (format "%s-mul" stub-feat)) 6 7)
+                           :require stub-feat
+                           :load-path (list tmp))))
+              (should (anvil-future-await future 30))
+              (should (= 42 (anvil-future-value future)))))
+        (delete-directory tmp t)))))
+
 (provide 'anvil-offload-test)
 ;;; anvil-offload-test.el ends here

@@ -142,6 +142,10 @@ Created lazily in `anvil-offload--ensure-pending'.")
   (created-at (float-time))
   done-at)
 
+(defun anvil-future-status (future)
+  "Return the status symbol of FUTURE (pending/done/error/cancelled)."
+  (anvil-future--status future))
+
 (defun anvil-future-done-p (future)
   "Non-nil when FUTURE has settled (done/error/cancelled)."
   (not (eq (anvil-future--status future) 'pending)))
@@ -336,28 +340,51 @@ Each element is `(:slot IDX :alive t-or-nil :pid PID-or-nil)'."
 
 ;;; Public entry point
 
+(defun anvil-offload--build-preamble (requires extra-load-path)
+  "Build the preamble forms to run before the user FORM in the REPL.
+REQUIRES is a feature symbol or list of symbols to (require \\='X).
+EXTRA-LOAD-PATH is a list of directories to prepend to `load-path'
+in the subprocess.  Returns a list of forms (possibly empty)."
+  (let ((features (cond
+                   ((null requires) nil)
+                   ((symbolp requires) (list requires))
+                   ((listp requires) requires)
+                   (t (error "anvil-offload :require must be symbol or list, got %S"
+                             requires)))))
+    (append
+     (and extra-load-path
+          (list `(dolist (d ',extra-load-path)
+                   (add-to-list 'load-path d))))
+     (mapcar (lambda (f) `(require ',f)) features))))
+
 ;;;###autoload
-(cl-defun anvil-offload (form &rest _keys)
+(cl-defun anvil-offload (form &rest keys)
   "Evaluate FORM in the offload REPL subprocess; return an `anvil-future'.
 
 FORM is sent as a single S-expression.  The subprocess evaluates
 it with lexical binding and sends back either `(:id N :ok VALUE)'
 or `(:id N :error MSG)'.  The main daemon never blocks.
 
-Additional keyword arguments are accepted but ignored in Phase 1
-to reserve the shape of the API:
-  :timeout SECONDS  — reserved for Phase 3 preemption
-  :require LIST     — reserved; libraries to preload
-  :env PLIST        — reserved
+Keyword arguments:
+  :require FEATURES   Symbol or list of symbols to `require' in the
+                      subprocess before FORM is evaluated.
+  :load-path DIRS     List of directories prepended to `load-path'
+                      in the subprocess (applied before :require).
+  :timeout SECONDS    Reserved for Phase 3 preemption.
+  :env PLIST          Reserved.
 
 Dispatch uses round-robin across the pool (`anvil-offload-pool-size')."
-  (let* ((proc (anvil-offload--pick-worker))
+  (let* ((requires (plist-get keys :require))
+         (extra-load-path (plist-get keys :load-path))
+         (preamble (anvil-offload--build-preamble requires extra-load-path))
+         (full-form (if preamble `(progn ,@preamble ,form) form))
+         (proc (anvil-offload--pick-worker))
          (id (cl-incf anvil-offload--next-id))
          (future (make-anvil-future
                   :id id :process proc :status 'pending)))
     (puthash id future (anvil-offload--ensure-pending))
     (process-send-string proc
-                         (concat (prin1-to-string (list :id id :form form))
+                         (concat (prin1-to-string (list :id id :form full-form))
                                  "\n"))
     future))
 
