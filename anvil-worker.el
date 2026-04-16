@@ -1024,6 +1024,9 @@ The actual `start-process' calls are deferred to a 1-second timer
 so the module-load phase of `anvil-enable' returns instantly and
 the human never sees the editor freeze."
   (anvil-worker--init-pool)
+  ;; Load the Phase 5 metrics UI so `M-x anvil-worker-metrics' is
+  ;; discoverable without a separate `(require 'anvil-worker-ui)'.
+  (require 'anvil-worker-ui)
   ;; Defer the heavy work (start-process × N) so it does not block
   ;; the synchronous module-load phase of `anvil-enable'.
   (run-at-time 1 nil #'anvil-worker-spawn)
