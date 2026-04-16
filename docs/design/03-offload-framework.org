@@ -1,9 +1,24 @@
 #+title: Offload Framework — Futures, Coalescing, Preemption
 #+date: 2026-04-15
-#+property: status DRAFT
+#+property: status PHASE-1-SHIPPED
 
 * STATUS
-~DRAFT~ — レビュー前。Doc 01 (worker pool v2) の batch pool を前提とする。
+
+- Phase 1 (Future API + batch REPL): ~SHIPPED~ (2026-04-17)
+  - 実装: ~anvil-offload.el~ (standalone、worker pool 非依存)
+  - REPL は ~emacs --batch -l REPL.el~、~send-string-to-terminal~ で
+    stdout flush を担保 (Windows pipe 全バッファリング回避)
+  - Protocol: 1行1 S式 (=(:id N :form EXPR)= / =(:id N :ok V)= or
+    =(:id N :error MSG)=)
+  - Future API: ~anvil-offload~, ~anvil-future-done-p~, ~-await~,
+    ~-value~, ~-error~, ~-cancel~ (local-only cancel)
+  - Sentinel は ~(:process PROC)~ で filter (stop→respawn race で
+    新 pending が巻き添え errored になるバグを fix)
+  - tests/anvil-offload-test.el: 8/8 pass (basic math / utf-8 /
+    error prop / concurrent / cancel / await timeout / REPL death /
+    respawn after stop)
+- Phase 2–5: ~DRAFT~ — レビュー前。Doc 01 (worker pool v2) の batch
+  pool を前提とする。
 
 * Goal
 

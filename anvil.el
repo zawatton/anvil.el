@@ -80,7 +80,9 @@ These are not loaded by default.  Available modules:
 - `org-index' — Persistent SQLite index of org files (requires Emacs 29+)
 - `buffer'    — Explicit buffer-* MCP tools (read/save/list-modified)
 - `dev'       — Developer helpers: `anvil-self-sync-check' for dev/installed
-                git HEAD mismatch detection"
+                git HEAD mismatch detection
+- `offload'   — Future-based API for running heavy elisp in a batch
+                subprocess (Doc 03 Phase 1)"
   :type '(repeat symbol)
   :group 'anvil)
 
