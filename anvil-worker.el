@@ -41,6 +41,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'server)
 
 ;;; Customization
 
@@ -131,6 +132,20 @@ probing daemon indefinitely."
 (defcustom anvil-worker-call-timeout 60
   "Default timeout in seconds for normal worker calls."
   :type 'integer
+  :group 'anvil-worker)
+
+(defcustom anvil-worker-connection-method 'server-eval-at
+  "Transport used by `anvil-worker-call' to reach a worker daemon.
+
+  `server-eval-at' (default)  — in-process TCP via the Emacs server
+      protocol.  No external `emacsclient' is spawned per call,
+      which is the Phase 4c optimisation for Windows where the
+      spawn + binary-load overhead accounts for tens of ms.
+  `emacsclient'               — legacy external process per call
+      (Phase 1-3 behaviour).  Kept as a safety fallback; set this
+      if `server-eval-at' misbehaves on your platform."
+  :type '(choice (const :tag "In-process TCP (server-eval-at)" server-eval-at)
+                 (const :tag "External process (emacsclient)" emacsclient))
   :group 'anvil-worker)
 
 (defcustom anvil-worker-heavy-timeout 300
@@ -818,30 +833,67 @@ the requested lane is reachable within `anvil-worker-spawn-wait'."
          'classified
          (format "%s → lane=%s" name (anvil-worker--lane-name lane))))
       (unwind-protect
-          (let ((buf (get-buffer-create (format " *anvil-worker-call-%s*" name)))
-                (t0 (float-time))
-                t1 t-end)
-            (with-current-buffer buf (erase-buffer))
-            (let* ((proc (start-process
-                          "anvil-worker-call" buf
-                          "emacsclient"
-                          "-f" server-file
-                          "-e" expression)))
-              (setq t1 (float-time))
-              (set-process-query-on-exit-flag proc nil)
-              (while (and (process-live-p proc)
-                          (< (- (float-time) t1) timeout))
-                (accept-process-output proc 0.1))
-              (setq t-end (float-time))
-              (when (process-live-p proc)
-                (kill-process proc)
-                (error "Anvil worker %s timeout (%ds)" name timeout))
-              (anvil-worker--latency-record
-               lane
-               (* 1000.0 (- t1 t0))
-               (* 1000.0 (- t-end t1)))
-              (string-trim (with-current-buffer buf (buffer-string)))))
+          (pcase anvil-worker-connection-method
+            ('server-eval-at
+             (anvil-worker--dispatch-via-server-eval-at
+              worker expression timeout))
+            ('emacsclient
+             (anvil-worker--dispatch-via-emacsclient
+              worker expression timeout))
+            (m (error "anvil-worker: unknown connection-method %S" m)))
         (plist-put worker :busy nil)))))
+
+(defun anvil-worker--dispatch-via-emacsclient (worker expression timeout)
+  "Dispatch EXPRESSION to WORKER by spawning an `emacsclient' process.
+Records per-call latency into `anvil-worker--metrics-latency'."
+  (let* ((server-file (plist-get worker :server-file))
+         (name        (plist-get worker :name))
+         (lane        (plist-get worker :lane))
+         (buf (get-buffer-create (format " *anvil-worker-call-%s*" name)))
+         (t0 (float-time))
+         t1 t-end)
+    (with-current-buffer buf (erase-buffer))
+    (let* ((proc (start-process
+                  "anvil-worker-call" buf
+                  "emacsclient"
+                  "-f" server-file
+                  "-e" expression)))
+      (setq t1 (float-time))
+      (set-process-query-on-exit-flag proc nil)
+      (while (and (process-live-p proc)
+                  (< (- (float-time) t1) timeout))
+        (accept-process-output proc 0.1))
+      (setq t-end (float-time))
+      (when (process-live-p proc)
+        (kill-process proc)
+        (error "Anvil worker %s timeout (%ds)" name timeout))
+      (anvil-worker--latency-record
+       lane
+       (* 1000.0 (- t1 t0))
+       (* 1000.0 (- t-end t1)))
+      (string-trim (with-current-buffer buf (buffer-string))))))
+
+(defun anvil-worker--dispatch-via-server-eval-at (worker expression timeout)
+  "Dispatch EXPRESSION to WORKER via `server-eval-at' (no external process).
+Records per-call latency; the `:spawn-ms' bucket stays at 0 since no
+child process is created, making the emacsclient vs server-eval-at
+comparison visible in `anvil-worker-latency-metrics-show'."
+  (let* ((name (plist-get worker :name))
+         (lane (plist-get worker :lane))
+         (t0 (float-time))
+         (form (read expression))
+         result t-end)
+    (with-timeout
+        (timeout (error "Anvil worker %s timeout (%ds)" name timeout))
+      (condition-case err
+          (setq result (prin1-to-string (server-eval-at name form)))
+        (error
+         (setq result
+               (format "*ERROR*: %s" (error-message-string err))))))
+    (setq t-end (float-time))
+    (anvil-worker--latency-record
+     lane 0.0 (* 1000.0 (- t-end t0)))
+    result))
 
 ;;; Pool status
 

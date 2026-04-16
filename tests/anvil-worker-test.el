@@ -488,4 +488,65 @@ Disable health timer + spawning so no real subprocesses start."
     (should (null (plist-get (plist-get anvil-worker--metrics-latency :read)
                              :totals)))))
 
+;;;; --- server-eval-at transport (Doc 01 Phase 4c) -------------------------
+
+(ert-deftest anvil-worker-test-connection-method-default-is-server-eval-at ()
+  "Phase 4c flipped the default transport to server-eval-at."
+  (should (eq 'server-eval-at
+              (default-value 'anvil-worker-connection-method))))
+
+(ert-deftest anvil-worker-test-dispatch-server-eval-at-roundtrips-value ()
+  "`--dispatch-via-server-eval-at' returns prin1 of the server's result."
+  (anvil-worker-test--with-fresh-latency
+    (cl-letf (((symbol-function 'server-eval-at)
+               (lambda (name form)
+                 (should (equal "anvil-worker-read-1" name))
+                 (should (equal '(emacs-pid) form))
+                 12345)))
+      (let* ((worker (list :lane :read :name "anvil-worker-read-1"))
+             (res (anvil-worker--dispatch-via-server-eval-at
+                   worker "(emacs-pid)" 10)))
+        (should (equal "12345" res))))))
+
+(ert-deftest anvil-worker-test-dispatch-server-eval-at-wraps-errors ()
+  "A signal inside the remote form becomes an *ERROR* string."
+  (anvil-worker-test--with-fresh-latency
+    (cl-letf (((symbol-function 'server-eval-at)
+               (lambda (_name _form) (error "boom from remote"))))
+      (let* ((worker (list :lane :read :name "w"))
+             (res (anvil-worker--dispatch-via-server-eval-at
+                   worker "(whatever)" 10)))
+        (should (string-match-p "\\`\\*ERROR\\*" res))
+        (should (string-match-p "boom from remote" res))))))
+
+(ert-deftest anvil-worker-test-dispatch-server-eval-at-records-latency ()
+  "server-eval-at path records a sample with spawn-ms=0 (no child proc)."
+  (anvil-worker-test--with-fresh-latency
+    (cl-letf (((symbol-function 'server-eval-at)
+               (lambda (_name _form) 'ok)))
+      (let ((worker (list :lane :write :name "anvil-worker-write-1")))
+        (anvil-worker--dispatch-via-server-eval-at worker "(x)" 10))
+      (let ((b (plist-get anvil-worker--metrics-latency :write)))
+        (should (= 1 (plist-get b :samples)))
+        (should (= 0.0 (plist-get b :spawn-ms-sum)))
+        (should (>= (plist-get b :wait-ms-sum) 0.0))))))
+
+(ert-deftest anvil-worker-test-call-honours-connection-method ()
+  "Setting anvil-worker-connection-method picks the matching dispatcher."
+  (anvil-worker-test--with-pool
+      '(:read 1 :write 1)
+      '("anvil-worker-read-1" "anvil-worker-write-1")
+    (anvil-worker-test--with-fresh-classifier-metrics
+      (anvil-worker-test--with-fresh-latency
+        (let (dispatched)
+          (cl-letf (((symbol-function 'anvil-worker--dispatch-via-server-eval-at)
+                     (lambda (&rest _) (push 'server dispatched) "s"))
+                    ((symbol-function 'anvil-worker--dispatch-via-emacsclient)
+                     (lambda (&rest _) (push 'client dispatched) "c")))
+            (let ((anvil-worker-connection-method 'server-eval-at))
+              (anvil-worker-call "(emacs-pid)" :kind :read :timeout 1))
+            (let ((anvil-worker-connection-method 'emacsclient))
+              (anvil-worker-call "(emacs-pid)" :kind :read :timeout 1))
+            (should (equal '(client server) dispatched))))))))
+
 ;;; anvil-worker-test.el ends here
