@@ -204,12 +204,16 @@ Returns a result plist with :file :ok :exit :elapsed-ms :total
 :passed :failed :skipped :output."
   (let* ((start (float-time))
          (buf (generate-new-buffer " *anvil-dev-test-out*"))
+         (tests-dir (expand-file-name "tests" root))
          (exit (let ((default-directory (file-name-as-directory root)))
-                 (call-process
-                  anvil-dev-emacs-bin nil buf nil
-                  "--batch" "-L" root
-                  "-l" "ert" "-l" file
-                  "-f" "ert-run-tests-batch-and-exit")))
+                 (apply #'call-process
+                        anvil-dev-emacs-bin nil buf nil
+                        (append
+                         (list "--batch" "-L" root)
+                         (and (file-directory-p tests-dir)
+                              (list "-L" tests-dir))
+                         (list "-l" "ert" "-l" file
+                               "-f" "ert-run-tests-batch-and-exit")))))
          (elapsed (- (float-time) start))
          (output (with-current-buffer buf (buffer-string))))
     (kill-buffer buf)
