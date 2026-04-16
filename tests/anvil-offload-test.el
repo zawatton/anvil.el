@@ -95,6 +95,64 @@
       (should (eq 'error (anvil-future--status future)))
       (should (stringp (anvil-future-error future))))))
 
+(ert-deftest anvil-offload-test-pool-spreads-across-workers ()
+  "With pool-size=2, two offloads land on two distinct processes."
+  (anvil-offload-test--with-clean-repl
+    (let ((anvil-offload-pool-size 2))
+      (let* ((f1 (anvil-offload '(emacs-pid)))
+             (f2 (anvil-offload '(emacs-pid))))
+        (should (anvil-future-await f1 30))
+        (should (anvil-future-await f2 30))
+        (let ((p1 (anvil-future-value f1))
+              (p2 (anvil-future-value f2)))
+          (should (integerp p1))
+          (should (integerp p2))
+          (should-not (= p1 p2))
+          ;; Pool status reflects 2 live slots.
+          (let ((status (anvil-offload-pool-status)))
+            (should (= 2 (length status)))
+            (should (cl-every (lambda (s) (plist-get s :alive)) status))))))))
+
+(ert-deftest anvil-offload-test-pool-round-robin-across-three-calls ()
+  "A 3rd offload with pool-size=2 cycles back to the first worker."
+  (anvil-offload-test--with-clean-repl
+    (let ((anvil-offload-pool-size 2))
+      (let* ((f1 (anvil-offload '(emacs-pid)))
+             (f2 (anvil-offload '(emacs-pid)))
+             (f3 (anvil-offload '(emacs-pid))))
+        (should (anvil-future-await f1 30))
+        (should (anvil-future-await f2 30))
+        (should (anvil-future-await f3 30))
+        (let ((p1 (anvil-future-value f1))
+              (p2 (anvil-future-value f2))
+              (p3 (anvil-future-value f3)))
+          (should-not (= p1 p2))
+          ;; 3rd call returns to slot used by either f1 or f2.
+          (should (or (= p1 p3) (= p2 p3))))))))
+
+(ert-deftest anvil-offload-test-pool-dead-slot-respawns ()
+  "Killing one slot does not poison the pool — next dispatch respawns it."
+  (anvil-offload-test--with-clean-repl
+    (let ((anvil-offload-pool-size 2))
+      ;; Prime both slots.
+      (anvil-future-await (anvil-offload '(+ 0 0)) 30)
+      (anvil-future-await (anvil-offload '(+ 0 0)) 30)
+      (let* ((status-before (anvil-offload-pool-status))
+             (victim-pid (plist-get (car status-before) :pid)))
+        (should (integerp victim-pid))
+        (kill-process (aref anvil-offload--pool 0))
+        ;; Sentinel runs async; give it a moment.
+        (let ((deadline (+ (float-time) 3)))
+          (while (and (aref anvil-offload--pool 0)
+                      (process-live-p (aref anvil-offload--pool 0))
+                      (< (float-time) deadline))
+            (sit-for 0.05)))
+        ;; Next dispatches should respawn slot 0 eventually.
+        (anvil-future-await (anvil-offload '(+ 1 1)) 30)
+        (anvil-future-await (anvil-offload '(+ 1 1)) 30)
+        (should (cl-every (lambda (s) (plist-get s :alive))
+                          (anvil-offload-pool-status)))))))
+
 (ert-deftest anvil-offload-test-repl-respawns-after-stop ()
   "Stopping the REPL does not prevent a subsequent `anvil-offload'."
   (anvil-offload-test--with-clean-repl

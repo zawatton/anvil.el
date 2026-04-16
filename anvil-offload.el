@@ -63,10 +63,25 @@
   :type 'number
   :group 'anvil-offload)
 
+(defcustom anvil-offload-pool-size 1
+  "Number of REPL subprocesses in the offload pool.
+Round-robin dispatch spreads offload requests across live slots;
+futures bound to distinct slots execute in parallel.  Default 1
+is the Phase 1 behaviour.  Changes take effect after the next
+`anvil-offload-stop-repl'."
+  :type 'integer
+  :group 'anvil-offload)
+
 ;;; State
 
-(defvar anvil-offload--repl-process nil
-  "Current long-lived REPL subprocess, or nil.")
+(defvar anvil-offload--pool nil
+  "Vector of live REPL processes, or nil before the first dispatch.
+Length matches `anvil-offload-pool-size' at the moment the pool
+was initialised.  Each slot is either a live `make-process' or nil
+\(unspawned / died and not yet respawned).")
+
+(defvar anvil-offload--round-robin 0
+  "Rolling index for pool dispatch.")
 
 (defvar anvil-offload--next-id 0
   "Monotonic request ID counter.")
@@ -229,45 +244,95 @@ error-settle the new REPL's pending futures."
                  (anvil-future--done-at future) (float-time))
            (remhash id table)))
        table))
-    (when (eq proc anvil-offload--repl-process)
-      (setq anvil-offload--repl-process nil))))
+    ;; Clear the dying slot so the next dispatch respawns it.
+    (when anvil-offload--pool
+      (dotimes (i (length anvil-offload--pool))
+        (when (eq proc (aref anvil-offload--pool i))
+          (aset anvil-offload--pool i nil))))))
 
-;;; REPL lifecycle
+;;; Pool lifecycle
 
-(defun anvil-offload--ensure-repl ()
-  "Return the live REPL process, spawning it if necessary."
-  (unless (and anvil-offload--repl-process
-               (process-live-p anvil-offload--repl-process))
-    (let* ((init-file (anvil-offload--repl-init-file))
-           (proc (make-process
-                  :name "anvil-offload-repl"
-                  :buffer (get-buffer-create " *anvil-offload-repl*")
-                  :command (list anvil-offload-emacs-bin
-                                 "--batch"
-                                 "-l" init-file)
-                  :connection-type 'pipe
-                  :coding 'utf-8-unix
-                  :noquery t
-                  :filter #'anvil-offload--filter
-                  :sentinel #'anvil-offload--sentinel)))
-      (process-put proc 'anvil-pending-bytes "")
-      (setq anvil-offload--repl-process proc)))
-  anvil-offload--repl-process)
+(defun anvil-offload--spawn-process (slot-index)
+  "Spawn a fresh REPL subprocess tagged for SLOT-INDEX.
+The tag only influences the process name / buffer name — it is
+diagnostic, not load-bearing for dispatch."
+  (let* ((init-file (anvil-offload--repl-init-file))
+         (name (format "anvil-offload-repl-%d" slot-index))
+         (proc (make-process
+                :name name
+                :buffer (get-buffer-create (format " *%s*" name))
+                :command (list anvil-offload-emacs-bin
+                               "--batch"
+                               "-l" init-file)
+                :connection-type 'pipe
+                :coding 'utf-8-unix
+                :noquery t
+                :filter #'anvil-offload--filter
+                :sentinel #'anvil-offload--sentinel)))
+    (process-put proc 'anvil-pending-bytes "")
+    proc))
+
+(defun anvil-offload--ensure-pool-vector ()
+  "Ensure `anvil-offload--pool' is a vector sized to the current size."
+  (let ((n (max 1 anvil-offload-pool-size)))
+    (unless (and anvil-offload--pool
+                 (= (length anvil-offload--pool) n))
+      (when anvil-offload--pool
+        (dotimes (i (length anvil-offload--pool))
+          (let ((p (aref anvil-offload--pool i)))
+            (when (and p (process-live-p p))
+              (kill-process p)))))
+      (setq anvil-offload--pool (make-vector n nil)))))
+
+(defun anvil-offload--ensure-slot (idx)
+  "Ensure slot IDX holds a live REPL; return it."
+  (anvil-offload--ensure-pool-vector)
+  (let ((cur (aref anvil-offload--pool idx)))
+    (if (and cur (process-live-p cur))
+        cur
+      (let ((proc (anvil-offload--spawn-process idx)))
+        (aset anvil-offload--pool idx proc)
+        proc))))
+
+(defun anvil-offload--pick-worker ()
+  "Return a live REPL from the pool via round-robin."
+  (anvil-offload--ensure-pool-vector)
+  (let ((n (length anvil-offload--pool)))
+    (anvil-offload--ensure-slot (mod (cl-incf anvil-offload--round-robin) n))))
 
 ;;;###autoload
 (defun anvil-offload-stop-repl ()
-  "Terminate the offload REPL.  Pending futures become errored."
+  "Terminate every REPL in the pool and clear the vector.
+Pending futures bound to those processes settle as errored via
+`anvil-offload--sentinel'.  The next `anvil-offload' call will
+rebuild the pool using the current `anvil-offload-pool-size'."
   (interactive)
-  (when (and anvil-offload--repl-process
-             (process-live-p anvil-offload--repl-process))
-    (kill-process anvil-offload--repl-process))
-  (setq anvil-offload--repl-process nil))
+  (when anvil-offload--pool
+    (dotimes (i (length anvil-offload--pool))
+      (let ((p (aref anvil-offload--pool i)))
+        (when (and p (process-live-p p))
+          (kill-process p))
+        (aset anvil-offload--pool i nil))))
+  (setq anvil-offload--pool nil))
 
 ;;;###autoload
 (defun anvil-offload-repl-alive-p ()
-  "Non-nil when the offload REPL subprocess is alive."
-  (and anvil-offload--repl-process
-       (process-live-p anvil-offload--repl-process)))
+  "Non-nil when at least one pooled REPL is alive."
+  (and anvil-offload--pool
+       (cl-some (lambda (p) (and p (process-live-p p)))
+                (append anvil-offload--pool nil))))
+
+;;;###autoload
+(defun anvil-offload-pool-status ()
+  "Return a list of slot descriptors describing the pool.
+Each element is `(:slot IDX :alive t-or-nil :pid PID-or-nil)'."
+  (and anvil-offload--pool
+       (cl-loop for i below (length anvil-offload--pool)
+                for p = (aref anvil-offload--pool i)
+                collect (list :slot i
+                              :alive (and p (process-live-p p) t)
+                              :pid (and p (process-live-p p)
+                                        (process-id p))))))
 
 ;;; Public entry point
 
@@ -283,8 +348,10 @@ Additional keyword arguments are accepted but ignored in Phase 1
 to reserve the shape of the API:
   :timeout SECONDS  — reserved for Phase 3 preemption
   :require LIST     — reserved; libraries to preload
-  :env PLIST        — reserved"
-  (let* ((proc (anvil-offload--ensure-repl))
+  :env PLIST        — reserved
+
+Dispatch uses round-robin across the pool (`anvil-offload-pool-size')."
+  (let* ((proc (anvil-offload--pick-worker))
          (id (cl-incf anvil-offload--next-id))
          (future (make-anvil-future
                   :id id :process proc :status 'pending)))

@@ -14,11 +14,22 @@
     ~-value~, ~-error~, ~-cancel~ (local-only cancel)
   - Sentinel は ~(:process PROC)~ で filter (stop→respawn race で
     新 pending が巻き添え errored になるバグを fix)
-  - tests/anvil-offload-test.el: 8/8 pass (basic math / utf-8 /
-    error prop / concurrent / cancel / await timeout / REPL death /
-    respawn after stop)
-- Phase 2–5: ~DRAFT~ — レビュー前。Doc 01 (worker pool v2) の batch
-  pool を前提とする。
+- Phase 2a (Offload pool): ~SHIPPED~ (2026-04-17)
+  - 原仕様の「batch pool (Doc 01) を使う」は、Doc 01 の batch-lane が
+    daemon (emacsclient 通信) で offload が pipe (stdin/stdout REPL)
+    と根本構造が違うため、*worker 統合は見送り* で self-contained な
+    pool に振り替えた
+  - ~anvil-offload-pool-size~ defcustom (既定 1 = Phase 1 互換)
+  - ~anvil-offload--pool~ vector + round-robin dispatch
+  - スロット死亡時 sentinel が当該 slot のみ nil 化 → 次 dispatch
+    で respawn
+  - 新公開 API: ~anvil-offload-pool-status~
+  - tests/anvil-offload-test.el: 11/11 pass (既存 8 + pool spreads /
+    round-robin / dead slot respawn)
+- Phase 2b (tool registration ~:offload t~ flag): ~DRAFT~
+- Phase 2c (anvil-worker との関係整理): ~DRAFT~ — daemon / pipe の
+  意味論を分けるか統合するかの設計判断が必要
+- Phase 3–5: ~DRAFT~ — レビュー前。
 
 * Goal
 
