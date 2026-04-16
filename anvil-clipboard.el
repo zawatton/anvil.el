@@ -1,6 +1,6 @@
 ;;; anvil-clipboard.el --- OS clipboard for anvil -*- lexical-binding: t; -*-
 
-;; Author: zawatton21
+;; Author: zawatton
 ;; Keywords: tools, mcp, claude, clipboard
 
 ;;; Commentary:

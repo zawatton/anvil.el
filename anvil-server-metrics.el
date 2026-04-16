@@ -3,7 +3,7 @@
 ;; Copyright (C) 2025 Laurynas Biveinis
 
 ;; Version: 0.2.0
-;; URL: https://github.com/zawatton21/anvil.el
+;; URL: https://github.com/zawatton/anvil.el
 
 ;; This file is part of anvil.el (vendored from mcp-server-lib).
 

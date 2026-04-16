@@ -1,6 +1,6 @@
 ;;; anvil-fs.el --- Filesystem tools for anvil -*- lexical-binding: t; -*-
 
-;; Author: zawatton21
+;; Author: zawatton
 ;; Keywords: tools, mcp, claude, files
 
 ;;; Commentary:

@@ -1,6 +1,6 @@
 ;;; anvil-xlsx.el --- Excel operations for anvil -*- lexical-binding: t; -*-
 
-;; Author: zawatton21
+;; Author: zawatton
 ;; Keywords: tools, mcp, claude, xlsx, openpyxl
 
 ;;; Commentary:

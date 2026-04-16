@@ -4,9 +4,9 @@
          "0.1.0"
          "An Emacs MCP server — your AI's workbench")
 
-(author "Fujisawa Electric Management Office")
+(author "zawatton")
 (license "GPLv3")
-(website-url "https://github.com/zawatton21/anvil.el")
+(website-url "https://github.com/zawatton/anvil.el")
 (keywords "comm" "tools" "ai" "mcp")
 
 (package-file "anvil.el")

@@ -1,6 +1,6 @@
 ;;; anvil-text.el --- Text processing for anvil -*- lexical-binding: t; -*-
 
-;; Author: zawatton21
+;; Author: zawatton
 ;; Keywords: tools, mcp, claude, text
 
 ;;; Commentary:

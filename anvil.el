@@ -1,8 +1,8 @@
 ;;; anvil.el --- An Emacs MCP server — your AI's workbench -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2025-2026 Fujisawa Electric Management Office
+;; Copyright (C) 2025-2026 zawatton
 
-;; Author: Fujisawa Electric Management Office
+;; Author: zawatton
 ;; Keywords: comm, tools, ai, mcp
 ;; Version: 0.1.0
 ;; Package-Requires: ((emacs "28.2"))

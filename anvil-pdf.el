@@ -1,6 +1,6 @@
 ;;; anvil-pdf.el --- PDF extraction for anvil -*- lexical-binding: t; -*-
 
-;; Author: zawatton21
+;; Author: zawatton
 ;; Keywords: tools, mcp, claude, pdf, pymupdf
 
 ;;; Commentary:

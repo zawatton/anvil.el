@@ -1,6 +1,6 @@
 ;;; anvil-net.el --- Network inspection for anvil -*- lexical-binding: t; -*-
 
-;; Author: zawatton21
+;; Author: zawatton
 ;; Keywords: tools, mcp, claude, network
 
 ;;; Commentary:

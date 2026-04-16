@@ -1,6 +1,6 @@
 ;;; anvil-data.el --- JSON and CSV data tools for anvil -*- lexical-binding: t; -*-
 
-;; Author: zawatton21
+;; Author: zawatton
 ;; Keywords: tools, mcp, claude, json, csv, data
 
 ;;; Commentary:

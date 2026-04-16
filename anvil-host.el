@@ -1,6 +1,6 @@
 ;;; anvil-host.el --- OS and shell abstraction for anvil -*- lexical-binding: t; -*-
 
-;; Author: zawatton21
+;; Author: zawatton
 ;; Keywords: tools, mcp, claude, system
 
 ;;; Commentary:

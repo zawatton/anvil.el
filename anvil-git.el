@@ -1,6 +1,6 @@
 ;;; anvil-git.el --- Git operations for anvil -*- lexical-binding: t; -*-
 
-;; Author: zawatton21
+;; Author: zawatton
 ;; Keywords: tools, mcp, claude, git, vc
 
 ;;; Commentary:

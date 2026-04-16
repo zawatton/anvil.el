@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2025 Laurynas Biveinis
 
-;; Author: Laurynas Biveinis (original mcp-server-lib), Fujisawa Electric Management Office (anvil fork)
+;; Author: Laurynas Biveinis (original mcp-server-lib), zawatton (anvil fork)
 ;; Keywords: comm, tools
 ;; Version: 0.2.0
 ;; Package-Requires: ((emacs "27.1"))

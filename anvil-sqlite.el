@@ -1,6 +1,6 @@
 ;;; anvil-sqlite.el --- SQLite query MCP tool for anvil -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2025-2026 Fujisawa Electric Management Office
+;; Copyright (C) 2025-2026 zawatton
 
 ;; This file is part of anvil.el.
 

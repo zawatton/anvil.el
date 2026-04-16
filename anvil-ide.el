@@ -1,7 +1,7 @@
 ;;; anvil-ide.el --- IDE tools for anvil: xref, diagnostics, imenu, tree-sitter -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2025 Yoav Orot (original claude-code-ide-emacs-tools)
-;; Copyright (C) 2025-2026 Fujisawa Electric Management Office (anvil fork)
+;; Copyright (C) 2025-2026 zawatton (anvil fork)
 
 ;; This file is part of anvil.el.
 

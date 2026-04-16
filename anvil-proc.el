@@ -1,6 +1,6 @@
 ;;; anvil-proc.el --- Process management for anvil -*- lexical-binding: t; -*-
 
-;; Author: zawatton21
+;; Author: zawatton
 ;; Keywords: tools, mcp, claude, process
 
 ;;; Commentary:

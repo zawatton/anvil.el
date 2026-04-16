@@ -1,6 +1,6 @@
 ;;; anvil-emacs.el --- Emacs buffer state inspection for anvil -*- lexical-binding: t; -*-
 
-;; Author: zawatton21
+;; Author: zawatton
 ;; Keywords: tools, mcp, claude, emacs
 
 ;;; Commentary:
