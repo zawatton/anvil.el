@@ -357,8 +357,104 @@ inheriting call must report a strictly larger `load-path'."
                (content (alist-get 'content result))
                (text (alist-get 'text (aref content 0))))
           (should (eq t is-error))
-          (should (string-match-p "timeout" text))))
+          (should (string-match-p "budget exceeded" text))))
     (anvil-server-unregister-tool "anvil-test-offload-slow" "anvil-test")
+    (ignore-errors (anvil-offload-stop-repl))))
+
+(ert-deftest anvil-test-offload-timeout-kills-and-respawns-slot ()
+  "Budget-exceeded kill actually terminates the subprocess slot.
+The PID observed on the second dispatch (after kill) must differ
+from the PID that ran the first call."
+  (require 'anvil-offload)
+  (let (pid-before pid-after)
+    (unwind-protect
+        (progn
+          (anvil-server-register-tool
+           #'anvil-offload-stub-pid-tool
+           :id "anvil-test-pid-probe"
+           :description "pid"
+           :server-id "anvil-test"
+           :offload t
+           :offload-timeout 30)
+          (anvil-server-register-tool
+           #'anvil-offload-stub-sleep
+           :id "anvil-test-sleeper"
+           :description "slow"
+           :server-id "anvil-test"
+           :offload t
+           :offload-timeout 0.4)
+          (let* ((metrics (make-anvil-server-metrics))
+                 (decode-pid (lambda (resp)
+                               (let* ((r (alist-get 'result
+                                                    (json-read-from-string resp)))
+                                      (txt (alist-get 'text
+                                                      (aref (alist-get 'content r) 0))))
+                                 (string-match "pid:\\([0-9]+\\)" txt)
+                                 (string-to-number (match-string 1 txt))))))
+            (setq pid-before
+                  (funcall decode-pid
+                           (anvil-server--handle-tools-call
+                            "t-pid1"
+                            '((name . "anvil-test-pid-probe")
+                              (arguments . ((tag . "before"))))
+                            metrics "anvil-test")))
+            ;; Fire the sleeper — should budget-exceed, killing the slot.
+            (let* ((sleep-resp
+                    (anvil-server--handle-tools-call
+                     "t-slp"
+                     '((name . "anvil-test-sleeper")
+                       (arguments . ((_ignored . "x"))))
+                     metrics "anvil-test"))
+                   (sleep-result (alist-get 'result
+                                            (json-read-from-string sleep-resp))))
+              (should (eq t (alist-get 'isError sleep-result))))
+            ;; Next probe call must land on a FRESH slot — PID differs.
+            (setq pid-after
+                  (funcall decode-pid
+                           (anvil-server--handle-tools-call
+                            "t-pid2"
+                            '((name . "anvil-test-pid-probe")
+                              (arguments . ((tag . "after"))))
+                            metrics "anvil-test")))))
+      (anvil-server-unregister-tool "anvil-test-pid-probe" "anvil-test")
+      (anvil-server-unregister-tool "anvil-test-sleeper" "anvil-test")
+      (ignore-errors (anvil-offload-stop-repl)))
+    (should (integerp pid-before))
+    (should (integerp pid-after))
+    (should-not (= pid-before pid-after))))
+
+(ert-deftest anvil-test-offload-resumable-returns-partial-on-budget ()
+  "A `:resumable t' tool converts budget-exceeded into a partial plist
+instead of `isError: t'.  The MCP content carries :status 'partial
+with a `:consumed-sec' number and `:reason' budget-exceeded."
+  (require 'anvil-offload)
+  (unwind-protect
+      (progn
+        (anvil-server-register-tool
+         #'anvil-offload-stub-sleep
+         :id "anvil-test-resumable-slow"
+         :description "slow-resumable"
+         :server-id "anvil-test"
+         :offload t
+         :resumable t
+         :offload-timeout 0.3)
+        (let* ((params '((name . "anvil-test-resumable-slow")
+                         (arguments . ((_ignored . "x")))))
+               (resp (anvil-server--handle-tools-call
+                      "t-resume" params
+                      (make-anvil-server-metrics) "anvil-test"))
+               (decoded (json-read-from-string resp))
+               (result (alist-get 'result decoded))
+               (is-error (alist-get 'isError result))
+               (text (alist-get 'text
+                                (aref (alist-get 'content result) 0)))
+               (plist (car (read-from-string text))))
+          (should (eq :json-false is-error))
+          (should (eq 'partial (plist-get plist :status)))
+          (should (eq 'budget-exceeded (plist-get plist :reason)))
+          (should (numberp (plist-get plist :consumed-sec)))
+          (should (>= (plist-get plist :consumed-sec) 0.25))))
+    (anvil-server-unregister-tool "anvil-test-resumable-slow" "anvil-test")
     (ignore-errors (anvil-offload-stop-repl))))
 
 ;;; anvil-test.el ends here

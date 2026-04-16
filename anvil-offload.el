@@ -136,7 +136,7 @@ Created lazily in `anvil-offload--ensure-pending'.")
 (cl-defstruct (anvil-future (:conc-name anvil-future--))
   id
   process
-  status                                ; 'pending 'done 'error 'cancelled
+  status                 ; 'pending 'done 'error 'cancelled 'killed
   result
   err
   (created-at (float-time))
@@ -156,6 +156,7 @@ Created lazily in `anvil-offload--ensure-pending'.")
     ('done      (anvil-future--result future))
     ('error     (error "anvil-offload: remote error: %s"
                        (anvil-future--err future)))
+    ('killed    (error "anvil-offload: %s" (anvil-future--err future)))
     ('cancelled (error "anvil-offload: future was cancelled"))
     ('pending   (error "anvil-offload: future still pending"))
     (other      (error "anvil-offload: unknown status %S" other))))
@@ -180,13 +181,39 @@ Return non-nil if settled, nil on timeout."
 (defun anvil-future-cancel (future)
   "Drop local tracking for FUTURE and mark it cancelled.
 The subprocess keeps running; its eventual reply is silently
-discarded.  To hard-stop offload work, call
-`anvil-offload-stop-repl' which terminates the REPL."
+discarded.  To hard-stop offload work, call `anvil-future-kill'
+\(per-future) or `anvil-offload-stop-repl' (whole pool)."
   (when (eq 'pending (anvil-future--status future))
     (remhash (anvil-future--id future) (anvil-offload--ensure-pending))
     (setf (anvil-future--status future) 'cancelled
           (anvil-future--done-at future) (float-time)))
   future)
+
+(defun anvil-future-kill (future)
+  "Hard-kill the subprocess slot owning FUTURE; settle it as errored.
+Unlike `anvil-future-cancel', this terminates the REPL process so
+a runaway call cannot keep tying up its pool slot.  The sentinel
+nils out the slot; the next `anvil-offload' dispatch respawns it.
+
+The elapsed wall time (seconds since the future's `created-at') is
+stored in `anvil-future--err' so callers can report it.  Returns
+FUTURE."
+  (let ((proc (anvil-future--process future))
+        (elapsed (- (float-time) (anvil-future--created-at future))))
+    (when (and proc (process-live-p proc))
+      (kill-process proc))
+    (when (eq 'pending (anvil-future--status future))
+      (remhash (anvil-future--id future) (anvil-offload--ensure-pending))
+      (setf (anvil-future--status future) 'killed
+            (anvil-future--err future)
+            (format "killed after %.2fs" elapsed)
+            (anvil-future--done-at future) (float-time))))
+  future)
+
+(defun anvil-future-elapsed (future)
+  "Return seconds between FUTURE's creation and now (or completion)."
+  (- (or (anvil-future--done-at future) (float-time))
+     (anvil-future--created-at future)))
 
 ;;; Process filter / sentinel
 

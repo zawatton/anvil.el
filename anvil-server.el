@@ -55,6 +55,8 @@
 (declare-function anvil-offload "anvil-offload" (form &rest keys))
 (declare-function anvil-future-await "anvil-offload" (future &optional timeout))
 (declare-function anvil-future-cancel "anvil-offload" (future))
+(declare-function anvil-future-kill "anvil-offload" (future))
+(declare-function anvil-future-elapsed "anvil-offload" (future))
 (declare-function anvil-future-status "anvil-offload" (future))
 (declare-function anvil-future-value "anvil-offload" (future))
 (declare-function anvil-future-error "anvil-offload" (future))
@@ -1076,21 +1078,36 @@ Signals `anvil-server-tool-error' on timeout or remote error."
          (extra-load-path (if inherit-lp (append base-lp load-path) base-lp))
          (timeout (or (plist-get tool :offload-timeout)
                       anvil-server-offload-default-timeout))
+         (resumable (plist-get tool :resumable))
          (future (anvil-offload form
                                 :require requires
                                 :load-path extra-load-path)))
-    (unless (anvil-future-await future timeout)
-      (anvil-future-cancel future)
-      (signal 'anvil-server-tool-error
-              (list (format "Offload timeout after %ss" timeout))))
-    (pcase (anvil-future-status future)
-      ('done (anvil-future-value future))
-      ('error (signal 'anvil-server-tool-error
-                      (list (format "Offload error: %s"
-                                    (anvil-future-error future)))))
-      (status (signal 'anvil-server-tool-error
-                      (list (format "Offload unexpected status: %s"
-                                    status)))))))
+    (if (not (anvil-future-await future timeout))
+        ;; Budget exceeded — hard-kill the subprocess so its slot does
+        ;; not stay wedged by the runaway call, then either surface a
+        ;; `partial' plist (for `:resumable t' tools) or an error.
+        (let ((elapsed (anvil-future-elapsed future)))
+          (anvil-future-kill future)
+          (if resumable
+              (format "%S" (list :status 'partial
+                                 :value nil
+                                 :cursor nil
+                                 :consumed-sec elapsed
+                                 :reason 'budget-exceeded))
+            (signal 'anvil-server-tool-error
+                    (list (format "Offload budget exceeded after %.2fs"
+                                  elapsed)))))
+      (pcase (anvil-future-status future)
+        ('done (anvil-future-value future))
+        ('error (signal 'anvil-server-tool-error
+                        (list (format "Offload error: %s"
+                                      (anvil-future-error future)))))
+        ('killed (signal 'anvil-server-tool-error
+                         (list (format "Offload killed: %s"
+                                       (anvil-future-error future)))))
+        (status (signal 'anvil-server-tool-error
+                        (list (format "Offload unexpected status: %s"
+                                      status))))))))
 
 ;;; Error handling helpers
 
@@ -1333,7 +1350,8 @@ See also:
         ;; name after loading the features listed in :offload-require.
         (dolist (k '(:offload :offload-require :offload-load-path
                               :offload-inherit-load-path
-                              :offload-timeout))
+                              :offload-timeout
+                              :resumable))
           (when (plist-member properties k)
             (setq tool (plist-put tool k (plist-get properties k)))))
         ;; Register the tool

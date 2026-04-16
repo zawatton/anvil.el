@@ -43,7 +43,23 @@
     pre-existing Windows batch 固有の supersession flake)
 - Phase 2c (anvil-worker との関係整理): ~DRAFT~ — daemon / pipe の
   意味論を分けるか統合するかの設計判断が必要
-- Phase 3–4: ~DRAFT~ — レビュー前。
+- Phase 3a (budget-exceed: hard-kill + slot respawn + `:resumable t' partial):
+  ~SHIPPED~ (2026-04-17)
+  - 新公開 API: ~anvil-future-kill FUTURE~ / ~anvil-future-elapsed FUTURE~
+    / status ~'killed~
+  - ~anvil-server--offload-apply~ は timeout 時に ~anvil-future-kill~ で
+    subprocess slot ごと hard-kill → sentinel が slot nil 化 → 次 dispatch
+    で respawn (以前は cancel のみで subprocess が生き残り slot が wedge)
+  - tool plist 新 keyword: ~:resumable t~ — budget-exceeded 時に error では
+    なく `(:status 'partial :value nil :cursor nil :consumed-sec N
+    :reason 'budget-exceeded)` を serialize して返す
+  - tests: kill-respawn PID 不一致確認 / resumable partial plist 返却確認 /
+    既存 timeout test は文言 update ("budget exceeded")
+- Phase 3b (checkpoint protocol + cursor + :value 保存): ~DRAFT~ —
+  handler 側で ~anvil-preempt-checkpoint VALUE CURSOR~ 呼び出し
+  → subprocess が partial-reply 送信 → anvil-offload が最新 checkpoint を
+  保持 → budget exceed 時に ~:value~ / ~:cursor~ 付きで返す
+- Phase 4: ~DRAFT~ — レビュー前。
 - Phase 5 (heavy tool retrofit): ~SHIPPED~ 2nd wave (2026-04-17)
   - 1st wave: ~file-outline~ / ~code-extract-pattern~ retrofit + auto-derive
     (~:offload t~ 単体で動く)
