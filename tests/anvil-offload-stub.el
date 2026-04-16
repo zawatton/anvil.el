@@ -40,5 +40,16 @@ MCP Parameters:
   _ignored - unused placeholder for the single-arg MCP schema convention"
   (format "%d" (length load-path)))
 
+(defun anvil-offload-stub-checkpoint-then-sleep (tag)
+  "Record a checkpoint with payload built from TAG, then sleep until killed.
+Used to verify that `:resumable t' folds the latest checkpoint into
+the partial reply on budget exceed.
+
+MCP Parameters:
+  tag - string used to build the :value payload so the test can verify it"
+  (anvil-preempt-checkpoint (format "value:%s" tag)
+                            (format "cursor:%s" tag))
+  (sleep-for 30))
+
 (provide 'anvil-offload-stub)
 ;;; anvil-offload-stub.el ends here

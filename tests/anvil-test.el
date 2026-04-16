@@ -457,4 +457,44 @@ with a `:consumed-sec' number and `:reason' budget-exceeded."
     (anvil-server-unregister-tool "anvil-test-resumable-slow" "anvil-test")
     (ignore-errors (anvil-offload-stop-repl))))
 
+(ert-deftest anvil-test-offload-resumable-folds-in-checkpoint ()
+  "With `:resumable t', the partial plist carries the latest
+checkpoint's `:value' and `:cursor' when the handler called
+`anvil-preempt-checkpoint' before running out of budget."
+  (require 'anvil-offload)
+  (unwind-protect
+      (progn
+        (anvil-server-register-tool
+         #'anvil-offload-stub-checkpoint-then-sleep
+         :id "anvil-test-resumable-ckpt"
+         :description "resumable with checkpoint"
+         :server-id "anvil-test"
+         :offload t
+         :offload-require 'anvil-offload-stub
+         ;; Subprocess needs tests/ on its load-path to find the stub,
+         ;; and enough time to actually run before budget fires so the
+         ;; checkpoint reaches the daemon — if this test ever flakes,
+         ;; bump :offload-timeout before doubting the assertions.
+         :offload-inherit-load-path t
+         :resumable t
+         :offload-timeout 2.0)
+        (let* ((params '((name . "anvil-test-resumable-ckpt")
+                         (arguments . ((tag . "run-A")))))
+               (resp (anvil-server--handle-tools-call
+                      "t-ckpt" params
+                      (make-anvil-server-metrics) "anvil-test"))
+               (decoded (json-read-from-string resp))
+               (result (alist-get 'result decoded))
+               (is-error (alist-get 'isError result))
+               (text (alist-get 'text
+                                (aref (alist-get 'content result) 0)))
+               (plist (car (read-from-string text))))
+          (should (eq :json-false is-error))
+          (should (eq 'partial (plist-get plist :status)))
+          (should (eq 'budget-exceeded (plist-get plist :reason)))
+          (should (equal "value:run-A"  (plist-get plist :value)))
+          (should (equal "cursor:run-A" (plist-get plist :cursor)))))
+    (anvil-server-unregister-tool "anvil-test-resumable-ckpt" "anvil-test")
+    (ignore-errors (anvil-offload-stop-repl))))
+
 ;;; anvil-test.el ends here

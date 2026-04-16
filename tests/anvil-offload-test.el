@@ -188,6 +188,52 @@
       (should (anvil-future-await future 30))
       (should (eq 'both-loaded (anvil-future-value future))))))
 
+(ert-deftest anvil-offload-test-checkpoint-updates-future ()
+  "Handler calling `anvil-preempt-checkpoint' populates the future's slot.
+The FORM writes an interim checkpoint then sleeps; the test waits
+until the checkpoint arrives (non-settling), then kills the future."
+  (anvil-offload-test--with-clean-repl
+    (let* ((form '(progn (anvil-preempt-checkpoint
+                          (list :so-far 42)
+                          (list :offset 7))
+                         (sleep-for 30)))
+           (future (anvil-offload form)))
+      ;; Wait up to 5s for the checkpoint to arrive — future stays pending.
+      (let ((deadline (+ (float-time) 5)))
+        (while (and (null (anvil-future-checkpoint future))
+                    (eq 'pending (anvil-future-status future))
+                    (< (float-time) deadline))
+          (accept-process-output (anvil-future--process future) 0.05)))
+      (should (eq 'pending (anvil-future-status future)))
+      (let ((cp (anvil-future-checkpoint future)))
+        (should cp)
+        (should (equal (list :so-far 42) (plist-get cp :value)))
+        (should (equal (list :offset 7)  (plist-get cp :cursor))))
+      ;; Clean up by killing the slot so the sleep doesn't hold anything.
+      (anvil-future-kill future)
+      (should (eq 'killed (anvil-future-status future))))))
+
+(ert-deftest anvil-offload-test-checkpoint-last-write-wins ()
+  "Multiple checkpoints: only the most recent is retained on the future."
+  (anvil-offload-test--with-clean-repl
+    (let* ((form '(progn (anvil-preempt-checkpoint 'first  'c1)
+                         (anvil-preempt-checkpoint 'second 'c2)
+                         (anvil-preempt-checkpoint 'third  'c3)
+                         (sleep-for 30)))
+           (future (anvil-offload form)))
+      (let ((deadline (+ (float-time) 5)))
+        ;; Wait for any checkpoint first, then give the filter one more
+        ;; beat to drain the remaining two so 'third is the one retained.
+        (while (and (null (anvil-future-checkpoint future))
+                    (< (float-time) deadline))
+          (accept-process-output (anvil-future--process future) 0.05))
+        (accept-process-output (anvil-future--process future) 0.1))
+      (let ((cp (anvil-future-checkpoint future)))
+        (should cp)
+        (should (eq 'third (plist-get cp :value)))
+        (should (eq 'c3    (plist-get cp :cursor))))
+      (anvil-future-kill future))))
+
 (ert-deftest anvil-offload-test-load-path-extra ()
   "`:load-path' prepends directories so (require 'X) can find them."
   (anvil-offload-test--with-clean-repl

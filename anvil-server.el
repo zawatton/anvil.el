@@ -60,6 +60,7 @@
 (declare-function anvil-future-status "anvil-offload" (future))
 (declare-function anvil-future-value "anvil-offload" (future))
 (declare-function anvil-future-error "anvil-offload" (future))
+(declare-function anvil-future-checkpoint "anvil-offload" (future))
 
 ;;; Customization variables
 
@@ -1083,15 +1084,19 @@ Signals `anvil-server-tool-error' on timeout or remote error."
                                 :require requires
                                 :load-path extra-load-path)))
     (if (not (anvil-future-await future timeout))
-        ;; Budget exceeded — hard-kill the subprocess so its slot does
-        ;; not stay wedged by the runaway call, then either surface a
-        ;; `partial' plist (for `:resumable t' tools) or an error.
-        (let ((elapsed (anvil-future-elapsed future)))
+        ;; Budget exceeded — snapshot the latest checkpoint BEFORE the
+        ;; hard-kill (kill clears pending state and we want the last
+        ;; observed partial state), then kill so the subprocess slot
+        ;; does not stay wedged by the runaway call.  Either surface a
+        ;; `partial' plist (for `:resumable t' tools, folding in the
+        ;; checkpoint's :value / :cursor when present) or an error.
+        (let* ((elapsed (anvil-future-elapsed future))
+               (cp (and resumable (anvil-future-checkpoint future))))
           (anvil-future-kill future)
           (if resumable
               (format "%S" (list :status 'partial
-                                 :value nil
-                                 :cursor nil
+                                 :value (plist-get cp :value)
+                                 :cursor (plist-get cp :cursor)
                                  :consumed-sec elapsed
                                  :reason 'budget-exceeded))
             (signal 'anvil-server-tool-error

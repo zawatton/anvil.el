@@ -55,10 +55,23 @@
     :reason 'budget-exceeded)` を serialize して返す
   - tests: kill-respawn PID 不一致確認 / resumable partial plist 返却確認 /
     既存 timeout test は文言 update ("budget exceeded")
-- Phase 3b (checkpoint protocol + cursor + :value 保存): ~DRAFT~ —
-  handler 側で ~anvil-preempt-checkpoint VALUE CURSOR~ 呼び出し
-  → subprocess が partial-reply 送信 → anvil-offload が最新 checkpoint を
-  保持 → budget exceed 時に ~:value~ / ~:cursor~ 付きで返す
+- Phase 3b (checkpoint protocol + cursor + :value 保存): ~SHIPPED~ (2026-04-17)
+  - 新公開 API: ~anvil-preempt-checkpoint VALUE &optional CURSOR~ (handler-side)
+    / ~anvil-future-checkpoint FUTURE~ (daemon-side accessor)
+  - Protocol 拡張: subprocess が intermediate ~(:id N :checkpoint
+    (:value V :cursor C))~ を送信、main daemon の filter は非 settling で
+    future の ~checkpoint~ slot を更新 (last-write-wins)
+  - REPL init file が ~anvil-preempt-checkpoint~ を defun し、eval 中は
+    ~anvil-offload--repl-current-id~ を dynamic-bind で current request-id に
+    束縛 (tag 用)
+  - ~anvil-server--offload-apply~: budget-exceed + ~:resumable t~ の時、
+    kill 前に ~anvil-future-checkpoint~ を snapshot し、partial plist の
+    ~:value~ / ~:cursor~ に畳み込む。checkpoint 未送信なら両方 nil (Phase 3a 互換)
+  - daemon 側 ~anvil-preempt-checkpoint~ は no-op (handler が offload 外で
+    呼ばれても安全)
+  - tests: unit 2 件 (updates-future / last-write-wins) + E2E 1 件
+    (resumable-folds-in-checkpoint)、total 247/249 (2 件は pre-existing Windows
+    batch supersession flake)
 - Phase 4: ~DRAFT~ — レビュー前。
 - Phase 5 (heavy tool retrofit): ~SHIPPED~ 2nd wave (2026-04-17)
   - 1st wave: ~file-outline~ / ~code-extract-pattern~ retrofit + auto-derive

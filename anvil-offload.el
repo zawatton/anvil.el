@@ -21,16 +21,24 @@
 ;; Public API:
 ;;   (anvil-offload FORM &rest KEYS)
 ;;       Returns an `anvil-future'.  FORM evaluates in the REPL.
-;;       KEYS reserved for future use (:timeout, :require, :env).
+;;       KEYS :require, :load-path, :timeout, :env.
 ;;   (anvil-future-done-p FUTURE)
 ;;   (anvil-future-await FUTURE &optional TIMEOUT)
 ;;   (anvil-future-value FUTURE)
 ;;   (anvil-future-error FUTURE)
 ;;   (anvil-future-cancel FUTURE)
+;;   (anvil-future-kill FUTURE)          ; Phase 3a
+;;   (anvil-future-checkpoint FUTURE)    ; Phase 3b
+;;   (anvil-preempt-checkpoint V &optional C)  ; handler-side, Phase 3b
 ;;
 ;; Protocol (one S-exp per line, utf-8-unix):
-;;   request : (:id N :form EXPR)
-;;   reply   : (:id N :ok VALUE) | (:id N :error MSG)
+;;   request    : (:id N :form EXPR)
+;;   reply      : (:id N :ok VALUE) | (:id N :error MSG)
+;;   checkpoint : (:id N :checkpoint (:value V :cursor C))  (Phase 3b)
+;;
+;; Checkpoints are intermediate, non-settling messages sent by handlers
+;; via `anvil-preempt-checkpoint' so the main daemon can return the last
+;; known partial state if the call is killed for running over budget.
 ;;
 ;; The REPL uses `send-string-to-terminal' for replies because it
 ;; calls fflush(stdout) in batch mode — a plain `princ' may stay in
@@ -104,16 +112,29 @@ Created lazily in `anvil-offload--ensure-pending'.")
   ";; anvil-offload REPL — auto-generated, do not edit.
 \(setq coding-system-for-read 'utf-8-unix
       coding-system-for-write 'utf-8-unix)
+\(defvar anvil-offload--repl-current-id nil
+  \"Request id currently being evaluated — tags checkpoint messages.\")
+\(defun anvil-preempt-checkpoint (value &optional cursor)
+  \"Send an interim (:value VALUE :cursor CURSOR) checkpoint, return VALUE.
+Handlers call this periodically during long work so the main daemon
+has the latest partial state if the call is killed over budget.\"
+  (when anvil-offload--repl-current-id
+    (let ((msg (list :id anvil-offload--repl-current-id
+                     :checkpoint (list :value value :cursor cursor))))
+      (send-string-to-terminal (prin1-to-string msg))
+      (send-string-to-terminal \"\\n\")))
+  value)
 \(condition-case nil
     (while t
       (let* ((msg (read t))
              (id (and (listp msg) (plist-get msg :id)))
              (form (and (listp msg) (plist-get msg :form))))
         (when id
-          (let ((reply
-                 (condition-case err
-                     (list :id id :ok (eval form t))
-                   (error (list :id id :error (format \"%S\" err))))))
+          (let* ((anvil-offload--repl-current-id id)
+                 (reply
+                  (condition-case err
+                      (list :id id :ok (eval form t))
+                    (error (list :id id :error (format \"%S\" err))))))
             (send-string-to-terminal (prin1-to-string reply))
             (send-string-to-terminal \"\\n\")))))
   (end-of-file (kill-emacs 0)))
@@ -139,12 +160,19 @@ Created lazily in `anvil-offload--ensure-pending'.")
   status                 ; 'pending 'done 'error 'cancelled 'killed
   result
   err
+  checkpoint             ; latest (:value V :cursor C) from subprocess, or nil
   (created-at (float-time))
   done-at)
 
 (defun anvil-future-status (future)
   "Return the status symbol of FUTURE (pending/done/error/cancelled)."
   (anvil-future--status future))
+
+(defun anvil-future-checkpoint (future)
+  "Return the latest checkpoint plist for FUTURE, or nil.
+The plist has keys `:value' and `:cursor', matching the arguments
+last handed to `anvil-preempt-checkpoint' inside the REPL."
+  (anvil-future--checkpoint future))
 
 (defun anvil-future-done-p (future)
   "Non-nil when FUTURE has settled (done/error/cancelled)."
@@ -217,20 +245,47 @@ FUTURE."
 
 ;;; Process filter / sentinel
 
+(defvar anvil-offload--repl-current-id nil
+  "Bound to the request id while a handler runs inside the REPL.
+Defined in the daemon as a no-op anchor so `anvil-preempt-checkpoint'
+compiles; the subprocess's init file has its own defvar which is what
+actually tags outbound checkpoint messages.")
+
+(defun anvil-preempt-checkpoint (value &optional cursor)
+  "Record VALUE (and optional CURSOR) as an interim checkpoint.
+Inside the offload REPL subprocess this writes a
+`(:id N :checkpoint (:value VALUE :cursor CURSOR))' message so the
+main daemon can fold it into the `partial' reply on budget exceed.
+In the main daemon this is a harmless no-op — handlers can call it
+unconditionally.  Returns VALUE."
+  (when (and anvil-offload--repl-current-id
+             (fboundp 'send-string-to-terminal))
+    (let ((msg (list :id anvil-offload--repl-current-id
+                     :checkpoint (list :value value :cursor cursor))))
+      (send-string-to-terminal (prin1-to-string msg))
+      (send-string-to-terminal "\n")))
+  value)
+
 (defun anvil-offload--dispatch-reply (msg)
-  "Route decoded reply MSG to its registered future, if any."
+  "Route decoded reply MSG to its registered future, if any.
+Checkpoint messages update `checkpoint' on the pending future but
+do not settle it; `:ok'/`:error' replies settle and dehashref."
   (when (listp msg)
     (let* ((id (plist-get msg :id))
            (table (anvil-offload--ensure-pending))
            (future (and id (gethash id table))))
       (when future
-        (remhash id table)
         (cond
+         ((plist-member msg :checkpoint)
+          (setf (anvil-future--checkpoint future)
+                (plist-get msg :checkpoint)))
          ((plist-member msg :ok)
+          (remhash id table)
           (setf (anvil-future--status future) 'done
                 (anvil-future--result future) (plist-get msg :ok)
                 (anvil-future--done-at future) (float-time)))
          ((plist-member msg :error)
+          (remhash id table)
           (setf (anvil-future--status future) 'error
                 (anvil-future--err future) (plist-get msg :error)
                 (anvil-future--done-at future) (float-time))))))))
