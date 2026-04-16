@@ -42,7 +42,7 @@ jobs:
       - name: Run tests (Unix)
         if: runner.os != 'Windows'
         run: |
-          emacs --batch -L . \
+          emacs --batch -L . -L tests \
             -l ert \
             -l tests/anvil-test.el \
             -f ert-run-tests-batch-and-exit
@@ -50,4 +50,4 @@ jobs:
       - name: Run tests (Windows)
         if: runner.os == 'Windows'
         run: |
-          emacs --batch -L . -l ert -l tests/anvil-test.el -f ert-run-tests-batch-and-exit
+          emacs --batch -L . -L tests -l ert -l tests/anvil-test.el -f ert-run-tests-batch-and-exit
