@@ -490,10 +490,60 @@ Anvil を使うと:
 
 * インストール
 
-** async-installer
+インストール方法は 2 系統あります。特別な理由がなければ *安定版*
+を選んでください。
+
+** 安定版 (推奨) — タグ =v0.1.0=
+
+=v0.1.0= がとりあえず開発が一段落したバージョンです。安定している
+のでこちらで試してください。随時アップデートしていきます。
+
+*** async-installer
 
 [[https://github.com/zawatton/async-installer][async-installer]] — 純 Elisp 構文で書ける、軽量・非同期な Emacs パッケージマネージャ。
 マクロ DSL は不要です。
+
+#+begin_src emacs-lisp
+(async-installer-git-add "https://github.com/zawatton/anvil.el.git"
+                            :tag "v0.1.0"
+                            :main "anvil.el")
+#+end_src
+
+*** straight.el
+
+#+begin_src emacs-lisp
+(straight-use-package
+ '(anvil :type git :host github :repo "zawatton/anvil.el"
+         :branch "v0.1.0"))
+#+end_src
+
+*** elpaca
+
+#+begin_src emacs-lisp
+(elpaca (anvil :host github :repo "zawatton/anvil.el"
+               :ref "v0.1.0"))
+#+end_src
+
+*** use-package (straight または elpaca と組み合わせて)
+
+#+begin_src emacs-lisp
+;; straight 利用時
+(use-package anvil
+  :straight (anvil :type git :host github :repo "zawatton/anvil.el"
+                   :branch "v0.1.0"))
+
+;; elpaca 利用時
+(use-package anvil
+  :ensure (:host github :repo "zawatton/anvil.el" :ref "v0.1.0"))
+#+end_src
+
+** 最新版 — =master= (強く非推奨)
+
+日々、色々機能が追加されていきます。非常に不安定であなたの環境
+を破壊してしまうかもしれません。推奨しません。受容できる
+user 向けです。
+
+*** async-installer
 
 #+begin_src emacs-lisp
 (async-installer-git-add "https://github.com/zawatton/anvil.el.git"
@@ -501,20 +551,20 @@ Anvil を使うと:
                             :main "anvil.el")
 #+end_src
 
-** straight.el
+*** straight.el
 
 #+begin_src emacs-lisp
 (straight-use-package
  '(anvil :type git :host github :repo "zawatton/anvil.el"))
 #+end_src
 
-** elpaca
+*** elpaca
 
 #+begin_src emacs-lisp
 (elpaca (anvil :host github :repo "zawatton/anvil.el"))
 #+end_src
 
-** use-package (straight または elpaca と組み合わせて)
+*** use-package (straight または elpaca と組み合わせて)
 
 #+begin_src emacs-lisp
 ;; straight 利用時
@@ -534,6 +584,9 @@ Anvil を使うと:
 (add-to-list 'load-path "/path/to/anvil")
 (require 'anvil)
 #+end_src
+
+手動で clone する場合、安定版を使うなら =git checkout v0.1.0= で
+タグに切り替えてください。=master= のままは自己責任です。
 
 * 設定
 
