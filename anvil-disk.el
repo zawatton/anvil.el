@@ -145,7 +145,11 @@ Returns a plist:
 pass :force t to override"
        (buffer-name (plist-get div :buffer)) abs status))
     (let ((coding-system-for-write 'utf-8-unix))
-      (write-region content nil abs nil 'silent))
+      ;; Divergence already checked + force guard applied above; Emacs'
+      ;; supersession prompt is redundant and errors out in batch mode.
+      (cl-letf (((symbol-function 'ask-user-about-supersession-threat)
+                 #'ignore))
+        (write-region content nil abs nil 'silent)))
     (list :file          abs
           :status        (or status 'no-buffer)
           :forced        (and force t)

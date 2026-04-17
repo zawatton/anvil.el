@@ -130,7 +130,12 @@ Returns a plist:
                   :forced (and force t) :status status :saved nil)
           (with-current-buffer buf
             (let ((coding-system-for-write 'utf-8-unix))
-              (write-region (point-min) (point-max) file nil 'silent))
+              ;; Divergence already checked + force guard applied above;
+              ;; Emacs' supersession prompt is redundant and errors out in
+              ;; batch mode.
+              (cl-letf (((symbol-function 'ask-user-about-supersession-threat)
+                         #'ignore))
+                (write-region (point-min) (point-max) file nil 'silent)))
             (set-buffer-modified-p nil)
             (set-visited-file-modtime)
             (setq bytes (- (position-bytes (point-max))
