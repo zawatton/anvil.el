@@ -4,7 +4,10 @@
 #+property: status DRAFT
 
 * STATUS
-~Phase 1a + 1b + 2 SHIPPED~ (2026-04-18)
+  :PROPERTIES:
+  :ID:       019da30b-92e3-7674-976d-020f7465940b
+  :END:
+~Phase 1a + 1b + 2 + 2b SHIPPED (develop branch)~ (2026-04-19)
 
 - Phase 1a (commit 45468b2): provider abstraction, claude provider,
   spawn + sentinel + timeout, pool + concurrency cap, state
@@ -22,8 +25,17 @@
   isolation is handled by the generic anvil-side fallback shipped
   in Phase 1b.
 
-Phase 2b (anvil-cron), 3/3b (gemini / ollama native), 4 (consensus)
-は design 残し。Review Questions Q1-Q12 resolved 状態キープ。
+- Phase 2b (branch feat/orchestrator-phase-2b): anvil-cron 連携 ×
+  =examples/nightly-orchestrator.org= ship.  No new production
+  code — the existing =anvil-cron-register :fn= hook is sufficient.
+  Example covers 4 patterns (dispatch-only / dispatch-then-collect
+  / hook-based batch-id logging / multi-provider mix) and
+  documents worker-vs-main-daemon trade-off.  ERT +2 = 49 pass / 1
+  live skip in anvil-orchestrator-test.el (355 total across the
+  suite, 2 live skips).
+
+Phase 3/3b (gemini / ollama native), 4 (consensus) は design
+残し。Review Questions Q1-Q12 resolved 状態キープ。
 
 * Goal
 
@@ -678,9 +690,28 @@ Phase 1a 単体で「Claude CLI ユーザーが Emacs から多並列 dispatch�
    via sh stub — 11 tests
 
 ** Phase 2b — anvil-cron 連携 (所要 1-2 日)
+   :PROPERTIES:
+   :ID:       019da30c-1789-75be-bdca-acd8cfe4d971
+   :END:
+
+SHIPPED 2026-04-19 (branch feat/orchestrator-phase-2b).
 
 1. =examples/nightly-orchestrator.org= — 夜間 batch 発火の完全例
+   (4 patterns: dispatch-only / dispatch-then-collect / hook-based
+   batch-id logging / multi-provider mix)
 2. anvil-cron hook に orchestrator dispatch を書けるか確認
+   → OK。既存 =anvil-cron-register :fn= + in-process mode
+   (=anvil-cron-use-worker= nil) で成立。新規 production code 不要
+
+Integration tests (2 件、49/50 orchestrator suite pass):
+- =anvil-orchestrator-test-cron-dispatches-batch=
+- =anvil-orchestrator-test-cron-after-run-hook-sees-batch-id=
+
+Worker vs main daemon trade-off が Phase 2b の唯一の非自明な
+設計判断: orchestrator state (batch hash / pump timer / dashboard
+buffer) が main daemon 側にあるため、cron dispatcher は
+=anvil-cron-use-worker= を nil にして main daemon で回す方が
+安全。
 
 ** Phase 3 / 3b / 4 — 後続
 

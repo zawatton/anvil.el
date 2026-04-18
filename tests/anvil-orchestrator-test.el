@@ -716,6 +716,89 @@ Registered under a distinct provider symbol so the built-in
         (should (string-match-p "requested tweak"
                                 (plist-get r :summary)))))))
 
+;;;; --- cron integration (Phase 2b) ---------------------------------------
+
+(require 'anvil-cron)
+
+(defvar anvil-orchestrator-test--cron-captured-batch nil)
+
+(defvar anvil-orchestrator-test--cron-hook-calls nil)
+
+(defun anvil-orchestrator-test--cron-dispatcher ()
+  "Dispatcher for `anvil-cron' `:fn'.  Submits one stub task."
+  (let ((batch (anvil-orchestrator-submit
+                (list (list :name "nightly"
+                            :provider 'test
+                            :prompt "hello from cron")))))
+    (setq anvil-orchestrator-test--cron-captured-batch batch)
+    batch))
+
+(defmacro anvil-orchestrator-test--with-cron (&rest body)
+  "Run BODY with a fresh orchestrator + isolated cron state.
+Forces in-process cron execution so the dispatcher runs on the
+main daemon where the orchestrator state lives."
+  (declare (indent 0))
+  `(let ((anvil-cron-use-worker nil)
+         (anvil-cron--tasks (make-hash-table :test 'eq))
+         (anvil-cron-after-run-functions nil)
+         (anvil-orchestrator-test--cron-captured-batch nil)
+         (anvil-orchestrator-test--cron-hook-calls nil))
+     (anvil-orchestrator-test--with-fresh
+       ,@body)))
+
+(ert-deftest anvil-orchestrator-test-cron-dispatches-batch ()
+  "A cron `:fn' that calls `anvil-orchestrator-submit' dispatches a
+real batch to the stub provider and the batch runs to completion."
+  (anvil-orchestrator-test--with-cron
+    (anvil-cron-register
+     :id 'nightly-test
+     :interval 3600
+     :fn #'anvil-orchestrator-test--cron-dispatcher)
+    (anvil-cron-run-now 'nightly-test)
+    ;; cron defers via run-with-timer 0 — spin until the dispatcher ran.
+    (let ((deadline (+ (float-time) 10)))
+      (while (and (not anvil-orchestrator-test--cron-captured-batch)
+                  (< (float-time) deadline))
+        (accept-process-output nil 0.05)))
+    (should anvil-orchestrator-test--cron-captured-batch)
+    (anvil-orchestrator-test--wait-batch
+     anvil-orchestrator-test--cron-captured-batch 10)
+    (let ((results (anvil-orchestrator-collect
+                    anvil-orchestrator-test--cron-captured-batch)))
+      (should (= 1 (length results)))
+      (should (eq 'done (plist-get (car results) :status)))
+      (should (equal "stub task done"
+                     (plist-get (car results) :summary))))))
+
+(ert-deftest anvil-orchestrator-test-cron-after-run-hook-sees-batch-id ()
+  "`anvil-cron-after-run-functions' receives the dispatcher's return
+value (the batch-id) as its RESULT argument."
+  (anvil-orchestrator-test--with-cron
+    (add-hook 'anvil-cron-after-run-functions
+              (lambda (id status result elapsed)
+                (push (list :id id :status status
+                            :result result :elapsed elapsed)
+                      anvil-orchestrator-test--cron-hook-calls)))
+    (anvil-cron-register
+     :id 'nightly-test
+     :interval 3600
+     :fn #'anvil-orchestrator-test--cron-dispatcher)
+    (anvil-cron-run-now 'nightly-test)
+    (let ((deadline (+ (float-time) 10)))
+      (while (and (not anvil-orchestrator-test--cron-hook-calls)
+                  (< (float-time) deadline))
+        (accept-process-output nil 0.05)))
+    (should (= 1 (length anvil-orchestrator-test--cron-hook-calls)))
+    (let* ((call (car anvil-orchestrator-test--cron-hook-calls))
+           (result (plist-get call :result)))
+      (should (eq 'nightly-test (plist-get call :id)))
+      (should (eq 'ok (plist-get call :status)))
+      (should (stringp result))
+      ;; batch-id is a 36-char UUID, round-tripped through `%S' → stringified.
+      (should (string-match-p
+               "[0-9a-f]\\{8\\}-[0-9a-f]\\{4\\}-[0-9a-f]\\{4\\}-[0-9a-f]\\{4\\}-[0-9a-f]\\{12\\}"
+               result)))))
+
 ;;;; --- live smoke test ---------------------------------------------------
 
 (ert-deftest anvil-orchestrator-test-live-claude ()
