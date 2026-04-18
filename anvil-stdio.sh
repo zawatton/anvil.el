@@ -178,16 +178,21 @@ while read -r line; do
 	# loses its `-print-nonl ' prefix and emacsclient prints it as
 	#   *ERROR*: Unknown message: <tail>
 	# interleaved with the legitimate base64 payload.  Strip those
-	# injection markers, then remove ALL CR/LF bytes (frame boundaries
-	# leave CRLF behind; whether awk recognises `\r' in its regex and
-	# whether it auto-strips CR with RS varies across gawk / mawk / MSYS
-	# builds, so do the CR/LF removal outside awk with `tr' for
-	# portability).  Finally decode with --ignore-garbage so any residual
-	# non-base64 bytes (odd whitespace, stray control chars) are tolerated
-	# instead of killing the whole script under `set -e'.
+	# injection markers with `sed s///g' (POSIX BRE, so `\*' is
+	# unambiguously a literal asterisk on every sed implementation --
+	# unlike `awk' where `\*' in ERE is treated differently by gawk /
+	# mawk / busybox / git-bash-bundled awk and may cause the strip to
+	# silently fail).  Then remove ALL CR/LF bytes; frame boundaries
+	# leave CRLF behind, and `tr' is trivially portable.  `--ignore-
+	# garbage' on the base64 decoder is NOT sufficient on its own: the
+	# marker text "ERROR Unknown message" is 15 base64-alphabet bytes
+	# that the decoder happily consumes as payload, throwing off the
+	# multiple-of-4 requirement and yielding `invalid input' under
+	# `set -e -o pipefail'.  Stripping the marker textually, before
+	# decoding, is what makes Windows work at all.
 	# (No-op on Linux/macOS where one frame fits in one read.)
 	base64_response=$(printf '%s' "$base64_response" \
-		| awk 'BEGIN{ORS=""} {sub(/^\*ERROR\*: Unknown message: /, ""); print}' \
+		| sed 's/\*ERROR\*: Unknown message: //g' \
 		| tr -d '\r\n')
 
 	# Decode the base64 content (lenient against stray non-base64 bytes)
