@@ -1,0 +1,655 @@
+#+title: HTTP Client — url-retrieve Wrapper with ETag/TTL Cache
+#+date: 2026-04-18
+#+author: zawatton
+#+property: status DRAFT
+
+* STATUS
+~APPROVED~ (2026-04-18) — Review Questions Q1-Q10 すべて既定案で
+resolved、Windows libxml fallback を明記した上で確定。Phase 1a 着手可能。
+Doc 07 Vision 節の Phase C1 を本 doc に切り出したもの。
+
+* Goal
+
+anvil.el 第三の fetch primitive として、**静的 HTTP/JSON リソース** を
+LLM 経由で取得する軽量 client を提供する。
+
+位置付け (Doc 07 Vision "ACTION" レイヤー):
+
+| 用途                                            | ツール            |
+|-------------------------------------------------+-------------------|
+| 静的 HTML / JSON / txt / RSS をトークン最小で取る | *anvil-http* ← 本 doc |
+| JS rendering 必須 / accessibility tree 欲しい   | anvil-browser      |
+| 定期巡回 robot・録画スクレイピング              | Maxun (外部、REST で叩く) |
+| ブラウザ対話・ログイン後操作                    | Claude in Chrome   |
+
+anvil-http は上記 4 つのうち「軽量 fetch」を担当し、Maxun / 公開 REST
+API を LLM から叩くための primitive にもなる。
+
+** 命名について
+
+=anvil-net.el= は既存の *listening port inspection* (netstat / ss / lsof
+wrapper)。命名空間は別で衝突しない。混同防止のため本 doc と module
+commentary に 1 行ガードを書く。
+
+* Problem
+
+** 現状の "HTTP fetch" 経路の散在
+
+2026-04 時点で anvil に汎用 HTTP client はなく、以下の経路が並立している:
+
+1. WebFetch / WebSearch tool (Claude 側組込) — markdown 化+要約が
+   強制的に走り、生 JSON が取れない。認証ヘッダ不可
+2. =agent-browser= + anvil-browser — Chrome cold start ~500ms/call、
+   Reddit の =.json= endpoint も JS challenge で弾かれるため本来不要な
+   overhead
+3. bash =curl= / =wget= — 1 call ごと process 起動 + shell quoting
+   + output parse を Claude が毎回書く。ETag / cache 一切なし
+
+結果として以下が発生 (本日 2026-04-18 soak で実測):
+
+- Reddit =reddit.com/r/.../comments/.../.json= を anvil-browser で叩く
+  と JS challenge + 404 っぽい HTML が返る (~15KB の無駄 token)
+- 公開 docs サイトを 10 分毎に polling する場合、ETag を使えば 304
+  で body 0B のはずが 毎回全量 (数百 KB) 転送 + Claude context に流入
+- Maxun (Docker self-host scraper) の REST API は素の JSON。browser で
+  叩くと HTML viewer が挟まって本体取得 1 段階増える
+
+** url-retrieve の罠
+
+Emacs 29 組込 =url-retrieve-synchronously= は使える状態だが:
+
+- callback ベースで sync 取得すると process sentinel が
+  =accept-process-output= を内側で呼び、MCP server の他 request 処理を
+  詰まらせる可能性 (memory =feedback_emacs_server_concurrency_model.md=)
+- gzip / brotli の自動 decode 挙動がバージョン依存
+- redirect loop の guard が弱い (=url-max-redirections= 既定 30)
+- charset 検出が HTML5 の =<meta charset>= をうまく拾わない
+- error response body を読み捨てる default 挙動 (=url-http-parse-response=
+  のエラー時挙動)
+
+anvil-http はこれらを 1 箇所で吸収する薄い wrapper として機能する。
+
+** ETag / Last-Modified cache がないコスト
+
+Claude が「このドキュメントページを 5 分毎にチェックして変化があれば知らせて」
+と言われて polling する場合、ETag を使えば:
+
+- 初回: 200 OK, body 全量 (例: 80KB)
+- 2-10 回目 (変化なし): 304 Not Modified, body 0B, LLM token 消費も 0
+- 11 回目 (更新あり): 200 OK, body 全量
+
+cache 無しの現状だと毎回 80KB が Claude context を食う。90%+ 削減の
+余地がある。
+
+* Proposed Design
+
+** Module boundary
+
+- 新規ファイル: =anvil-http.el=
+- 依存 (hard):
+  - =anvil-server= (MCP tool 登録)
+  - =anvil-state= (ETag/body cache の backing store)
+- 依存 (soft): =anvil-offload= — 長時間 fetch を offload したい時のみ
+- 依存 (built-in): =url=, =url-http= (Emacs 29+)
+- 公開 MCP tool: server-id は =emacs-eval= に合流 (anvil-browser と同方針)
+
+** Public Elisp API
+
+#+begin_src elisp
+;; 設定
+(defcustom anvil-http-user-agent
+  (format "anvil.el/%s (+https://github.com/zawatton/anvil.el)" anvil-version)
+  "Default User-Agent header." :type 'string)
+
+(defcustom anvil-http-cache-ttl-sec 300
+  "Default freshness TTL in seconds for `anvil-http-get' responses.
+0 disables TTL check (cache still stores validators for If-None-Match)."
+  :type 'integer)
+
+(defcustom anvil-http-timeout-sec 30
+  "Per-call transport timeout (seconds)." :type 'integer)
+
+(defcustom anvil-http-retry-max 3 :type 'integer)
+(defcustom anvil-http-retry-base-ms 200 :type 'integer)
+
+(defcustom anvil-http-max-inline-body-bytes 200000
+  "Body size threshold above which `http-fetch' spills to disk.
+Body > この値なら :body に head (先頭 2KB) を残し、全量は tempfile に
+書き出して :body-overflow-path で path を返す。呼び出し元は
+file-read offset/limit で部分読みできる。0 で無効化 (常に inline)。"
+  :type 'integer)
+
+(defcustom anvil-http-overflow-head-bytes 2048
+  "Leading bytes of body to keep inline when overflowing to disk."
+  :type 'integer)
+
+(defcustom anvil-http-batch-max 16
+  "Maximum number of URLs accepted by `http-fetch-batch' in one call."
+  :type 'integer)
+
+(defcustom anvil-http-batch-concurrency 4
+  "Parallel in-flight requests for `http-fetch-batch'.
+url-queue が sync fetch を裏で multiplex する。1 で直列。"
+  :type 'integer)
+
+(defcustom anvil-http-respect-robots-txt t
+  "When non-nil, consult robots.txt before each fetch (cached).
+User-Agent で `anvil-http-user-agent' が Disallow されている path は
+user-error で refuse。" :type 'boolean)
+
+;; 中核 API
+(anvil-http-get URL &rest ARGS)
+  ;; URL: string。
+  ;; ARGS (plist):
+  ;;   ;; transport
+  ;;   :headers         ALIST of (STRING . STRING) extra request headers
+  ;;   :accept          MIME type, short-hand for Accept header
+  ;;   :timeout-sec     override `anvil-http-timeout-sec'
+  ;;   ;; cache
+  ;;   :no-cache        skip cache on both read and write when non-nil
+  ;;   :cache-ttl-sec   override `anvil-http-cache-ttl-sec'
+  ;;   :if-newer-than   UNIX-EPOCH-INT, adds If-Modified-Since
+  ;;   ;; efficiency levers (token reduction、§ "Efficiency levers" 参照)
+  ;;   :selector        CSS selector STRING — text/html の時のみ、body を
+  ;;                    libxml + dom で抽出して返す (matched subtree の
+  ;;                    visible text、既定は内部)
+  ;;   :json-path       dotted path STRING (e.g. "items[0].title") —
+  ;;                    application/json の時 server 側で抽出
+  ;;   :body-mode       'full (既定、ただし max-inline-body-bytes 超過時
+  ;;                            は自動 'overflow) / 'head / 'meta-only
+  ;;   :max-inline-body-bytes  override `anvil-http-max-inline-body-bytes'
+  ;;   :header-filter   'minimal (既定) / 'all
+  ;;
+  ;; 戻り値 plist:
+  ;;   (:status 200 :headers PLIST :body STRING
+  ;;    :from-cache BOOL :cached-at FLOAT-TIME
+  ;;    :final-url STRING  ; redirect 後の実 URL
+  ;;    :elapsed-ms INT
+  ;;    ;; overflow 時のみ:
+  ;;    :body-truncated t :total-bytes N :body-sha256 STR
+  ;;    :body-overflow-path "/tmp/anvil-http-XXX"
+  ;;    ;; selector / json-path 使用時のみ:
+  ;;    :extract-applied SYMBOL :extract-miss BOOL)
+
+(anvil-http-head URL &rest ARGS)
+  ;; :body は常に ""、headers + status のみ。liveness / metadata probe 用。
+
+(anvil-http-get-batch URLS &rest ARGS)
+  ;; URLS: list of strings (max `anvil-http-batch-max', 既定 16)
+  ;; ARGS は `anvil-http-get' と同形式、全 URL に適用
+  ;; 戻り値: URLS と同順の response plist リスト
+  ;; 並列度は `anvil-http-batch-concurrency' (既定 4)
+
+(anvil-http-cache-clear &optional URL)
+  ;; URL 省略で http ns 全削除、指定で該当 key のみ。戻り値: 削除件数。
+#+end_src
+
+~anvil-http-post~ は Phase C1.5 に分離 (Review Q4 で議論)。
+
+** Public MCP tools
+
+| id                    | 主要引数                                              | 戻り値                               | 備考                              |
+|-----------------------+-------------------------------------------------------+--------------------------------------+-----------------------------------|
+| ~http-fetch~          | url, selector?, json_path?, body_mode?, no_cache?, if_newer_than?, accept?, timeout_sec?, header_filter? | status, headers, body(+overflow meta) | GET、cache + 抽出 + disk overflow |
+| ~http-fetch-batch~    | urls (array ≤16), ...http-fetch 全 option          | responses (同順 array)               | 並列 4 (defcustom override 可)    |
+| ~http-head~           | url, timeout_sec?                                     | status, headers                      | HEAD、metadata probe              |
+| ~http-cache-clear~    | url?                                                  | removed_count                        | 引数なしなら http ns 全 flush     |
+
+全 tool は body を *文字列として* 返す。JSON 自動 parse はしない
+(Review Q5): raw で返し、抽出が必要なら =json_path= で server 側に寄せる。
+
+** Efficiency levers (Phase C1 MVP で入れる)
+
+本 MCP tool の **最大の存在価値はトークン削減**。以下 5 つを既定動作に
+組み込み、「素朴に URL 投げる → 無駄なく最小 body だけ返る」状態を作る。
+
+*** Lever 1: server-side extract (selector / json-path)
+
+Claude が巨大 HTML / JSON の一部分を見たいだけの時、body 全量を往復
+させるのは純粋な浪費。anvil-http は content-type を見て server 側で
+抽出する:
+
+- =text/html=: primary path は =libxml-parse-html-region= + dom.el で
+  CSS selector を評価し、matched element の visible text を返す。
+  libxml 未搭載ビルド (稀だが Windows の一部) に向けて **regex-subset
+  fallback** を同梱: =tag=, =.class=, =#id=, =tag.class=, =tag#id=
+  レベルを自前で評価して text 抽出。combinator (="a > b"=) や
+  pseudo-class (=:nth-child=) は libxml 必須
+- =application/json=: =json-parse-string= → dotted path walk
+  (e.g. =items[0].title=、=data.results[*].id=)。JMESPath full 実装は
+  Phase C1' 以降。json-parse-string は Emacs 27+ 全 platform で built-in
+- =application/xml= / =text/xml=: libxml あれば同機構、無ければ fallback
+  せず =:extract-miss t= + full body を返す
+- selector が何も match しなかった時: body を full 返し =:extract-miss t=
+  付与 (silently 空返しは罠)
+
+実測期待値: HTML 100KB → selector 適用で 2-5KB、**~20-50x 削減**
+(libxml path)、fallback path は 70-90% 削減 (簡易 parser ゆえ構造情報が
+減るぶん控えめ)。
+
+=anvil-http-enable= 時に =(fboundp 'libxml-parse-html-region)= を
+確認し、無い場合は message で "fallback selector mode (simple)" を告知。
+
+*** Lever 2: body size management (disk overflow)
+
+大量 body を inline で返すと Claude の context が一気に消費される。
+=anvil-http-max-inline-body-bytes= (既定 200KB) 超過時の挙動:
+
+- =:body= には先頭 =anvil-http-overflow-head-bytes= (既定 2KB) のみ
+- 残りは tempfile (=temporary-file-directory=/=anvil-http-SHA-.bin=) に
+  書き出し
+- 戻り値に =:body-truncated t :total-bytes N :body-overflow-path PATH
+  :body-sha256 HEX= を付与
+- 呼び出し元 (Claude) は ~file-read~ tool で offset/limit を使って必要な
+  部分のみ読み直せる (既存 anvil-file と dovetail)
+
+常時 inline 欲しい時は =:body-mode 'full= を明示 (MCP 引数
+=body_mode="full"=)、逆に probe だけしたい時は =:body-mode 'meta-only=
+で body は捨てる。
+
+Phase C1 の cache 層は body 自体を SQLite に入れる (Q1 既定案 A)。
+overflow 発生 body は =SHA:length:overflow_path= のみを state に格納
+し、実体は disk。cache hit 時は overflow path の存在チェック → 無ければ
+再 fetch、という lazy rehydrate。
+
+*** Lever 3: header filter (既定 minimal)
+
+url-http の response headers は 20-40 entries 返ってくるが、LLM が
+typically 必要なのは 5-7 個:
+
+| key                | 用途                                    |
+|--------------------+-----------------------------------------|
+| =content-type=     | 抽出ロジックと encoding 判定            |
+| =content-length=   | 予想サイズ / overflow 判定              |
+| =etag=             | 次回 If-None-Match                      |
+| =last-modified=    | 次回 If-Modified-Since                  |
+| =content-encoding= | gzip 既に decode 済かの可視化           |
+| =location=         | redirect 追跡デバッグ                   |
+| =retry-after=      | 429 時の backoff 判断                   |
+
+=:header-filter 'minimal= (既定) でこの 7 key のみ返す。=:header-filter
+'all= でフル headers。Minimal だけで 1 req あたり ~200-500 bytes 削減、
+塵も積もって batch で効いてくる。
+
+*** Lever 4: batch fetch (http-fetch-batch)
+
+LLM が URL 複数を順次調べる workflow は頻出 (RSS list → 各記事 fetch、
+API index → 各 detail、等)。単純 loop だと:
+
+- N x MCP envelope overhead (~200-400 bytes/ call)
+- N x 往復 latency (Claude roundtrip、概ね 300-500ms/call)
+- cache も N 回 check (同 origin なら keep-alive も逃している)
+
+=http-fetch-batch= で 1 call に畳み込み、内部は url-queue で =anvil-http-
+batch-concurrency= (既定 4) 並列。envelope は 1 つ、cache 共有、ETag
+も独立。URL 上限は =anvil-http-batch-max= (既定 16)。
+
+Emacs 29 の =url-queue-retrieve= は既に存在、concurrency 制御を持つ。
+本体コスト ~50 行。
+
+*** Lever 5: conditional / 304 fast path
+
+既定設計を再掲 + 強調:
+
+- TTL 内 cache hit → body も含めて **0 network** serve
+- TTL 超過 + ETag/Last-Modified あり → =If-None-Match= + =If-Modified-
+  Since= 送信、304 なら *body 転送なし* + cache 再利用
+- cache miss / 200 → 全量転送 → cache 書き込み
+
+**304 時の body** は Claude には従来通り返す (cache から)。完全な
+metadata-only revalidation が欲しいケースは =:body-mode 'meta-only=
+で明示。
+
+*** 効率の合計目安 (期待値)
+
+| シナリオ                              | 削減ソース                                     | 体感    |
+|---------------------------------------+------------------------------------------------+---------|
+| 同 URL 5 分以内再 fetch               | TTL hit                                        | 100%    |
+| ETag ありサイトの 1 日 polling        | 304 body skip                                  | ~99%    |
+| 巨大 HTML から 1 section              | selector extract                               | 90-98%  |
+| 巨大 JSON から 1 field                | json-path extract                              | 95-99%  |
+| 200KB+ body 全読み                    | overflow + file-read offset                    | 90% (初回 inline 分のみ) |
+| URL 10 件順次 (no cache)              | batch + concurrency=4                          | 遅延 ~4x短縮、envelope -90% |
+
+上記はいずれも "既存 anvil-browser / bash curl 経路比" の粗見積。
+
+** Internal: cache semantics
+
+anvil-state ns = =http=、key = 正規化 URL (lowercase scheme + host、fragment
+除去、query は保持)。
+
+#+begin_src elisp
+;; cache value 形式
+(:status 200
+ :headers PLIST         ; :content-type :content-length :etag :last-modified ...
+ :body "..."            ; RAW STRING。gzip は転送層で展開済み
+ :fetched-at FLOAT-TIME
+ :final-url "..."
+ :etag STRING-OR-NIL
+ :last-modified STRING-OR-NIL)
+#+end_src
+
+*** GET アルゴリズム (pseudo)
+
+#+begin_src
+entry = state-get ns=http key=norm-url
+if entry and not :no-cache:
+  if (now - entry.fetched-at) < cache-ttl:
+    return entry with :from-cache t          ; fresh serve
+  else:
+    req = GET url
+    if entry.etag:       req.headers += If-None-Match: entry.etag
+    if entry.last-modified: req.headers += If-Modified-Since: entry.last-modified
+    resp = do-request(req)
+    if resp.status == 304:
+      entry.fetched-at = now                 ; revalidate-only
+      state-set entry
+      return entry with :from-cache t
+    if resp.status == 200:
+      new-entry = build-entry(resp)
+      state-set ns=http key=norm-url new-entry
+      return new-entry with :from-cache nil
+    ; 4xx/5xx → エラー、cache 据え置き
+else:
+  resp = do-request(GET url)
+  if resp.status == 200:
+    state-set ... new-entry
+  return new-entry with :from-cache nil
+#+end_src
+
+*** 304 Not Modified の扱い
+
+- body は cache のものを返す
+- headers は cache + 新 response headers を shallow merge (Date 等の
+  揮発 header は新側優先)
+- =:from-cache t= 付与、=:fetched-at= は更新 (TTL 延長)
+
+*** cache eviction
+
+- TTL は lazy (anvil-state 既定動作と同じ)
+- =anvil-http-cache-clear= で明示 flush
+- 自動 LRU / size limit は Phase C1 MVP では入れない (Review Q7 候補、
+  body が大量に積もったら必要)
+
+** robots.txt
+
+=anvil-http-respect-robots-txt= が non-nil (既定) の時:
+
+1. 対象 URL の origin から =/robots.txt= を取得 (anvil-http 自身で GET、
+   ただし robots.txt 自身に対しては再帰的 robots.txt check を skip)
+2. robots.txt は anvil-state ns =http-robots=、TTL 24h で cache
+3. RFC 9309 パーサで User-Agent (anvil-http-user-agent の product token) 向けの
+   Allow/Disallow を評価
+4. Disallow hit → =user-error "anvil-http: %s is Disallowed for %s by robots.txt"=
+5. parse 失敗 / robots.txt 自体が 404 → permissive (fail open)
+
+parser は既存 Emacs にないので小さな自前実装 (Phase 1 実装時に 50 行
+程度見込み)。
+
+** redirect
+
+- =url-max-redirections= を呼び出し毎に =let= で 5 に絞る (既定 30 は多すぎ)
+- redirect 後の URL を =:final-url= で返す
+- cache key は *元 URL* を使う (同 origin の redirect が cache を汚さない)
+
+** charset / encoding
+
+- =Content-Type: */*; charset=XXX= を最優先
+- 無ければ =text/html= の場合のみ body 先頭 4KB から HTML5
+  =<meta charset>= を検出
+- それ以外は UTF-8 仮定 → decode 失敗時 =:encoding-warning= を headers に足す
+
+body は常に *Emacs 内部表現の文字列* として返す (multibyte)。バイナリ
+(image など) は Phase C1 MVP では想定しない — =http-head= で content-type
+を事前確認し、binary なら別手段 (=http-download-to-file=、Phase C1.5) に
+回す。
+
+** timeout / retry
+
+- transport timeout: =anvil-http-timeout-sec= 既定 30s
+- retry 対象: network error, 5xx, 408, 429
+- retry なし: 4xx (429 除く), 3xx (redirect は url-http が自前で処理)
+- backoff: =base-ms * (2 ^ attempt)=、jitter なし (簡素、将来入れる)
+- 429 の =Retry-After= header を尊重 (秒数 or HTTP-date 両対応)
+
+** concurrency
+
+- 1 call ごとに url-retrieve を sync で spawn
+- url-retrieve は内部で =accept-process-output= を呼ぶため *他 MCP
+  request の処理は継続可能* (memory =feedback_emacs_server_concurrency_model.md=
+  参照、yield point あり)
+- ただし main daemon が tight loop 中だと詰まる。長時間 fetch は Phase
+  C1' で anvil-offload 経由 (=:offload t= 引数) に出す設計 (本 MVP 非対象)
+
+** 認証 / headers
+
+Phase C1 MVP では =:headers= で任意 header を足せる I/F のみ provide:
+
+#+begin_src elisp
+(anvil-http-get "https://api.example.com/v1/foo"
+                :headers '(("Authorization" . "Bearer ...")
+                           ("X-Api-Key"    . "...")))
+#+end_src
+
+Bearer / Basic helper や auth-source 連携は Phase C1' 候補。
+
+* Non-goals (Phase C1)
+
+- *WebSocket / SSE / HTTP/3* — url-http は 1.1 のみ、本 scope 外
+- *大容量 download* (>数 MB) の in-memory body — Phase C1.5 で
+  =http-download-to-file= として分離 (disk-first)
+- *Cookie jar* — Claude in Chrome / anvil-browser の session 機能に委譲
+- *JSON schema validation* — anvil-validate (Phase E) に委譲
+- *OAuth2 flow* — browser-assisted 認証は anvil-browser、server-side
+  flow は init.org composition
+- *MIME multipart POST* — Phase C1.5+
+- *CLI (shell) からの利用* — anvil は MCP tool server。CLI が欲しければ
+  =curl= を使う
+- *proxy 設定 UI* — =url-proxy-services= (built-in) を尊重、docstring で案内
+- *binary response* — =:body= は text 前提、binary は content-type で
+  早期 refuse
+
+* Migration / Backward Compatibility
+
+- 新規モジュール。既存 tool 挙動変更なし
+- =anvil-optional-modules= に =http= を追加、=anvil-enable= で有効化
+- 既存の anvil-browser は Phase C1 完了後も in-memory cache のまま
+  並立 (browser は JS rendering 必須 path 用)。anvil-http が Reddit
+  =.json= / 公開 REST 用の速い経路を提供する棲み分け
+
+* Risks
+
+- *url-retrieve の subtle bug*
+  → Emacs 29 以降に絞る (Doc 08 と同方針)。28.2 は非対応
+- *robots.txt 解釈の protocol-compliance*
+  → RFC 9309 の Allow/Disallow 優先度 + wildcard 扱いを test で固定。
+    parse 失敗は fail open
+- *redirect を悪用した SSRF/内部網到達*
+  → scheme 制限 (http/https のみ)、=127.0.0.1= / =localhost= / RFC1918
+    は defcustom =anvil-http-allow-private-hosts= (既定 =t= だが、
+    docstring で「公開自動化 context では nil 推奨」を明示)
+- *gzip / brotli decode*
+  → url-http は gzip 自動 decode。brotli は Emacs built-in 未対応 →
+    =Accept-Encoding: gzip, deflate= のみ送る
+- *libxml 欠損ビルド (稀な Windows カスタム build)*
+  → enable 時に =fboundp 'libxml-parse-html-region= を check、無ければ
+    message + regex-subset fallback。selector 精度は下がるが crash なし。
+    =anvil-http-status= に mode 表示
+- *DNS / TLS エラーの分類*
+  → anvil-server-tool-error にマップ、エラーメッセージに URL/phase を含める
+- *cache が SQLite に膨れる*
+  → body が毎回 100KB+ だと 1 day で MB 単位増殖。Phase 後半で
+    =anvil-http-cache-max-bytes= + LRU を Review Q7 で検討
+
+* Platform Notes
+
+** Windows
+
+- proxy 設定は =url-proxy-services= 経由、Emacs が MSYS でも native でも
+  同じ形式
+- TLS は url が gnutls / openssl を呼ぶ。Emacs 29 Windows 公式 build は
+  gnutls 同梱、HTTPS は問題なし。証明書 chain は OS 側 trust store を参照
+- *libxml* は Emacs 26 以降 Windows 公式 binary にも同梱されており、
+  通常 =libxml-parse-html-region= が動く。MSYS2 mingw64 で自前 build
+  した Emacs 等 libxml 無しの場合は Lever 1 の fallback selector (tag /
+  .class / #id) に自動切替。=M-x anvil-http-status= で mode を可視化
+- overflow の tempfile path は =temporary-file-directory= (native 側
+  =%TEMP%= / MSYS 側 =/tmp=) に作成。anvil-file は両 path を扱えるため
+  後続の =file-read= 連携で path 変換は不要
+
+** macOS / Linux
+
+- 特記なし
+
+* Success Metrics
+
+軸 1: *機能* (Reddit / Maxun / ETag)
+
+- Reddit =.json= を 1 call で取得 (現状 anvil-browser 経由で 0 成功)
+- 同 URL を 2 回 fetch した時 304 経路で body 0B wire 転送確認
+- Maxun REST endpoint を =http-fetch= で叩いて JSON 取得
+
+軸 2: *トークン効率* (本 doc の目玉、実測目標値)
+
+- selector 付き HTML fetch: body 全量比 **80% 以上削減**
+  (jmatsuzaki.com 約 16KB → selector "article" で 3KB 想定)
+- json-path 付き JSON fetch: body 全量比 **95% 以上削減**
+  (typical REST list → item 1 field)
+- batch fetch 10 URLs: 単発 loop 比 MCP envelope overhead **80% 削減**
+- 200KB+ body overflow: Claude context に流入する bytes **90% 以上削減**
+  (= overflow_head=2KB のみ inline)
+- header-filter minimal: 1 response あたり headers 表現 **50% 以上削減**
+
+軸 3: *latency / スループット*
+
+- batch concurrency=4 で 10 URL 直列比 **3x 以上高速化** (ネットワーク
+  律速が前提)
+- TTL cache hit 時 1 call あたり 2ms 未満 (10,000 entry bench)
+
+* Review Questions (RESOLVED 2026-04-18)
+
+初回レビューですべて既定案を採用 (+ Windows libxml fallback 追加):
+
+- [X] *Q1: body を state に cache するか、validators のみか?* →
+  **body も cache (TTL 300s)**。daemon 再起動跨ぎで 304 経路が効く。
+  cache 膨張は Q7 の Phase C1' LRU で対処
+- [X] *Q2: robots.txt 既定有効 / 無効?* → **有効 (opt-out)**。
+  anvil は公開 package、LLM 自動 fetch context だからこそ default on
+- [X] *Q3: sync-only / offload 併用?* → **Phase C1 sync のみ**、
+  Phase 2 で =:offload t= 引数追加
+- [X] *Q4: POST support* → **Phase C1.5 で別立て**。Phase C1 は
+  GET/HEAD に集中して API 型を固める
+- [X] *Q5: content-type aware body parse (JSON auto-parse)?* →
+  **raw string + server-side extract (=json_path=)**。全量 auto-parse
+  は LLM 側の表現自由度を奪う。抽出が欲しい時は json-path で明示
+- [X] *Q6: user-agent string の既定値* → =anvil.el/VERSION (+github)=。
+  override は =anvil-http-user-agent= defcustom。bot-unfriendly サイト
+  向け spoofing はユーザー自身の判断で
+- [X] *Q7: cache サイズ上限 / LRU eviction* → **Phase C1 MVP 無し**、
+  Phase 3 で =anvil-http-cache-max-bytes= + LRU 追加
+- [X] *Q8: server-side extract の parser 範囲* → **libxml primary +
+  regex-subset fallback** (Windows 互換維持)。tag/.class/#id レベルは
+  fallback でも動く。combinator / pseudo-class は libxml 必須。JMESPath
+  / XPath は Phase C1' 以降
+- [X] *Q9: batch fetch の並列度 / URL 上限* → **concurrency=4,
+  batch-max=16**。concurrency は same-origin polite crawler の慣習値、
+  url-http が HTTP/1.1 のみなので 8+ にしても接続効率は伸びない。
+  batch-max は MCP envelope と 1 call の安全率で初期値 16 (必要なら
+  defcustom で上げる)
+- [X] *Q10: body-mode 既定値 / overflow 閾値* → =:body-mode 'full=
+  (ただし =max-inline-body-bytes 200KB= 超過で自動 overflow)。
+  200KB ≈ 50-70K tokens、Claude Opus 1M context の 7% 程度で "1 fetch
+  が context を食い潰さない" 安全ライン。overflow head 2KB ≈ 500-700
+  tokens、"何の body か" 判断できる最小情報量
+
+* Phase 分解
+
+Phase 1 は 5 つの sub-phase に分割し、各 sub-phase 単体で ship 可能な
+粒度に落とす (1 PR = 1 sub-phase、レビューと soak が刻める)。
+
+| Phase | 内容                                                   | 1st user             | 工数 |
+|-------+--------------------------------------------------------+----------------------+------|
+| 1a    | GET/HEAD + state cache + ETag/304 + MCP 登録           | Reddit =.json=       | 中   |
+| 1b    | selector + json-path (libxml primary + regex fallback) | 公開 docs 抽出        | 中   |
+| 1c    | overflow (disk spill + head slice) + header-filter     | 大 HTML 取り込み      | 小   |
+| 1d    | =http-fetch-batch= (url-queue concurrency)             | RSS index 一括        | 小   |
+| 1e    | robots.txt fetcher + RFC 9309 parser                   | 公開 crawler etiquette | 小   |
+| 1.5   | POST + auth headers + retry policy refine              | Maxun REST            | 中   |
+| 2     | =:offload t= 引数で anvil-offload 経由                 | 長時間 fetch          | 小   |
+| 3     | LRU eviction + size cap + metrics instrumentation      | 運用監視              | 中   |
+
+各 sub-phase ship 時 ~make test-all~ + 1 live bench + README の該当節を
+1 PR で流す。Phase 1a 単体でも Reddit =.json= 取得は可能 (selector 無し、
+raw JSON をそのまま Claude が parse) なので、1a だけでも価値を届けられる。
+
+Phase 1b〜1d は *独立に並ぶ* (依存なし)。1a 完了後、体力とユースケース
+優先度で順序を決める。robots.txt (1e) は 1a-1d のどこに挟んでも良いが、
+公開 site へ自動 fetch が増えてくる 1d の前に入れるのが礼儀として自然。
+
+* Implementation Plan (sub-phase 別)
+
+** Phase 1a — Core fetch + cache (所要 2-3 日)
+
+1. =anvil-http.el= スケルトン + =anvil-http-get= 最小実装
+   (url-retrieve-synchronously + timeout + retry + redirect guard +
+    encoding detection)
+2. anvil-state ns="http" cache + ETag / If-None-Match / If-Modified-Since
+3. =anvil-http-head= + =anvil-http-cache-clear=
+4. MCP tool 登録 (=http-fetch= / =http-head= / =http-cache-clear=、この
+   時点の =http-fetch= は selector / batch / overflow なし版)
+5. =anvil-optional-modules= に =http= 追加、enable で libxml 有無を
+   message
+6. ERT 10-14 tests (mock + live httpbin.org / example.com)
+7. README / docstring → PR → ship
+
+ここまでで Reddit =.json= 直叩き / 単純 API 取得 / 公開 docs polling が
+動く。anvil-browser との棲み分けが確立する。
+
+** Phase 1b — Server-side extract (所要 2 日)
+
+1. libxml 判定 helper (=anvil-http--libxml-p=)
+2. =anvil-http--select-html-libxml= (dom.el + matcher)
+3. =anvil-http--select-html-fallback= (regex-subset: tag / .class / #id)
+4. =anvil-http--select-json-dotted= (JSON dotted path walker)
+5. =http-fetch= tool に =selector= / =json_path= 引数追加
+6. ERT +6 (libxml あり/無し分岐、miss ケース含む)
+
+** Phase 1c — Overflow + header filter (所要 1 日)
+
+1. =anvil-http--spill-to-disk= (sha256 base + tempfile)
+2. =:body-mode= 引数 dispatch
+3. =:header-filter 'minimal= default + 'all opt-in
+4. cache に overflow path を保存、cache hit 時の lazy rehydrate
+5. ERT +4 (overflow / head-only / meta-only / filter variants)
+
+** Phase 1d — Batch fetch (所要 1-2 日)
+
+1. =anvil-http-get-batch= + url-queue 並列制御
+2. per-URL cache / ETag 独立
+3. =http-fetch-batch= tool 登録
+4. ERT +4 (直列比較 / concurrency=1 / concurrency=4 / 部分失敗)
+5. bench (10 URL 単発 loop vs batch)
+
+** Phase 1e — robots.txt (所要 1-2 日)
+
+1. robots.txt fetcher (ns=http-robots、TTL 24h)
+2. RFC 9309 parser (Allow / Disallow / User-Agent matching / longest-match
+   rule)
+3. =anvil-http-respect-robots-txt= defcustom hook-in
+4. ERT +5 (parser + fetcher + disallow refuse + fail-open behavior)
+
+合計: Phase 1a-1e で 7-10 日目安 (単一 sub-phase ship + 挟み PR 間隔
+込み)。各 sub-phase 独立に shippable なので本業の合間でも刻める。
+
+* References
+
+- Doc 07 Vision 節 ~anvil-http~ 概要: [[file:07-browser-framework.org][07-browser-framework.org]]
+- Doc 08 anvil-state (本 doc の cache backend): [[file:08-state.org][08-state.org]]
+- Phase A soak で判明した Reddit JS challenge / X login wall:
+  =memory/feedback_anvil_browser_login_antibot_limits.md=
+- Emacs server concurrency / yield 点の限界:
+  =memory/feedback_emacs_server_concurrency_model.md=
+- url-retrieve の挙動: Emacs manual =(info "(url) Retrieving URLs")=
+- RFC 9309 — Robots Exclusion Protocol
+- 既存の異名モジュール (命名衝突ガード): =anvil-net.el= は listening
+  port 調査 (netstat/ss/lsof wrapper)。HTTP fetch は本 =anvil-http= が担当
