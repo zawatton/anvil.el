@@ -731,6 +731,14 @@ Phase 2 adds:
   non-claude provider).  Persistent extra flags go in
   =anvil-orchestrator-aider-extra-args=.
 
+- *Scheduled batches via anvil-cron*.  Register a dispatcher
+  function that calls =anvil-orchestrator-submit=, then schedule
+  it with =anvil-cron-register :time "02:00"= for autonomous
+  overnight runs.  See =examples/nightly-orchestrator.org= for
+  four end-to-end patterns (dispatch-only, dispatch-then-collect,
+  hook-based batch-id logging, multi-provider mix) and the
+  worker-vs-main-daemon trade-off.
+
 Requires Emacs 29+ (via =anvil-state=).
 
 ** Git helpers

@@ -1,0 +1,215 @@
+#+TITLE: Nightly batch dispatch — anvil-cron + anvil-orchestrator
+#+AUTHOR: anvil.el
+
+* Why this example
+
+=anvil-orchestrator= dispatches batches of AI CLI tasks (claude /
+aider / …) but, on its own, relies on an interactive caller to
+submit the batch.  Combine it with =anvil-cron= and you get
+/fire-and-forget/ autonomous batches: schedule dispatch at a fixed
+time, let the tasks run overnight, inspect results in the morning
+via =M-x anvil-orchestrator-dashboard=.
+
+This doc shows four patterns, ordered by increasing ambition.
+
+* Prerequisites
+
+#+begin_src emacs-lisp
+  (require 'anvil-cron)
+  (require 'anvil-orchestrator)
+  (anvil-cron-enable)           ; start the scheduler
+  (anvil-orchestrator-enable)   ; register MCP tools + pump timer
+#+end_src
+
+Both modules persist across daemon restart:
+- =anvil-cron= re-arms its timers from =anvil-cron--tasks= on
+  re-=enable=
+- =anvil-orchestrator= restores queued tasks from =anvil-state=;
+  tasks that were /running/ when the daemon died are marked
+  =failed= with ="daemon restart interrupted"= so nothing is left
+  "stuck"
+
+* Pattern 1 — dispatch-only (simplest)
+
+Cron dispatches a batch and returns immediately.  Tasks run
+asynchronously in the orchestrator pool.  Check the dashboard
+whenever you like.
+
+#+begin_src emacs-lisp
+  (defun my/nightly-lint-wiki ()
+    "Dispatch a small overnight batch to lint the wiki."
+    (anvil-orchestrator-submit
+     '((:name     "lint-wiki"
+        :provider claude
+        :prompt   "Run /lint-wiki skill and fix any broken links you find."
+        :timeout-sec 1800))))
+
+  (anvil-cron-register
+   :id          'nightly-lint
+   :description "Overnight wiki lint via Claude"
+   :time        "02:00"
+   :fn          #'my/nightly-lint-wiki)
+#+end_src
+
+Tomorrow morning:
+
+#+begin_src emacs-lisp
+  (anvil-orchestrator-dashboard)   ; visual inspection
+  ;; or programmatically:
+  (anvil-orchestrator-status <batch-id>)
+#+end_src
+
+* Pattern 2 — dispatch + collect (cron blocks until done)
+
+If you want the cron log to record success/failure, have the
+dispatcher block on =anvil-orchestrator-collect :wait t=:
+
+#+begin_src emacs-lisp
+  (defun my/nightly-lint-and-wait ()
+    "Dispatch + block until the batch completes (or times out)."
+    (let* ((batch (anvil-orchestrator-submit
+                   '((:name     "lint-wiki"
+                      :provider claude
+                      :prompt   "Lint wiki and fix broken links."
+                      :timeout-sec 1800))))
+           (results (anvil-orchestrator-collect
+                     batch :wait t :max-wait-sec 2400)))
+      ;; Return value becomes the cron task's :last-result.
+      (format "%d task(s), %d done, %d failed"
+              (length results)
+              (cl-count 'done results :key (lambda (r) (plist-get r :status)))
+              (cl-count 'failed results :key (lambda (r) (plist-get r :status))))))
+
+  (anvil-cron-register
+   :id   'nightly-lint-sync
+   :time "02:00"
+   :fn   #'my/nightly-lint-and-wait)
+#+end_src
+
+*Trade-off*: a blocking dispatcher holds the cron slot for the
+full duration.  If you have multiple cron jobs, long-running ones
+can delay later jobs.  Prefer Pattern 1 for long batches.
+
+* Pattern 3 — hook-based batch-id logging
+
+Record every dispatched batch-id to a log/notification channel via
+the =anvil-cron-after-run-functions= hook.  This is useful when
+the dispatcher returns the batch-id (Pattern 1 style) and you want
+a durable record of what got launched.
+
+#+begin_src emacs-lisp
+  (defun my/cron-orchestrator-logger (id status result elapsed)
+    "Log orchestrator-producing cron tasks to a dedicated buffer."
+    (when (and (memq id '(nightly-lint nightly-review))
+               (eq status 'ok))
+      (with-current-buffer (get-buffer-create "*nightly-batches*")
+        (goto-char (point-max))
+        (insert (format "[%s] %s → batch=%s (%.1fs)\n"
+                        (format-time-string "%Y-%m-%d %H:%M:%S")
+                        id result elapsed)))))
+
+  (add-hook 'anvil-cron-after-run-functions
+            #'my/cron-orchestrator-logger)
+#+end_src
+
+Next morning you can open =*nightly-batches*= and see every
+batch-id the cron launched — feed those into
+=anvil-orchestrator-collect= to retrieve results.
+
+* Pattern 4 — multi-provider batch (claude + aider mix)
+
+Mix expensive-but-capable =claude= tasks with cheap =aider=
+tasks (OpenAI / Gemini / Ollama via aider middleware) in one
+overnight batch:
+
+#+begin_src emacs-lisp
+  (defun my/nightly-review-batch ()
+    "High-level review via claude, plus cheap secondary scans via aider."
+    (anvil-orchestrator-submit
+     '((:name     "arch-review"
+        :provider claude
+        :prompt   "Read docs/design/10-orchestrator.org and write a 5-bullet
+critique focused on concurrency edge cases."
+        :timeout-sec 1200)
+       (:name     "dep-audit"
+        :provider aider
+        :model    "openai/gpt-4o-mini"
+        :prompt   "Scan Cargo.toml / package.json / requirements.txt for
+dependencies with known CVEs.  Report findings, don't modify files."
+        :read-only-files ("Cargo.toml" "package.json" "requirements.txt")
+        :no-auto-commits t
+        :timeout-sec 900)
+       (:name     "spelling"
+        :provider aider
+        :model    "ollama/qwen2.5-coder"   ; free, local
+        :prompt   "Find obvious spelling / grammar typos in *.md files."
+        :read-only-files ("README.md")
+        :no-auto-commits t
+        :timeout-sec 600))))
+
+  (anvil-cron-register
+   :id   'nightly-review
+   :time "03:00"
+   :fn   #'my/nightly-review-batch)
+#+end_src
+
+=anvil-orchestrator= enforces =anvil-orchestrator-concurrency=
+globally and =anvil-orchestrator-per-provider-concurrency= per
+provider, so the 3 tasks above will not oversubscribe one vendor's
+rate limits.
+
+* Worker vs. main-daemon execution
+
+=anvil-cron= has a defcustom =anvil-cron-use-worker= (default =t=)
+controlling whether =:fn= runs on a worker daemon or in the main
+Emacs process.
+
+For orchestrator dispatchers, *prefer main-daemon execution*:
+
+#+begin_src emacs-lisp
+  ;; Either globally:
+  (setq anvil-cron-use-worker nil)
+
+  ;; Or per-session just before registering:
+  (let ((anvil-cron-use-worker nil))
+    (anvil-cron-register ...))
+#+end_src
+
+Why: the orchestrator's batch hash tables, pump timer, and
+=anvil-orchestrator-dashboard= all live in the main daemon.  A
+worker-side =anvil-orchestrator-submit= would create the batch on
+the worker — invisible to your main-daemon dashboard and
+disconnected from the shared =anvil-state= SQLite DB rows it
+writes.  For simple, short dispatchers there is no benefit to
+worker isolation anyway.
+
+(Long-running collection blocks (Pattern 2) are also fine in the
+main daemon because =anvil-orchestrator-collect :wait t= uses
+=accept-process-output= so the daemon remains responsive.)
+
+* Daemon restart recovery
+
+If the main daemon crashes or restarts between cron fire and batch
+completion:
+
+- =anvil-orchestrator= restores =queued= tasks from =anvil-state=
+  and re-enqueues them on =anvil-orchestrator-enable=
+- =running= tasks become =failed= with
+  ="daemon restart interrupted"= (their processes died with the
+  daemon)
+- The =anvil-cron= task itself will fire again at the next
+  scheduled time
+
+Pattern for durable recovery of running tasks: combine Pattern 2
+(=:wait t=) with =anvil-orchestrator-retry= in a second cron that
+runs a bit later and scans for =failed=-with-restart-reason tasks
+in a known batch-id list.
+
+* See also
+
+- =docs/design/10-orchestrator.org= — full design (Phase 2b:
+  "anvil-cron 連携")
+- =anvil-cron.el= — =anvil-cron-register= signature,
+  =anvil-cron-after-run-functions= hook
+- =anvil-orchestrator.el= — =anvil-orchestrator-submit=,
+  =-collect=, =-status=, =-retry=
