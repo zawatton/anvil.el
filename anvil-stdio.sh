@@ -178,15 +178,20 @@ while read -r line; do
 	# loses its `-print-nonl ' prefix and emacsclient prints it as
 	#   *ERROR*: Unknown message: <tail>
 	# interleaved with the legitimate base64 payload.  Strip those
-	# injection markers AND the trailing `\r' (MSYS emits CRLF per
-	# frame, and GNU `base64 -d' silently truncates at invalid chars)
-	# then rejoin so `base64 -d' sees clean single-line input.
+	# injection markers, then remove ALL CR/LF bytes (frame boundaries
+	# leave CRLF behind; whether awk recognises `\r' in its regex and
+	# whether it auto-strips CR with RS varies across gawk / mawk / MSYS
+	# builds, so do the CR/LF removal outside awk with `tr' for
+	# portability).  Finally decode with --ignore-garbage so any residual
+	# non-base64 bytes (odd whitespace, stray control chars) are tolerated
+	# instead of killing the whole script under `set -e'.
 	# (No-op on Linux/macOS where one frame fits in one read.)
 	base64_response=$(printf '%s' "$base64_response" \
-		| awk 'BEGIN{ORS=""} {sub(/^\*ERROR\*: Unknown message: /, ""); sub(/\r$/, ""); print}')
+		| awk 'BEGIN{ORS=""} {sub(/^\*ERROR\*: Unknown message: /, ""); print}' \
+		| tr -d '\r\n')
 
-	# Decode the base64 content
-	formatted_response=$(echo -n "$base64_response" | base64 -d)
+	# Decode the base64 content (lenient against stray non-base64 bytes)
+	formatted_response=$(echo -n "$base64_response" | base64 -d --ignore-garbage)
 
 	mcp_debug_log "RESPONSE" "$formatted_response"
 
