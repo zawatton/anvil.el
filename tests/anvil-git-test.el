@@ -12,36 +12,28 @@
 (require 'ert)
 (require 'cl-lib)
 (require 'anvil-git)
+(require 'anvil-test-fixtures)
 
 ;;;; --- fixtures -----------------------------------------------------------
 
 (defun anvil-git-test--run (dir &rest args)
-  "Run git ARGS in DIR, silencing stdout/stderr.  Signals on non-zero."
+  "Run git ARGS in DIR, signaling on non-zero exit.
+Kept as a thin wrapper for tests that mutate an existing repo
+(checkout, commit) where the shared fixtures library has no
+equivalent helper."
   (let ((rc (apply #'call-process "git" nil nil nil
                    "-C" dir args)))
     (unless (eql rc 0)
       (error "anvil-git-test: git %s in %s -> exit %s"
              (mapconcat #'identity args " ") dir rc))))
 
-(defun anvil-git-test--make-repo ()
-  "Create a fresh throwaway repo with one commit on branch `main'.
-Returns the absolute directory."
-  (let ((dir (make-temp-file "anvil-git-test-" t)))
-    (anvil-git-test--run dir "init" "-q" "-b" "main")
-    (anvil-git-test--run dir "config" "user.email" "t@test")
-    (anvil-git-test--run dir "config" "user.name"  "test")
-    (anvil-git-test--run dir "config" "commit.gpgsign" "false")
-    (write-region "hello\n" nil (expand-file-name "README" dir))
-    (anvil-git-test--run dir "add" "README")
-    (anvil-git-test--run dir "commit" "-q" "-m" "init")
-    dir))
-
 (defmacro anvil-git-test--with-repo (sym &rest body)
-  "Bind SYM to a fresh repo path, run BODY, then delete the repo."
+  "Bind SYM to a fresh repo path (via shared fixture), run BODY,
+then delete the repo."
   (declare (indent 1))
-  `(let ((,sym (anvil-git-test--make-repo)))
+  `(let ((,sym (anvil-test-fixtures-make-repo)))
      (unwind-protect (progn ,@body)
-       (ignore-errors (delete-directory ,sym t)))))
+       (anvil-test-fixtures-destroy-repo ,sym))))
 
 ;;;; --- repo-root ----------------------------------------------------------
 
@@ -156,26 +148,20 @@ Returns the absolute directory."
 
 ;;;; --- enable / disable round-trip ---------------------------------------
 
-(defun anvil-git-test--tool-ids ()
-  "Return the list of tool ids currently registered on the git server-id."
-  (let ((tbl (anvil-server--get-server-tools anvil-git--server-id))
-        ids)
-    (when (hash-table-p tbl)
-      (maphash (lambda (id _tool) (push id ids)) tbl))
-    ids))
-
 (ert-deftest anvil-git-test-enable-registers-tools ()
   "`anvil-git-enable' makes tools visible; `anvil-git-disable' removes them."
-  ;; Start from a clean slate regardless of prior state.
   (ignore-errors (anvil-git-disable))
   (anvil-git-enable)
   (unwind-protect
-      (let ((ids (anvil-git-test--tool-ids)))
+      (let ((ids (anvil-test-fixtures-registered-tool-ids
+                  anvil-git--server-id)))
         (should (member "git-repo-root"     ids))
         (should (member "git-head-sha"      ids))
         (should (member "git-worktree-list" ids)))
     (anvil-git-disable))
-  (should-not (member "git-repo-root" (anvil-git-test--tool-ids))))
+  (should-not (member "git-repo-root"
+                      (anvil-test-fixtures-registered-tool-ids
+                       anvil-git--server-id))))
 
 (provide 'anvil-git-test)
 ;;; anvil-git-test.el ends here

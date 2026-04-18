@@ -14,6 +14,7 @@
 (require 'json)
 (require 'anvil-state)
 (require 'anvil-orchestrator)
+(require 'anvil-test-fixtures)
 
 ;;;; --- fixtures -----------------------------------------------------------
 
@@ -23,17 +24,15 @@
 
 (defun anvil-orchestrator-test--register-stub (&optional stream-json exit-code)
   "Register / overwrite the `test' provider with STREAM-JSON output.
-EXIT-CODE overrides the sh exit status (default 0)."
-  (let ((payload (or stream-json anvil-orchestrator-test--stream-json))
-        (code    (or exit-code 0)))
+EXIT-CODE overrides the sh exit status (default 0).  The argv is
+built by `anvil-test-fixtures-stub-cmd'."
+  (let ((payload (or stream-json anvil-orchestrator-test--stream-json)))
     (anvil-orchestrator-register-provider
      'test
      :cli "sh"
      :version-check (lambda () t)
      :build-cmd (lambda (_task)
-                  (list "sh" "-c"
-                        (format "printf '%%s\\n' %s; exit %d"
-                                (shell-quote-argument payload) code)))
+                  (anvil-test-fixtures-stub-cmd payload exit-code))
      :parse-output #'anvil-orchestrator--claude-parse-output
      :supports-tool-use             t
      :supports-worktree             nil
@@ -49,33 +48,15 @@ EXIT-CODE overrides the sh exit status (default 0)."
    :cli "sh"
    :version-check (lambda () t)
    :build-cmd (lambda (_task)
-                (list "sh" "-c"
-                      (format "sleep %s; printf '%%s\\n' %s"
-                              (number-to-string sleep-sec)
-                              (shell-quote-argument
-                               anvil-orchestrator-test--stream-json))))
+                (anvil-test-fixtures-sleep-stub-cmd
+                 sleep-sec anvil-orchestrator-test--stream-json))
    :parse-output #'anvil-orchestrator--claude-parse-output
    :default-model "slow"))
 
-(defun anvil-orchestrator-test--teardown-processes ()
-  "SIGKILL every process in the running table and wait briefly for exit.
-Keeps per-test state deterministic — without this, a long-lived
-stub subprocess can fire its sentinel after the fixture has
-already deleted the work-dir, which pollutes later tests."
-  (maphash
-   (lambda (_id proc)
-     (when (process-live-p proc)
-       ;; Mark as cancelled so finalize doesn't queue a retry.
-       (process-put proc 'anvil-cancel-reason 'cancelled)
-       (ignore-errors (signal-process proc 'SIGKILL))))
-   anvil-orchestrator--running)
-  (let ((deadline (+ (float-time) 2.0)))
-    (while (and (> (hash-table-count anvil-orchestrator--running) 0)
-                (< (float-time) deadline))
-      (accept-process-output nil 0.05))))
-
 (defmacro anvil-orchestrator-test--with-fresh (&rest body)
-  "Run BODY inside a freshly initialised orchestrator + state DB."
+  "Run BODY inside a freshly initialised orchestrator + state DB.
+Uses `anvil-test-fixtures-kill-processes' to SIGKILL any stub
+subprocess left behind by BODY before removing the work dir."
   (declare (indent 0))
   `(let ((anvil-state-db-path (make-temp-file "anvil-orch-st-" nil ".db"))
          (anvil-state--db nil)
@@ -93,7 +74,8 @@ already deleted the work-dir, which pollutes later tests."
            (anvil-orchestrator-test--register-stub)
            ,@body)
        (anvil-orchestrator--cancel-pump-timer)
-       (anvil-orchestrator-test--teardown-processes)
+       (anvil-test-fixtures-kill-processes
+        anvil-orchestrator--running)
        (anvil-state-disable)
        (ignore-errors (delete-file anvil-state-db-path))
        (ignore-errors
@@ -385,18 +367,9 @@ already deleted the work-dir, which pollutes later tests."
                  (anvil-orchestrator--worktree-name-for
                   (list :name "foo/bar baz")))))
 
-(defun anvil-orchestrator-test--make-repo ()
-  "Create a tiny disposable git repo and return its absolute path."
-  (let ((dir (make-temp-file "anvil-orch-repo-" t)))
-    (let ((default-directory (file-name-as-directory dir)))
-      (with-temp-buffer
-        (call-process "git" nil nil nil "init" "-q")
-        (call-process "git" nil nil nil "config" "user.email" "t@test")
-        (call-process "git" nil nil nil "config" "user.name"  "test")
-        (write-region "hi\n" nil (expand-file-name "README" dir))
-        (call-process "git" nil nil nil "add" "README")
-        (call-process "git" nil nil nil "commit" "-q" "-m" "init")))
-    dir))
+(defalias 'anvil-orchestrator-test--make-repo
+  'anvil-test-fixtures-make-repo
+  "Use the shared test fixture helper.")
 
 ;;;; --- Phase 1b: :depends-on DAG -----------------------------------------
 
