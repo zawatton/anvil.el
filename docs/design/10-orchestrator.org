@@ -4,9 +4,15 @@
 #+property: status DRAFT
 
 * STATUS
-~APPROVED~ (2026-04-18) — Review Questions Q1-Q12 すべて resolved
-(Q4/Q7 は subscription 前提で調整)。Phase 1a 着手可能。anvil-http
-(Doc 09) の後に続く上位レイヤー。
+~Phase 1a SHIPPED~ (2026-04-18) — =anvil-orchestrator.el= +
+=tests/anvil-orchestrator-test.el= (18 pass / 1 live skipped) +
+README section + =anvil-optional-modules= entry。byte-compile clean。
+Phase 1a scope に含まれる全項目 (provider abstraction、claude
+provider、spawn + sentinel + timeout、pool + concurrency cap、state
+persist + restore、5 MCP tools、dashboard) を実装完了。
+
+Phase 1b-4 は design 残し、着手順は batch 進捗を見てから。Review
+Questions Q1-Q12 resolved 状態キープ。
 
 * Goal
 

@@ -501,6 +501,7 @@ budget goes to reasoning about your code, not re-reading it.
 | =browser=    | Web fetch / interact / capture / screenshot via agent-browser (opt.) | agent-browser CLI |
 | =state=      | Persistent SQLite-backed KV store (ns / TTL, opt.) | Emacs 29+        |
 | =http=       | GET/HEAD with ETag/TTL cache via `url-retrieve' (opt.) | Emacs 29+ (state) |
+| =orchestrator= | Parallel AI CLI dispatcher (claude today) with concurrency cap + state-persisted queue + dashboard (opt.) | claude CLI, Emacs 29+ |
 
 * Quick Start
 
@@ -649,6 +650,45 @@ are served from the in-memory cache.
 On Windows, the agent-browser Rust binary is occasionally flagged
 by Defender; whitelist =%APPDATA%\npm\node_modules\agent-browser\bin\=
 if you hit that.
+
+** Orchestrator module (optional)
+
+The =orchestrator= module spawns several agentic AI CLI subprocesses
+in parallel and exposes a terse submit / status / collect API, so the
+parent Claude session only spends context on task ids and final
+summaries — not on the intermediate tool calls each sub-task makes.
+
+Add =orchestrator= to =anvil-optional-modules=.  The registered tools
+are:
+
+- =orchestrator-submit= — queue a batch of tasks (JSON array); each
+  task is a plist with =name=, =provider=, =prompt= (plus optional
+  =model=, =budget_usd=, =timeout_sec=, …).  Returns a batch id
+  without blocking.
+- =orchestrator-status= — return counts + slim per-task plist for a
+  batch (or a single task).
+- =orchestrator-collect= — return the list of slim task results for a
+  batch; with =wait="t"= blocks until every task is terminal.
+- =orchestrator-cancel= — SIGTERM / SIGKILL a running or queued task.
+- =orchestrator-retry= — re-submit a task under a new id.
+
+Phase 1a ships one provider: =claude= (hard dependency on the
+=claude= CLI on =exec-path=).  aider / gemini / ollama adapters land
+in Phase 2+.  Concurrency caps (=anvil-orchestrator-concurrency=,
+=anvil-orchestrator-per-provider-concurrency=) protect against
+draining a Claude MAX plan's 5-hour window; the default is 3 global
+and 3 per-provider.
+
+=M-x anvil-orchestrator-dashboard= opens a =tabulated-list= view of
+every task: keys =g= refresh, =RET= open stdout file, =k= cancel,
+=r= retry.
+
+Task state is persisted to =anvil-state= (ns=orchestrator) so the
+queue survives a daemon restart.  Running tasks at shutdown are
+marked =failed= with a clear error on reload, since the OS pids no
+longer belong to Emacs.
+
+Requires Emacs 29+ (via =anvil-state=).
 
 * Client setup — connecting your AI to Anvil
 

@@ -90,7 +90,11 @@ These are not loaded by default.  Available modules:
                 (ns / TTL / Lisp prin1 values, requires Emacs 29+,
                 Doc 08 Phase 1)
 - `http'      — HTTP client via `url-retrieve-synchronously' with a
-                state-backed ETag/TTL cache (Doc 09 Phase 1a)"
+                state-backed ETag/TTL cache (Doc 09 Phase 1a)
+- `orchestrator' — Parallel AI CLI dispatcher (claude today, more
+                   providers in Phase 2+) with concurrency-capped
+                   queue, state-persisted status, and a
+                   tabulated-list dashboard (Doc 10 Phase 1a)"
   :type '(repeat symbol)
   :group 'anvil)
 
