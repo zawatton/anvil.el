@@ -501,6 +501,7 @@ budget goes to reasoning about your code, not re-reading it.
 | =browser=    | Web fetch / interact / capture / screenshot via agent-browser (opt.) | agent-browser CLI |
 | =state=      | Persistent SQLite-backed KV store (ns / TTL, opt.) | Emacs 29+        |
 | =http=       | GET/HEAD with ETag/TTL cache via `url-retrieve' (opt.) | Emacs 29+ (state) |
+| =orchestrator= | Parallel AI CLI dispatcher (claude today) with concurrency cap + state-persisted queue + dashboard (opt.) | claude CLI, Emacs 29+ |
 
 * Quick Start
 
@@ -649,6 +650,115 @@ are served from the in-memory cache.
 On Windows, the agent-browser Rust binary is occasionally flagged
 by Defender; whitelist =%APPDATA%\npm\node_modules\agent-browser\bin\=
 if you hit that.
+
+** Orchestrator module (optional)
+
+The =orchestrator= module spawns several agentic AI CLI subprocesses
+in parallel and exposes a terse submit / status / collect API, so the
+parent Claude session only spends context on task ids and final
+summaries — not on the intermediate tool calls each sub-task makes.
+
+Add =orchestrator= to =anvil-optional-modules=.  The registered tools
+are:
+
+- =orchestrator-submit= — queue a batch of tasks (JSON array); each
+  task is a plist with =name=, =provider=, =prompt= (plus optional
+  =model=, =budget_usd=, =timeout_sec=, …).  Returns a batch id
+  without blocking.
+- =orchestrator-status= — return counts + slim per-task plist for a
+  batch (or a single task).
+- =orchestrator-collect= — return the list of slim task results for a
+  batch; with =wait="t"= blocks until every task is terminal.
+- =orchestrator-cancel= — SIGTERM / SIGKILL a running or queued task.
+- =orchestrator-retry= — re-submit a task under a new id.
+
+Phase 1a ships the =claude= provider (hard dependency on the
+=claude= CLI on =exec-path=).  Phase 2 adds the =aider= provider —
+use =:provider 'aider= with =:model "<vendor>/<model>"= (e.g.
+=openai/gpt-4o-mini=, =anthropic/claude-3-5-sonnet-latest=,
+=gemini/gemini-2.0-flash=, =ollama/llama3=) to route a single
+=aider --message= shot through the multi-vendor aider CLI.
+gemini / ollama native adapters land in Phase 3+.  Concurrency caps
+(=anvil-orchestrator-concurrency=,
+=anvil-orchestrator-per-provider-concurrency=) protect against
+draining a Claude MAX plan's 5-hour window; the default is 3 global
+and 3 per-provider.
+
+=M-x anvil-orchestrator-dashboard= opens a =tabulated-list= view of
+every task: keys =g= refresh, =RET= open stdout file, =k= cancel,
+=r= retry.
+
+Task state is persisted to =anvil-state= (ns=orchestrator) so the
+queue survives a daemon restart.  Running tasks at shutdown are
+marked =failed= with a clear error on reload, since the OS pids no
+longer belong to Emacs.
+
+Phase 1b adds:
+
+- *Git worktree isolation*.  When a task's =:cwd= is inside a git
+  repo and =anvil-orchestrator-worktree-auto= is on (default), the
+  claude provider receives =--worktree NAME= so N parallel tasks
+  never stomp on the same working tree.  Providers without native
+  worktree support fall back to an =anvil-git worktree add= under
+  =anvil-orchestrator-work-dir/worktrees/=; =:cwd= is rewritten to
+  that path before spawn.  Opt out per task with =:no-worktree t=.
+- *DAG scheduling*.  A task may name sibling-in-batch dependencies
+  via =:depends-on ("other-name" …)=.  The pool only starts a task
+  once every dep has reached =done=; if any dep =failed= or
+  =cancelled=, dependents are flipped to =failed= with a
+  "dependency X did not succeed" error.  Batch-level cycle and
+  unknown-name detection happens at submit time.
+- *stdout / stderr overflow*.  Per-task output files over
+  =anvil-orchestrator-output-size-cap= (default 1 MB) are rewritten
+  as =head 256 KB= + truncation marker + =tail 256 KB=; the
+  original byte count survives on the task record as
+  =:stdout-bytes-original= so the dashboard and the parent session
+  can see that a log was slimmed down.
+
+Phase 2 adds:
+
+- *aider provider*.  =:provider 'aider= routes the prompt through
+  =aider --message --yes-always --no-stream --no-check-update= with
+  the target model selected by =:model=.  Optional task fields:
+  =:files= (positional args aider is allowed to edit),
+  =:read-only-files= (become =--read FILE= pairs),
+  =:subtree-only=, =:no-auto-commits=.  The parser extracts the
+  last =Commit <sha>= line into =:commit-sha= and the trailing
+  non-diff paragraph into =:summary=.  Since aider has no native
+  worktree flag, anvil creates a =git worktree add= under
+  =anvil-orchestrator-work-dir/worktrees/= and rewrites =:cwd=
+  before spawn (same fallback path Phase 1b uses for every
+  non-claude provider).  Persistent extra flags go in
+  =anvil-orchestrator-aider-extra-args=.
+
+Requires Emacs 29+ (via =anvil-state=).
+
+** Git helpers
+
+The =git= module is part of the default =anvil-modules= list.  It
+exposes read-only git inspection tools under the shared
+=emacs-eval= server id:
+
+- =git-repo-root= — top-level directory for a path, nil outside
+  a repo.
+- =git-head-sha= — full or abbreviated HEAD commit.
+- =git-branch-current= — current branch name, nil for detached.
+- =git-log= — recent commits as =(hash, date, author, subject)=
+  objects, capped at =anvil-git-log-default-count=.
+- =git-diff-names= — paths changed between FROM and TO.
+- =git-diff-stats= — structured =(files, insertions, deletions)=
+  counts.
+- =git-status= — branch / upstream / ahead / behind + buckets of
+  staged / modified / untracked / unmerged paths.
+- =git-worktree-list= — attached worktrees with =(path, head,
+  branch, bare, detached)=.
+
+The Elisp API adds =anvil-git-worktree-add= and
+=anvil-git-worktree-remove= (write operations, deliberately not
+exposed via MCP — =anvil-orchestrator= uses them to isolate
+parallel tasks).  Every call runs =git --no-pager -c
+core.quotepath=false ...= so Japanese paths round-trip cleanly
+and pager-configured repos don't leak terminal escapes.
 
 * Client setup — connecting your AI to Anvil
 

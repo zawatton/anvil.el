@@ -77,7 +77,19 @@ Returns (EXIT STDOUT STDERR). Errors on timeout."
                  :buffer stdout-buf
                  :stderr stderr-buf
                  :noquery t
+                 ;; Emacs' default process sentinel writes a
+                 ;; "Process NAME finished" status line into the
+                 ;; process buffer on exit, which then shows up in
+                 ;; the captured stdout.  Silence it so callers can
+                 ;; `string-trim' :stdout and get the actual bytes.
+                 :sentinel #'ignore
                  :command (list shell-file-name shell-command-switch command)))
+          ;; `make-process' wraps the :stderr buffer in a pipe process
+          ;; whose default sentinel ALSO writes a status line.  Nuke
+          ;; that too.
+          (let ((stderr-proc (get-buffer-process stderr-buf)))
+            (when (processp stderr-proc)
+              (set-process-sentinel stderr-proc #'ignore)))
           (let ((deadline (+ (float-time) timeout)))
             (while (and (process-live-p proc)
                         (< (float-time) deadline))

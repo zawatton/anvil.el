@@ -27,14 +27,20 @@
 (require 'cl-lib)
 (require 'subr-x)
 (require 'anvil-host)
+(require 'anvil-server)
+
+(defconst anvil-git--server-id "emacs-eval"
+  "MCP server id that git-* tools register under.")
 
 ;;;; --- internal: shell wrapper --------------------------------------------
 
 (defun anvil-git--run (args repo &optional opts)
   "Run `git -c core.quotepath=false ARGS' in REPO. Returns anvil-shell plist.
 ARGS is a single string already shell-quoted by the caller. OPTS is
-merged into the anvil-shell call (cwd is forced to REPO if non-nil)."
-  (let* ((cmd (concat "git -c core.quotepath=false " args))
+merged into the anvil-shell call (cwd is forced to REPO if non-nil).
+`--no-pager' is added unconditionally so pager-configured repos
+never inject terminal escapes into captured stdout."
+  (let* ((cmd (concat "git --no-pager -c core.quotepath=false " args))
          (merged (append (and repo (list :cwd (expand-file-name repo)))
                          (list :coding 'utf-8)
                          opts)))
@@ -293,6 +299,290 @@ OPTS plist:
                               (list :max-output max-out :coding 'utf-8))))
     (anvil-git--check res "diff --staged")
     (plist-get res :stdout)))
+
+;;;; --- anvil-git-repo-root ------------------------------------------------
+
+(defun anvil-git-repo-root (&optional dir)
+  "Return the absolute top-level directory of the git repo for DIR.
+Cheap probe; every worktree / orchestrator helper calls this
+first.  Never signals — returns nil when DIR is not in a repo.
+Behaves identically to `anvil-git-toplevel'; the `repo-root' name
+matches the orchestrator / other-module naming convention."
+  (anvil-git-toplevel dir))
+
+;;;; --- anvil-git-head-sha -------------------------------------------------
+
+(defun anvil-git-head-sha (&optional repo short)
+  "Return the HEAD commit SHA for REPO (default `default-directory').
+SHORT non-nil returns the abbreviated form.  Returns nil when REPO
+has no commits or is not a repo."
+  (let* ((args (if short "rev-parse --short HEAD" "rev-parse HEAD"))
+         (res  (anvil-git--run args repo '(:max-output 4096))))
+    (when (eql (plist-get res :exit) 0)
+      (let ((s (string-trim (plist-get res :stdout))))
+        (and (not (string-empty-p s)) s)))))
+
+;;;; --- anvil-git-branch-current -------------------------------------------
+
+(defun anvil-git-branch-current (&optional repo)
+  "Return the current branch name for REPO, or nil for detached HEAD."
+  (let ((res (anvil-git--run "symbolic-ref --quiet --short HEAD" repo
+                             '(:max-output 4096))))
+    (when (eql (plist-get res :exit) 0)
+      (let ((s (string-trim (plist-get res :stdout))))
+        (and (not (string-empty-p s)) s)))))
+
+;;;; --- anvil-git-diff-names -----------------------------------------------
+
+(defun anvil-git-diff-names (&optional repo from to)
+  "Return paths changed between FROM and TO in REPO as a list.
+FROM and TO default to unstaged-vs-HEAD when both omitted.  Pass
+FROM alone for `git diff FROM' (FROM..worktree); pass both for
+`FROM..TO'."
+  (let* ((args (concat "diff --name-only"
+                       (when from (concat " " (shell-quote-argument from)))
+                       (when to   (concat " " (shell-quote-argument to)))))
+         (res  (anvil-git--run args repo '(:max-output 524288))))
+    (anvil-git--check res "diff --name-only")
+    (split-string (plist-get res :stdout) "\n" t)))
+
+;;;; --- anvil-git-worktree-list --------------------------------------------
+
+(defun anvil-git--parse-worktree-porcelain (output)
+  "Parse `git worktree list --porcelain' OUTPUT into a list of plists.
+Each entry is a normal (:key VAL ...) plist."
+  (let (entries current)
+    (dolist (line (split-string output "\n"))
+      (cond
+       ((string-empty-p line)
+        (when current
+          (push current entries)
+          (setq current nil)))
+       ((string-prefix-p "worktree " line)
+        (setq current (list :path (substring line (length "worktree ")))))
+       ((string-prefix-p "HEAD " line)
+        (when current
+          (setq current (plist-put current :head
+                                   (substring line (length "HEAD "))))))
+       ((string-prefix-p "branch " line)
+        (when current
+          (setq current (plist-put current :branch
+                                   (substring line (length "branch "))))))
+       ((equal line "bare")
+        (when current (setq current (plist-put current :bare t))))
+       ((equal line "detached")
+        (when current (setq current (plist-put current :detached t))))))
+    (when current (push current entries))
+    (nreverse entries)))
+
+(defun anvil-git-worktree-list (&optional repo)
+  "Return the list of worktrees attached to REPO.
+Each entry is a plist (:path :head :branch :bare :detached).
+Bare / detached flags are only present when true."
+  (let ((res (anvil-git--run "worktree list --porcelain" repo
+                             '(:max-output 65536))))
+    (anvil-git--check res "worktree list")
+    (anvil-git--parse-worktree-porcelain (plist-get res :stdout))))
+
+;;;; --- anvil-git-worktree-add / remove (Elisp only) -----------------------
+
+(cl-defun anvil-git-worktree-add (path &optional repo &key ref branch force)
+  "Create a git worktree at PATH in REPO.
+Returns the absolute PATH on success; signals otherwise.
+Keys: :ref (commit-ish to check out, default \"HEAD\"),
+      :branch (create a new branch at REF),
+      :force (pass `--force')."
+  (let* ((target (expand-file-name path))
+         (parent (file-name-directory target))
+         (args (concat "worktree add"
+                       (when force  " --force")
+                       (when branch (concat " -b " (shell-quote-argument branch)))
+                       " " (shell-quote-argument target)
+                       " " (shell-quote-argument (or ref "HEAD")))))
+    (unless (file-directory-p parent) (make-directory parent t))
+    (anvil-git--check (anvil-git--run args repo nil) "worktree add")
+    target))
+
+(cl-defun anvil-git-worktree-remove (path &optional repo &key force)
+  "Remove the worktree at PATH from REPO.  Returns t on success."
+  (let ((args (concat "worktree remove"
+                      (when force " --force")
+                      " " (shell-quote-argument (expand-file-name path)))))
+    (anvil-git--check (anvil-git--run args repo nil) "worktree remove")
+    t))
+
+;;;; --- MCP tool wrappers --------------------------------------------------
+
+(defun anvil-git--tool-repo-root (path)
+  "Return the git repo top-level dir for PATH, or nil.
+
+MCP Parameters:
+  path - Directory or file path inside the repo."
+  (anvil-server-with-error-handling
+   (or (anvil-git-repo-root path) :null)))
+
+(defun anvil-git--tool-head-sha (path &optional short)
+  "Return HEAD SHA for the repo containing PATH.
+
+MCP Parameters:
+  path  - Directory inside the repo.
+  short - Truthy → return the abbreviated SHA."
+  (anvil-server-with-error-handling
+   (or (anvil-git-head-sha path (and short (not (equal short ""))))
+       :null)))
+
+(defun anvil-git--tool-branch-current (path)
+  "Return the current branch for PATH, or nil when detached.
+
+MCP Parameters:
+  path - Directory inside the repo."
+  (anvil-server-with-error-handling
+   (or (anvil-git-branch-current path) :null)))
+
+(defun anvil-git--tool-log (path &optional limit)
+  "Return recent commits for repo at PATH.
+
+MCP Parameters:
+  path  - Directory inside the repo.
+  limit - Max commits to return (integer or numeric string)."
+  (anvil-server-with-error-handling
+   (let ((n (cond ((integerp limit) limit)
+                  ((and (stringp limit)
+                        (string-match "\\`[0-9]+\\'" limit))
+                   (string-to-number limit))
+                  (t nil))))
+     (or (anvil-git-log path n) :empty-array))))
+
+(defun anvil-git--tool-diff-names (path &optional from to)
+  "Return changed paths between FROM and TO in repo at PATH.
+
+MCP Parameters:
+  path - Directory inside the repo.
+  from - Base revision (optional).
+  to   - Target revision (optional)."
+  (anvil-server-with-error-handling
+   (let ((f  (and (stringp from) (not (string-empty-p from)) from))
+         (t* (and (stringp to)   (not (string-empty-p to))   to)))
+     (or (anvil-git-diff-names path f t*) :empty-array))))
+
+(defun anvil-git--tool-diff-stats (path &optional rev)
+  "Return structured diff counts for repo at PATH.
+
+MCP Parameters:
+  path - Directory inside the repo.
+  rev  - Optional revision (e.g. \"HEAD~1\" or \"main..HEAD\")."
+  (anvil-server-with-error-handling
+   (let ((r (and (stringp rev) (not (string-empty-p rev)) rev)))
+     (anvil-git-diff-stats path r))))
+
+(defun anvil-git--tool-status (path)
+  "Return porcelain status + branch info for repo at PATH.
+
+MCP Parameters:
+  path - Directory inside the repo."
+  (anvil-server-with-error-handling
+   (anvil-git-status path)))
+
+(defun anvil-git--tool-worktree-list (path)
+  "Return attached worktrees for repo at PATH.
+
+MCP Parameters:
+  path - Directory inside the repo."
+  (anvil-server-with-error-handling
+   (or (anvil-git-worktree-list path) :empty-array)))
+
+;;;; --- module lifecycle ---------------------------------------------------
+
+(defun anvil-git--register-tools ()
+  "Register git-* MCP tools under `anvil-git--server-id'."
+  (anvil-server-register-tool
+   #'anvil-git--tool-repo-root
+   :id "git-repo-root"
+   :server-id anvil-git--server-id
+   :description
+   "Return the git top-level directory for PATH, or nil when PATH is
+not inside a repository."
+   :read-only t)
+
+  (anvil-server-register-tool
+   #'anvil-git--tool-head-sha
+   :id "git-head-sha"
+   :server-id anvil-git--server-id
+   :description
+   "Return the HEAD commit SHA for the repo containing PATH.  Pass
+short=1 for the abbreviated form."
+   :read-only t)
+
+  (anvil-server-register-tool
+   #'anvil-git--tool-branch-current
+   :id "git-branch-current"
+   :server-id anvil-git--server-id
+   :description
+   "Return the current branch name, or nil when HEAD is detached."
+   :read-only t)
+
+  (anvil-server-register-tool
+   #'anvil-git--tool-log
+   :id "git-log"
+   :server-id anvil-git--server-id
+   :description
+   "Return recent commits as (hash, date, author, subject) plists.
+limit defaults to 20."
+   :read-only t)
+
+  (anvil-server-register-tool
+   #'anvil-git--tool-diff-names
+   :id "git-diff-names"
+   :server-id anvil-git--server-id
+   :description
+   "Return the paths differing between FROM and TO (defaults
+unstaged-vs-HEAD)."
+   :read-only t)
+
+  (anvil-server-register-tool
+   #'anvil-git--tool-diff-stats
+   :id "git-diff-stats"
+   :server-id anvil-git--server-id
+   :description
+   "Return structured diff counts (files, insertions, deletions)
+for REV or unstaged-vs-HEAD."
+   :read-only t)
+
+  (anvil-server-register-tool
+   #'anvil-git--tool-status
+   :id "git-status"
+   :server-id anvil-git--server-id
+   :description
+   "Return porcelain status + branch/upstream/ahead/behind counts
+as one plist.  Buckets: staged / modified / untracked / unmerged."
+   :read-only t)
+
+  (anvil-server-register-tool
+   #'anvil-git--tool-worktree-list
+   :id "git-worktree-list"
+   :server-id anvil-git--server-id
+   :description
+   "Return attached git worktrees as plists (path, head, branch,
+bare, detached)."
+   :read-only t))
+
+(defun anvil-git--unregister-tools ()
+  "Remove every git-* MCP tool from the shared server."
+  (dolist (id '("git-repo-root" "git-head-sha" "git-branch-current"
+                "git-log" "git-diff-names" "git-diff-stats"
+                "git-status" "git-worktree-list"))
+    (anvil-server-unregister-tool id anvil-git--server-id)))
+
+;;;###autoload
+(defun anvil-git-enable ()
+  "Register git-* MCP tools."
+  (interactive)
+  (anvil-git--register-tools))
+
+(defun anvil-git-disable ()
+  "Unregister git-* MCP tools."
+  (interactive)
+  (anvil-git--unregister-tools))
 
 ;;;; --- discoverability ----------------------------------------------------
 
