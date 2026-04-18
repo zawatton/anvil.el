@@ -85,7 +85,10 @@ These are not loaded by default.  Available modules:
                 subprocess (Doc 03 Phase 1)
 - `browser'   — agent-browser CLI wrapper: fetch / interact / capture
                 / screenshot (requires `agent-browser' on PATH,
-                Doc 07 Phase A)"
+                Doc 07 Phase A)
+- `state'     — Persistent SQLite-backed KV store shared across modules
+                (ns / TTL / Lisp prin1 values, requires Emacs 29+,
+                Doc 08 Phase 1)"
   :type '(repeat symbol)
   :group 'anvil)
 

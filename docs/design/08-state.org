@@ -4,8 +4,14 @@
 #+property: status DRAFT
 
 * STATUS
-~APPROVED~ (2026-04-18、初回レビュー完了) — 実装着手可。
-Review Questions 6 件すべて既定案で resolved。Phase 1+2 同梱で ship 予定。
+~Phase 1+2 SHIPPED~ (2026-04-18)
+- Phase 1: ~anvil-state.el~ + ~tests/anvil-state-test.el~ (14/14 pass)
+- Phase 2: anvil-browser cache を ~anvil-state-get/set/delete-ns~ 経由に差替
+  (browser 側 11/11 pass、live example.com 含む)
+- ~anvil-optional-modules~ に ~state~ 登録、README 更新済
+- 残: Phase 3 (offload checkpoint)、Phase 4 (WAL)、Phase 5 (dashboard)
+
+Review Questions 6 件すべて既定案で resolved。
 
 * Goal
 

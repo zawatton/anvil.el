@@ -14,6 +14,7 @@
 (require 'cl-lib)
 (require 'json)
 (require 'anvil-browser)
+(require 'anvil-state)
 
 ;;;; --- fixtures -----------------------------------------------------------
 
@@ -47,23 +48,30 @@ deterministic `:snapshot' string so tests can assert on it."
 
 (defmacro anvil-browser-test--with-stub (&rest body)
   "Run BODY with `anvil-browser--run-batch' replaced by a stub.
-The stub records arguments in
+Also gives each test a fresh `anvil-state' DB so cache entries
+do not leak between runs.  The stub records arguments in
 `anvil-browser-test--last-commands' and returns the fixture from
 `anvil-browser-test--stub-result-for'."
   (declare (indent 0))
   `(let ((anvil-browser-test--last-commands nil)
          (anvil-browser-test--last-session nil)
-         (anvil-browser--cache (make-hash-table :test 'equal))
+         (anvil-state-db-path (make-temp-file "anvil-browser-st-" nil ".db"))
+         (anvil-state--db nil)
          (anvil-browser--metrics (list :fetches 0 :cache-hits 0
                                        :errors 0 :log nil)))
-     (cl-letf (((symbol-function 'anvil-browser--run-batch)
-                (lambda (commands &optional session)
-                  (setq anvil-browser-test--last-commands commands)
-                  (setq anvil-browser-test--last-session session)
-                  (anvil-browser-test--stub-result-for commands)))
-               ((symbol-function 'anvil-browser--cli-path)
-                (lambda () "/stub/agent-browser")))
-       ,@body)))
+     (unwind-protect
+         (progn
+           (anvil-state-enable)
+           (cl-letf (((symbol-function 'anvil-browser--run-batch)
+                      (lambda (commands &optional session)
+                        (setq anvil-browser-test--last-commands commands)
+                        (setq anvil-browser-test--last-session session)
+                        (anvil-browser-test--stub-result-for commands)))
+                     ((symbol-function 'anvil-browser--cli-path)
+                      (lambda () "/stub/agent-browser")))
+             ,@body))
+       (anvil-state-disable)
+       (ignore-errors (delete-file anvil-state-db-path)))))
 
 ;;;; --- browser-fetch ------------------------------------------------------
 
@@ -187,14 +195,20 @@ The stub records arguments in
   "Hit the real CLI against example.com if agent-browser is installed."
   (skip-unless (and (executable-find "agent-browser")
                     (not (getenv "ANVIL_SKIP_LIVE"))))
-  (let ((anvil-browser--cache (make-hash-table :test 'equal))
+  (let ((anvil-state-db-path (make-temp-file "anvil-browser-live-" nil ".db"))
+        (anvil-state--db nil)
         (anvil-browser--metrics (list :fetches 0 :cache-hits 0
                                       :errors 0 :log nil))
         (anvil-browser-cache-ttl-sec 0)
         (anvil-browser-timeout-sec 90))
-    (let ((snap (anvil-browser--tool-fetch "https://example.com")))
-      (should (stringp snap))
-      (should (string-match-p "Example Domain" snap)))))
+    (unwind-protect
+        (progn
+          (anvil-state-enable)
+          (let ((snap (anvil-browser--tool-fetch "https://example.com")))
+            (should (stringp snap))
+            (should (string-match-p "Example Domain" snap))))
+      (anvil-state-disable)
+      (ignore-errors (delete-file anvil-state-db-path)))))
 
 (provide 'anvil-browser-test)
 ;;; anvil-browser-test.el ends here

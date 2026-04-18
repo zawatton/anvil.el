@@ -48,6 +48,7 @@
 (require 'subr-x)
 (require 'json)
 (require 'anvil-server)
+(require 'anvil-state)
 
 ;;;; --- configuration ------------------------------------------------------
 
@@ -121,9 +122,8 @@ rendered string.  The dual-type pattern mirrors
 
 ;;;; --- internal state -----------------------------------------------------
 
-(defvar anvil-browser--cache (make-hash-table :test 'equal)
-  "URL+selector -> (:snapshot TEXT :fetched-at FLOAT-TIME) plist.
-Keys are `anvil-browser--cache-key' strings.")
+(defconst anvil-browser--state-ns "browser"
+  "Namespace used when storing fetched snapshots in `anvil-state'.")
 
 (defvar anvil-browser--metrics
   (list :fetches 0 :cache-hits 0 :errors 0 :log nil)
@@ -143,28 +143,41 @@ Keys are `anvil-browser--cache-key' strings.")
        anvil-browser-cli)))
 
 (defun anvil-browser--cache-key (url selector)
-  "Build the hash-table key for URL + SELECTOR."
+  "Build the `anvil-state' key for URL + SELECTOR.
+Selectors are serialized as `URL\\0SELECTOR' so an empty selector
+produces a distinct key from any non-empty one."
   (format "%s\0%s" url (or selector "")))
 
 (defun anvil-browser--cache-get (url selector)
-  "Return cached snapshot text for URL+SELECTOR or nil when absent or stale."
+  "Return the cached snapshot text for URL+SELECTOR or nil.
+Looks the entry up in `anvil-state' under the \"browser\"
+namespace.  TTL is enforced by `anvil-state' via lazy expiry."
   (when (and (numberp anvil-browser-cache-ttl-sec)
              (> anvil-browser-cache-ttl-sec 0))
-    (let* ((entry (gethash (anvil-browser--cache-key url selector)
-                           anvil-browser--cache)))
-      (when entry
-        (let ((age (- (float-time) (plist-get entry :fetched-at))))
-          (when (<= age anvil-browser-cache-ttl-sec)
-            (plist-get entry :snapshot)))))))
+    (anvil-state-get (anvil-browser--cache-key url selector)
+                     :ns anvil-browser--state-ns)))
 
 (defun anvil-browser--cache-put (url selector snapshot)
-  "Store SNAPSHOT text in the cache under URL+SELECTOR.
+  "Store SNAPSHOT text for URL+SELECTOR with the configured TTL.
 No-op when caching is disabled."
   (when (and (numberp anvil-browser-cache-ttl-sec)
              (> anvil-browser-cache-ttl-sec 0))
-    (puthash (anvil-browser--cache-key url selector)
-             (list :snapshot snapshot :fetched-at (float-time))
-             anvil-browser--cache)))
+    (anvil-state-set (anvil-browser--cache-key url selector)
+                     snapshot
+                     :ns anvil-browser--state-ns
+                     :ttl anvil-browser-cache-ttl-sec)))
+
+(defun anvil-browser--cache-clear ()
+  "Delete every cached browser snapshot from `anvil-state'."
+  (condition-case _err
+      (anvil-state-delete-ns anvil-browser--state-ns)
+    (error 0)))
+
+(defun anvil-browser--cache-count ()
+  "Return the live cached-entry count under the browser namespace."
+  (condition-case _err
+      (anvil-state-count anvil-browser--state-ns)
+    (error 0)))
 
 (defun anvil-browser--metrics-bump (key &optional delta)
   "Increment the counter at KEY in `anvil-browser--metrics' by DELTA (default 1)."
@@ -527,11 +540,11 @@ in-memory fetch cache."
                (accept-process-output proc 0.1))
              (when (process-live-p proc)
                (delete-process proc)))
-           (clrhash anvil-browser--cache)
-           (format "%S"
-                   (list :ok t
-                         :exit (process-exit-status proc)
-                         :cache-cleared t)))
+           (let ((cleared (anvil-browser--cache-clear)))
+             (format "%S"
+                     (list :ok t
+                           :exit (process-exit-status proc)
+                           :cache-cleared cleared))))
        (when (buffer-live-p stdout-buf) (kill-buffer stdout-buf))))))
 
 ;;;; --- status / introspection ---------------------------------------------
@@ -548,7 +561,7 @@ in-memory fetch cache."
     (princ (format "Session   : %s\n" anvil-browser-session-name))
     (princ (format "Cache TTL : %s sec  (entries: %d)\n"
                    anvil-browser-cache-ttl-sec
-                   (hash-table-count anvil-browser--cache)))
+                   (anvil-browser--cache-count)))
     (princ (format "Fetches   : %d   cache-hits: %d   errors: %d\n"
                    (or (plist-get anvil-browser--metrics :fetches) 0)
                    (or (plist-get anvil-browser--metrics :cache-hits) 0)
@@ -620,8 +633,10 @@ fetch cache.  Safe when no sessions exist."))
 (defun anvil-browser-enable ()
   "Register browser-* MCP tools.  Does not spawn a browser session.
 The first call to `browser-fetch' (or kin) lazily launches
-Chrome via agent-browser."
+Chrome via agent-browser.  The snapshot cache is backed by
+`anvil-state', which is opened here."
   (interactive)
+  (anvil-state-enable)
   (anvil-browser--register-tools))
 
 (defun anvil-browser-disable ()
