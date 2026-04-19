@@ -80,6 +80,18 @@ tree-sitter で構造編集する。
 |----+---------------------------------------------+--------+----------+------+-------|
 | 21 | [[file:21-ts-js-edits.org][TS / JS Tree-sitter Edits]]                   | 06     | 大       | 2    | DRAFT |
 
+** Orchestrator Polish (Doc 22–23, DRAFT, 2026-04-19)
+
+Derived from the v1 orchestrator benchmark
+([[file:../../benchmarks/results/report-2026-04-19.org][=report-2026-04-19.org=]]).  Observations drive both: a 14× latency
+gap between providers (routing), and emergent recurring provider
+combinations (presets).
+
+| #  | Doc                                         | 依存   | 想定工数 | Tier | 状態  |
+|----+---------------------------------------------+--------+----------+------+-------|
+| 22 | [[file:22-provider-routing.org][Provider Latency Routing]]                    | 10     | 小       | 2    | DRAFT |
+| 23 | [[file:23-consensus-presets.org][Consensus Presets]]                           | 10, 22 | 小       | 2    | DRAFT |
+
 * Status Legend
 
 各 doc 冒頭の =STATUS= に以下のいずれかを記す:

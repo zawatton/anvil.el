@@ -69,9 +69,15 @@ explicitly (`let' or `setq') for large nightly batches."
   :group 'anvil-orchestrator)
 
 (defcustom anvil-orchestrator-per-provider-concurrency
-  '((claude . 3) (gemini . 4) (ollama . 2) (aider . 2) (codex . 3))
+  '((claude . 3) (gemini . 4) (ollama . 2) (aider . 2) (codex . 6))
   "Per-provider concurrency cap alist.
-Providers not listed fall back to `anvil-orchestrator-concurrency'."
+Providers not listed fall back to `anvil-orchestrator-concurrency'.
+
+The codex default was raised from 3 to 6 in v0.3.1 after the
+v1 ramp benchmark saw zero 429s at 8 concurrent on ChatGPT Plus
+OAuth (see `benchmarks/results/report-2026-04-19.org').  Users
+on Team / Enterprise plans may want to push higher; Plus users
+who hit throttling can set this back to 3."
   :type '(alist :key-type symbol :value-type integer)
   :group 'anvil-orchestrator)
 
@@ -1007,7 +1013,18 @@ malformed lines so a partial stream does not poison the summary."
   "Hash table id → process object for currently running tasks.")
 
 (defvar anvil-orchestrator--batches (make-hash-table :test 'equal)
-  "Hash table batch-id → list of task-ids in submission order.")
+  "Hash table batch-id → list of task-ids in submission order.
+
+Note: this differs from `anvil-orchestrator--consensus-groups' (which
+stores plists).  Prefer the accessor `anvil-orchestrator--batch-task-ids'
+so callers are decoupled from the storage shape.")
+
+(defun anvil-orchestrator--batch-task-ids (batch-id)
+  "Return the list of task ids that belong to BATCH-ID.
+Nil when BATCH-ID is unknown.  Encapsulates the storage shape of
+`anvil-orchestrator--batches' so callers do not have to know it
+is a raw list today (see Doc 12 follow-up for a plist migration)."
+  (gethash batch-id anvil-orchestrator--batches))
 
 (defvar anvil-orchestrator--pump-timer nil
   "Timer running the pool pump + timeout scan.")
@@ -2333,6 +2350,51 @@ Errors when no judge has been submitted for the consensus."
       (user-error "orchestrator-submit: tasks JSON must parse to an array"))
     parsed))
 
+;;;; --- JSON helpers for MCP wrapping --------------------------------------
+
+(defun anvil-orchestrator--plist-p (x)
+  "Return non-nil when X is a plist (keyword-keyed list)."
+  (and (consp x) (keywordp (car x))))
+
+(defun anvil-orchestrator--to-json-value (x)
+  "Recursively convert X into a value that `json-encode' renders sensibly.
+Plists become alists with symbol keys (leading colon stripped).
+Plain lists of scalars become vectors so they emit as JSON arrays."
+  (cond
+   ((or (null x) (eq x t) (numberp x)) x)
+   ((stringp x) x)
+   ((keywordp x) (substring (symbol-name x) 1))
+   ((symbolp x) (symbol-name x))
+   ((vectorp x)
+    (vconcat (mapcar #'anvil-orchestrator--to-json-value x)))
+   ((anvil-orchestrator--plist-p x)
+    (cl-loop for (k v) on x by #'cddr
+             collect (cons (intern (substring (symbol-name k) 1))
+                           (anvil-orchestrator--to-json-value v))))
+   ((listp x)
+    (apply #'vector (mapcar #'anvil-orchestrator--to-json-value x)))
+   (t x)))
+
+(defun anvil-orchestrator--encode-for-mcp (value)
+  "Encode VALUE (plist / list / scalar) as a JSON string for MCP transport.
+Strings and nil pass through unchanged; other shapes round-trip
+through `anvil-orchestrator--to-json-value' then `json-encode'."
+  (cond
+   ((or (null value) (stringp value)) value)
+   (t (json-encode (anvil-orchestrator--to-json-value value)))))
+
+(defun anvil-orchestrator--encode-handler (handler)
+  "Return a wrapper around HANDLER that JSON-encodes its result.
+
+Keeps the underlying tool body returning a rich plist for direct
+Elisp / ERT callers while the MCP transport receives a JSON string.
+HANDLER is called with whatever positional/rest arguments the
+wrapper receives."
+  (lambda (&rest args)
+    (anvil-orchestrator--encode-for-mcp (apply handler args))))
+
+;;;; --- MCP tool wrappers --------------------------------------------------
+
 (defun anvil-orchestrator--tool-submit (tasks)
   "Submit TASKS (JSON array string) and return the batch id.
 
@@ -2346,9 +2408,9 @@ MCP Parameters:
 
 Returns a plist (:batch-id STR :total N)."
   (anvil-server-with-error-handling
-   (let* ((parsed    (anvil-orchestrator--parse-tasks-json tasks))
-          (batch-id  (anvil-orchestrator-submit parsed)))
-     (list :batch-id batch-id :total (length parsed)))))
+    (let* ((parsed    (anvil-orchestrator--parse-tasks-json tasks))
+           (batch-id  (anvil-orchestrator-submit parsed)))
+      (list :batch-id batch-id :total (length parsed)))))
 
 (defun anvil-orchestrator--tool-status (id)
   "Return orchestrator status for task or batch ID.
@@ -3349,7 +3411,7 @@ MCP Parameters:
        :limit  lim))))
 
 (defconst anvil-orchestrator--preamble-tool-specs
-  `((,#'anvil-orchestrator--tool-preamble-set
+  `((,(anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-preamble-set)
      :id "orchestrator-preamble-set"
      :description
      "Register reusable context TEXT under KEY (Phase 7b).  Tasks
@@ -3357,24 +3419,24 @@ referring to the same KEY via :preamble-ref have TEXT prepended
 verbatim to their prompt at submit time, so a common preamble
 (design notes, conventions, daily-ops context) lives in anvil-
 state rather than being re-typed into every prompt.")
-    (,#'anvil-orchestrator--tool-preamble-get
+    (,(anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-preamble-get)
      :id "orchestrator-preamble-get"
      :description
      "Return the preamble text registered under KEY, plus :found
 boolean.  Empty text when KEY is absent."
      :read-only t)
-    (,#'anvil-orchestrator--tool-preamble-list
+    (,(anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-preamble-list)
      :id "orchestrator-preamble-list"
      :description
      "List every registered preamble key and its stored text length.
 Read-only snapshot, sorted by key."
      :read-only t)
-    (,#'anvil-orchestrator--tool-preamble-delete
+    (,(anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-preamble-delete)
      :id "orchestrator-preamble-delete"
      :description
      "Remove the preamble registered under KEY.  Returns
 :deleted t when a row existed, :deleted nil when KEY was absent.")
-    (,#'anvil-orchestrator--tool-preamble-set-from-file
+    (,(anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-preamble-set-from-file)
      :id "orchestrator-preamble-set-from-file"
      :description
      "Register a preamble whose body lives in a file the daemon
@@ -3540,7 +3602,7 @@ cursor line."
 (defun anvil-orchestrator--register-tools ()
   "Register orchestrator-* MCP tools under the emacs-eval server."
   (anvil-server-register-tool
-   #'anvil-orchestrator--tool-submit
+   (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-submit)
    :id "orchestrator-submit"
    :server-id anvil-orchestrator--server-id
    :description
@@ -3553,7 +3615,7 @@ final summaries (<= `anvil-orchestrator-summary-max-chars',
 default 4000) come back by default.")
 
   (anvil-server-register-tool
-   #'anvil-orchestrator--tool-status
+   (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-status)
    :id "orchestrator-status"
    :server-id anvil-orchestrator--server-id
    :description
@@ -3562,7 +3624,7 @@ counts and slim task summaries (no full stdout / prompt)."
    :read-only t)
 
   (anvil-server-register-tool
-   #'anvil-orchestrator--tool-collect
+   (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-collect)
    :id "orchestrator-collect"
    :server-id anvil-orchestrator--server-id
    :description
@@ -3572,7 +3634,7 @@ block until every task reaches a terminal state (done / failed
    :read-only t)
 
   (anvil-server-register-tool
-   #'anvil-orchestrator--tool-cancel
+   (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-cancel)
    :id "orchestrator-cancel"
    :server-id anvil-orchestrator--server-id
    :description
@@ -3580,7 +3642,7 @@ block until every task reaches a terminal state (done / failed
 2s grace).  Already terminal tasks are left alone.")
 
   (anvil-server-register-tool
-   #'anvil-orchestrator--tool-retry
+   (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-retry)
    :id "orchestrator-retry"
    :server-id anvil-orchestrator--server-id
    :description
@@ -3589,7 +3651,7 @@ provider / model).  Useful after a manual cancel or a
 non-auto-retryable failure.")
 
   (anvil-server-register-tool
-   #'anvil-orchestrator--tool-consensus-submit
+   (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-consensus-submit)
    :id "orchestrator-consensus-submit"
    :server-id anvil-orchestrator--server-id
    :description
@@ -3599,7 +3661,7 @@ via `orchestrator-consensus-collect' to get a verdict (unanimous
 / divergent) based on pairwise Jaccard similarity of summaries.")
 
   (anvil-server-register-tool
-   #'anvil-orchestrator--tool-consensus-collect
+   (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-consensus-collect)
    :id "orchestrator-consensus-collect"
    :server-id anvil-orchestrator--server-id
    :description
@@ -3610,7 +3672,7 @@ until every fan-out task reaches a terminal state."
    :read-only t)
 
   (anvil-server-register-tool
-   #'anvil-orchestrator--tool-consensus-judge
+   (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-consensus-judge)
    :id "orchestrator-consensus-judge"
    :server-id anvil-orchestrator--server-id
    :description
@@ -3622,7 +3684,7 @@ Returns the judge-task-id; poll with
 `orchestrator-consensus-judge-collect'.")
 
   (anvil-server-register-tool
-   #'anvil-orchestrator--tool-consensus-judge-collect
+   (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-consensus-judge-collect)
    :id "orchestrator-consensus-judge-collect"
    :server-id anvil-orchestrator--server-id
    :description
@@ -3632,7 +3694,7 @@ state."
    :read-only t)
 
   (anvil-server-register-tool
-   #'anvil-orchestrator--tool-stats
+   (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-stats)
    :id "orchestrator-stats"
    :server-id anvil-orchestrator--server-id
    :description
@@ -3642,7 +3704,7 @@ p50/p95, and total cost-usd sum.  Read-only snapshot."
    :read-only t)
 
   (anvil-server-register-tool
-   #'anvil-orchestrator--tool-extract-result
+   (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-extract-result)
    :id "orchestrator-extract-result"
    :server-id anvil-orchestrator--server-id
    :description
@@ -3655,7 +3717,7 @@ three-tool glue dance (Read stdout-path + python3 json extract
    :read-only t)
 
   (anvil-server-register-tool
-   #'anvil-orchestrator--tool-submit-one
+   (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-submit-one)
    :id "orchestrator-submit-one"
    :server-id anvil-orchestrator--server-id
    :description
@@ -3665,7 +3727,7 @@ pool / retry / budget semantics.  Use orchestrator-submit for
 DAGs, consensus, or multi-task batches.")
 
   (anvil-server-register-tool
-   #'anvil-orchestrator--tool-submit-and-collect
+   (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-submit-and-collect)
    :id "orchestrator-submit-and-collect"
    :server-id anvil-orchestrator--server-id
    :description
@@ -3679,7 +3741,7 @@ submit-one / poll / tail / extract-result 4-hop chain with a
 single call for short-running tasks.")
 
   (anvil-server-register-tool
-   #'anvil-orchestrator--tool-tail
+   (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-tail)
    :id "orchestrator-tail"
    :server-id anvil-orchestrator--server-id
    :description
@@ -3690,7 +3752,7 @@ claude partial output, or to inspect stderr after a failure."
    :read-only t)
 
   (anvil-server-register-tool
-   #'anvil-orchestrator--tool-list-interrupted
+   (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-list-interrupted)
    :id "orchestrator-list-interrupted"
    :server-id anvil-orchestrator--server-id
    :description
@@ -3700,7 +3762,7 @@ Phase 6C'' DAG resume diagnostic."
    :read-only t)
 
   (anvil-server-register-tool
-   #'anvil-orchestrator--tool-resume-interrupted
+   (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-resume-interrupted)
    :id "orchestrator-resume-interrupted"
    :server-id anvil-orchestrator--server-id
    :description
@@ -3717,7 +3779,7 @@ Phase 6C'' DAG resume.")
                                anvil-orchestrator--preamble-tool-specs)
 
   (anvil-server-register-tool
-   #'anvil-orchestrator--tool-stream
+   (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-stream)
    :id "orchestrator-stream"
    :server-id anvil-orchestrator--server-id
    :description

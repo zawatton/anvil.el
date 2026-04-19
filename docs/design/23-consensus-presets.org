@@ -1,0 +1,209 @@
+#+title: Consensus Presets — Named Provider Combinations for Fan-Out
+#+date: 2026-04-19
+#+author: zawatton
+#+property: status DRAFT
+
+* STATUS
+  :PROPERTIES:
+  :ID:       019da400-c22a-7000-0002-consensus-presets
+  :END:
+~DRAFT~ (2026-04-19)
+
+Observation driving this doc: the v1 benchmark
+(=benchmarks/results/report-2026-04-19.org=) showed that a 3-way
+consensus (=claude + codex + ollama=) runs in 12.5 s wallclock and
+$0.029 per batch, while the same batch plus a meta-LLM judge (C5)
+takes 34.6 s and $0.041.  In practice callers pick the provider list
+*every single time* they invoke =orchestrator-consensus-submit=.  That
+hurts usability and makes a/b comparisons between configurations
+fragile (different callers type slightly different lists).
+
+*Consensus presets* solve this with a named-combination registry.  A
+preset bundles =(candidates, judge-provider, threshold, extra-rules)=
+under a human-readable key ("fast", "cheap", "broad", "release-check")
+so callers — whether Claude Code, scheduled batch scripts, or
+interactive Emacs — can say "run this prompt through the fast preset"
+without restating every wire.
+
+* Motivation
+
+** The pattern is already emergent
+
+The author's own dogfood notes (=memory/feedback_orchestrator_...=)
+call out three recurring combinations:
+
+1. *=fast=* — =claude + codex= (skip ollama, no judge).  2-wide
+   consensus for short prose answers.  Benchmarked wall ≈ 12.5 s.
+2. *=cheap=* — =codex + ollama= (skip claude, no judge).  Zero marginal
+   cost on ChatGPT Plus + local ollama.  Good for spelling sweeps and
+   rough drafts.
+3. *=broad=* — =claude + codex + ollama + gemini= + judge = claude.
+   Maximum diversity; used for releases and "did I miss something?"
+   reviews.
+
+These are not hypothetical — they are the combinations the author
+has typed repeatedly during the v0.3.0 development sprint.  Naming
+them lets the next user skip the rediscovery phase.
+
+** Presets vs ad-hoc provider lists
+
+Ad-hoc lists still work — presets are a *shorthand*, not a
+restriction.  The preset registry is an anvil-state namespace keyed
+by name, and =consensus-submit='s existing =:providers= keyword
+accepts either a list of symbols (today) or =':preset NAME= (new).
+
+** Interaction with Doc 22 routing
+
+Doc 22 (provider latency routing) defines the *selection mechanism*
+— given candidates + policy, pick one.  Doc 23 defines *named
+combinations* — here is the set of candidates commonly used
+together.  A preset can even include =:policy 'balanced= so the
+selected providers within the preset follow routing logic.  The
+two features are orthogonal: Doc 22 is for =submit-one= (one task,
+one provider); Doc 23 is for =consensus-submit= (one task, many
+providers).
+
+* Design
+
+** Preset shape
+
+Each preset is an alist / plist stored in =anvil-state= under ns
+=orchestrator-consensus-presets=, keyed by the preset name:
+
+#+begin_src emacs-lisp
+  (:providers        (claude codex ollama)   ; required
+   :judge            claude                  ; optional; nil = no judge
+   :judge-extra      "Answer in <= 3 lines." ; optional, template extra
+   :threshold        0.5                     ; optional, Jaccard gate
+   :timeout-sec      120                     ; optional, per-task cap
+   :budget-usd       0.50                    ; optional, per-task cap
+   :overrides        ((claude . (:model "claude-haiku-4-5"))
+                      (ollama . (:model "llama3.2:3b"))))
+#+end_src
+
+** Built-in presets
+
+Shipped pre-populated at module load; overridable:
+
+| Name         | Providers                        | Judge     | Threshold |
+|--------------+----------------------------------+-----------+-----------|
+| =fast=       | claude, codex                    | nil       | 0.5       |
+| =cheap=      | codex, ollama                    | nil       | 0.4       |
+| =broad=      | claude, codex, ollama, gemini    | claude    | 0.4       |
+| =rigorous=   | claude, codex, ollama, gemini    | claude    | 0.7       |
+| =local-only= | ollama (single; degenerate case) | nil       | —         |
+
+Users modify built-ins via =orchestrator-consensus-preset-set=; a
+=orchestrator-consensus-preset-reset= restores defaults.  The built-in
+definitions live in =anvil-orchestrator-consensus-preset-defaults=
+(defcustom alist) — i.e. presets are just data.
+
+** Public API
+
+#+begin_src emacs-lisp
+  ;; CRUD.
+  (anvil-orchestrator-consensus-preset-set   NAME SPEC)
+  (anvil-orchestrator-consensus-preset-get   NAME)      ; -> SPEC or nil
+  (anvil-orchestrator-consensus-preset-list)            ; -> ((NAME . SPEC) ...)
+  (anvil-orchestrator-consensus-preset-delete NAME)
+
+  ;; Submission via preset.
+  (anvil-orchestrator-consensus-submit
+   :preset 'fast                 ; <-- new keyword, replaces :providers
+   :prompt "…"
+   :overrides ...)               ; still allowed, merged on top of preset
+
+  ;; Or: explicit providers wins if both specified (caller override).
+  (anvil-orchestrator-consensus-submit
+   :preset 'broad
+   :providers '(claude codex)    ; overrides preset's provider list
+   :prompt "…")
+#+end_src
+
+** Preset-aware judge dispatch
+
+When the preset specifies =:judge=, =consensus-submit= returns a
+compound id (the consensus-id as today) AND auto-schedules the judge
+as soon as the fan-out terminates.  New keyword
+=:auto-judge= (default =nil= for API compatibility, preset-driven
+otherwise) can be flipped to =t= explicitly even without a preset.
+
+** MCP surface
+
+Two new tools:
+
+| Tool                                         | Purpose                                 |
+|----------------------------------------------+-----------------------------------------|
+| =orchestrator-consensus-preset-set=          | Register / overwrite a preset (JSON arg).|
+| =orchestrator-consensus-preset-list=         | Read-only snapshot of all presets.       |
+
+Existing =orchestrator-consensus-submit= gets a new JSON field
+=preset= (optional) alongside =providers=.
+
+* Non-goals
+
+- *Preset inheritance / composition.*  No "extend preset A with
+  overrides B".  Copy and edit; complexity does not pay for itself.
+- *Preset-level retry policy.*  Retry semantics stay at the task
+  level (=anvil-orchestrator-auto-retry-on=).  Presets do not override
+  retry rules.
+- *Automatic preset inference from recent usage.*  Out of scope;
+  users name their own patterns.
+
+* Phases
+
+- *Phase 1 — preset registry + =consensus-submit= integration*.
+  CRUD functions, built-in defaults, =:preset= keyword plumbing,
+  unit tests.  No persistence yet (presets live in a defvar +
+  defcustom defaults on each daemon start).
+- *Phase 2 — anvil-state persistence + MCP tools*.  Presets survive
+  daemon restart; =preset-set= / =-list= MCP tools land.
+- *Phase 3 — =:auto-judge= defaulting from preset*.  The consensus
+  fan-out auto-schedules judge when the preset says so.  Requires
+  Phase 1.  Builds on Doc 10 Phase 4b.
+
+* Decisions
+
+- *Preset is a plist, not a defstruct* — plists serialize cleanly to
+  =anvil-state= (=prin1=) and to JSON via the new Doc 22 encoder
+  helper.  defstruct would force conversion on every read/write.
+- *=:providers= on submit wins over =:preset='s providers.*  Users
+  often want "run the broad preset but just these two today"; making
+  the direct argument authoritative keeps the override cheap.
+- *Built-ins defined via defcustom, not hardcoded*.  Users can
+  =setq= an empty alist to ship environment without any built-ins
+  preloaded (consultancy / multi-tenant use case).
+
+* Alternatives considered
+
+- *Only support ad-hoc =:providers='* (status quo).  Works, but each
+  caller rediscovers which combinations are worth running.  The v1
+  benchmark is the forcing function to turn the recurring patterns
+  into checked-in names.
+- *Separate tool names (=orchestrator-consensus-submit-fast=,
+  =-broad=, …)*.  Doubles the tool surface; caller can only use
+  names known at tool-registration time; MCP clients struggle to
+  pass the preset name as data.  Rejected.
+- *Preset per-user in a config file.*  Viable, but anvil-state
+  already handles persistence uniformly.  Config files would mean
+  one more location to remember.
+
+* Testing plan
+
+- Unit tests: preset CRUD, default built-ins present, provider
+  override precedence, =:judge= propagation to fan-out result.
+- A regression test that the v1-benchmark sized prompt through
+  the =fast= preset produces the same =:task-ids= shape as the
+  hand-typed 2-provider call that already works.
+- Snapshot tests for the JSON-encoded MCP responses via the Doc 22
+  =anvil-orchestrator--encode-for-mcp= helper.
+
+* Observability
+
+- =anvil-orchestrator-stats-dashboard= gains a "Preset" column
+  showing which preset a task batch was submitted under
+  (=:consensus-preset= on the task plist when applicable).  Makes
+  it obvious at a glance which combinations were dogfooded most.
+- A one-liner =anvil-orchestrator-consensus-preset-summary= in
+  interactive use prints a table of preset → recent usage count +
+  median wall + total cost.

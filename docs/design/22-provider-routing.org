@@ -1,0 +1,242 @@
+#+title: Provider Latency Routing — Auto-Dispatch by Measured Latency and Cost
+#+date: 2026-04-19
+#+author: zawatton
+#+property: status DRAFT
+
+* STATUS
+  :PROPERTIES:
+  :ID:       019da400-c22a-7000-0001-provider-routing
+  :END:
+~DRAFT~ (2026-04-19)
+
+Observation driving this doc: the v1 orchestrator benchmark
+(=benchmarks/results/report-2026-04-19.org=) showed that on the author's
+account, =codex-gpt-5.4= returns short-prompt answers in ~5.5 s while
+=claude-haiku-4-5= takes ~14 s, and on local =ollama-llama3.2:3b= simple
+generations finish in under 2 s.  Cost is even more asymmetric: codex
+(via ChatGPT Plus OAuth) and ollama both have *no per-token fee* at
+current subscriptions, while claude charges.  And yet =submit-one=,
+=submit-and-collect=, and most dogfood patterns send everything to
+=claude= by default.  That is leaving speed and money on the table.
+
+Provider *latency routing* adds a thin dispatch layer so the orchestrator
+— not the caller — picks the right provider for a given task, based on
+the provider's *measured* recent latency and cost, with pluggable
+preference hooks for domain-specific overrides (e.g. "correctness over
+speed" for releases, "speed over correctness" for spelling sweeps).
+
+* Motivation
+
+** Three latency tiers on one desk
+
+The v1 benchmark (=benchmarks/results/bench-s1-focused-20260419-195827.csv=)
+captured a single scenario (recursive fibonacci).  Wallclock, sorted:
+
+| Provider               | Wall   | Cost   |
+|------------------------+--------+--------|
+| =ollama llama3.2:3b=   | ~1.0 s | $0     |
+| =codex gpt-5.4= (Plus) | ~5.5 s | $0     |
+| =claude-haiku-4-5=     | ~14 s  | $0.030 |
+
+A 14× speed gap and an unbounded-to-zero cost gap, for the *same task*,
+sitting behind the same MCP tool call.  The caller (Claude Code, OpenCode,
+any downstream agent) has no visibility into which provider will answer
+fastest.  Today they must either hardcode =:provider claude=, write
+their own cost/latency-aware dispatcher, or bear whichever default the
+orchestrator ships.
+
+** The orchestrator already has the data
+
+=anvil-orchestrator-stats= (Phase 6C observability bundle) already
+aggregates, per-provider, =:elapsed-ms-avg=, =:elapsed-ms-p50=,
+=:elapsed-ms-p95=, and =:total-cost-usd=, filtering by =:since= and
+=:provider=.  It is a one-call answer to "what is my recent latency
+distribution for codex?" — it just isn't wired into *dispatch* yet.
+
+Adding routing is a matter of:
+1. Defining a pluggable selector that takes a prompt + optional policy
+   keywords and returns a provider symbol.
+2. Plumbing the selector into =submit-one= and =submit-and-collect= so
+   =:provider auto= becomes a thing.
+3. Providing a default selector that reads =anvil-orchestrator-stats=
+   output.
+
+** Memory, not lab numbers
+
+The routing decision reads from the *live* stats table, not a
+benchmark snapshot baked into the package.  A user whose codex account
+hits throttling at 3 concurrent will naturally see codex's p95 grow,
+which pushes routing toward claude without any human intervention.
+
+* Design
+
+** Public API
+
+#+begin_src emacs-lisp
+  (anvil-orchestrator-select-provider
+   &key prompt
+        (policy 'balanced)
+        (candidates nil)        ; default: all registered providers
+        (since (- (float-time) 3600))
+        (min-samples 3))
+  ;; => SYMBOL (provider name) or nil when no candidate qualifies
+#+end_src
+
+Policies:
+- =speed=       — minimize p50 wallclock among candidates with enough samples
+- =cost=        — minimize total cost, breaking ties by p50
+- =balanced=    — minimize (p50 * 1.0) + (cost * 1000) per task; the
+                  coefficient reflects "1 dollar of cost is worth waiting
+                  1 wall-second to avoid", tunable via
+                  =anvil-orchestrator-routing-balance-coefficient=.
+- =quality=     — defer to an explicit ranking, configured via
+                  =anvil-orchestrator-routing-quality-order= (default
+                  =(claude codex gemini aider ollama)=)
+- A =function= value — caller-provided selector =(fn prompt candidates
+                      stats) => SYMBOL=.
+
+When fewer than =:min-samples= tasks exist for every candidate in the
+=:since= window, the selector falls back to
+=anvil-orchestrator-routing-cold-start-provider= (default =claude=, the
+historically available baseline).
+
+** =submit-one= integration
+
+Today:
+
+#+begin_src emacs-lisp
+  (anvil-orchestrator-submit-one :provider 'claude :prompt "…")
+#+end_src
+
+After Phase 1:
+
+#+begin_src emacs-lisp
+  ;; Unchanged — explicit provider wins.
+  (anvil-orchestrator-submit-one :provider 'claude :prompt "…")
+
+  ;; New — orchestrator picks.
+  (anvil-orchestrator-submit-one :provider 'auto :prompt "…")
+  (anvil-orchestrator-submit-one :provider 'auto :prompt "…" :policy 'speed)
+#+end_src
+
+The token =auto= is the sentinel that triggers selection.  Once selected,
+the chosen provider name is recorded on the task plist as
+=:provider= (the regular key) *and* =:routing-policy= /
+=:routing-candidates= / =:routing-chose= for observability.
+
+** =submit= integration
+
+For batched =anvil-orchestrator-submit=, per-task plists may set
+=:provider 'auto= individually.  Each such task is resolved at submit
+time, not re-evaluated later — consistent with current behaviour where
+=:provider= is captured into the task plist.
+
+** MCP surface
+
+Add two tools:
+
+| Tool                                    | Purpose                                     |
+|-----------------------------------------+---------------------------------------------|
+| =orchestrator-routing-select=           | Dry-run: returns the provider a given policy would pick, with the reasoning plist. |
+| =orchestrator-routing-config=           | Read / update routing defaults (policy, balance coefficient, quality order, cold-start provider). |
+
+Existing submit tools accept =provider= argument value =auto= with no
+schema change.
+
+** Persistence
+
+Routing configuration lives in =anvil-state= ns =orchestrator-routing=:
+keys =default-policy=, =balance-coefficient=, =quality-order=,
+=cold-start-provider=, =per-prompt-hints= (alist of regex → provider
+for surgical overrides).
+
+** Integration with =consensus-submit=
+
+Per-provider overrides keep working.  A new shorthand
+=:providers 'auto-top-n= with =:n= (default 3) picks the top-N
+providers per =policy=; this is distinct from =all registered= and
+enables "fan out to my 3 fastest providers without typing them".
+Phase 2.
+
+** Integration with Doc 23 presets
+
+Doc 23 defines named presets (=fast=, =cheap=, =broad=).  Provider
+routing is the *mechanism* those presets are built on: each preset
+is essentially a =candidates + policy= pair.  Doc 23 names them; Doc 22
+executes them.
+
+* Non-goals
+
+- *Prompt-content-aware routing.*  We do not parse the prompt to
+  guess difficulty; a user-provided =function= policy can, but the
+  stock policies are all based on recent latency / cost only.
+- *Cross-account rate-limit prediction.*  If codex throttles, p95
+  climbs and routing avoids it naturally; we do not speculate about
+  quotas we cannot observe.
+- *Retrieval-time re-routing.*  Once a task has been submitted, the
+  chosen provider is final.  Retry semantics are unchanged
+  (=orchestrator-retry= makes a fresh routing decision if the original
+  task used =:provider 'auto=).
+
+* Phases
+
+- *Phase 1 — stats-driven selector* (SHIPPED-candidate).  The pure
+  selector function + =submit-one= integration + dry-run MCP tool.
+  No config persistence (routing defaults are defcustoms).
+  Benchmark-grade measurement already available via existing
+  =anvil-orchestrator-stats=.
+- *Phase 2 — persistent config + =auto-top-n= consensus*.  Wires
+  =anvil-state= persistence, adds the N-best fan-out shorthand, and
+  exposes the =orchestrator-routing-config= MCP tool.
+- *Phase 3 — adaptive balance coefficient*.  Learn the balance
+  coefficient from caller feedback (=orchestrator-tag= a task with
+  "preferred" / "too slow" / "too wrong" and gradient-descend the
+  coefficient over rolling windows).  Almost certainly a v0.4+ item.
+
+* Decisions
+
+- *Sentinel value =auto= rather than =:provider nil=* — =nil= already
+  means "inherit default" in several internal callers; introducing a
+  third meaning would be fragile.
+- *Default cold-start to =claude=, not =ollama=* — claude is the
+  provider most installed users actually have configured, per the
+  orchestrator's own test fixtures.  We can revisit when the provider
+  registry tracks "actually callable".
+- *Balance coefficient units are "dollars per wall-second"* — makes
+  the default (=1000=, so $1 is worth 1 s) readable.  =speed= policy
+  is equivalent to coefficient = 0; =cost= policy is equivalent to
+  coefficient = ∞.
+
+* Alternatives considered
+
+- *Roll-your-own dispatch shim in user init.el.*  Works today, but
+  every Claude Code / OpenCode / Emacs-interactive call would need
+  the shim wrapped around it.  Centralizing in the orchestrator
+  means every downstream agent benefits.
+- *Gateway-style provider (one "anvil-meta" CLI that itself fans out).*
+  Would break the one-process-per-task abstraction, complicate
+  cost attribution, and obscure which actual LLM answered.  Rejected.
+- *Per-task static preference tag only.*  Less expressive than a
+  policy — can't ask "use my fastest provider" without naming it.
+  =auto=+policy gives the caller both axes.
+
+* Testing plan
+
+- Unit tests for the selector against synthetic stats tables
+  (matrix: {enough/too-few samples} × {cheap+slow / expensive+fast
+  / equal / all throttled}).
+- Cross-validate against the v1 benchmark CSV: given the actual
+  measured 2026-04-19 distribution, =balanced= should pick codex,
+  =speed= should pick ollama, =cost= should pick ollama/codex
+  (tied at $0).
+- Live smoke (=ANVIL_ALLOW_LIVE=1=) on a 3-way dispatch with
+  =:provider 'auto= verifying the task lands on the expected
+  provider and the routing meta is captured on the task plist.
+
+* Observability
+
+- =anvil-orchestrator-stats-dashboard= gains a "Routing" column that
+  displays =:routing-policy= / =:routing-chose= per task when set.
+- =orchestrator-routing-select= (dry-run MCP tool) logs every
+  consultation to =*anvil-orchestrator*= so operators can trace which
+  policy picked what, when.
