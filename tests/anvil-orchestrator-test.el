@@ -1081,6 +1081,196 @@ value (the batch-id) as its RESULT argument."
                "[0-9a-f]\\{8\\}-[0-9a-f]\\{4\\}-[0-9a-f]\\{4\\}-[0-9a-f]\\{4\\}-[0-9a-f]\\{12\\}"
                result)))))
 
+;;;; --- Phase 5: codex native provider ------------------------------------
+
+(ert-deftest anvil-orchestrator-test-codex-provider-registered ()
+  "Built-in `codex' provider is registered on load."
+  (let ((prov (anvil-orchestrator--provider 'codex)))
+    (should (anvil-orchestrator-provider-p prov))
+    (should (equal "codex" (anvil-orchestrator-provider-cli prov)))
+    (should (anvil-orchestrator-provider-supports-tool-use prov))
+    (should-not (anvil-orchestrator-provider-supports-worktree prov))
+    (should-not (anvil-orchestrator-provider-supports-budget prov))
+    (should-not (anvil-orchestrator-provider-supports-system-prompt-append
+                 prov))
+    (should (equal "gpt-5.4"
+                   (anvil-orchestrator-provider-default-model prov)))))
+
+(ert-deftest anvil-orchestrator-test-codex-build-cmd-basic ()
+  "codex build-cmd emits exec + required flags + prompt."
+  (cl-letf (((symbol-function 'executable-find)
+             (lambda (_) "/usr/bin/codex")))
+    (let ((cmd (anvil-orchestrator--codex-build-cmd
+                (list :prompt "summarize readme"
+                      :model "gpt-5-codex"))))
+      (should (equal "/usr/bin/codex"   (nth 0 cmd)))
+      (should (equal "exec"             (nth 1 cmd)))
+      (should (member "--skip-git-repo-check" cmd))
+      (should (member "--json"                cmd))
+      (should (member "-m"                    cmd))
+      (should (member "gpt-5-codex"           cmd))
+      ;; Prompt is the final positional.
+      (should (equal "summarize readme" (car (last cmd)))))))
+
+(ert-deftest anvil-orchestrator-test-codex-build-cmd-default-model ()
+  "build-cmd falls back to `anvil-orchestrator-codex-default-model'."
+  (let ((anvil-orchestrator-codex-default-model "gpt-5.4"))
+    (cl-letf (((symbol-function 'executable-find)
+               (lambda (_) "/usr/bin/codex")))
+      (let ((cmd (anvil-orchestrator--codex-build-cmd
+                  (list :prompt "x"))))
+        (should (member "gpt-5.4" cmd))))))
+
+(ert-deftest anvil-orchestrator-test-codex-build-cmd-default-sandbox ()
+  "`--sandbox' defaults to `anvil-orchestrator-codex-sandbox'."
+  (let ((anvil-orchestrator-codex-sandbox "read-only"))
+    (cl-letf (((symbol-function 'executable-find)
+               (lambda (_) "/usr/bin/codex")))
+      (let ((cmd (anvil-orchestrator--codex-build-cmd
+                  (list :prompt "x" :model "m"))))
+        (should (member "--sandbox"  cmd))
+        (should (member "read-only"  cmd))))))
+
+(ert-deftest anvil-orchestrator-test-codex-build-cmd-sandbox-override ()
+  "Task `:sandbox' beats the defcustom default."
+  (let ((anvil-orchestrator-codex-sandbox "read-only"))
+    (cl-letf (((symbol-function 'executable-find)
+               (lambda (_) "/usr/bin/codex")))
+      (let ((cmd (anvil-orchestrator--codex-build-cmd
+                  (list :prompt "x" :model "m"
+                        :sandbox "workspace-write"))))
+        (should (member "workspace-write" cmd))
+        (should-not (member "read-only"    cmd))))))
+
+(ert-deftest anvil-orchestrator-test-codex-build-cmd-extra-args ()
+  "Global extra-args sit between required flags and the prompt."
+  (let ((anvil-orchestrator-codex-extra-args
+         '("-c" "model_reasoning_effort=\"high\"")))
+    (cl-letf (((symbol-function 'executable-find)
+               (lambda (_) "/usr/bin/codex")))
+      (let ((cmd (anvil-orchestrator--codex-build-cmd
+                  (list :prompt "the prompt" :model "m"))))
+        (should (member "-c" cmd))
+        (should (member "model_reasoning_effort=\"high\"" cmd))
+        (should (equal "the prompt" (car (last cmd))))))))
+
+(ert-deftest anvil-orchestrator-test-codex-parse-output-agent-message ()
+  "Parser returns the last `agent_message' text and the usage plist."
+  (let ((path (make-temp-file "codex-out-")))
+    (unwind-protect
+        (progn
+          (write-region
+           (concat
+            "{\"type\":\"thread.started\",\"thread_id\":\"t1\"}\n"
+            "{\"type\":\"turn.started\"}\n"
+            "{\"type\":\"item.completed\",\"item\":{"
+            "\"id\":\"i0\",\"type\":\"agent_message\","
+            "\"text\":\"Rust enforces memory safety at compile time.\"}}\n"
+            "{\"type\":\"turn.completed\",\"usage\":{"
+            "\"input_tokens\":11954,\"cached_input_tokens\":10624,"
+            "\"output_tokens\":18}}\n")
+           nil path nil 'silent)
+          (let ((parsed (anvil-orchestrator--codex-parse-output path nil 0)))
+            (should (stringp (plist-get parsed :summary)))
+            (should (string-match-p "Rust enforces memory safety"
+                                    (plist-get parsed :summary)))
+            (should (plist-get parsed :cost-tokens))
+            (should (equal 11954
+                           (plist-get (plist-get parsed :cost-tokens)
+                                      :input_tokens)))
+            (should-not (plist-get parsed :cost-usd))
+            (should-not (plist-get parsed :commit-sha))))
+      (delete-file path))))
+
+(ert-deftest anvil-orchestrator-test-codex-parse-output-picks-last ()
+  "When the stream contains multiple `agent_message' events, the last wins."
+  (let ((path (make-temp-file "codex-out-")))
+    (unwind-protect
+        (progn
+          (write-region
+           (concat
+            "{\"type\":\"item.completed\",\"item\":{"
+            "\"type\":\"agent_message\",\"text\":\"first draft\"}}\n"
+            "{\"type\":\"item.completed\",\"item\":{"
+            "\"type\":\"agent_message\",\"text\":\"final answer\"}}\n"
+            "{\"type\":\"turn.completed\"}\n")
+           nil path nil 'silent)
+          (let ((parsed (anvil-orchestrator--codex-parse-output path nil 0)))
+            (should (equal "final answer" (plist-get parsed :summary)))))
+      (delete-file path))))
+
+(ert-deftest anvil-orchestrator-test-codex-parse-output-empty ()
+  "Empty stdout yields nil summary (and no crash)."
+  (let ((path (make-temp-file "codex-out-")))
+    (unwind-protect
+        (progn
+          (write-region "" nil path nil 'silent)
+          (let ((parsed (anvil-orchestrator--codex-parse-output path nil 0)))
+            (should-not (plist-get parsed :summary))))
+      (delete-file path))))
+
+(ert-deftest anvil-orchestrator-test-codex-parse-output-skips-non-agent-items ()
+  "Non agent_message `item.completed' events do not contribute to summary."
+  (let ((path (make-temp-file "codex-out-")))
+    (unwind-protect
+        (progn
+          (write-region
+           (concat
+            "{\"type\":\"item.completed\",\"item\":{"
+            "\"type\":\"tool_call\",\"text\":\"ls /tmp\"}}\n"
+            "{\"type\":\"item.completed\",\"item\":{"
+            "\"type\":\"agent_message\",\"text\":\"The answer is X.\"}}\n"
+            "{\"type\":\"turn.completed\"}\n")
+           nil path nil 'silent)
+          (let ((parsed (anvil-orchestrator--codex-parse-output path nil 0)))
+            (should (equal "The answer is X." (plist-get parsed :summary)))))
+      (delete-file path))))
+
+(ert-deftest anvil-orchestrator-test-codex-cost-always-zero ()
+  "codex cost-estimator returns 0 (Plus OAuth, no per-token billing)."
+  (should (= 0 (anvil-orchestrator--codex-cost
+                (list :prompt "hi" :model "gpt-5.4"))))
+  (should (= 0 (anvil-orchestrator--codex-cost
+                (list :prompt (make-string 10000 ?x)
+                      :model "gpt-5-codex")))))
+
+(ert-deftest anvil-orchestrator-test-codex-end-to-end-stub ()
+  "End-to-end: stub codex via sh emitting a JSONL event stream through
+the codex parser.  Registered under a distinct provider symbol so
+the built-in `codex' descriptor isn't overwritten for the rest of
+the suite."
+  (anvil-orchestrator-test--with-fresh
+    (let ((payload
+           (concat
+            "{\"type\":\"thread.started\",\"thread_id\":\"t1\"}\n"
+            "{\"type\":\"turn.started\"}\n"
+            "{\"type\":\"item.completed\",\"item\":{"
+            "\"id\":\"i0\",\"type\":\"agent_message\","
+            "\"text\":\"stub codex summary\"}}\n"
+            "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":5}}")))
+      (anvil-orchestrator-register-provider
+       'codex-stub
+       :cli "sh"
+       :version-check (lambda () t)
+       :build-cmd (lambda (_task)
+                    (anvil-test-fixtures-stub-cmd payload 0))
+       :parse-output #'anvil-orchestrator--codex-parse-output
+       :supports-tool-use             t
+       :supports-worktree             nil
+       :supports-budget               nil
+       :supports-system-prompt-append nil
+       :default-model                 "gpt-5.4"
+       :cost-estimator #'anvil-orchestrator--codex-cost))
+    (let* ((batch (anvil-orchestrator-submit
+                   (list (list :name "codex-stub"
+                               :provider 'codex-stub
+                               :prompt   "probe")))))
+      (anvil-orchestrator-test--wait-batch batch 5)
+      (let ((r (car (anvil-orchestrator-collect batch))))
+        (should (eq 'done (plist-get r :status)))
+        (should (equal "stub codex summary"
+                       (plist-get r :summary)))))))
+
 ;;;; --- Phase 4: consensus -------------------------------------------------
 
 (defun anvil-orchestrator-test--consensus-stream-json (summary)

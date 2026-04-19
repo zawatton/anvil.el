@@ -69,7 +69,7 @@ explicitly (`let' or `setq') for large nightly batches."
   :group 'anvil-orchestrator)
 
 (defcustom anvil-orchestrator-per-provider-concurrency
-  '((claude . 3) (gemini . 4) (ollama . 2) (aider . 2))
+  '((claude . 3) (gemini . 4) (ollama . 2) (aider . 2) (codex . 3))
   "Per-provider concurrency cap alist.
 Providers not listed fall back to `anvil-orchestrator-concurrency'."
   :type '(alist :key-type symbol :value-type integer)
@@ -776,6 +776,118 @@ Returns (:summary STR :cost-usd NIL :cost-tokens NIL
  :supports-system-prompt-append nil
  :default-model                 "llama3.2"
  :cost-estimator #'anvil-orchestrator--ollama-cost)
+
+;;;; --- codex native provider ---------------------------------------------
+
+(defcustom anvil-orchestrator-codex-default-model "gpt-5.4"
+  "Default `-m MODEL' value when a task omits `:model'.
+The codex CLI's own default (as of 0.121) is also \"gpt-5.4\".
+Set to \"gpt-5-codex\" for code-heavy tasks."
+  :type 'string
+  :group 'anvil-orchestrator)
+
+(defcustom anvil-orchestrator-codex-extra-args nil
+  "Global argv appended to every `codex exec' invocation.
+Useful for e.g. `-c \"model_reasoning_effort=high\"' overrides.
+Must not include `--sandbox' or `--json' as those are already
+passed by the build-cmd."
+  :type '(repeat string)
+  :group 'anvil-orchestrator)
+
+(defcustom anvil-orchestrator-codex-sandbox "read-only"
+  "Default sandbox mode for `codex exec' tasks.
+Orchestrator submissions are short single-shot Q&A or
+non-mutating code review, so read-only is the safe default.
+Override per task with `:sandbox' in the task plist."
+  :type '(choice (const "read-only")
+                 (const "workspace-write")
+                 (const "danger-full-access"))
+  :group 'anvil-orchestrator)
+
+(defun anvil-orchestrator--codex-check ()
+  "Return non-nil when the codex CLI is on PATH."
+  (and (executable-find "codex") t))
+
+(defun anvil-orchestrator--codex-cost (_task)
+  "Codex via ChatGPT Plus OAuth has no per-token billing."
+  0.0)
+
+(defun anvil-orchestrator--codex-build-cmd (task)
+  "Build the `codex exec' command line for TASK plist.
+Uses `--json' (JSONL events) so parse-output picks
+`agent_message.text' off each completed turn.  Accepts
+`:sandbox' on the task plist to override the default."
+  (let* ((model   (or (plist-get task :model)
+                      anvil-orchestrator-codex-default-model))
+         (prompt  (plist-get task :prompt))
+         (sandbox (or (plist-get task :sandbox)
+                      anvil-orchestrator-codex-sandbox))
+         (cmd     (list (executable-find "codex")
+                        "exec"
+                        "--skip-git-repo-check"
+                        "--sandbox" sandbox
+                        "--json"
+                        "-m" model)))
+    (if anvil-orchestrator-codex-extra-args
+        (append cmd anvil-orchestrator-codex-extra-args
+                (list prompt))
+      (append cmd (list prompt)))))
+
+(defun anvil-orchestrator--codex-parse-output (stdout-path stderr-path exit-code)
+  "Parse codex STDOUT-PATH JSONL into a summary plist.
+Scans every line, parses each as JSON, and keeps the last
+`agent_message' text produced by `item.completed' events.
+`turn.completed' carries the token usage object.  Silent on
+malformed lines so a partial stream does not poison the summary."
+  (let (summary tokens)
+    (condition-case _err
+        (when (file-readable-p stdout-path)
+          (with-temp-buffer
+            (insert-file-contents stdout-path)
+            (goto-char (point-min))
+            (while (not (eobp))
+              (let* ((line (buffer-substring-no-properties
+                            (line-beginning-position)
+                            (line-end-position)))
+                     (j (and (not (string-empty-p line))
+                             (ignore-errors
+                               (json-parse-string
+                                line
+                                :object-type 'plist
+                                :null-object nil
+                                :false-object nil)))))
+                (cond
+                 ((and j (equal "item.completed" (plist-get j :type)))
+                  (let* ((item  (plist-get j :item))
+                         (itype (and item (plist-get item :type)))
+                         (text  (and item (plist-get item :text))))
+                    (when (and (equal "agent_message" itype)
+                               (stringp text))
+                      (setq summary text))))
+                 ((and j (equal "turn.completed" (plist-get j :type)))
+                  (setq tokens (plist-get j :usage)))))
+              (forward-line 1))))
+      (error nil))
+    (list :summary         (anvil-orchestrator--truncate-summary summary)
+          :cost-usd        nil
+          :cost-tokens     tokens
+          :commit-sha      nil
+          :auto-retry-code (and (not summary)
+                                (anvil-orchestrator--stderr-retry-code
+                                 stderr-path exit-code)))))
+
+(anvil-orchestrator-register-provider
+ 'codex
+ :cli "codex"
+ :version-check #'anvil-orchestrator--codex-check
+ :build-cmd     #'anvil-orchestrator--codex-build-cmd
+ :parse-output  #'anvil-orchestrator--codex-parse-output
+ :supports-tool-use             t
+ :supports-worktree             nil
+ :supports-budget               nil
+ :supports-system-prompt-append nil
+ :default-model                 "gpt-5.4"
+ :cost-estimator #'anvil-orchestrator--codex-cost)
 
 ;;;; --- UUID + internal state ---------------------------------------------
 
