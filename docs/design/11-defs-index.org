@@ -190,9 +190,11 @@ anvil-org-index.  Safe to delete — full rebuild is cheap (projected
   ;; Returns: plist (:name :kind :arity-min :arity-max :docstring-head)
   ;;  or nil if not indexed.  Lighter than elisp-describe-function.
 
-(anvil-defs-module-deps MODULE &key direction depth)
-  ;; Returns: adjacency list. :direction 'out (what this requires) /
-  ;; 'in (what requires this) / 'both.  :depth for transitive.
+;; Deferred (Phase 3+): anvil-defs-module-deps MODULE &key direction depth.
+;; Not registered in the initial Phase 1+2 ship — the `features'
+;; table is populated and `anvil-defs-who-requires' gives the
+;; common "reverse-dep" answer; full transitive graph will land
+;; alongside filenotify in Phase 3.
 
 (anvil-defs-index-rebuild &optional root)
   ;; Full rebuild.  Returns plist (:files N :defs N :refs N :duration-ms N).
@@ -209,7 +211,7 @@ anvil-org-index.  Safe to delete — full rebuild is cheap (projected
 | ~defs-references~   | symbol, kind?, limit?          | list of ref records       | 1-hop "who calls X"            |
 | ~defs-who-requires~ | feature                        | list of file paths        | module reverse-dep             |
 | ~defs-signature~    | symbol                         | signature plist           | arity + docstring-head         |
-| ~defs-module-deps~  | module, direction?, depth?     | adjacency list            | require graph                  |
+| ~defs-module-deps~  | module, direction?, depth?     | adjacency list            | /deferred to Phase 3/          |
 | ~defs-index-rebuild~| root?                          | stats plist               | opt-in, slow (~seconds)        |
 
 All are read-only (=:read-only t= in registration — Doc 10 glue-helpers

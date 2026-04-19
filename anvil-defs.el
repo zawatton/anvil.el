@@ -202,10 +202,34 @@ availability (see memory feedback_sqlite_with_transaction_not_portable)."
     "CREATE INDEX IF NOT EXISTS idx_features_feat_kind ON features(feature, kind)")
   "DDL applied on DB open.")
 
+(defun anvil-defs--stored-schema-version (db)
+  "Return the integer schema_meta.version stored in DB, or nil."
+  (condition-case _err
+      (car-safe (car-safe
+                 (anvil-defs--select db "SELECT version FROM schema_meta" nil)))
+    (error nil)))
+
+(defun anvil-defs--drop-all-tables (db)
+  "Drop every anvil-defs-owned table from DB.
+Used when the stored `schema_meta.version' does not match
+`anvil-defs-schema-version' — a trivial drop-and-rebuild gives
+correct behavior without a per-version migration dispatcher."
+  (dolist (tbl '("defs" "refs" "features" "file" "schema_meta"))
+    (anvil-defs--execute db (format "DROP TABLE IF EXISTS %s" tbl))))
+
 (defun anvil-defs--apply-ddl (db)
-  "Apply DDL, pragmas, and schema version row to DB."
+  "Apply DDL, pragmas, and schema version row to DB.
+When the stored schema version does not match
+`anvil-defs-schema-version', drop every owned table first so the
+new DDL lands on a clean slate.  Full rebuild after this is the
+user's responsibility (and cheap — sub-second on project scale)."
   (anvil-defs--execute db "PRAGMA journal_mode = WAL")
   (anvil-defs--execute db "PRAGMA foreign_keys = ON")
+  (let ((stored (anvil-defs--stored-schema-version db)))
+    (when (and stored (not (= stored anvil-defs-schema-version)))
+      (message "anvil-defs: schema version mismatch (db=%s code=%s); dropping index"
+               stored anvil-defs-schema-version)
+      (anvil-defs--drop-all-tables db)))
   (dolist (stmt anvil-defs--ddl)
     (anvil-defs--execute db stmt))
   (anvil-defs--execute
@@ -285,6 +309,10 @@ purpose (we cannot statically bound keyword call arity)."
          ((memq a '(&rest &body &key))
           (setq ret (cons min nil))
           (throw 'done nil))
+         ;; Skip modifier keywords that do not count as arguments.
+         ((memq a '(&allow-other-keys &aux)) nil)
+         ;; Specializer lists in cl-defmethod look like `(x integer)' —
+         ;; treat them as one positional arg, matching call arity.
          ((eq stage 'req) (cl-incf min) (cl-incf max))
          ((eq stage 'opt) (cl-incf max))))
       (setq ret (cons min max)))
@@ -298,18 +326,37 @@ calls) is deferred."
 
 (defun anvil-defs--arglist (sexp)
   "Return the ARGLIST of a defun-like SEXP, or nil.
-For `cl-defstruct' (whose CADR is (NAME :option ...)), returns nil."
-  (let ((op (car sexp))
-        (second (cadr sexp))
-        (third (caddr sexp)))
+Handles shapes the naive (caddr sexp) form misses:
+  - `cl-defmethod' with keyword qualifiers like `:around',
+    whose arglist sits after any :KEYWORD that follows the name
+  - `define-minor-mode' / `define-derived-mode' whose third slot
+    is a docstring rather than an arglist (returns nil — arity is
+    not statically extractable for those macros)
+  - `cl-defstruct' whose CADR is `(NAME :option ...)' and has no
+    separate arglist (returns nil)."
+  (let* ((op (car sexp))
+         (tail (cdr sexp))
+         (second (car-safe tail)))
     (cond
-     ((memq op (anvil-defs--kinds-function))
-      ;; Most function-likes: (OP NAME ARGLIST ...).  For cl-defstruct
-      ;; the NAME position is itself a list and there is no separate
-      ;; arglist.
-      (when (and (symbolp second) (listp third))
-        third))
-     (t nil))))
+     ((not (memq op (anvil-defs--kinds-function))) nil)
+     ;; (cl-defmethod NAME [KW ...] ARGLIST BODY).  Skip qualifier
+     ;; keywords between NAME and the real arglist.
+     ((eq op 'cl-defmethod)
+      (let ((rest (cdr-safe tail)))
+        (while (and rest (keywordp (car rest)))
+          (setq rest (cdr rest)))
+        (let ((candidate (car-safe rest)))
+          (when (listp candidate) candidate))))
+     ;; Define-*-mode macros — no statically-known arglist shape.
+     ((memq op '(define-minor-mode define-derived-mode
+                 define-globalized-minor-mode
+                 define-obsolete-function-alias))
+      nil)
+     ;; Standard (OP NAME ARGLIST ...) shape.
+     (t
+      (let ((third (car-safe (cdr-safe tail))))
+        (when (and (symbolp second) (listp third))
+          third))))))
 
 (defun anvil-defs--walk-each (xs fn)
   "Apply FN to each element of XS, tolerating improper / dotted lists.
@@ -524,13 +571,21 @@ same top-level parser."
 
 ;;;; --- ensure-db + refresh -----------------------------------------------
 
+(defun anvil-defs--live-db-p (db)
+  "Non-nil when DB is a usable handle for the active backend.
+`sqlitep' only exists on Emacs 29+ — the `fboundp' guard keeps
+the helper safe when anvil-defs is loaded on an older Emacs that
+falls through to the emacsql stub branch."
+  (pcase anvil-defs--backend
+    ('builtin (and (fboundp 'sqlitep) (sqlitep db)))
+    ('emacsql (and db t))
+    (_ nil)))
+
 (defun anvil-defs--ensure-db ()
   "Open the backing DB if not already open.  Return the handle."
   (unless anvil-defs--backend
     (setq anvil-defs--backend (anvil-defs--detect-backend)))
-  (unless (and anvil-defs--db
-               (or (eq anvil-defs--backend 'emacsql)
-                   (ignore-errors (sqlitep anvil-defs--db))))
+  (unless (and anvil-defs--db (anvil-defs--live-db-p anvil-defs--db))
     (make-directory (file-name-directory anvil-defs-index-db-path) t)
     (setq anvil-defs--db (anvil-defs--open anvil-defs-index-db-path))
     (anvil-defs--apply-ddl anvil-defs--db))
@@ -671,7 +726,7 @@ PLIST keys:
                                  kind))
            ((symbolp kind) (list (symbol-name kind)))
            (t (list kind))))
-         (sql (format "SELECT f.path, r.line, r.context, r.kind
+         (sql (format "SELECT f.path, r.line, r.context, r.kind, r.name
                       FROM refs r JOIN file f ON r.file_id = f.id
                       WHERE r.name = ?%s
                       ORDER BY f.path, r.line
@@ -679,7 +734,8 @@ PLIST keys:
                       (or kind-sql "")))
          (params (append (list name) kind-params (list limit))))
     (mapcar (lambda (row)
-              (list :file (nth 0 row)
+              (list :name (nth 4 row)
+                    :file (nth 0 row)
                     :line (nth 1 row)
                     :context (nth 2 row)
                     :kind (nth 3 row)))

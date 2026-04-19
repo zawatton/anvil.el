@@ -798,6 +798,46 @@ edit plan (ops count + byte ranges + replacement texts)."
               (ops (plist-get plan :ops)))
          (should (>= (length ops) 4)))))))
 
+(ert-deftest anvil-sexp-test-phase2b-stale-index-picks-up-new-file ()
+  "Adding a new .el file after the last rebuild must not cause the
+index-narrowed backend to miss references inside it.  The
+project-wide mtime refresh closes the codex-flagged staleness
+window."
+  (require 'anvil-defs)
+  (anvil-sexp-test--with-phase2a-dir
+   (lambda (dir file)
+     (let* ((anvil-defs-index-db-path (expand-file-name "defs.db" dir))
+            (anvil-defs-paths (list dir))
+            (anvil-defs--db nil)
+            (anvil-defs--backend nil)
+            (new-file (expand-file-name "new-caller.el" dir)))
+       (unwind-protect
+           (progn
+             ;; Build the index against the single pre-existing fixture.
+             (anvil-defs-index-rebuild (list dir))
+             ;; Drop a second .el into the project AFTER rebuild.
+             (with-temp-file new-file
+               (insert ";;; new-caller.el --- -*- lexical-binding: t; -*-\n"
+                       ";;; Commentary:\n;; Added after rebuild.\n;;; Code:\n"
+                       "(defun new-caller () \"calls p2a-hello.\""
+                       " (p2a-hello \"late\"))\n"
+                       "(provide 'new-caller)\n"
+                       ";;; new-caller.el ends here\n"))
+             (ignore file)
+             (let* ((plan-idx
+                     (let ((anvil-sexp-use-index-backend t))
+                       (anvil-sexp--tool-rename-symbol
+                        "p2a-hello" "p2a-hi" nil dir)))
+                    (plan-rd
+                     (let ((anvil-sexp-use-index-backend nil))
+                       (anvil-sexp--tool-rename-symbol
+                        "p2a-hello" "p2a-hi" nil dir))))
+               (should (= (length (plist-get plan-idx :ops))
+                          (length (plist-get plan-rd :ops))))))
+         (when anvil-defs--db
+           (anvil-defs--close anvil-defs--db)
+           (setq anvil-defs--db nil)))))))
+
 
 (ert-deftest anvil-sexp-test-rename-var-binding-kind ()
   "rename-symbol with kinds=var touches only LHS-binding sites."

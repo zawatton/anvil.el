@@ -534,21 +534,54 @@ Uses the nearest `.git' ancestor; falls back to HINT itself."
           (locate-dominating-file d ".git"))
         (file-name-directory d))))
 
+(defun anvil-sexp--index-refresh-project ()
+  "Ingest / re-ingest every .el file under the project whose on-disk
+mtime differs from the indexed mtime.  Also ingests files the
+index has never seen.  Safe to call repeatedly; touches only files
+whose state has actually changed.  Returns the list of files that
+were (re-)ingested.
+
+This is the guard against codex's stale-index hazard: if a file
+started mentioning the target symbol since the last rebuild, its
+row is absent from `refs' and the narrowing query would skip it.
+Walking every .el on disk with a cheap mtime compare closes the
+gap while preserving the fast path for the common case where
+nothing has changed (O(project) stat calls is ~ms)."
+  (when (and (featurep 'anvil-defs)
+             (fboundp 'anvil-defs--ensure-db)
+             (fboundp 'anvil-defs--collect-files)
+             (fboundp 'anvil-defs--indexed-mtime)
+             (fboundp 'anvil-defs--current-mtime)
+             (fboundp 'anvil-defs--ingest-file))
+    (let* ((db (anvil-defs--ensure-db))
+           (root (anvil-sexp--project-root))
+           (files (anvil-defs--collect-files (list root)))
+           (touched nil))
+      (dolist (f files)
+        (let ((indexed (anvil-defs--indexed-mtime db f))
+              (current (anvil-defs--current-mtime f)))
+          (when (and current (or (null indexed) (> current indexed)))
+            (anvil-defs--ingest-file db f)
+            (push f touched))))
+      (nreverse touched))))
+
 (defun anvil-sexp--index-candidate-files (sym)
   "Return the set of .el files the Doc 11 index reports as touching SYM.
 Returns nil when `anvil-defs' is not loaded, the index is empty,
 or `anvil-sexp-use-index-backend' is non-nil but false.  Includes
 files from both `anvil-defs-references' (call / quote / symbol /
 var sites) and `anvil-defs-search' (definition name sites) so a
-never-referenced defun-name is still surfaced.  Any candidate
-whose on-disk mtime is newer than the indexed mtime is lazily
-re-ingested before it is returned."
+never-referenced defun-name is still surfaced.  Before querying,
+a project-wide mtime refresh ensures files modified (or newly
+added) since the last rebuild are re-ingested — otherwise the
+query would silently miss them."
   (when (and anvil-sexp-use-index-backend
              (featurep 'anvil-defs)
              (fboundp 'anvil-defs-index-status)
              (fboundp 'anvil-defs-references)
              (fboundp 'anvil-defs-search)
              (> (or (plist-get (anvil-defs-index-status) :files) 0) 0))
+    (anvil-sexp--index-refresh-project)
     (let* ((name (if (symbolp sym) (symbol-name sym) sym))
            (files
             (delete-dups
@@ -558,9 +591,6 @@ re-ingested before it is returned."
                             (anvil-defs-references name :limit 100000))
                     (mapcar (lambda (h) (plist-get h :file))
                             (anvil-defs-search name :limit 1000)))))))
-      (when (fboundp 'anvil-defs-refresh-if-stale)
-        (dolist (f files)
-          (anvil-defs-refresh-if-stale f)))
       files)))
 
 (defun anvil-sexp--project-el-files (root)
