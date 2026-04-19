@@ -1,0 +1,5 @@
+scenario,condition,rep,wall-ms,serial-sum-ms,cost-usd,providers,task-count,compiles,loads,pass,total,summary-len
+s1-fib,c1,0,14156,14156,0.02971025,claude,1,t,t,5,5,105
+s1-fib,c3,0,15105,39481,0.086632,claude|claude|claude,3,t,t,5,5,105
+s1-fib,c4,0,12539,21156,0.02875275,claude|codex|ollama,3,t,t,5,5,105
+s1-fib,c5,0,34575,39999,0.04133715,claude|codex|ollama|claude,4,t,t,5,5,105

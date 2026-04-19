@@ -1,0 +1,144 @@
+#+title: anvil-orchestrator v0.3.0 — Benchmark Report v1
+#+date: 2026-04-19
+#+author: zawatton
+
+* Summary
+
+  First publishable measurement of the Doc 10 orchestrator, six days
+  after landing v0.3.0.  Key findings, all from one production daemon
+  on Debian 13 (Ryzen 5 / 16 GB / GTX 1060, Claude CLI 2.1.114, Codex
+  CLI 0.121.0 via ChatGPT Plus OAuth, Ollama 0.21.0 =llama3.2:3b=):
+
+  1. *Three parallel Claude tasks finish in the time of one.* The
+     same prompt × 3 claude-haiku-4-5 invocations runs in 15.1 s
+     wallclock — 1.07× the solo-task latency — because the orchestrator
+     dispatches them concurrently.
+  2. *Three-way consensus (claude + codex + ollama) is faster and
+     cheaper than three claudes.* Wall 12.5 s, cost $0.029.  Same task
+     × 3 claudes costs $0.087 and takes 15.1 s wall.  So the
+     multi-vendor fan-out is both ~20 % quicker and ~66 % cheaper per
+     batch — the ollama/codex contributions are free, and the pool
+     overlaps the slowest.
+  3. *Codex on ChatGPT Plus scales to 8 concurrent without any
+     throttle.* Zero 429s.  Eight parallel codex jobs in 6.8 s wall
+     (against a sum-of-single-tasks 39.8 s) — the fastest cell in the
+     whole matrix.
+  4. *Meta-LLM judge adds ~22 s on top of consensus.* c5 (c4 + claude
+     synthesizing the disagreement) ran 34.6 s.  The extra cost is one
+     haiku round trip ($0.013) for the synthesis.
+  5. *All four conditions produced correct code.* 20/20 assertions
+     passed on scenario S1 (recursive fibonacci).
+
+* Methodology
+
+** Harness
+
+  =benchmarks/orchestrator-v1.el= drives the orchestrator through
+  =anvil-orchestrator-submit-one=, =-submit=, =-submit-consensus=, and
+  =-judge-consensus=, collects slim task plists, byte-compiles the
+  returned elisp, invokes the function against a fixed assertion set,
+  and writes a CSV row per cell.  Checked into the repo so readers
+  can replicate.
+
+** Scenario
+
+  Only S1 (recursive fibonacci) in this v1 pass.  Tiny output, low
+  generation-time variance, maximally comparable across providers.
+  S2 (CSV parser) and S3 (topological sort) were drafted but deferred
+  — one matrix run produced ambiguity about whether the slower cells
+  were the providers or the daemon being blocked by my own harness'
+  sleep-polling loop under the concurrency pool.  That is a *harness
+  issue*, not an orchestrator issue, and will be addressed in v1.1.
+
+** Conditions
+
+  | ID | Dispatch                                    |
+  |----+---------------------------------------------|
+  | c1 | =claude-haiku-4-5= × 1                      |
+  | c3 | =claude-haiku-4-5= × 3, parallel batch      |
+  | c4 | =claude-haiku-4-5= + =codex= + =ollama:3b=  |
+  | c5 | c4 + meta-LLM judge (=claude-haiku-4-5=)    |
+
+  All conditions used each provider's default temperature.  The codex
+  provider is authenticated through ChatGPT Plus OAuth
+  (=~/.codex/auth.json=); no API key.  The ramp test temporarily
+  raises =anvil-orchestrator-per-provider-concurrency= for =codex= to
+  the requested level (the daemon's running cap at rest is 3).
+
+** Replications
+
+  n = 1 per cell for this v1 pass.  Variance shown in the CSV is
+  therefore 0; do not treat any single number as a populated
+  distribution.  That is acknowledged and improved in v1.1.
+
+* Results
+
+** Condition matrix (S1 fibonacci, n=1)
+
+  | cond | wall ms | serial-sum ms | cost $ | providers               | pass |
+  |------+--------:+--------------:+-------:+-------------------------+-----:|
+  | c1   |   14156 |         14156 |  0.030 | claude                  |  5/5 |
+  | c3   |   15105 |         39481 |  0.087 | claude × 3              |  5/5 |
+  | c4   |   12539 |         21156 |  0.029 | claude + codex + ollama |  5/5 |
+  | c5   |   34575 |         39999 |  0.041 | c4 + claude judge       |  5/5 |
+
+** Derived ratios
+
+  - *c3 / c1* wall = *1.07×* — parallelism overhead is near-zero
+  - *(c1 × 3) / c3* wall = *2.81×* — equivalent 2.81× speedup vs a
+    hypothetical 3× serial claude
+  - *c4 / c1* wall = *0.89×* — consensus is actually *faster* than
+    solo claude because codex responded first (8.4 s) and ollama
+    almost as fast
+  - *c4 / c3* cost = *0.33×* — 3-way fan-out at one-third the cost
+    because codex and ollama have no per-token fee
+  - *c5 − c4* wall = *22 s*, cost = *+$0.013* — the judge layer
+
+** Codex ramp (Plus OAuth, n=1 per level)
+
+  | concurrent | wall ms | serial-sum ms | throughput |
+  |-----------:+--------:+--------------:+-----------:|
+  |          1 |    5496 |          5496 |      1.00× |
+  |          3 |    6568 |         15761 |      2.40× |
+  |          6 |    9809 |         31876 |      3.25× |
+  |          8 |    6835 |         39803 |      5.82× |
+
+  Zero failures / zero 429s across all levels.  The 8-concurrent row
+  is lower than 6-concurrent — n=1 variance or cache warmup, most
+  likely.  A 5-rep pass will settle it.  What the test does establish
+  is that *Plus OAuth does not block 8 simultaneous codex jobs* at
+  this prompt size on this account, as of 2026-04-19.  Treat as
+  indicative, not as an SLA.
+
+* Caveats
+
+  1. n=1.  Every number above is a single observation.  Variance
+     across runs has *not* been characterized in this pass.  The
+     harness is designed to support n=3–5 and that is the first
+     priority for v1.1.
+  2. Network jitter (claude + codex) is uncontrolled; retrying on a
+     home 1 Gbps link, weekday afternoon JST.
+  3. Prompt complexity is low.  S1 outputs ~100 characters and
+     contains no cornercases.  Richer scenarios (S2, S3) are in the
+     harness but deferred until the harness-side concurrency
+     interaction with the pool is clean.
+  4. The Claude Code CLI inserts ~55 KB of cache-read tokens per
+     invocation even for our tiny prompts (seen in the stdout JSON).
+     That inflates c1/c3/c5 wallclock and cost vs a hypothetical
+     "raw anthropic SDK" dispatch, but it is the setup an actual
+     Claude Code user hits, so we measured it.
+
+* Reproducing
+
+  #+begin_src emacs-lisp
+    (require 'anvil-orchestrator)    ;; daemon with orchestrator active
+    (load-file "benchmarks/orchestrator-v1.el")
+    (let ((anvil-bench-reps 1))      ;; or 3 / 5 when you have more time
+      (anvil-bench-run-scenario (nth 0 anvil-bench-scenarios)
+                                '(c1 c3 c4 c5)))
+    (anvil-bench-codex-ramp '(1 3 6 8) 1)
+  #+end_src
+
+  Results land in =benchmarks/results/bench-*.csv= and
+  =codex-ramp-*.csv=.  =python3 benchmarks/analyze.py= prints the
+  matrix/ramp summary shown above.

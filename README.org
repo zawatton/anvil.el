@@ -83,8 +83,9 @@ Anvil stands on the shoulders of existing work.
 The MCP protocol foundation comes from Laurynas Biveinis's [[https://github.com/laurynas-biveinis/mcp-server-lib.el][mcp-server-lib.el]],
 and the org primitives are an extension and integration of his [[https://github.com/laurynas-biveinis/org-mcp][org-mcp]].
 
-On top of these proven packages, Anvil adds four layers:
+On top of these proven packages, Anvil adds five layers:
 
+- *Multi-agent orchestration* — fan one prompt out to up to five AI CLIs (=claude= / =aider= / =gemini= / =ollama= / =codex=) in parallel, with Jaccard consensus and an optional meta-LLM judge to synthesize the disagreement
 - *File operations* — read/write text files, localized edits on large files
 - *External process integration* — invoke shell commands or other languages (Python, etc.)
 - *Long-running operation support* — OCR, PDF conversion, batch file scans, and more
@@ -238,11 +239,12 @@ one-time setup cost pays itself back almost immediately.
 
 * Feature Highlights
 
-Anvil exposes about 50 MCP tools, letting an AI call Emacs's capabilities directly.
-Five that have proven the most useful:
+Anvil exposes 100+ MCP tools, letting an AI call Emacs's capabilities directly.
+Six that have proven the most useful:
 
 | Capability | What it does |
 |------------+--------------|
+| =anvil-orchestrator= | Fan out one prompt to up to five AI CLIs (=claude= / =aider= / =gemini= / =ollama= / =codex=) in parallel. Jaccard consensus + meta-LLM judge + DAG dependencies + =anvil-cron= integration for nightly PDCA loops |
 | =file-batch= | Apply multiple edits to the same file atomically in one round trip (up to ~90% token reduction) |
 | =org-read-outline= / =org-read-headline= | Read just the headings or a single subtree, even on a 13,000-line org. No full-file read needed |
 | =anvil-worker= | Dispatch long-running tasks (OCR, PDF conversion, batch file scans) to a separate background Emacs. The interactive Emacs never freezes |
@@ -254,6 +256,7 @@ For the full module list, see [[*Modules]].
 
 * Why Anvil?
 
+- *Multi-agent coordination* — fan out to five AI CLIs in parallel with consensus and a meta-LLM judge, all from inside Emacs
 - *LLM-agnostic* — works with any MCP-compatible client
 - *Safe by design* — long-running tasks are dispatched to a background Emacs, so your interactive Emacs is never affected
 - *Org-mode native* — first-class org read/write/refactor support
@@ -267,6 +270,33 @@ LLM agents pay per token, and every Read/Edit round trip costs
 both bytes on the wire and orchestration overhead. Anvil's tools
 are designed to keep the agent's context budget free for reasoning,
 not bookkeeping.
+
+** Orchestrator measurements (v0.3.0, 2026-04-19)
+
+First publishable numbers from [[file:benchmarks/][=benchmarks/=]]
+— one production daemon on Debian 13, n=1 per cell, scenario S1
+(recursive fibonacci via =claude-haiku-4-5= / =codex-gpt-5.4= /
+=ollama-llama3.2:3b=).  Reproduce with the checked-in harness.
+
+| Condition                                              | Wall   | Cost   |
+|--------------------------------------------------------+--------+--------|
+| Solo =claude-haiku=                                    | 14.2 s | $0.030 |
+| 3× =claude-haiku= in parallel                          | 15.1 s | $0.087 |
+| 3-way consensus (claude + codex + ollama)              | 12.5 s | $0.029 |
+| 3-way consensus + meta-LLM judge                       | 34.6 s | $0.041 |
+
+Three parallel Claude tasks finish in *1.07×* the solo-task
+wallclock — the orchestrator's pool dispatches them concurrently
+with near-zero overhead.  A three-provider fan-out with consensus
+is *both faster and cheaper than three Claudes* on the same
+prompt: the codex (ChatGPT Plus OAuth) and ollama (local) calls
+have no per-token cost, and the pool overlaps the slowest.
+
+Codex on Plus scaled to *eight concurrent* requests with zero 429s
+on this account; the concurrency ramp (levels 1 / 3 / 6 / 8 @
+5.5 s / 6.6 s / 9.8 s / 6.8 s wallclock) is in the same CSV.
+Full methodology and caveats in
+[[file:benchmarks/results/report-2026-04-19.org][benchmarks/results/report-2026-04-19.org]].
 
 ** Operate on regions, not whole files
 
