@@ -286,5 +286,38 @@ with the git-bisect skip code (125) and the bisect does not crash."
                       (anvil-bisect-last-result)))))))
 
 
+
+;;;; --- review-feedback hardening ------------------------------------
+
+(ert-deftest anvil-bisect-test-first-bad-sha-fallback-picks-last ()
+  "When `# first bad commit' is absent, the fallback returns the *last*
+`# bad:' SHA — the introducing commit — not the first, which is the
+initial bad ref."
+  (let ((log (concat
+              "git bisect start\n"
+              "# bad: [aaaaaaaaaaaaaaaa] initial bad ref\n"
+              "# good: [bbbbbbbbbbbbbbbb] initial good ref\n"
+              "# bad: [cccccccccccccccc] mid-step 1\n"
+              "# bad: [dddddddddddddddd] final bad\n")))
+    (should (equal "dddddddddddddddd"
+                   (anvil-bisect--first-bad-sha log)))))
+
+(ert-deftest anvil-bisect-test-concurrent-bisect-refused ()
+  "While `anvil-bisect--active-worktree' is set, a second bisect must
+be refused rather than silently starting on top of the first."
+  (let ((anvil-bisect--active-worktree "/tmp/fake-worktree"))
+    (should-error
+     (anvil-bisect-test 'foo :test-file "tests/x.el"))
+    (setq anvil-bisect--active-worktree nil)))
+
+(ert-deftest anvil-bisect-test-entry-path-prefers-source ()
+  "`anvil-bisect--entry-path' resolves to the .el file, not a .elc,
+so the subprocess always runs fresh source even if a stale byte-
+compiled cache sits next to it."
+  (let ((p (anvil-bisect--entry-path)))
+    (should (string-suffix-p "anvil-bisect-entry.el" p))
+    (should (not (string-suffix-p ".elc" p)))))
+
+
 (provide 'anvil-bisect-test)
 ;;; anvil-bisect-test.el ends here

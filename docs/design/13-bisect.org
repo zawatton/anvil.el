@@ -113,7 +113,7 @@ Each bisect step is ~emacs --batch~ via ~make-process~:
 ** Result schema
 
 #+begin_src elisp
-(:status 'found / 'inconclusive / 'timeout
+(:status 'found / 'timeout / 'cancelled / 'error
  :breaking-sha "abcd123..."
  :breaking-subject "feat(worker): add dispatcher lane"
  :breaking-author "zawatton"
@@ -121,18 +121,33 @@ Each bisect step is ~emacs --batch~ via ~make-process~:
  :steps N                 ; number of bisect iterations
  :range "origin/main..HEAD"
  :elapsed-sec FLOAT
- :log-path "/tmp/anvil-bisect-xxx/bisect.log"
+ :log STR                 ; raw contents of BISECT_LOG, inlined so the
+                          ; caller does not have to reach into the
+                          ; temp worktree (which is destroyed on exit)
  :diff-files (list of filenames changed in breaking commit)
- :test-failure-detail STR ; head of ert backtrace
  )
 #+end_src
+
+/Revision 2026-04-20:/ Phase 1 ship inlines `:log' content rather
+than a `:log-path' file pointer because the worktree (and therefore
+any path underneath it) is destroyed by the cleanup step.  The
+formerly-documented `:test-failure-detail' field is deferred to
+Phase 3 alongside diff-blame enrichment — it requires keeping the
+subprocess stderr on hand past cleanup.  Status value `inconclusive'
+is folded into `timeout' / `error' so the surface reflects only the
+outcomes the driver can actually produce.
 
 * Public API
 
 #+begin_src elisp
-(anvil-bisect-test TEST-NAME &key good bad timeout-total timeout-per-step)
+(anvil-bisect-test TEST-NAME &key good bad test-file
+                                  timeout-total timeout-per-step)
   ;; TEST-NAME: symbol or string (ert test name)
   ;; :good / :bad: refs, default origin/main / HEAD
+  ;; :test-file: path to the ERT file defining TEST-NAME, relative to
+  ;;   the repo root.  Required — we do not auto-discover the file
+  ;;   from the test name because many projects keep the same test
+  ;;   name in fixture and production paths.
   ;; :timeout-total seconds (default 600), :timeout-per-step (default 60)
 
 (anvil-bisect-expr EXPR &key good bad timeout-total timeout-per-step
@@ -153,7 +168,7 @@ Each bisect step is ~emacs --batch~ via ~make-process~:
 
 | id                      | args                                          | returns              | notes                |
 |-------------------------+-----------------------------------------------+----------------------+----------------------|
-| ~bisect-test~           | test-name, good?, bad?, timeout-total?, ...   | result plist         | sync, can block long |
+| ~bisect-test~           | test-name, test-file, good?, bad?, timeout-total?, ...   | result plist         | sync, can block long |
 | ~bisect-expr~           | expr (elisp source str), good?, bad?, ...     | result plist         |                      |
 | ~bisect-cancel~         | (no args)                                     | ok (bool)            | kill running worktree|
 | ~bisect-last-result~    | (no args)                                     | result plist or nil  | read-only            |

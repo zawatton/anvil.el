@@ -193,13 +193,12 @@ the combined stdout/stderr trimmed of trailing newline."
 
 (defun anvil-bisect--entry-path ()
   "Return absolute path to the subprocess entry file loaded on -l.
-Resolved via `locate-library' against the *current* load-path
-(the live source checkout), not against the worktree — the
-worktree is a historical checkout that may pre-date this file
-existing on disk.  Callers who ship anvil-bisect separately
-should add its `tests/' directory to `load-path' before invoking
-the bisect."
-  (or (locate-library "anvil-bisect-entry")
+Pins to the .el source (never a stale .elc) so the subprocess
+always loads the same version the caller is running.  Resolved
+against the live source checkout's `load-path', not against the
+worktree — the worktree is a historical checkout that may
+pre-date this file existing on disk."
+  (or (locate-file "anvil-bisect-entry.el" load-path)
       (error "anvil-bisect: cannot locate anvil-bisect-entry.el on load-path")))
 
 (defun anvil-bisect--step-command (worktree test-name test-file)
@@ -278,37 +277,56 @@ TEST-FILE is a path relative to WORKTREE (e.g. \"tests/foo-test.el\")."
 ;;;; --- control loop ----------------------------------------------------
 
 (defun anvil-bisect--collect-bisect-log (worktree)
-  "Return the contents of WORKTREE/.git*/BISECT_LOG as a string.
-Works both for a normal checkout and for a linked worktree (whose
-git state lives at .git/worktrees/<name>/BISECT_LOG)."
-  (let ((candidate
-         (cond
-          ((file-directory-p (expand-file-name ".git" worktree))
-           (expand-file-name ".git/BISECT_LOG" worktree))
-          (t
-           (let* ((gitdir (car-safe
-                           (split-string
-                            (cdr (anvil-bisect--git worktree "rev-parse"
-                                                    "--git-dir"))
-                            "\n" t))))
-             (and gitdir (expand-file-name "BISECT_LOG" gitdir)))))))
+  "Return the contents of WORKTREE's BISECT_LOG as a string, or nil.
+Works both for a normal checkout and for a linked worktree
+(whose git state lives at .git/worktrees/<name>/BISECT_LOG).
+Older git versions print a relative `--git-dir' path, which must
+be resolved against WORKTREE (not the caller's default-directory)
+or the lookup silently reads the wrong repository."
+  (let* ((worktree-abs (file-name-as-directory
+                        (expand-file-name worktree)))
+         (candidate
+          (cond
+           ((file-directory-p (expand-file-name ".git" worktree-abs))
+            (expand-file-name ".git/BISECT_LOG" worktree-abs))
+           (t
+            (let* ((gitdir (car-safe
+                            (split-string
+                             (cdr (anvil-bisect--git worktree-abs "rev-parse"
+                                                     "--git-dir"))
+                             "\n" t))))
+              (and gitdir
+                   (expand-file-name
+                    "BISECT_LOG"
+                    ;; Force absolute: if git returned a relative
+                    ;; path, anchor it to the worktree.
+                    (expand-file-name gitdir worktree-abs))))))))
     (when (and candidate (file-exists-p candidate))
       (with-temp-buffer
         (insert-file-contents candidate)
         (buffer-string)))))
 
 (defun anvil-bisect--first-bad-sha (log)
-  "Extract the final \"first bad commit\" SHA from a bisect log string."
+  "Extract the final \"first bad commit\" SHA from a bisect log string.
+Prefers the terminating `# first bad commit' header that git
+writes when the range collapses.  When that header is absent
+(unusual — skipped-commit layouts), returns the SHA of the
+*last* `# bad:' entry in the log rather than the first; the
+first `# bad:' is the initial bad ref, not the introducing
+commit."
   (when log
     (cond
      ((string-match
        "# first bad commit: \\[\\([0-9a-f]+\\)\\]"
        log)
       (match-string 1 log))
-     ((string-match
-       "\\(?:\\`\\|\n\\)# bad: \\[\\([0-9a-f]+\\)\\][^\n]*\\(?:\n#\\|\n\\'\\|\\'\\)"
-       log)
-      (match-string 1 log)))))
+     (t
+      (let ((pat "# bad: \\[\\([0-9a-f]+\\)\\]")
+            (start 0) (last-sha nil))
+        (while (string-match pat log start)
+          (setq last-sha (match-string 1 log))
+          (setq start (match-end 0)))
+        last-sha)))))
 
 (defun anvil-bisect--drive (repo worktree test-name test-file
                                  good bad timeout-total timeout-per-step)
@@ -336,12 +354,19 @@ where `git bisect' runs."
         (setq last-step
               (anvil-bisect--run-step
                worktree test-name test-file timeout-per-step))
+        ;; If cancel arrived *during* the step, its SIGINT will have
+        ;; made `--run-step' report `error' (signal-exited process).
+        ;; Interpret the cancel flag first so the outer status
+        ;; reflects user intent rather than a post-hoc error code.
+        (when anvil-bisect--cancelled
+          (setq outcome 'cancelled)
+          (throw 'done nil))
         (pcase last-step
           ('pass (anvil-bisect--git-check worktree "bisect" "good"))
           ('fail (anvil-bisect--git-check worktree "bisect" "bad"))
           ('skip (anvil-bisect--git-check worktree "bisect" "skip"))
           ('timeout
-           ;; treat as skip so bisect can make progress elsewhere
+           ;; Treat as skip so bisect can make progress elsewhere.
            (anvil-bisect--git-check worktree "bisect" "skip"))
           (_
            (setq outcome 'error)
