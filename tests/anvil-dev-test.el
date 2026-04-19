@@ -272,4 +272,215 @@ Non-git `call-process' calls still signal exit-status 1."
             (should (equal 0 (plist-get r :failed)))))
       (delete-directory d t))))
 
+;;;; --- release audit -----------------------------------------------------
+
+(defun anvil-dev-test--audit-write (file content)
+  "Create FILE with CONTENT, making parent directories as needed."
+  (let ((dir (file-name-directory file)))
+    (when dir (make-directory dir t)))
+  (with-temp-file file (insert content)))
+
+(defun anvil-dev-test--audit-make-root ()
+  "Return a fresh temp directory set up like an anvil checkout."
+  (let ((d (make-temp-file "anvil-dev-audit-" t)))
+    (make-directory (expand-file-name "docs/design" d) t)
+    d))
+
+(ert-deftest anvil-dev-test-audit-flags-arglist-strip ()
+  "A wrapper with `(_args)` is reported as an arglist-strip hazard."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-foo.el" d)
+           (concat
+            "(defun anvil-foo--tool-probe (_args)\n"
+            "  \"docstring.\n\nMCP Parameters:\n  (none)\"\n"
+            "  (ignore _args) \"ok\")\n"))
+          (let* ((r (anvil-dev-release-audit d))
+                 (hits (plist-get r :arglist-strip)))
+            (should (= 1 (length hits)))
+            (should (equal "anvil-foo.el"
+                           (plist-get (car hits) :file)))
+            (should (equal "anvil-foo--tool-probe"
+                           (plist-get (car hits) :defun)))
+            (should-not (plist-get r :clean-p))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-allows-empty-arglist ()
+  "A wrapper with `()` is NOT an arglist-strip hazard."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-foo.el" d)
+           (concat
+            "(defun anvil-foo--tool-probe ()\n"
+            "  \"no-arg tool.\" \"ok\")\n"))
+          (let ((r (anvil-dev-release-audit d)))
+            (should (null (plist-get r :arglist-strip)))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-flags-missing-params-section ()
+  "A wrapper with real args but no `MCP Parameters:' is flagged."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-foo.el" d)
+           (concat
+            "(defun anvil-foo--tool-run (task-id)\n"
+            "  \"Run something.  Yes, this has an arg but no section.\"\n"
+            "  task-id)\n"))
+          (let* ((r (anvil-dev-release-audit d))
+                 (hits (plist-get r :missing-params)))
+            (should (= 1 (length hits)))
+            (should (equal "anvil-foo--tool-run"
+                           (plist-get (car hits) :defun)))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-accepts-documented-params ()
+  "A wrapper with real args and an `MCP Parameters:' section is clean."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-foo.el" d)
+           (concat
+            "(defun anvil-foo--tool-run (task-id)\n"
+            "  \"Run task.\n\nMCP Parameters:\n  task-id - Task identifier\"\n"
+            "  task-id)\n"))
+          (let ((r (anvil-dev-release-audit d)))
+            (should (null (plist-get r :missing-params)))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-ignores-error-helpers ()
+  "Helpers named `*--tool-*-error' are not MCP wrappers and must not be audited."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-foo.el" d)
+           (concat
+            "(defun anvil-foo--tool-validation-error (message &rest args)\n"
+            "  \"Throw validation error MESSAGE with ARGS.\"\n"
+            "  (error message args))\n"
+            "(defun anvil-foo--tool-file-access-error (locator)\n"
+            "  \"Throw file access error for LOCATOR.\"\n"
+            "  (error \"%s\" locator))\n"))
+          (let ((r (anvil-dev-release-audit d)))
+            (should (null (plist-get r :arglist-strip)))
+            (should (null (plist-get r :missing-params)))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-ignores-single-dash-tool-names ()
+  "Only `--tool-' (double-dash) names are MCP wrappers; `-tool-' are not."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-foo.el" d)
+           (concat
+            "(defun anvil-foo-process-tool-response (response)\n"
+            "  \"Process a response coming back from a tool.\"\n"
+            "  response)\n"))
+          (let ((r (anvil-dev-release-audit d)))
+            (should (null (plist-get r :missing-params)))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-skips-anvil-dev-module ()
+  "The audit must skip `anvil-dev.el' even when it lives in the root."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          ;; Put something that would match if scanned.
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-dev.el" d)
+           (concat
+            "(defun anvil-dev--tool-probe (_args) \"x\" \"ok\")\n"))
+          (let ((r (anvil-dev-release-audit d)))
+            (should (null (plist-get r :arglist-strip)))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-flags-non-shipped-design-doc ()
+  "A design org whose STATUS lacks `SHIPPED' is reported."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "docs/design/04-pty.org" d)
+           (concat
+            "#+title: PTY\n"
+            "* STATUS\n"
+            "~DRAFT~ — レビュー前\n"))
+          (let* ((r (anvil-dev-release-audit d))
+                 (docs (plist-get r :non-shipped-docs)))
+            (should (= 1 (length docs)))
+            (should (equal "04-pty.org" (plist-get (car docs) :file)))
+            (should (string-match-p "DRAFT"
+                                    (plist-get (car docs) :status)))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-accepts-shipped-design-doc ()
+  "A design org whose STATUS contains `SHIPPED' is silent."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "docs/design/01-worker.org" d)
+           (concat
+            "#+title: Worker\n"
+            "* STATUS\n"
+            "~Phase 1+2+3 SHIPPED 2026-04-16~\n"))
+          (let ((r (anvil-dev-release-audit d)))
+            (should (null (plist-get r :non-shipped-docs)))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-skips-properties-drawer ()
+  "The status extractor must skip the :PROPERTIES: drawer before
+picking up the status line itself."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "docs/design/02-ix.org" d)
+           (concat
+            "* STATUS\n"
+            "  :PROPERTIES:\n"
+            "  :ID:       abc\n"
+            "  :END:\n"
+            "~Phase 1 SHIPPED~\n"))
+          (let ((r (anvil-dev-release-audit d)))
+            (should (null (plist-get r :non-shipped-docs)))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-clean-report-all-green ()
+  "A tidy tree reports `:clean-p' t and no findings."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-foo.el" d)
+           "(defun anvil-foo--tool-probe () \"no-arg.\" \"ok\")\n")
+          (anvil-dev-test--audit-write
+           (expand-file-name "docs/design/01-ok.org" d)
+           "* STATUS\n~SHIPPED~\n")
+          (let ((r (anvil-dev-release-audit d)))
+            (should (plist-get r :clean-p))
+            (should (null (plist-get r :arglist-strip)))
+            (should (null (plist-get r :missing-params)))
+            (should (null (plist-get r :non-shipped-docs)))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-formatted-report-has-root-and-time ()
+  "Formatter includes root + audited-at headers regardless of state."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (let* ((r (anvil-dev-release-audit d))
+               (text (anvil-dev--audit-format-report r)))
+          (should (stringp text))
+          (should (string-match-p "anvil release audit — " text))
+          (should (string-match-p "root: " text)))
+      (delete-directory d t))))
+
 ;;; anvil-dev-test.el ends here

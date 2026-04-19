@@ -444,6 +444,276 @@ MCP Parameters:
   (anvil-server-with-error-handling
    (format "%S" (anvil-dev-scaffold-module name description))))
 
+;;;; --- release audit -------------------------------------------------------
+;;
+;; v0.2.0 shipped with an Emacs 30 arglist-strip bug (issue #9) because
+;; the pre-release review missed `(_args)`-style MCP wrappers in three
+;; modules even though an earlier fix had documented the pattern.  This
+;; audit scans the anvil tree for classes of defect that are cheap to
+;; detect and painful to discover in production:
+;;
+;;   1. `_`-prefix argument on an MCP tool wrapper (Emacs 30 strips the
+;;      underscore; the schema validator then rejects the tool).
+;;   2. An MCP tool wrapper takes a real argument but has no
+;;      `MCP Parameters:' section in its docstring — the schema generator
+;;      can't describe the parameter and Claude can't call the tool.
+;;   3. Any docs/design/*.org whose `* STATUS' text does not contain
+;;      `SHIPPED' — informational surface of the master-integration gate.
+
+(defun anvil-dev--audit-default-root ()
+  "Return the directory that should be audited.
+Prefers the dev checkout (`anvil-dev-source-path') when set; falls
+back to the installed anvil directory (containing `anvil-dev.el')."
+  (or (and anvil-dev-source-path
+           (file-directory-p anvil-dev-source-path)
+           (file-name-as-directory anvil-dev-source-path))
+      (when-let* ((lib (locate-library "anvil-dev")))
+        (file-name-directory lib))))
+
+(defun anvil-dev--audit-module-files (root)
+  "Return the anvil-*.el source files in ROOT, excluding tests and anvil-dev.el.
+The audit skips anvil-dev.el because its own scanners match its own
+regexes and would report spurious hits on its template strings."
+  (let ((files (directory-files root t "\\`anvil-[^/]+\\.el\\'" t)))
+    (cl-remove-if (lambda (f)
+                    (let ((base (file-name-nondirectory f)))
+                      (or (string-match-p "-test\\.el\\'" base)
+                          (equal base "anvil-dev.el"))))
+                  files)))
+
+(defconst anvil-dev--audit-wrapper-regex
+  "^(defun \\([a-zA-Z0-9-]+--tool-[a-zA-Z0-9-]+\\) (\\([^)]*\\))"
+  "Matches a top-level MCP tool wrapper `defun'.
+Group 1 captures the defun name (must use the `--tool-' private
+prefix convention).  Group 2 captures the literal argument list,
+possibly empty.
+
+The `--tool-' double-dash prefix is treated as authoritative; a
+function named `foo--tool-bar-error' is still caught structurally
+and filtered out separately via `anvil-dev--audit-wrapper-name-p'
+because it is idiomatic to name error helpers alongside real
+wrappers.")
+
+(defun anvil-dev--audit-wrapper-name-p (name)
+  "Return non-nil when NAME is a real MCP tool wrapper (not a helper).
+Names ending in `-error' are error-helper siblings of real
+wrappers (e.g. `anvil-org--tool-validation-error') and must not
+be audited."
+  (not (string-suffix-p "-error" name)))
+
+(defun anvil-dev--audit-scan-arglist-strip (root)
+  "Scan ROOT for MCP tool wrappers with `(_arg)`-style arguments.
+Returns a list of plists `(:file NAME :line N :defun SYM :args ARGS)'
+for every wrapper whose first argument begins with an underscore
+— that is the exact Emacs 30 arglist-strip regression that
+broke v0.2.0 (issue #9)."
+  (let (findings)
+    (dolist (file (anvil-dev--audit-module-files root))
+      (with-temp-buffer
+        (insert-file-contents file)
+        (goto-char (point-min))
+        (while (re-search-forward anvil-dev--audit-wrapper-regex nil t)
+          (let ((name  (match-string 1))
+                (args  (match-string 2))
+                (line  (line-number-at-pos (match-beginning 0))))
+            (when (and (anvil-dev--audit-wrapper-name-p name)
+                       (string-match-p "\\`_\\|[ \t]_" args))
+              (push (list :file (file-name-nondirectory file)
+                          :line line
+                          :defun name
+                          :args args)
+                    findings))))))
+    (nreverse findings)))
+
+(defun anvil-dev--audit-wrapper-has-real-args-p (args)
+  "Return non-nil when the wrapper ARG-STRING describes a real parameter.
+Empty, `&rest', `&optional _x', and `_foo' forms are treated as
+no-arg; anything else counts as a real argument that ought to be
+documented in an `MCP Parameters:' section."
+  (let ((trimmed (string-trim args)))
+    (cond
+     ((string-empty-p trimmed) nil)
+     ((string-match-p "\\`&rest[ \t]" trimmed) nil)
+     ((string-match-p "\\`_" trimmed) nil)
+     ((string-match-p "\\`&optional[ \t]+_" trimmed) nil)
+     (t t))))
+
+(defun anvil-dev--audit-scan-missing-params-section (root)
+  "Scan ROOT for MCP tool wrappers that take real args but lack
+an `MCP Parameters:' docstring section.  Returns a list of
+plists `(:file NAME :line N :defun SYM :args ARGS)'."
+  (let (findings)
+    (dolist (file (anvil-dev--audit-module-files root))
+      (with-temp-buffer
+        (insert-file-contents file)
+        (goto-char (point-min))
+        (while (re-search-forward anvil-dev--audit-wrapper-regex nil t)
+          (let* ((name  (match-string 1))
+                 (args  (match-string 2))
+                 (start (match-beginning 0))
+                 (line  (line-number-at-pos start)))
+            (when (and (anvil-dev--audit-wrapper-name-p name)
+                       (anvil-dev--audit-wrapper-has-real-args-p args))
+              (let* ((form-end
+                      (save-excursion
+                        (goto-char start)
+                        (condition-case nil
+                            (progn (forward-sexp) (point))
+                          (error (point-max))))))
+                (unless (save-excursion
+                          (goto-char start)
+                          (re-search-forward "MCP Parameters:" form-end t))
+                  (push (list :file (file-name-nondirectory file)
+                              :line line
+                              :defun name
+                              :args args)
+                        findings))))))))
+    (nreverse findings)))
+
+(defun anvil-dev--audit-design-doc-status (file)
+  "Extract the first non-blank line of FILE's `* STATUS' section.
+Returns the trimmed string or nil when the file has no STATUS
+heading or the section is empty.  The org heading and the
+PROPERTIES drawer are skipped; `~...~' verbatim delimiters are
+stripped so the caller sees the plain status text."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (goto-char (point-min))
+    (when (re-search-forward "^\\* STATUS" nil t)
+      (forward-line 1)
+      (let ((end (save-excursion
+                   (or (and (re-search-forward "^\\* " nil t)
+                            (match-beginning 0))
+                       (point-max)))))
+        (catch 'found
+          (while (< (point) end)
+            (let ((line (buffer-substring-no-properties
+                         (line-beginning-position)
+                         (line-end-position))))
+              (unless (or (string-match-p "\\`[[:space:]]*\\'" line)
+                          (string-match-p "\\`[[:space:]]*:PROPERTIES:" line)
+                          (string-match-p "\\`[[:space:]]*:ID:" line)
+                          (string-match-p "\\`[[:space:]]*:END:" line))
+                (throw 'found
+                       (string-trim
+                        (replace-regexp-in-string "\\`[[:space:]]*~\\|~[[:space:]]*\\'"
+                                                  "" line)))))
+            (forward-line 1))
+          nil)))))
+
+(defun anvil-dev--audit-scan-design-docs (root)
+  "Scan ROOT/docs/design/*.org for STATUS lines that do not contain `SHIPPED'.
+Returns a list of plists `(:file NAME :status LINE)' in lexical
+order, surfacing DRAFT / APPROVED / partial-phase docs so the
+reader can judge the master-integration gate criterion."
+  (let ((design-dir (expand-file-name "docs/design" root))
+        findings)
+    (when (file-directory-p design-dir)
+      (dolist (file (sort (directory-files design-dir t "\\.org\\'" t)
+                          #'string-lessp))
+        (let ((base (file-name-nondirectory file)))
+          (unless (equal base "README.org")
+            (let ((status (anvil-dev--audit-design-doc-status file)))
+              (cond
+               ((null status)
+                (push (list :file base :status "(no STATUS section)")
+                      findings))
+               ((not (string-match-p "SHIPPED" status))
+                (push (list :file base :status status) findings))))))))
+    (nreverse findings)))
+
+(defun anvil-dev-release-audit (&optional project-dir)
+  "Audit the anvil tree at PROJECT-DIR for pre-release hazards.
+
+Runs three cheap scanners (see the `release audit' section for
+details) and returns a plist:
+
+  :arglist-strip    — list of wrapper plists hit by the Emacs 30
+                      underscore-strip regression
+  :missing-params   — list of wrapper plists with real args but
+                      no `MCP Parameters:' docstring section
+  :non-shipped-docs — list of `(:file :status)' plists for design
+                      docs whose STATUS line lacks `SHIPPED'
+  :clean-p          — t iff all three scans returned empty
+  :root             — absolute directory that was audited
+  :audited-at       — ISO timestamp when the scan ran"
+  (interactive)
+  (let* ((root (or project-dir (anvil-dev--audit-default-root)))
+         (_    (unless (and root (file-directory-p root))
+                 (error "anvil-dev-release-audit: no anvil root found (tried %S)"
+                        root)))
+         (arglist-strip  (anvil-dev--audit-scan-arglist-strip root))
+         (missing-params (anvil-dev--audit-scan-missing-params-section root))
+         (non-shipped    (anvil-dev--audit-scan-design-docs root))
+         (clean-p        (and (null arglist-strip)
+                              (null missing-params)
+                              (null non-shipped)))
+         (result
+          (list :arglist-strip arglist-strip
+                :missing-params missing-params
+                :non-shipped-docs non-shipped
+                :clean-p clean-p
+                :root (file-name-as-directory (expand-file-name root))
+                :audited-at (format-time-string "%Y-%m-%d %H:%M:%S"))))
+    (when (called-interactively-p 'any)
+      (message "%s" (anvil-dev--audit-format-report result)))
+    result))
+
+(defun anvil-dev--audit-format-findings (header findings formatter)
+  "Render FINDINGS as an indented bullet list with HEADER.
+FORMATTER is a function called with each finding plist; it must
+return a one-line string."
+  (when findings
+    (concat
+     (format "%s (%d):\n" header (length findings))
+     (mapconcat (lambda (f) (format "    %s" (funcall formatter f)))
+                findings
+                "\n")
+     "\n\n")))
+
+(defun anvil-dev--audit-format-report (result)
+  "Render RESULT as a human-readable release audit report."
+  (let ((arglist (plist-get result :arglist-strip))
+        (params  (plist-get result :missing-params))
+        (docs    (plist-get result :non-shipped-docs))
+        (clean-p (plist-get result :clean-p)))
+    (concat
+     (format "anvil release audit — %s\n" (plist-get result :audited-at))
+     (format "root: %s\n\n"                (plist-get result :root))
+     (if clean-p
+         "OK — no hazards found, release-ready from this audit's POV.\n"
+       (concat
+        (anvil-dev--audit-format-findings
+         "FAIL arglist-strip (Emacs 30 `_arg' underscore-strip)"
+         arglist
+         (lambda (f)
+           (format "%s:%d  %s  (args=(%s))"
+                   (plist-get f :file)
+                   (plist-get f :line)
+                   (plist-get f :defun)
+                   (plist-get f :args))))
+        (anvil-dev--audit-format-findings
+         "FAIL missing `MCP Parameters:' section"
+         params
+         (lambda (f)
+           (format "%s:%d  %s  (args=(%s))"
+                   (plist-get f :file)
+                   (plist-get f :line)
+                   (plist-get f :defun)
+                   (plist-get f :args))))
+        (anvil-dev--audit-format-findings
+         "WARN design docs not yet SHIPPED (master-gate informational)"
+         docs
+         (lambda (f)
+           (format "%s — %s"
+                   (plist-get f :file)
+                   (plist-get f :status)))))))))
+
+(defun anvil-dev--tool-release-audit ()
+  "Audit the anvil tree for pre-release hazards and return a formatted report."
+  (anvil-server-with-error-handling
+    (anvil-dev--audit-format-report (anvil-dev-release-audit))))
+
 ;;;; --- module lifecycle ----------------------------------------------------
 
 ;;;###autoload
@@ -478,7 +748,18 @@ verification across every test file."
 with standard GPL header, defgroup, enable/disable stubs, and two
 passing smoke tests so the new module compiles and runs before
 any real code lives in it."
-   :read-only nil))
+   :read-only nil)
+  (anvil-server-register-tool
+   #'anvil-dev--tool-release-audit
+   :id "anvil-release-audit"
+   :server-id anvil-dev--server-id
+   :description
+   "Scan the anvil tree for three pre-release hazard classes:
+Emacs 30 `_arg' arglist-strip regressions in MCP tool wrappers,
+wrappers with real args but no `MCP Parameters:' docstring
+section, and docs/design/*.org files whose STATUS text lacks
+`SHIPPED'.  Returns a formatted report; `clean' when empty."
+   :read-only t))
 
 (defun anvil-dev-disable ()
   "Unregister the dev-* MCP tools."
@@ -487,6 +768,8 @@ any real code lives in it."
   (anvil-server-unregister-tool "anvil-test-run-all"
                                 anvil-dev--server-id)
   (anvil-server-unregister-tool "anvil-scaffold-module"
+                                anvil-dev--server-id)
+  (anvil-server-unregister-tool "anvil-release-audit"
                                 anvil-dev--server-id))
 
 (provide 'anvil-dev)
