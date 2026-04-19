@@ -2625,5 +2625,53 @@ status is checked against the *post-flip* state."
       (let ((r (anvil-orchestrator--tool-resume-interrupted nil)))
         (should (= 0 (plist-get r :total)))))))
 
+;;;; --- MCP result encoder (v0.3.1 fix) -----------------------------------
+
+(ert-deftest anvil-orchestrator--encode-for-mcp-passes-strings-and-nil ()
+  "Strings and nil are returned unchanged — they already satisfy the MCP
+transport contract."
+  (should (equal "hello" (anvil-orchestrator--encode-for-mcp "hello")))
+  (should (equal nil     (anvil-orchestrator--encode-for-mcp nil)))
+  (should (equal ""      (anvil-orchestrator--encode-for-mcp ""))))
+
+(ert-deftest anvil-orchestrator--encode-for-mcp-plist-becomes-json-object ()
+  "A plist becomes a JSON object with kebab-case keys."
+  (let* ((out (anvil-orchestrator--encode-for-mcp
+               '(:batch-id "abc-123" :total 3 :providers (claude codex))))
+         (back (json-parse-string out :object-type 'plist)))
+    (should (stringp out))
+    (should (equal "abc-123" (plist-get back :batch-id)))
+    (should (= 3 (plist-get back :total)))
+    (should (equal ["claude" "codex"] (plist-get back :providers)))))
+
+(ert-deftest anvil-orchestrator--encode-for-mcp-nested-plist ()
+  "Nested plists round-trip (the real `orchestrator-status' shape)."
+  (let* ((input '(:batch-id "b" :tasks ((:id "t1" :status done)
+                                        (:id "t2" :status queued))))
+         (out (anvil-orchestrator--encode-for-mcp input))
+         (back (json-parse-string out :object-type 'plist
+                                       :array-type 'list)))
+    (should (equal "b" (plist-get back :batch-id)))
+    (should (= 2 (length (plist-get back :tasks))))
+    (should (equal "t1" (plist-get (car (plist-get back :tasks)) :id)))))
+
+(ert-deftest anvil-orchestrator--encode-handler-wraps-tool ()
+  "`anvil-orchestrator--encode-handler' wraps a tool so its plist result
+becomes a JSON string (the fix for MCP transport)."
+  (let* ((inner (lambda (x) (list :echo x :doubled (* 2 x))))
+         (wrapped (anvil-orchestrator--encode-handler inner))
+         (out (funcall wrapped 21))
+         (back (json-parse-string out :object-type 'plist)))
+    (should (stringp out))
+    (should (= 21 (plist-get back :echo)))
+    (should (= 42 (plist-get back :doubled)))))
+
+(ert-deftest anvil-orchestrator--batch-task-ids-accessor ()
+  "Encapsulates the `--batches' storage shape so callers stay decoupled."
+  (let ((anvil-orchestrator--batches (make-hash-table :test 'equal)))
+    (puthash "bid-a" '("t1" "t2") anvil-orchestrator--batches)
+    (should (equal '("t1" "t2") (anvil-orchestrator--batch-task-ids "bid-a")))
+    (should (null (anvil-orchestrator--batch-task-ids "missing")))))
+
 (provide 'anvil-orchestrator-test)
 ;;; anvil-orchestrator-test.el ends here
