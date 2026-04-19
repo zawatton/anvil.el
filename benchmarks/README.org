@@ -1,0 +1,80 @@
+#+title: anvil-orchestrator — Benchmark Suite
+
+This directory contains reproducible benchmarks for
+=anvil-orchestrator= (Doc 10).  Every measurement in
+=results/= can be regenerated from the elisp drivers
+checked in here.
+
+* Files
+
+| Path                       | Purpose                                     |
+|----------------------------+---------------------------------------------|
+| =orchestrator-v1.el=       | v0.3.0 baseline harness (Scenarios S1/S2/S3, Conditions C1–C5, codex ramp) |
+| =results/bench-*.csv=      | Per-cell raw measurements (wallclock, cost, validation) |
+| =results/codex-ramp-*.csv= | Codex concurrency ramp (Plus plan)          |
+| =results/report-*.org=     | Narrative summary + charts                  |
+
+* Running
+
+#+begin_src emacs-lisp
+  (require 'anvil-orchestrator)  ;; must be active
+  (load-file "benchmarks/orchestrator-v1.el")
+  (anvil-bench-run-all)          ;; full matrix → CSV
+  (anvil-bench-codex-ramp)       ;; concurrency sweep → CSV
+#+end_src
+
+Each cell is replicated =anvil-bench-reps= times (default 3).
+Timeout per task is =anvil-bench-timeout-sec= seconds
+(default 120).
+
+* Scenarios
+
+- *S1 fibonacci*: straightforward recursion.  Tiny output,
+  measures raw CLI startup + generation latency.
+- *S2 csv-parser*: quoted-field parsing + whitespace
+  trimming.  Medium token load, exercises cornercase handling.
+- *S3 topo-sort*: algorithmic + =user-error= signaling for
+  cycles.  Larger token budget, differentiates providers on
+  code quality.
+
+Validation: each returned summary is stripped of markdown
+fences, byte-compiled via =byte-compile=, and the resulting
+function is invoked against a fixed set of assertion pairs
+(plus a cycle-detection assertion for S3).
+
+* Conditions
+
+| ID | Dispatch                                    | Purpose                       |
+|----+---------------------------------------------+-------------------------------|
+| C1 | =claude-haiku= × 1                          | Solo baseline                 |
+| C2 | =claude-haiku= × 3 sequential               | Naive serial                  |
+| C3 | =claude-haiku= × 3 via =orchestrator-submit=| Same-provider parallel        |
+| C4 | =claude-haiku= + =codex= + =ollama= fan-out | 3-way consensus (Phase 4)     |
+| C5 | C4 + meta-LLM judge via =claude-haiku=      | Consensus + synthesis (4b)    |
+
+* Methodology notes
+
+- *Model pinning*: claude uses =claude-haiku-4-5=; codex
+  uses its default (=gpt-5.4= as of 2026-04-19); ollama uses
+  =llama3.2:3b= on a single GTX 1060.  Temperature is left at
+  each provider's default — we want *realistic* production
+  latency, not lab-deterministic output.
+- *Wallclock* is computed as =max(:finished-at) -
+  min(:started-at)= across the tasks in a cell; =serial-sum-ms=
+  is =sum(:elapsed-ms)= for comparison.
+- *Success* is a 3-level ladder: byte-compiles, loads (=eval=
+  survives), and the scenario's assertions pass.
+- *Cost* sums per-task =:cost-usd=; codex (ChatGPT Plus
+  OAuth) and ollama both report no per-token billing.
+
+* Caveats
+
+1. These are *observations from a production single-user
+   Emacs daemon on Debian 13*, not a clean-room lab rig.
+   Other daemon activity (notably the claude-code-ide side
+   car) may add 50–200 ms of jitter to wallclock.
+2. Network variability affects claude and codex, not ollama.
+   Results from different ISPs / times of day will differ.
+3. ChatGPT Plus rate limits changed in the past; the codex
+   ramp CSV captures the 429 onset on *our* account at the
+   stated timestamp.  Treat as indicative, not as an SLA.
