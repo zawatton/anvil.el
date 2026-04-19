@@ -1032,8 +1032,12 @@ malformed lines so a partial stream does not poison the summary."
 
 (defun anvil-orchestrator--restore-from-state ()
   "Re-hydrate task records from anvil-state into memory.
-Tasks that were `running' at shutdown are marked failed with a
-`daemon restart' error, as the OS pids no longer belong to us."
+Tasks that were `running' at shutdown are marked failed because
+their OS pids no longer belong to us, but also flagged
+`:interrupted t' + `:interrupted-at TS' so
+`anvil-orchestrator-resume-interrupted' can distinguish
+daemon-restart orphans from genuine exit-code failures and
+re-queue them without breaking `:depends-on' chains."
   (anvil-state-enable)
   (clrhash anvil-orchestrator--tasks)
   (clrhash anvil-orchestrator--batches)
@@ -1052,7 +1056,10 @@ Tasks that were `running' at shutdown are marked failed with a
               (pcase (plist-get task :status)
                 ('running
                  (setq task (plist-put task :status 'failed))
-                 (setq task (plist-put task :error "anvil-orchestrator: daemon restart interrupted task"))
+                 (setq task (plist-put task :error
+                                       "anvil-orchestrator: daemon restart interrupted task"))
+                 (setq task (plist-put task :interrupted t))
+                 (setq task (plist-put task :interrupted-at (float-time)))
                  (anvil-orchestrator--persist task))
                 ('queued
                  (puthash (plist-get task :id) task anvil-orchestrator--tasks)
@@ -2505,6 +2512,153 @@ The server layer performs JSON serialisation; this function
 returns the stats plist verbatim."
   (anvil-orchestrator-stats))
 
+;;;; --- DAG resume (Phase 6C'') ---------------------------------------------
+;;
+;; When the main daemon dies mid-task, every `running' task's subprocess
+;; becomes a detached orphan that anvil can no longer collect stdout
+;; from.  `--restore-from-state' flips those tasks to `failed' with an
+;; `:interrupted t' flag so the distinction between "genuine exit-code
+;; failure" and "daemon restart orphan" survives rehydration.  This
+;; section adds the resume operation: re-queue interrupted tasks in
+;; place (preserving their task-id + `:depends-on' so downstream work
+;; reconnects to the resumed upstream) and let the existing DAG-aware
+;; pump restart them in topological order.
+
+(defun anvil-orchestrator--task-interrupted-p (task)
+  "Return non-nil when TASK was orphaned by a daemon restart and not yet resumed.
+Requires status = `failed' + `:interrupted t' + no `:resumed-at'.
+Status check is defensive against inconsistent state where only
+the flag survives a manual patch."
+  (and task
+       (eq 'failed (plist-get task :status))
+       (plist-get task :interrupted)
+       (not (plist-get task :resumed-at))))
+
+;;;###autoload
+(defun anvil-orchestrator-list-interrupted (&optional batch-id)
+  "Return the list of task plists orphaned by a daemon restart.
+When BATCH-ID is non-nil, restrict to that batch; otherwise scan
+the whole in-memory task table."
+  (let (out)
+    (if batch-id
+        (dolist (id (gethash batch-id anvil-orchestrator--batches))
+          (let ((task (anvil-orchestrator--task-get id)))
+            (when (anvil-orchestrator--task-interrupted-p task)
+              (push task out))))
+      (maphash (lambda (_id task)
+                 (when (anvil-orchestrator--task-interrupted-p task)
+                   (push task out)))
+               anvil-orchestrator--tasks))
+    (nreverse out)))
+
+(defun anvil-orchestrator--resume-one (task)
+  "Flip TASK from `:interrupted' `failed' to a fresh `queued' record.
+Clears the `:error' / `:finished-at' / `:elapsed-ms' /
+`:exit-code' / `:summary' / `:interrupted*' slots so the task
+looks like a first-time queue entry; keeps `:id' so inbound
+`:depends-on' references stay valid."
+  (let ((id (plist-get task :id)))
+    (anvil-orchestrator--task-update
+     id
+     :status         'queued
+     :error          nil
+     :finished-at    nil
+     :elapsed-ms     nil
+     :exit-code      nil
+     :summary        nil
+     :cost-usd       nil
+     :cost-tokens    nil
+     :started-at     nil
+     :interrupted    nil
+     :interrupted-at nil
+     :resumed-at     (float-time))
+    (setq anvil-orchestrator--queue
+          (append anvil-orchestrator--queue (list id)))
+    id))
+
+;;;###autoload
+(defun anvil-orchestrator-resume-interrupted (&optional batch-id)
+  "Re-queue every interrupted (daemon-restart orphan) task.
+When BATCH-ID is non-nil, restrict the resume to that batch.
+
+Each target task is flipped from `:interrupted' `failed' back
+to `queued' in place — its task-id is preserved so inbound
+`:depends-on' references stay valid and the existing DAG-aware
+pump (`--classify-for-pump') handles topological ordering.
+
+Returns a plist `(:resumed IDS :already-blocked IDS :total N)':
+  :resumed         — task-ids re-queued and immediately DAG-ready
+  :already-blocked — task-ids re-queued but waiting on a dep that
+                     is still `failed' / `interrupted'; the pump
+                     will fail them unless the dep is resumed too
+  :total           — count of tasks acted on"
+  (interactive)
+  (let* ((targets (anvil-orchestrator-list-interrupted batch-id))
+         resumed blocked)
+    (dolist (task targets)
+      (let ((id (anvil-orchestrator--resume-one task)))
+        (let* ((reloaded (anvil-orchestrator--task-get id)))
+          (if (anvil-orchestrator--dag-ready-p reloaded)
+              (push id resumed)
+            (push id blocked)))))
+    (when targets
+      (anvil-orchestrator--ensure-pump-timer)
+      (anvil-orchestrator--pump))
+    (list :resumed         (nreverse resumed)
+          :already-blocked (nreverse blocked)
+          :total           (length targets))))
+
+(defun anvil-orchestrator--dag-ready-p (task)
+  "Return non-nil when every TASK `:depends-on' dep is already `done'."
+  (let ((deps (plist-get task :depends-on)))
+    (or (null deps)
+        (cl-every (lambda (dep-id-or-name)
+                    ;; deps are stored as names within a batch; resolve
+                    ;; to the actual task record
+                    (let ((dep (or (anvil-orchestrator--task-get dep-id-or-name)
+                                   (anvil-orchestrator--find-dep-by-name
+                                    dep-id-or-name
+                                    (plist-get task :batch-id)))))
+                      (and dep (eq 'done (plist-get dep :status)))))
+                  deps))))
+
+(defun anvil-orchestrator--find-dep-by-name (name batch-id)
+  "Return the task record whose `:name' = NAME within BATCH-ID.
+`:depends-on' stores sibling names; callers that want status
+resolution have to map back to the task record via the batch."
+  (when (and name batch-id)
+    (cl-some (lambda (id)
+               (let ((t0 (anvil-orchestrator--task-get id)))
+                 (and t0
+                      (equal name (plist-get t0 :name))
+                      t0)))
+             (gethash batch-id anvil-orchestrator--batches))))
+
+(defun anvil-orchestrator--tool-list-interrupted (&optional batch_id)
+  "MCP wrapper — list interrupted (daemon-restart orphan) tasks.
+
+MCP Parameters:
+  batch_id - Optional batch-id filter; omit to scan all tasks."
+  (anvil-server-with-error-handling
+    (list :tasks
+          (mapcar #'anvil-orchestrator--task-summary-plist
+                  (anvil-orchestrator-list-interrupted
+                   (and batch_id
+                        (not (string-empty-p batch_id))
+                        batch_id))))))
+
+(defun anvil-orchestrator--tool-resume-interrupted (&optional batch_id)
+  "MCP wrapper — re-queue interrupted tasks.
+
+MCP Parameters:
+  batch_id - Optional batch-id scope; omit to resume every
+             interrupted task in the orchestrator."
+  (anvil-server-with-error-handling
+    (anvil-orchestrator-resume-interrupted
+     (and batch_id
+          (not (string-empty-p batch_id))
+          batch_id))))
+
 ;;;; --- glue helpers (dogfood friction reducers) ---------------------------
 
 ;;;###autoload
@@ -2910,7 +3064,28 @@ DAGs, consensus, or multi-task batches.")
 Provider-agnostic raw-byte tail: no parsing, no truncation at
 summary granularity.  Use this to watch in-flight codex /
 claude partial output, or to inspect stderr after a failure."
-   :read-only t))
+   :read-only t)
+
+  (anvil-server-register-tool
+   #'anvil-orchestrator--tool-list-interrupted
+   :id "orchestrator-list-interrupted"
+   :server-id anvil-orchestrator--server-id
+   :description
+   "List tasks orphaned by a daemon restart (status=failed,
+interrupted=t, not yet resumed).  Optional batch_id filter.
+Phase 6C'' DAG resume diagnostic."
+   :read-only t)
+
+  (anvil-server-register-tool
+   #'anvil-orchestrator--tool-resume-interrupted
+   :id "orchestrator-resume-interrupted"
+   :server-id anvil-orchestrator--server-id
+   :description
+   "Re-queue every interrupted (daemon-restart orphan) task in
+place, preserving task-ids + :depends-on so downstream work
+reconnects to resumed upstream.  Optional batch_id scope.
+Returns counts of immediately-DAG-ready vs dep-blocked ids.
+Phase 6C'' DAG resume."))
 
 (defun anvil-orchestrator--unregister-tools ()
   (dolist (id '("orchestrator-submit" "orchestrator-status"
@@ -2923,7 +3098,9 @@ claude partial output, or to inspect stderr after a failure."
                 "orchestrator-stats"
                 "orchestrator-extract-result"
                 "orchestrator-submit-one"
-                "orchestrator-tail"))
+                "orchestrator-tail"
+                "orchestrator-list-interrupted"
+                "orchestrator-resume-interrupted"))
     (anvil-server-unregister-tool id anvil-orchestrator--server-id)))
 
 ;;;###autoload
