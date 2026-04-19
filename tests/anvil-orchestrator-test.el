@@ -2116,5 +2116,156 @@ Cleans up the task hash afterwards so the ambient state stays pristine."
          (default-value 'anvil-orchestrator-summary-max-chars)))
     (should (equal 4000 anvil-orchestrator-summary-max-chars))))
 
+;;;; --- DAG resume (Phase 6C'') --------------------------------------------
+
+(defmacro anvil-orchestrator-test--with-pool (tasks &rest body)
+  "Install TASKS (list of plists) into the task + batch tables for BODY.
+Cleans up afterwards so the ambient orchestrator state is pristine."
+  (declare (indent 1))
+  `(let ((saved-tasks   (copy-hash-table anvil-orchestrator--tasks))
+         (saved-batches (copy-hash-table anvil-orchestrator--batches))
+         (saved-queue   (copy-sequence anvil-orchestrator--queue)))
+     (unwind-protect
+         (progn
+           (clrhash anvil-orchestrator--tasks)
+           (clrhash anvil-orchestrator--batches)
+           (setq anvil-orchestrator--queue nil)
+           (dolist (t0 ,tasks)
+             (puthash (plist-get t0 :id) t0 anvil-orchestrator--tasks)
+             (let ((bid (plist-get t0 :batch-id)))
+               (when bid
+                 (puthash bid
+                          (append (gethash bid anvil-orchestrator--batches)
+                                  (list (plist-get t0 :id)))
+                          anvil-orchestrator--batches))))
+           ,@body)
+       (setq anvil-orchestrator--tasks saved-tasks
+             anvil-orchestrator--batches saved-batches
+             anvil-orchestrator--queue saved-queue))))
+
+(ert-deftest anvil-orchestrator--interrupted-predicate ()
+  "`:interrupted t' + no `:resumed-at' ⇒ interrupted."
+  (should (anvil-orchestrator--task-interrupted-p
+           '(:id "a" :status failed :interrupted t)))
+  (should-not (anvil-orchestrator--task-interrupted-p
+               '(:id "a" :status failed :interrupted t :resumed-at 1.0)))
+  (should-not (anvil-orchestrator--task-interrupted-p
+               '(:id "a" :status failed)))
+  (should-not (anvil-orchestrator--task-interrupted-p
+               '(:id "a" :status done :interrupted t))))
+
+(ert-deftest anvil-orchestrator--list-interrupted-scans-all-and-batch ()
+  "list-interrupted surfaces the right subset with and without batch-id."
+  (anvil-orchestrator-test--with-pool
+      (list
+       (list :id "a1" :batch-id "b1" :status 'failed :interrupted t)
+       (list :id "a2" :batch-id "b1" :status 'done)
+       (list :id "b1" :batch-id "b2" :status 'failed :interrupted t)
+       (list :id "c1" :batch-id "b2" :status 'failed
+             :interrupted t :resumed-at 5.0))
+    (let* ((all (anvil-orchestrator-list-interrupted))
+           (all-ids (mapcar (lambda (t0) (plist-get t0 :id)) all)))
+      (should (= 2 (length all)))
+      (should (member "a1" all-ids))
+      (should (member "b1" all-ids)))
+    (let ((only-b1 (anvil-orchestrator-list-interrupted "b1")))
+      (should (= 1 (length only-b1)))
+      (should (equal "a1" (plist-get (car only-b1) :id))))))
+
+(ert-deftest anvil-orchestrator--resume-flips-status-preserves-id ()
+  "resume-interrupted keeps the task-id and flips status to queued."
+  (anvil-orchestrator-test--with-pool
+      (list
+       (list :id "iid" :batch-id "b" :name "unit"
+             :provider 'codex :prompt "x"
+             :status 'failed :interrupted t
+             :interrupted-at 1.0
+             :error "anvil-orchestrator: daemon restart interrupted task"))
+    (cl-letf (((symbol-function 'anvil-orchestrator--ensure-pump-timer)
+               (lambda () nil))
+              ((symbol-function 'anvil-orchestrator--pump)
+               (lambda () nil)))
+      (let ((r (anvil-orchestrator-resume-interrupted)))
+        (should (member "iid" (plist-get r :resumed)))
+        (should (= 1 (plist-get r :total)))
+        (let ((t0 (anvil-orchestrator--task-get "iid")))
+          (should (eq 'queued (plist-get t0 :status)))
+          (should (null (plist-get t0 :interrupted)))
+          (should (null (plist-get t0 :error)))
+          (should (plist-get t0 :resumed-at)))
+        (should (member "iid" anvil-orchestrator--queue))))))
+
+(ert-deftest anvil-orchestrator--resume-reports-blocked-when-dep-failed ()
+  "Task B resumed but its dep A is still failed ⇒ :already-blocked."
+  (anvil-orchestrator-test--with-pool
+      (list
+       ;; Dep A is a real hard failure (no :interrupted)
+       (list :id "a" :batch-id "b" :name "A"
+             :status 'failed :error "real failure")
+       ;; B was orphaned by daemon restart; dep-on A
+       (list :id "b" :batch-id "b" :name "B"
+             :provider 'codex :prompt "p"
+             :depends-on '("A")
+             :status 'failed :interrupted t))
+    (cl-letf (((symbol-function 'anvil-orchestrator--ensure-pump-timer)
+               (lambda () nil))
+              ((symbol-function 'anvil-orchestrator--pump)
+               (lambda () nil)))
+      (let ((r (anvil-orchestrator-resume-interrupted "b")))
+        (should (member "b" (plist-get r :already-blocked)))
+        (should-not (member "b" (plist-get r :resumed)))))))
+
+(ert-deftest anvil-orchestrator--resume-handles-dep-on-interrupted-peer ()
+  "When both A and B are interrupted, both flip to queued; DAG-ready
+status is checked against the *post-flip* state."
+  (anvil-orchestrator-test--with-pool
+      (list
+       (list :id "ax" :batch-id "bx" :name "A"
+             :provider 'codex :prompt "pa"
+             :status 'failed :interrupted t)
+       (list :id "bx" :batch-id "bx" :name "B"
+             :provider 'codex :prompt "pb"
+             :depends-on '("A")
+             :status 'failed :interrupted t))
+    (cl-letf (((symbol-function 'anvil-orchestrator--ensure-pump-timer)
+               (lambda () nil))
+              ((symbol-function 'anvil-orchestrator--pump)
+               (lambda () nil)))
+      (let ((r (anvil-orchestrator-resume-interrupted "bx")))
+        (should (= 2 (plist-get r :total)))
+        ;; A had no deps so it's immediately ready; B depends on A which
+        ;; is now :queued (not :done) so B is reported as blocked.
+        (should (member "ax" (plist-get r :resumed)))
+        (should (member "bx" (plist-get r :already-blocked)))))))
+
+(ert-deftest anvil-orchestrator--dag-ready-p-honours-depends-on ()
+  (anvil-orchestrator-test--with-pool
+      (list
+       (list :id "x" :batch-id "bb" :name "X" :status 'done)
+       (list :id "y" :batch-id "bb" :name "Y" :status 'running))
+    (let ((ok (list :id "ok" :batch-id "bb" :depends-on '("X")))
+          (bad (list :id "bad" :batch-id "bb" :depends-on '("Y"))))
+      (should (anvil-orchestrator--dag-ready-p ok))
+      (should-not (anvil-orchestrator--dag-ready-p bad))
+      (should (anvil-orchestrator--dag-ready-p
+               '(:id "nodep" :batch-id "bb"))))))
+
+(ert-deftest anvil-orchestrator--tool-resume-interrupted-coerces-empty ()
+  "tool wrapper treats empty batch_id string as nil (whole-pool)."
+  (anvil-orchestrator-test--with-pool
+      (list
+       (list :id "t1" :batch-id "b1" :name "A"
+             :provider 'codex :prompt "p"
+             :status 'failed :interrupted t))
+    (cl-letf (((symbol-function 'anvil-orchestrator--ensure-pump-timer)
+               (lambda () nil))
+              ((symbol-function 'anvil-orchestrator--pump)
+               (lambda () nil)))
+      (let ((r (anvil-orchestrator--tool-resume-interrupted "")))
+        (should (= 1 (plist-get r :total))))
+      ;; re-run: now already resumed, so nothing to do
+      (let ((r (anvil-orchestrator--tool-resume-interrupted nil)))
+        (should (= 0 (plist-get r :total)))))))
+
 (provide 'anvil-orchestrator-test)
 ;;; anvil-orchestrator-test.el ends here

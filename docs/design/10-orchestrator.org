@@ -7,7 +7,7 @@
   :PROPERTIES:
   :ID:       019da30b-92e3-7674-976d-020f7465940b
   :END:
-~Phase 1a + 1b + 2 + 2b + 3 + 3b + 4 + 4b + 5 + 6C MVP + 6C' + gemma4-strip + observability SHIPPED (develop branch)~ (2026-04-19)
+~Phase 1a + 1b + 2 + 2b + 3 + 3b + 4 + 4b + 5 + 6C MVP + 6C' + 6C'' + gemma4-strip + observability + glue-helpers SHIPPED (develop branch)~ (2026-04-19)
 
 - Phase 1a (commit 45468b2): provider abstraction, claude provider,
   spawn + sentinel + timeout, pool + concurrency cap, state
@@ -170,10 +170,34 @@
   / 1 live skip in anvil-orchestrator-test.el, 435 total across
   the suite, 2 live skips).
 
-Doc 10 の全 Phase (1a / 1b / 2 / 2b / 3 / 3b / 4 / 4b / 5 / 6C MVP / 6C' + gemma4-strip + observability) を
+Doc 10 の全 Phase (1a / 1b / 2 / 2b / 3 / 3b / 4 / 4b / 5 / 6C MVP /
+6C' / 6C'' + gemma4-strip + observability + glue-helpers) を
 develop branch 上で ship 済み。さらに同日の 2 件 bug fix (commit
 31d2f3f stdin EOF / 5a2610f shared-tail copy-sequence) も含む。
 Review Questions Q1-Q12 resolved 状態キープ。
+
+- Phase 6C'' (DAG resume across daemon restart): =--restore-from-state=
+  で `running` → `failed` に flip する際 =:interrupted t= +
+  =:interrupted-at= フラグを付け、genuine 失敗と daemon orphan を
+  識別可能に。新 API =anvil-orchestrator-list-interrupted
+  [batch-id]= / =anvil-orchestrator-resume-interrupted [batch-id]= は
+  task-id を保持したまま status を =failed= → =queued= に戻し、
+  =:depends-on= 関係を破壊せず pump の既存 DAG-aware
+  =--classify-for-pump= に topological 再実行を任せる。MCP tool
+  =orchestrator-list-interrupted= / =orchestrator-resume-interrupted=
+  も追加。ERT +7 in anvil-orchestrator-test.el。
+
+- glue-helpers (dogfood friction reducers): セッション末尾 feedback で
+  挙がった 4 項目を 1 branch に bundle。=anvil-orchestrator-extract-result=
+  は task-id から summary + cost + tokens + commit-sha + exit-code を 1 call
+  で返し、=:full t= で =summary-max-chars= を fixnum-max に一時 bind して
+  raw agent message を再 parse。=anvil-orchestrator-submit-one= は単発
+  prompt 用 convenience wrapper (batch-id 経由せず task-id を直接返す)。
+  =anvil-orchestrator-tail= は provider-agnostic raw-byte tail で in-flight
+  stdout / post-mortem stderr の両方に対応。=summary-max-chars= default を
+  300 → 4000 に引き上げて common case の再 parse round-trip を排除。
+  MCP tools =orchestrator-extract-result / -submit-one / -tail= も同時 land。
+  ERT +11。
 
 * Goal
 
