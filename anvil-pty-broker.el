@@ -407,7 +407,7 @@ MCP Parameters:
   text - UTF-8 text to write into the pty's stdin.  Append \"\\n\"
          yourself if the command needs a newline."
   (anvil-pty-send id text)
-  (list :sent (length text)))
+  (anvil-server-encode-for-mcp (list :sent (length text))))
 
 (defun anvil-pty-broker--tool-kill (id &optional signal)
   "MCP wrapper for `anvil-pty-kill'.
@@ -418,11 +418,11 @@ MCP Parameters:
   (anvil-pty-kill id (and (stringp signal)
                           (not (string-empty-p signal))
                           signal))
-  (list :killed id))
+  (anvil-server-encode-for-mcp (list :killed id)))
 
 (defun anvil-pty-broker--tool-list ()
   "MCP wrapper for `anvil-pty-list'."
-  (list :ids (or (anvil-pty-list) nil)))
+  (anvil-server-encode-for-mcp (list :ids (or (anvil-pty-list) nil))))
 
 (defun anvil-pty-broker--tool-read (id &optional consume)
   "MCP wrapper for `anvil-pty-read'.
@@ -437,9 +437,10 @@ MCP Parameters:
                 ((stringp consume)
                  (not (member (downcase consume) '("" "nil" "false" "0"))))
                 (t t))))
-    (list :id id
-          :output (anvil-pty-read id consume-p)
-          :consumed consume-p)))
+    (anvil-server-encode-for-mcp
+     (list :id id
+           :output (anvil-pty-read id consume-p)
+           :consumed consume-p))))
 
 (defun anvil-pty-broker--register-tools ()
   "Register pty-broker MCP tools.  Idempotent."

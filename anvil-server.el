@@ -47,6 +47,7 @@
 
 ;;; Code:
 
+(require 'cl-lib)
 (require 'json)
 (require 'anvil-server-metrics)
 
@@ -1668,6 +1669,66 @@ MESSAGE is the error message string.
 This function does not return - it signals an error condition that
 will be caught by the resource handler infrastructure."
   (signal 'anvil-server-resource-error (list code message)))
+
+;;;; --- MCP return value encoder -------------------------------------------
+;;
+;; The MCP transport contract (see `anvil-server--tool-call') requires
+;; handlers to return a string or nil.  Modules that want to return rich
+;; Lisp data (plists, nested lists) have two options:
+;;
+;;   1. Wrap the return expression in `anvil-server-encode-for-mcp' so the
+;;      result becomes a JSON string at the boundary.  Works per-call and
+;;      keeps the bug class visible to `anvil-release-audit' — the scanner
+;;      flags any `(list :K ...)' that is still the terminal form.
+;;
+;;   2. Tag the file with the `;;; anvil-audit: tools-wrapped-at-registration'
+;;      header and wrap each registered handler with `anvil-server-encode-
+;;      handler' at registration time (the pattern anvil-orchestrator uses
+;;      for its ~25 tools).
+;;
+;; Option 1 is the smaller, per-tool fix; option 2 is the whole-module
+;; pattern.  Both produce the same wire format and pass the scanner.
+
+(defun anvil-server--plist-p (x)
+  "Return non-nil when X is a plist (keyword-keyed list)."
+  (and (consp x) (keywordp (car x))))
+
+(defun anvil-server--to-json-value (x)
+  "Recursively convert X into a value that `json-encode' renders sensibly.
+Plists become alists with symbol keys (leading colon stripped).
+Plain lists become vectors so they emit as JSON arrays.  Scalars pass
+through unchanged.  Keywords serialize as their bare name (no colon)."
+  (cond
+   ((or (null x) (eq x t) (numberp x)) x)
+   ((stringp x) x)
+   ((keywordp x) (substring (symbol-name x) 1))
+   ((symbolp x) (symbol-name x))
+   ((vectorp x)
+    (vconcat (mapcar #'anvil-server--to-json-value x)))
+   ((anvil-server--plist-p x)
+    (cl-loop for (k v) on x by #'cddr
+             collect (cons (intern (substring (symbol-name k) 1))
+                           (anvil-server--to-json-value v))))
+   ((listp x)
+    (apply #'vector (mapcar #'anvil-server--to-json-value x)))
+   (t x)))
+
+(defun anvil-server-encode-for-mcp (value)
+  "Encode VALUE (plist / list / scalar) as a JSON string for MCP transport.
+Strings and nil pass through unchanged; other shapes round-trip through
+`anvil-server--to-json-value' then `json-encode'."
+  (cond
+   ((or (null value) (stringp value)) value)
+   (t (json-encode (anvil-server--to-json-value value)))))
+
+(defun anvil-server-encode-handler (handler)
+  "Return a wrapper around HANDLER that JSON-encodes its result.
+Lets the underlying tool body keep returning a rich plist for direct
+Elisp / ERT callers while the MCP transport receives a JSON string.
+HANDLER is called with whatever positional/rest arguments the
+wrapper receives."
+  (lambda (&rest args)
+    (anvil-server-encode-for-mcp (apply handler args))))
 
 (provide 'anvil-server)
 ;;; anvil-server.el ends here
