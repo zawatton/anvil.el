@@ -1,13 +1,17 @@
 #+title: Provider Latency Routing — Auto-Dispatch by Measured Latency and Cost
 #+date: 2026-04-19
 #+author: zawatton
-#+property: status DRAFT
+#+property: status PHASE-1-SHIPPED
 
 * STATUS
   :PROPERTIES:
   :ID:       019da400-c22a-7000-0001-provider-routing
   :END:
-~DRAFT~ (2026-04-19)
+~Phase 1 SHIPPED~ (2026-04-20, develop branch) — pure selector +
+=:provider 'auto= sentinel resolution in =anvil-orchestrator--coerce-task=
++ dry-run MCP tool =orchestrator-routing-select=.  Phase 2 (persistent
+config + =auto-top-n= consensus) and Phase 3 (adaptive coefficient)
+remain DRAFT.
 
 Observation driving this doc: the v1 orchestrator benchmark
 (=benchmarks/results/report-2026-04-19.org=) showed that on the author's
@@ -180,9 +184,19 @@ executes them.
 
 * Phases
 
-- *Phase 1 — stats-driven selector* (SHIPPED-candidate).  The pure
-  selector function + =submit-one= integration + dry-run MCP tool.
-  No config persistence (routing defaults are defcustoms).
+- *Phase 1 — stats-driven selector* (~SHIPPED~, 2026-04-20, develop).
+  The pure selector function + =submit-one= / =submit-and-collect=
+  integration (=:provider 'auto= sentinel resolved inside
+  =anvil-orchestrator--coerce-task=) + dry-run MCP tool
+  =orchestrator-routing-select=.  No config persistence — routing
+  defaults live in defcustoms
+  (=anvil-orchestrator-routing-default-policy=,
+  =anvil-orchestrator-routing-balance-coefficient=,
+  =anvil-orchestrator-routing-quality-order=,
+  =anvil-orchestrator-routing-cold-start-provider=,
+  =anvil-orchestrator-routing-min-samples=).  The selector is pure
+  w.r.t. the task table (reads only via =anvil-orchestrator-stats=)
+  and accepts an injected =:stats-fn= seam for ERT fixtures.
   Benchmark-grade measurement already available via existing
   =anvil-orchestrator-stats=.
 - *Phase 2 — persistent config + =auto-top-n= consensus*.  Wires
