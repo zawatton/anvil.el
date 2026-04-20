@@ -684,12 +684,14 @@ METHOD-METRICS is used to track errors."
 (defun anvil-server--handle-resources-read
     (id params method-metrics server-id)
   "Handle resources/read request with ID and PARAMS for SERVER-ID.
-METHOD-METRICS is used to track errors for this method."
+METHOD-METRICS is used to track errors for this method.
+SERVER-ID is resolved through `anvil-server-id-aliases'."
   (let* ((uri (alist-get 'uri params))
+         (resolved-id (anvil-server--resolve-id server-id))
          (resources-table
-          (anvil-server--get-server-resources server-id))
+          (anvil-server--get-server-resources resolved-id))
          (templates-table
-          (anvil-server--get-server-templates server-id))
+          (anvil-server--get-server-templates resolved-id))
          (resource (gethash uri resources-table))
          (template-match
           (unless resource
@@ -754,13 +756,15 @@ Returns a JSON-RPC response string for the request."
 (defun anvil-server--handle-initialize (id server-id)
   "Handle initialize request with ID for SERVER-ID.
 This implements the MCP initialize handshake, which negotiates protocol
-version and capabilities between the client and server."
-  (let ((capabilities '()))
-    (let ((tools-table (gethash server-id anvil-server--tools))
+version and capabilities between the client and server.  SERVER-ID
+is resolved through `anvil-server-id-aliases' for capability lookup."
+  (let ((capabilities '())
+        (resolved-id (anvil-server--resolve-id server-id)))
+    (let ((tools-table (gethash resolved-id anvil-server--tools))
           (resources-table
-           (gethash server-id anvil-server--resources))
+           (gethash resolved-id anvil-server--resources))
           (templates-table
-           (gethash server-id anvil-server--resource-templates)))
+           (gethash resolved-id anvil-server--resource-templates)))
       (when (and tools-table (> (hash-table-count tools-table) 0))
         (push `(tools . ,(make-hash-table)) capabilities))
       (when (or (and resources-table
@@ -784,41 +788,80 @@ This is called after successful initialization to complete the handshake.
 The client sends this notification to acknowledge the server's response
 to the initialize request.")
 
+(defvar anvil-server-tool-filter-function nil
+  "Optional filter applied to tools/list advertisements.
+When bound to a function, it is called with (TOOL-ID TOOL-PLIST
+SERVER-ID) for each registered tool and must return non-nil to keep
+the tool in the response.  The SERVER-ID argument is the original
+(possibly virtual) server-id the client asked for — useful when
+filtering per connection, not per daemon.
+
+Handlers remain live either way, so hidden tools stay callable via
+explicit tools/call.
+
+Set by `anvil-manifest' (Doc 26) to implement ANVIL_PROFILE.")
+
+(defvar anvil-server-id-aliases nil
+  "Alist mapping virtual server-ids to real server-ids.
+Entries are (VIRTUAL . REAL) string pairs.  Used to advertise the
+same set of tool handlers under multiple server-ids, typically so
+`anvil-manifest' (Doc 26) can apply a per-connection profile filter
+without duplicating the tool registrations.
+
+Example: ((\"emacs-eval-ultra\" . \"emacs-eval\")) makes tools/list
+for `emacs-eval-ultra' look up the `emacs-eval' tools table while
+the filter function still sees the original virtual server-id and
+can pick a different profile for it.")
+
+(defun anvil-server--resolve-id (server-id)
+  "Return the real server-id SERVER-ID resolves to.
+Follows `anvil-server-id-aliases'.  Safe to call on a real id (it
+becomes a no-op)."
+  (or (cdr (assoc server-id anvil-server-id-aliases)) server-id))
+
 (defun anvil-server--handle-tools-list (id server-id)
   "Handle tools/list request with ID for SERVER-ID.
-Returns a list of all registered tools with their metadata."
-  (let ((tool-list (vector)))
+Returns a list of registered tools with their metadata, minus any
+filtered out by `anvil-server-tool-filter-function'.  SERVER-ID may
+be a virtual id registered in `anvil-server-id-aliases'; in that
+case tool lookup uses the resolved real id but the filter function
+still sees the original virtual id for profile selection."
+  (let ((tool-list (vector))
+        (resolved-id (anvil-server--resolve-id server-id)))
     (when-let* ((tools-table
-                 (gethash server-id anvil-server--tools)))
+                 (gethash resolved-id anvil-server--tools)))
       (maphash
        (lambda (tool-id tool)
-         (let* ((tool-description (plist-get tool :description))
-                (tool-title (plist-get tool :title))
-                (tool-read-only (plist-get tool :read-only))
-                (tool-schema
-                 (or (plist-get tool :schema) '((type . "object"))))
-                (tool-entry
-                 `((name . ,tool-id)
-                   (description . ,tool-description)
-                   (inputSchema . ,tool-schema)))
-                (annotations nil))
-           ;; Collect annotations if present
-           (when tool-title
-             (push (cons 'title tool-title) annotations))
-           ;; Add readOnlyHint when :read-only is explicitly provided (both t
-           ;; and nil)
-           (when (plist-member tool :read-only)
-             (let ((annot-value
-                    (if tool-read-only
-                        t
-                      :json-false)))
-               (push (cons 'readOnlyHint annot-value) annotations)))
-           ;; Add annotations to tool entry if any exist
-           (when annotations
-             (setq tool-entry
-                   (append
-                    tool-entry `((annotations . ,annotations)))))
-           (setq tool-list (vconcat tool-list (vector tool-entry)))))
+         (when (or (null anvil-server-tool-filter-function)
+                   (funcall anvil-server-tool-filter-function
+                            tool-id tool server-id))
+           (let* ((tool-description (plist-get tool :description))
+                  (tool-title (plist-get tool :title))
+                  (tool-read-only (plist-get tool :read-only))
+                  (tool-schema
+                   (or (plist-get tool :schema) '((type . "object"))))
+                  (tool-entry
+                   `((name . ,tool-id)
+                     (description . ,tool-description)
+                     (inputSchema . ,tool-schema)))
+                  (annotations nil))
+             ;; Collect annotations if present
+             (when tool-title
+               (push (cons 'title tool-title) annotations))
+             ;; Add readOnlyHint when :read-only is explicitly provided (both t
+             ;; and nil)
+             (when (plist-member tool :read-only)
+               (let ((annot-value
+                      (if tool-read-only
+                          t
+                        :json-false)))
+                 (push (cons 'readOnlyHint annot-value) annotations)))
+             ;; Add annotations to tool entry if any exist
+             (when annotations
+               (setq tool-entry
+                     (append
+                      tool-entry `((annotations . ,annotations)))))
+             (setq tool-list (vconcat tool-list (vector tool-entry))))))
        tools-table))
     (anvil-server--jsonrpc-response id `((tools . ,tool-list)))))
 
@@ -862,9 +905,11 @@ Returns a vector of resource entries."
 
 (defun anvil-server--handle-resources-list (id server-id)
   "Handle resources/list request with ID for SERVER-ID.
-Returns a list of all registered resources with their metadata."
-  (let* ((resources-table
-          (gethash server-id anvil-server--resources))
+Returns a list of all registered resources with their metadata.
+SERVER-ID is resolved through `anvil-server-id-aliases'."
+  (let* ((resolved-id (anvil-server--resolve-id server-id))
+         (resources-table
+          (gethash resolved-id anvil-server--resources))
          (resource-list
           (if resources-table
               (anvil-server--collect-resources-from-hash
@@ -875,9 +920,11 @@ Returns a list of all registered resources with their metadata."
 
 (defun anvil-server--handle-resources-templates-list (id server-id)
   "Handle resources/templates/list request with ID for SERVER-ID.
-Returns a list of all registered resource templates."
-  (let* ((templates-table
-          (gethash server-id anvil-server--resource-templates))
+Returns a list of all registered resource templates.
+SERVER-ID is resolved through `anvil-server-id-aliases'."
+  (let* ((resolved-id (anvil-server--resolve-id server-id))
+         (templates-table
+          (gethash resolved-id anvil-server--resource-templates))
          (template-list
           (if templates-table
               (anvil-server--collect-resources-from-hash
@@ -889,9 +936,12 @@ Returns a list of all registered resource templates."
 (defun anvil-server--handle-tools-call
     (id params method-metrics server-id)
   "Handle tools/call request with ID and PARAMS for SERVER-ID.
-METHOD-METRICS is used to track errors for this method."
+METHOD-METRICS is used to track errors for this method.  SERVER-ID
+is resolved through `anvil-server-id-aliases' before tool lookup so
+virtual server-ids share the same handler pool."
   (let* ((tool-name (alist-get 'name params))
-         (tools-table (gethash server-id anvil-server--tools))
+         (resolved-id (anvil-server--resolve-id server-id))
+         (tools-table (gethash resolved-id anvil-server--tools))
          (tool
           (when tools-table
             (gethash tool-name tools-table)))

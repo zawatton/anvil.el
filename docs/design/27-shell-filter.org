@@ -1,0 +1,269 @@
+#+title: anvil-shell-filter — Per-Command Output Compression + Tee
+#+date: 2026-04-20
+#+author: zawatton
+#+property: status DRAFT
+#+property: scope GENERIC
+
+* STATUS
+  :PROPERTIES:
+  :ID:       c6f05c1e-72a6-4e3b-87a6-d0a6a3b7c002
+  :END:
+~DRAFT~ (2026-04-20) — Week-3 Ship 2, 競合 rtk (Rust Token Killer)
+由来。Emacs 内 shell 呼び出し (=shell-command= / =call-process= /
+=anvil-pty-broker=) の出力を per-command 戦略で圧縮、失敗時は raw
+を =anvil-state= に tee。実装 ETA 3-5 日。
+
+* Motivation
+
+rtk は 30 分の Claude Code セッションで 118k → 24k tokens (-80%)
+を実測している。主な削減源:
+
+| Command        | Raw    | Filtered | Savings |
+|----------------+--------+----------+---------|
+| =git status=   | 3000   | 600      | -80%    |
+| =git diff=     | 10000  | 2500     | -75%    |
+| =cargo test=   | 25000  | 2500     | -90%    |
+| =pytest=       | 8000   | 800      | -90%    |
+| =rg pattern=   | 16000  | 3200     | -80%    |
+
+rtk は *Claude Code の Bash PreToolUse hook* で =git status= を
+=rtk git status= に書換える戦略。anvil には別の強みがあり:
+
+- =anvil-pty-broker= 経由で Emacs 内の長期 process を直接監視できる。
+- =anvil-offload= で重い process を pool に逃がせる。
+- filter 結果を =anvil-state= に永続化して再参照できる (tee)。
+
+なので anvil-shell-filter は *Emacs-side で per-command filter を
+提供し、pty-broker / offload / state と統合* する方向で作る。
+
+電気管理業務でも =emacs --batch tangle=, =python report_pipeline.py=,
+=gh pr create=, =pytest= を日常的に叩くので、汎用 filter の効用は
+大きい。
+
+* Goals
+
+1. 20-30 の common command に per-command filter を用意 (rtk は
+   100+、anvil は Emacs + 電気管理用途に絞った subset)。
+2. Filter は pure Emacs Lisp (外部 binary 不要、Windows でも動く)。
+3. 失敗時 (exit code ≠ 0 or regex 検出) は *raw 全文を =anvil-state=
+   に tee*、 =shell-tee-get <id>= で再読可能に。
+4. =anvil-pty-broker= の long-running 出力にも適用可能 (ring buffer
+   tail に filter 適用)。
+5. =shell-gain= tool で節約量 (local 計測) を累積、ユーザーが ROI
+   を見られるように (rtk の =rtk gain= 相当)。
+
+* Non-goals
+
+- Claude Code Bash hook を書換える (rtk の戦略): anvil は Emacs-side
+  のみ。Bash 経路は hook を別途書いてもらう。
+- 全 CLI 網羅: AWS / kubectl / docker 等は業務外なので後回し。
+- Streaming 圧縮: line-by-line のリアルタイム filter は Phase 2 以降。
+
+* Architecture
+
+** 戦略の分類
+
+rtk の README で整理されている 4 戦略を踏襲:
+
+1. *Smart Filtering* — noise (comment, whitespace, boilerplate) 削除。
+2. *Grouping* — similar items (files by dir, errors by type) 集約。
+3. *Truncation* — 末尾無関係部をカット、先頭 N + 末尾 M 残す。
+4. *Deduplication* — 同一 log line を =(count)= 付きで潰す。
+
+=anvil-shell-filter.el= に per-command handler を =defalist=:
+
+#+begin_src elisp
+(defvar anvil-shell-filter-handlers
+  '((git-status    . anvil-shell-filter-git-status)
+    (git-log       . anvil-shell-filter-git-log)
+    (git-diff      . anvil-shell-filter-git-diff)
+    (rg            . anvil-shell-filter-rg)
+    (find          . anvil-shell-filter-find)
+    (ls            . anvil-shell-filter-ls)
+    (pytest        . anvil-shell-filter-pytest)
+    (ert-batch     . anvil-shell-filter-ert)
+    (emacs-batch   . anvil-shell-filter-emacs-batch)
+    (gh-pr-list    . anvil-shell-filter-gh)
+    (gh-pr-view    . anvil-shell-filter-gh)
+    (make          . anvil-shell-filter-make)
+    (pip-install   . anvil-shell-filter-pip)
+    (npm-install   . anvil-shell-filter-npm)
+    (docker-ps     . anvil-shell-filter-docker)))
+#+end_src
+
+** 主要 filter の outline
+
+*** =git-status=
+
+=## branch...upstream= を先頭 1 行、それ以降は
+=?? untracked (3)= / = M modified (5)= / = D deleted (2)= に集約。
+ファイル個別は対象が ≤ 5 件の場合のみ列挙。
+
+*** =git-log=
+
+=--oneline --decorate= 形式に強制。コミット詳細は除去、著者 +
+subject のみ。
+
+*** =git-diff=
+
+=@@ hunk= header + ±1 line of context のみ。long patch は 3 hunk で
+打ち切り、=[... 17 more hunks omitted]= を付す。
+
+*** =rg= / =grep=
+
+file 名で grouping、各 file 先頭 3 match、超過は =(N more)=。
+
+*** =pytest= / =ert-batch=
+
+pass は count のみ、fail は full traceback。
+
+*** =emacs-batch=
+
+=Compiling /path/to/foo.el...done= を 1 行に圧縮、warning は残す。
+=gcs-done= / =Process exited= は削除。
+
+*** =gh=
+
+PR list は =#NUM TITLE (AUTHOR, +ADD -DEL)= 1 行ずつ。
+PR view は body 先頭 500 chars + check status のみ。
+
+** 起動方法
+
+#+begin_src elisp
+;; 明示呼び出し
+(anvil-shell-filter-run 'git-status "git status --porcelain=v2")
+;; => (:compressed "branch:main +2 ??:3 M:5" :raw-size 3014
+;;     :compressed-size 28 :tee-id "abc123")
+
+;; MCP tool
+{
+  "tool": "shell-run",
+  "args": {
+    "cmd": "git status",
+    "filter": "auto"   ; or explicit 'git-status'
+  }
+}
+#+end_src
+
+=filter: "auto"= の場合、先頭トークンで handler を lookup。
+handler 無しは raw passthrough + tee のみ。
+
+** Tee 戦略
+
+全ての filter 呼び出しは (成否によらず) raw 出力を
+=anvil-state-set= で =(:ns "shell-tee" :key TEE-ID)= に保存。
+TTL は =anvil-shell-tee-ttl-sec= (default 3600 秒 = 1h)。
+
+=shell-tee-get= MCP tool で TEE-ID を指定すれば raw を取り戻せる
+(LLM が圧縮しすぎと判断したときの retry path)。
+
+=anvil-state-prune= が既に TTL 管理を持つので、追加実装不要。
+
+** Gain 統計
+
+=anvil-shell-filter-gain= は各呼び出しで:
+
+#+begin_src elisp
+(anvil-state-append-ns "shell-gain"
+  (format "%s" (format-time-string "%Y-%m-%d"))
+  `(:cmd ,filter-name
+    :raw ,raw-size
+    :compressed ,compressed-size
+    :saved ,(- raw-size compressed-size)))
+#+end_src
+
+=shell-gain= MCP tool で日次 summary + 累積節約 token を返す。
+1 token ≈ 4 chars 換算。
+
+** pty-broker との統合
+
+=anvil-pty-broker= の session ring buffer に対しても
+=anvil-shell-filter-apply-to-buffer= で filter を掛けられる。
+長期 process を watch しつつ、LLM に渡すときだけ filter 通す。
+
+Phase 2 で streaming 適用を検討 (tail -f 風 incremental filter)。
+
+* Public MCP tools
+
+| id              | args                              | notes                     |
+|-----------------+-----------------------------------+---------------------------|
+| ~shell-run~     | cmd, filter?, timeout?            | 実行 + filter + tee       |
+| ~shell-filter~  | filter, raw-text                  | raw 文字列への filter 単体|
+| ~shell-tee-get~ | tee-id                            | raw 再取得                 |
+| ~shell-gain~    | days?                             | 節約量 summary            |
+
+=shell-run= は =anvil-proc-run= (既存) の thin wrapper に filter
+hook を足したもの。
+
+* Phases
+
+** Phase 1 — 10 filter + tee + gain (~DRAFT~)
+
+最低限の 10 filter:
+=git-status= / =git-log= / =git-diff= / =rg= / =find= / =ls= /
+=pytest= / =ert-batch= / =emacs-batch= / =make=。
+
++ =shell-run= / =shell-filter= / =shell-tee-get= / =shell-gain= の
+4 MCP tool。
+
+** Phase 2 — 10 filter 追加 + streaming
+
+=gh= / =git log --graph= / =pip install= / =npm install= /
+=docker ps= / =docker logs= / =kubectl= 系 / =aws cli= subset /
+=prettier= / =ruff=。
+
+Streaming: =anvil-pty-broker-watch= との統合、tail on filter.
+
+** Phase 3 — user-defined filter
+
+=~/.emacs.d/anvil-shell-filters.el= で user 定義。
+=(anvil-shell-filter-register 'my-tool #'my-filter-fn)= API 公開。
+
+** Phase 4 — 電気管理業務固有 filter
+
+- =report-pipeline.py= 出力: =[OK] N reports generated= 1 行化。
+- =elisp tangle= errors: 重複 message 集約。
+- =MF csv import=: 行数 summary + error 抽出。
+
+* Testing strategy
+
+- Unit: 各 filter に「raw fixture → expected compressed」の snapshot
+  test。fixture は =tests/fixtures/shell/= 配下に実コマンド出力を
+  置く。
+- Property: compressed が raw の subset になっていること
+  (token savings ≥ 50%)。
+- Tee round-trip: filter → shell-tee-get で raw を復元できる。
+- Idempotency: filter を二度掛けても結果が安定。
+
+* Platform notes
+
+- Windows: =git.exe= の改行が CRLF、正規表現は =[\r\n]= 許容必須。
+- Emacs encoding: =locale-coding-system= で日本語 commit message
+  が化けないよう =utf-8-unix= 強制。
+- =anvil-proc-run= は Windows MSYS bash 経由 or cmd.exe の違いを
+  吸収済 (既存)。
+
+* Out of scope / future
+
+- Claude Code Bash hook 書換え (rtk 戦略): hook を書くのは easy だが、
+  anvil の value は Emacs-side で完結させる側にある。
+- Universal 圧縮 (=gzip= 風 line-level): 業務用途では per-command
+  の方が質が高い。
+
+* Review Questions
+
+1. Q. =shell-run= は =anvil-proc-run= を拡張する形で良いか、別 tool?
+   → 別 tool。=anvil-proc-run= は生データ、=shell-run= は filter
+   必須で役割分離。
+2. Q. Tee は成功時も常に残すか、失敗時のみか? → 常に残す。LLM が
+   「もっと詳細欲しい」と要求した場合の cost を下げる。TTL 1h で
+   自動 prune。
+3. Q. Filter を手書き (正規表現ベース) で保守するのか、DSL 化するか?
+   → Phase 1-2 は elisp 手書き。30 本超えたら DSL 検討。
+
+* References
+
+- rtk README: 戦略 4 分類 + per-command 一覧。
+  https://github.com/rtk-ai/rtk
+- Memory ~project_anvil_state_phase1_2.md~: =anvil-state= TTL API。
+- Memory ~project_anvil_pty_broker_phase1.md~: pty-broker ring buffer。

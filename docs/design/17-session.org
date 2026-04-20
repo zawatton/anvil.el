@@ -8,7 +8,8 @@
   :PROPERTIES:
   :ID:       f1dd6d46-6e38-4942-97d6-feb402fb826a
   :END:
-~DRAFT~ (2026-04-19)
+~DRAFT~ (2026-04-19, extended 2026-04-20 with Phase 3-4 for Claude
+Code lifecycle hooks — Week-3 Ship 5, 競合 context-mode 由来)
 
 Tier 3 of Week-2 roadmap.  Ephemeral-state persistence that sits
 between a single Claude conversation and the long-term memory system.
@@ -102,6 +103,114 @@ Minimum viable.  ERT 5.
 Optional hook on branch-switch or after ~my-anvil-ship-verify~ to
 capture automatically under a computed name.
 
+** Phase 3 — Claude Code lifecycle hooks (Ship 5)
+
+context-mode の "4-hook session continuity" pattern を anvil へ。
+Claude Code の =~/.claude/settings.json= から anvil MCP tool を
+hook で呼ぶ。
+
+*** Hook 一覧
+
+| Hook             | 発火タイミング                    | Role                              |
+|------------------+-----------------------------------+-----------------------------------|
+| =SessionStart=   | 会話開始時 / =--continue= 時      | 前回 snapshot を復元              |
+| =PreCompact=     | context window 圧迫で compact 直前 | working state を snapshot         |
+| =PostToolUse=    | 各 tool call 後                   | event を FTS5 に index            |
+| =UserPromptSubmit= | ユーザー入力確定時              | 意思決定 / 訂正を capture         |
+| =SessionEnd=     | /exit 時                          | 最終 snapshot + TTL reset         |
+
+*** 実装戦略
+
+Claude Code の hook は shell command を発火するだけなので、各 hook
+から anvil MCP を叩く thin wrapper を用意する:
+
+#+begin_src bash
+# ~/.claude/settings.json (hooks section)
+{
+  "hooks": {
+    "PreCompact": "anvil-hook pre-compact $CLAUDE_SESSION_ID",
+    "SessionStart": "anvil-hook session-start $CLAUDE_SESSION_ID",
+    "PostToolUse": "anvil-hook post-tool-use $CLAUDE_TOOL_NAME",
+    "UserPromptSubmit": "anvil-hook user-prompt $CLAUDE_PROMPT"
+  }
+}
+#+end_src
+
+=anvil-hook= は POSIX shell script、=emacsclient -e
+'(anvil-session-hook-dispatch ...)'= に forward。Emacs server 側で:
+
+#+begin_src elisp
+(defun anvil-session-hook-dispatch (event &rest args)
+  "Dispatch Claude Code lifecycle hook."
+  (pcase event
+    ('pre-compact
+     (anvil-session-snapshot
+       (anvil-session--auto-name)
+       :task-summary (anvil-session--derive-task-summary)
+       :buffers (anvil-session--capture-buffers)))
+    ('session-start
+     (let ((last (anvil-session--most-recent-snapshot)))
+       (when last (anvil-session--emit-preamble last))))
+    ('post-tool-use
+     (anvil-session--index-event (car args)))
+    ('user-prompt
+     (anvil-session--capture-decision (car args)))))
+#+end_src
+
+*** Event indexing (FTS5)
+
+PostToolUse / UserPromptSubmit は snapshot とは別に =anvil-session-
+events.db= (sqlite FTS5) に per-session log:
+
+#+begin_src
+CREATE TABLE events (
+  session_id TEXT,
+  seq INTEGER,
+  ts DATETIME,
+  kind TEXT,        -- tool-use / user-prompt / error / decision
+  tool TEXT,
+  summary TEXT      -- 200-char digest (not full payload)
+);
+CREATE VIRTUAL TABLE events_fts USING fts5(summary, content='events');
+#+end_src
+
+=session-events-search= MCP tool で "前回あの bug を直した時どの
+tool 使った?" が検索できる。
+
+*** Context-mode との差分
+
+context-mode は PreCompact で *全 event を compact payload に再
+注入* するが、anvil は FTS5 に置くだけで、resume 時も必要な event
+だけ検索させる。"don't dump it back, index it" 方針。
+
+*** Preamble の自動生成
+
+SessionStart hook で前回 snapshot があれば、=orchestrator-preamble-
+set= に:
+
+#+begin_example
+Resuming session "refactor-anvil-worker" (last active 2026-04-20 10:30).
+Branch: feat/worker-v2 (base develop).
+Last task: "Phase 4a backoff implementation".
+Baseline tests: 508/510 passing (2 known flaky).
+Recent key events (last 5 tool calls):
+  - file-batch: anvil-worker.el (12 edits)
+  - ert-run: worker-retry-test (passed)
+  - ...
+#+end_example
+
+を emit。Claude は 1 回の preamble 読みで context を再構築できる。
+
+** Phase 4 — hook 無効化 / opt-out
+
+hook は全 anvil ユーザーに強制すべきではない。=anvil-session-hooks-
+enabled= defcustom (default nil) で明示 opt-in。有効化すると
+=anvil-hook-install-settings= command が
+=~/.claude/settings.json= に hook 5 件を追記する。
+
+=anvil-hook-install-settings --dry-run= で差分プレビュー、
+=--uninstall= で撤去。破壊的変更は避け、既存 hook を保持。
+
 * Out of scope / future
 
 - Cross-Claude session diffing ("what's changed since I last worked
@@ -109,8 +218,42 @@ capture automatically under a computed name.
   be composed later.
 - Structured re-planning from a resumed snapshot — belongs to the
   caller Claude, not the tool.
+- Multi-terminal session merge (同時に 2 つ Claude Code を動かす):
+  single-session 前提。
+- hook で勝手に memory 書き込み: auto-memory とは明確に分離する
+  (Doc 29 で議論)。
+
+* Platform notes
+
+- Hook shell command は Windows native では =cmd.exe= 経由になる。
+  =anvil-hook.bat= wrapper を別途用意する (Phase 3 実装時)。
+- =emacsclient -e= の quoting は OS ごとに差がある。MSYS path /
+  Windows path の混在に注意 (Memory
+  ~reference_emacsclient_main_daemon_via_mcp_worker.md~ 参照)。
+- Claude Code の hook spec (env var 名、timeout) は v1.x で
+  stable だが、将来変更あれば wrapper 側で吸収。
+
+* Review Questions
+
+1. Q. Hook の event index を =anvil-session-events.db= に分けるか
+   =anvil-state= に namespace で入れるか? → 分ける。FTS5 + 大量
+   row の access pattern が =anvil-state= (軽量 KV) と合わない。
+2. Q. PostToolUse を全 tool で発火すると event 数が爆発しない?
+   → per-tool の =summary= だけで 200 chars 以内に抑える。1 session
+   100-500 event 想定で FTS5 なら軽量。
+3. Q. SessionStart で preamble を *自動 inject* するか、suggest
+   だけか? → suggest (orchestrator-preamble-set は opt-in)。強制
+   injection は context の主導権を奪う。
+4. Q. 複数 Claude Code instance (並列起動) で session-id 衝突は?
+   → Claude Code の =$CLAUDE_SESSION_ID= は uuid、衝突しない想定。
+   不安なら hook 内で pid もタグる。
 
 * References
 
 - Doc 08 (~08-state.org~): the KV store we persist in.
 - Doc 10 Phase 7b (preamble): what =:preamble-suggested= feeds into.
+- Doc 29 (~29-memory-engine.org~): auto-memory との境界線。
+- context-mode README ("Session Continuity" section):
+  https://github.com/mksglu/context-mode
+- Claude Code hooks ドキュメント:
+  https://docs.claude.com/en/docs/claude-code/hooks

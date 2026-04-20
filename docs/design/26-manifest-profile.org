@@ -1,0 +1,389 @@
+#+title: anvil-manifest-profile — Per-Session tools/list Filter
+#+date: 2026-04-20
+#+author: zawatton
+#+property: status APPROVED
+#+property: scope GENERIC
+
+* STATUS
+  :PROPERTIES:
+  :ID:       c6f05c1e-72a6-4e3b-87a6-d0a6a3b7c001
+  :END:
+~APPROVED~ (2026-04-20) — DRAFT 1 回目は Phase 1 impl を main session
+で先行 ship したが、*opt-in 化* と *Phase 0 実測* を待たずに develop
+merge した点で別 session の review から reset がかかった。
+
+方針調整 (2026-04-20 review):
+- =manifest= モジュールは =anvil-optional-modules= 側に置く。
+  =anvil-modules= default からは外す。既存挙動と完全互換。
+- Phase 1 impl (=anvil-manifest.el= + filter hook + manifest-cost
+  tool + 16 ERT) は feat/doc-26-manifest-profile で cherry-pick 済、
+  self-PR 経由で squash merge 予定。
+- Phase 0 として *actual token 実測* を先に走らせ、main session
+  (Opus 1M) で ROI < 1% なら Phase 1 の main session 適用は中止、
+  orchestrator child session 限定に絞る。
+
+Week-3 Ship 1、競合 token-savior の =TOKEN_SAVIOR_PROFILE= 移植。
+
+* Motivation
+
+anvil は 2026-04 時点で =anvil-bench= / =anvil-browser= / =anvil-orchestrator=
+/ =anvil-worker= 等 20 モジュール、合計 *90+ MCP tool* を advertise している。
+Claude Code は session 開始時に =tools/list= 全体を system prompt に詰める
+ため、per-turn *manifest cost* がじわじわ効いている。
+
+token-savior は同じ痛みに =TOKEN_SAVIOR_PROFILE= で対処している:
+
+| Profile | Advertised | ~Tokens | Use case                         |
+|---------+------------+---------+----------------------------------|
+| full    |        106 |  10 950 | All capabilities                 |
+| core    |         54 |   5 800 | Daily coding, no memory engine   |
+| nav     |         28 |   3 100 | Read-only exploration            |
+| lean    |         59 |   6 620 | Memory engine off                |
+| ultra   |         17 |   2 740 | Hot tools + =ts_extended= lazy   |
+
+=tools/list= payload を絞っても handler は生きているので、explicit call
+はそのまま通る ("hidden but callable")。
+
+anvil の per-session cost を実測してから profile を当てると、Claude の
+context window が 30-50% 広く使えると期待できる。
+
+* Goals
+
+1. =ANVIL_PROFILE= env var + defcustom =anvil-manifest-profile= で
+   tools/list の出力を subset に絞る。
+2. Profile 定義はコード側 (Lisp table) ではなく data (=anvil-manifest-
+   profiles.el= の =defconst=) として分離し、ユーザー定義可能に。
+3. 既存の =anvil-register-tools= マクロに =:profiles= タグを追加、
+   既存 registration を *壊さない* (タグ無しは =full= 扱い)。
+4. =manifest-cost= MCP tool を 1 本提供 — 現在 profile の advertised
+   tools 数と推定 token を返す (Claude 自身が profile 選択できる)。
+5. 全 profile の token 実測値を =tests/manifest-cost-snapshot.el= に
+   記録、CI で regression 検出。
+
+* Non-goals
+
+- 動的 (session 中の) profile 切替: JSON-RPC に profile 変更通知を
+  送る仕組みは MCP 1.0 に無い。env var + 再起動で十分。
+- Per-tool lazy loading: handler は常時 live を維持。advertised が
+  絞られるだけ。
+- User 側 (Claude Code) の =disabled_mcpServers= と重ねる: 競合する
+  なら Claude Code 側を優先。
+- =ultra= profile に相当する "meta-tool + tool-name lookup" (token-
+  savior の =ts_extended=) は Phase 2。Phase 1 は静的 filter のみ。
+
+* Architecture
+
+** Profile 定義
+
+#+begin_src elisp
+;;; anvil-manifest-profiles.el
+(defconst anvil-manifest-profile-ultra
+  '(file-read file-batch org-read-outline org-read-headline
+    org-index-search bench-compare http-fetch offload-submit
+    git-status git-diff-names git-log manifest-cost)
+  "Hot tools only — Claude Code daily driver.")
+
+(defconst anvil-manifest-profile-nav
+  (append anvil-manifest-profile-ultra
+          '(file-outline code-extract-pattern org-index-rebuild
+            defs-search bench-last))
+  "Read-only exploration.")
+
+(defconst anvil-manifest-profile-core
+  (append anvil-manifest-profile-nav
+          '(file-batch-across file-replace-string file-replace-regexp
+            file-ensure-import json-object-add code-add-field-by-map
+            org-update-todo-state org-add-todo org-rename-headline
+            ...)))
+  "Daily coding + edits, no orchestrator / worker UI.")
+
+(defvar anvil-manifest-profile-full :all
+  "Magic sentinel: all registered tools.")
+#+end_src
+
+** Register-tools macro 拡張
+
+#+begin_src elisp
+(anvil-register-tools
+  :module 'anvil-file
+  :tools '((file-read :handler anvil-file-read-handler
+                      :profiles (ultra nav core full))
+           (file-batch :handler anvil-file-batch-handler
+                       :profiles (ultra nav core full))
+           (file-outline :handler anvil-file-outline-handler
+                         :profiles (nav core full))
+           ...))
+#+end_src
+
+タグ無しの既存 registration は ~:profiles '(full)~ として解釈 (後方
+互換)。
+
+** tools/list filter
+
+=anvil-server-handle-tools-list= で =anvil-current-manifest-profile=
+を参照、該当 profile の set に含まれるものだけ返す。profile が
+=:all= (=full=) の場合 filter 無し。
+
+#+begin_src elisp
+(defcustom anvil-manifest-profile
+  (intern (or (getenv "ANVIL_PROFILE") "full"))
+  "Active manifest profile."
+  :type '(choice (const full) (const core) (const nav)
+                 (const ultra) (const lean)))
+
+(defun anvil-current-profile-toolset ()
+  (pcase anvil-manifest-profile
+    ('full :all)
+    ('core anvil-manifest-profile-core)
+    ('nav  anvil-manifest-profile-nav)
+    ('ultra anvil-manifest-profile-ultra)
+    ('lean anvil-manifest-profile-lean)
+    (_ (user-error "Unknown profile: %s" anvil-manifest-profile))))
+#+end_src
+
+** Manifest cost tool
+
+#+begin_src elisp
+(defun anvil-manifest-cost-handler (&optional _args)
+  "Return current profile + advertised tool count + approx tokens."
+  (let* ((advertised (anvil-server-advertised-tools))
+         (schema-tokens (cl-reduce #'+
+                          (mapcar #'anvil-tool-schema-token-count
+                                  advertised)
+                          :initial-value 0)))
+    (list :profile anvil-manifest-profile
+          :advertised-count (length advertised)
+          :approx-tokens schema-tokens
+          :profiles-available '(full core nav ultra lean))))
+#+end_src
+
+~anvil-tool-schema-token-count~ は tool の JSON-Schema を
+=json-encode= して 1 token ≈ 4 chars で概算。厳密でない。
+
+* Public MCP tools
+
+| id              | args   | notes                                            |
+|-----------------+--------+--------------------------------------------------|
+| ~manifest-cost~ | (none) | 現在 profile の advertised 数 + 概算 token       |
+
+他は全て既存 tool の =:profiles= タグ追記のみ。tool 新設は 1 本。
+
+* Phases
+
+** Phase 0 — Actual-token ROI 実測 (~DONE~, 2026-04-20)
+
+実測結果: =benchmarks/results/manifest-cost-2026-04-20.org=
+
+Running main daemon (=/run/user/1000/emacs/server=, server-id
+=emacs-eval=) に =anvil-manifest= を一時 load して測定。
+
+| Profile | Advertised | Tokens | vs full            |
+|---------+------------+--------+--------------------|
+| full    |         78 | 13 471 | —                  |
+| core    |         52 | 10 371 | -23%               |
+| nav     |         31 |  5 782 | -57%               |
+| ultra   |         13 |  2 099 | -84% (-11 372 tok) |
+| lean    |         52 | 10 371 | same as core       |
+
+Prompt cache 補正 (cache read = 10% input price):
+
+| Profile | Raw    | Per-turn cached | % of 1M context |
+|---------+--------+-----------------+-----------------|
+| full    | 13 471 |           1 347 | 0.13%           |
+| ultra   |  2 099 |             210 | 0.02%           |
+| delta   | 11 372 |           1 137 | 0.11%           |
+
+Main session 1% 閾値 (Review Q 4) 未到達。
+
+*判定:*
+- *Main session*: =full= 固定 (env 無指定の default) — 採用しない。
+- *Orchestrator worker*: =ANVIL_PROFILE=ultra= を env で強制 — 採用。
+  Child session は cold start、cross-job cache warm-up が効かない
+  想定。-11 k tok × 並列 × 短命性で ROI 大。
+
+Phase 1 は本採用、ただし注入先を orchestrator worker subprocess
+限定に絞る (=anvil-worker-init.el= で設定)。
+
+** Phase 1 — static profile + manifest-cost (~Impl on feat branch~)
+
+1. =anvil-manifest.el= 新規追加、4 profile を =defconst= (ultra /
+   nav / core / lean) + =full= sentinel。
+2. =anvil-server.el= に =anvil-server-tool-filter-function= defvar
+   追加、=anvil-server--handle-tools-list= で filter 適用。
+3. =manifest-cost= MCP tool を =anvil-manifest.el= 内に同梱。
+4. =anvil-manifest= を =anvil-optional-modules= 側に登録 (default
+   load 対象外、既存挙動完全互換)。
+5. =tests/anvil-manifest-test.el= で 16 ERT (profile 包含関係 /
+   filter hook / manifest-cost / snapshot regression)。
+
+実装は feat/doc-26-manifest-profile branch 上 (cherry-pick 後 opt-in
+修正済)。user が手 merge で develop へ統合。
+
+** Phase 1a — per-server-id profile + alias resolution (~Impl~)
+
+Phase 0 の判定で「orchestrator worker 限定 ultra 適用」に倒したが、
+単純な env 注入では効かないことが判明:
+
+- =ANVIL_PROFILE= env は subprocess が継承するだけで、anvil-stdio.sh
+  経由の emacsclient では server (main daemon) の状態に影響しない。
+- Server 側 filter は *全 client 共通* のため、main session と
+  orchestrator child で別 profile を返すには *server-id 別の
+  filter 判定* が必要。
+
+実装アプローチ (採用):
+
+1. *Server-id alias 解決*: =anvil-server.el= に
+   =anvil-server-id-aliases= defvar + =anvil-server--resolve-id=
+   追加。virtual server-id (=emacs-eval-ultra= 等) を real id
+   (=emacs-eval=) に解決して tool table を lookup。5 handler
+   (initialize / tools-list / tools-call / resources-list /
+   resources-templates-list / resources-read) で alias 解決を適用。
+2. *Filter シグネチャ拡張*: =anvil-server-tool-filter-function= を
+   =(tool-id tool-plist server-id)= に。server-id は *解決前の
+   virtual id* を渡し、filter 側で profile を切り分けられるように。
+3. *Per-server-id profile map*: =anvil-manifest.el= に
+   =anvil-manifest-server-profiles= defcustom。既定:
+   #+begin_src elisp
+   '(("emacs-eval-ultra" . ultra)
+     ("emacs-eval-nav"   . nav)
+     ("emacs-eval-core"  . core))
+   #+end_src
+   =anvil-manifest-enable= で =anvil-server-id-aliases= に既定
+   alias を追加 (=emacs-eval-ultra= 等を =emacs-eval= にマップ)。
+4. *Back-compat*: filter signature に optional arg を追加した形なので
+   legacy 2-arg 呼び出しも通る。
+
+*Claude Code config 例* (orchestrator subprocess 用):
+
+#+begin_src json
+{
+  "mcpServers": {
+    "emacs-eval-ultra": {
+      "type": "stdio",
+      "command": "/home/<user>/.emacs.d/anvil-stdio.sh",
+      "args": [
+        "--server-id=emacs-eval-ultra",
+        "--init-function=anvil-enable"
+      ],
+      "env": {}
+    }
+  }
+}
+#+end_src
+
+Orchestrator worker (=anvil-orchestrator.el= の =spawn=) がこの
+config を持つ claude-cli / codex-cli を起動すれば、child session の
+=tools/list= は自動的に ultra profile に絞られる。Main session の
+=emacs-eval= は変更なしで =full= 表示を維持。
+
+テスト: =tests/anvil-manifest-test.el= に 8 ERT 追加 (alias 解決 /
+per-server-id profile / enable/disable で alias install/uninstall /
+end-to-end で emacs-eval-ultra が ultra 絞り込み反映)。全 24 ERT pass。
+
+** Phase 1b — orchestrator subprocess env 自動注入 (~DRAFT~)
+
+現状 Phase 1a は *Claude Code config 側で手動に* virtual server-id
+を指定する必要がある。Phase 1b では =anvil-orchestrator.el= の
+=anvil-orchestrator--spawn= で、provider が claude-cli / codex 等
+の場合に自動で =--mcp-server emacs-eval-ultra= 相当の設定を差し込む:
+
+- Provider の =build-cmd= で claude-cli の =--mcp-config= に ultra 版
+  を組み込み。
+- 既存 user config と衝突しないよう temp file or env で分離。
+- Opt-out: task plist に =:no-manifest-override t= があれば無効化。
+
+Phase 1a 経過観察 (orchestrator 実戦での token 削減実測) 後に
+Phase 1b 着手。
+
+** Phase 2 — lazy discovery (=ultra= + meta-tool)
+
+token-savior の =ts_extended= パターン:
+- =ultra= profile では =anvil-extended= meta-tool 1 本のみ advertise。
+- =anvil-extended {tool: "file-outline", args: {...}}= で任意 tool
+  を呼べる (hidden なだけで handler は live)。
+- Claude は =manifest-cost= で =ultra= 検出 → =anvil-extended= で
+  lazy discovery。
+
+ただし Claude Code が tool name を明示的に検索/推論できるかは
+2026-04 時点で未検証。Phase 1 の反応を見てから判断。
+
+** Phase 3 — user-defined profiles
+
+~~/.emacs.d/anvil-profiles.el~ で user override:
+#+begin_src elisp
+(setq anvil-manifest-profile-custom
+      '(file-read file-batch org-read-outline my-custom-tool))
+(setq anvil-manifest-profile 'custom)
+#+end_src
+
+* Testing strategy
+
+- Unit: 4 profile × 「含まれる / 含まれない」assertion。
+- Integration: =anvil-server-handle-tools-list= が profile ごとに
+  期待 count を返す。
+- Token snapshot: =tests/manifest-cost-snapshot.el= に
+  =(ultra 17 2740) (nav 28 3100) ...= 形式で baseline。±10% 超える
+  と fail。
+- Hidden-but-callable: =ultra= profile 下でも =file-batch-across=
+  の explicit call が通ることを確認。
+
+* Platform notes
+
+env var =ANVIL_PROFILE= は Windows (cmd.exe / PowerShell) でも
+=set ANVIL_PROFILE=core= で効く。MSYS/mingw64 も同様。
+
+* Out of scope / future
+
+- Per-conversation profile (MCP に profile 変更通知が無い以上、
+  現状 env var 起動時固定)。
+- tools/list の差分配信 (MCP 1.x にはない)。
+- Profile 自動選択 (session 開始時に conversation 内容から推定) —
+  深掘り価値薄い、ユーザーが設定する方が明確。
+
+* Review Questions
+
+1. Q. Default profile を =full= にすべきか? → A. はい。既存ユーザー
+   が env 設定なしで tool を失うのは破壊的。Opt-in で絞る。
+2. Q. =anvil-manifest-profile-lean= (memory engine 無し) は Doc 29
+   前提の命名。Doc 29 より先に出していい?
+   → 空集合として定義可 (=core= と同一) にしておき、Doc 29 SHIPPED
+   時に差分を足す。
+3. Q. =manifest-cost= の approx token 計算は JSON-encode → ÷ 4 で
+   十分か? 実測 tiktoken との乖離は? → Phase 1 は概算で良い。
+   ±20% でも profile 選択判断には足りる。
+4. Q. (2026-04-20 review 追加) Main session (Opus 1M) で ROI は実際
+   に出るのか? tools/list は session 冒頭 1 回 + prompt cache 対象で
+   per-turn ゲインは薄いはず。
+   → A. Phase 0 で実測。ROI < 1% なら main session 適用は不採用、
+   orchestrator child session 限定 (=ANVIL_PROFILE=ultra= を
+   orchestrator worker の env に設定) で使う方針に倒す。
+5. Q. (2026-04-20 review 追加) Profile 所属ルールはどう決める?
+   新 tool 追加時に誰がどの profile に入れるか、tag 付け忘れは
+   どう検出?
+   → A. ルール:
+   - read-only tool (= =:read-only t=) は自動で =nav= 候補。
+   - 編集系 tool (=file-replace-*= / =json-object-add= 等) は =core=
+     候補。orchestrator/browser/pty/cron は non-core (full 限定)。
+   - tag 付け忘れは =anvil-release-audit= の 6 本目 scanner として
+     実装: 「=:read-only t= だが nav 所属でない」「新 tool id が
+     どの profile にも現れない」を warning として出す。
+   - ultra は author 主観 (Phase 0/1 後に measurement ベースで再
+     調整、Review Q 6 参照)。
+6. Q. (2026-04-20 review 追加) =ultra= 16 tools の根拠は? 客観基準
+   が無いと 2 ヶ月後に誰も更新できない。
+   → A. Phase 1 時点は *author 主観* (daily-driver の頻度感覚)。
+   Phase 2 で =orchestrator-stats= + main session tool-call log を
+   組み合わせ、*直近 30 日の tools/call frequency 上位 N* を候補
+   として提示する仕組みを追加。=anvil-manifest-suggest-ultra= command
+   で periodic に推薦。
+   ただし頻度だけで hot 判定すると =file-outline= 等「低頻度だが
+   絶対外せない」tool を落とす恐れ。frequency × "alternative cost"
+   (= 同目的の他 tool 必要ツールホップ数) で重み付け。
+
+* References
+
+- token-savior README: =TOKEN_SAVIOR_PROFILE= の 5 profile 一覧。
+- Memory ~project_anvil_efficiency_bundle.md~: register-tools macro
+  の既存実装。
+- MCP spec: https://modelcontextprotocol.io/ (tools/list response
+  format)。

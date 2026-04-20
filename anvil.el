@@ -116,7 +116,15 @@ These are not loaded by default.  Available modules:
                 / py-list-functions / py-list-classes / py-list-methods
                 / py-list-decorators / py-find-definition /
                 py-surrounding-form.  Requires Emacs 29+ treesit and
-                tree-sitter-python grammar (Doc 21 Phase 1a)"
+                tree-sitter-python grammar (Doc 21 Phase 1a)
+- `manifest'  — Per-session tools/list filter driven by
+                `ANVIL_PROFILE' (ultra / nav / core / lean / full).
+                Handlers remain live regardless of profile; only the
+                advertised manifest shrinks.  Opt-in: primarily useful
+                for orchestrator child sessions where per-session
+                manifest cost dominates (Doc 26 Phase 1).  Add
+                `manifest' last in the module list so it sees every
+                earlier registration."
   :type '(repeat symbol)
   :group 'anvil)
 

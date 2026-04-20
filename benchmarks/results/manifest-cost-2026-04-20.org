@@ -1,0 +1,114 @@
+#+title: anvil-manifest Phase 0 — Actual-token ROI 実測
+#+date: 2026-04-20
+#+author: zawatton
+#+property: doc 26
+
+* Summary
+
+Doc 26 Phase 0 ゲートの実測結果。Phase 1 (=anvil-manifest.el=) が
+feat/doc-26-manifest-profile 上に用意された状態で、running main
+daemon (=/run/user/1000/emacs/server=) に temporarily load し、
+profile ごとの =tools/list= 実効コストを測定。
+
+*結論:* =ANVIL_PROFILE=ultra= の効果は生の数値では -84%
+(13 471 → 2 099 tokens) と大きいが、*prompt cache 対象* となる main
+session では 1 turn あたりの実効コストが 10% 以下になるため、
+ROI は文脈の約 0.1% と低い。**main session には =full= を維持**、
+*orchestrator child session* (fresh、短命、多数並列) 限定で
+=ultra= 適用する方針で Phase 1 を採用する。
+
+* Raw numbers
+
+主 daemon (anvil-enable 済、13 default modules + 数個の optional
+module) 上で =emacs-eval= server-id に登録されていた tool:
+
+| Profile | Advertised | Registered | Approx tokens | Reduction vs full |
+|---------+------------+------------+---------------+-------------------|
+| full    |         78 |         78 |        13 471 | —                 |
+| core    |         52 |         78 |        10 371 | -23% (-3 100 tok) |
+| nav     |         31 |         78 |         5 782 | -57% (-7 689 tok) |
+| ultra   |         13 |         78 |         2 099 | -84% (-11 372 tok)|
+| lean    |         52 |         78 |        10 371 | same as core      |
+
+Approx tokens は tool-id + description + JSON-encoded inputSchema
+の char 数を 4 で割った概算。tiktoken 実測との乖離は ±20%。
+
+* Prompt cache による実効コスト補正
+
+Anthropic の prompt caching では cache read は input price の 10%。
+Main session (Opus 1M) では =tools/list= が system prompt に含まれ
+*session 冒頭 1 回のみ* full 送信、以降は cache 対象。per-turn
+コストを概算すると:
+
+| Profile | Raw tokens | Per-turn cost (cached) | % of 1M context |
+|---------+------------+------------------------+-----------------|
+| full    |     13 471 |              ~1 347    |  0.13%          |
+| ultra   |      2 099 |                ~210    |  0.02%          |
+| delta   |     11 372 |              ~1 137    |  0.11%          |
+
+Main session の 1% 閾値 (Review Q 4 で合意) に対し delta は 0.11%
+で *未到達*。Opus 1M で ultra 適用しても実効ゲインは per-turn
+1 100 tokens 程度で、他のコスト (会話 message、memory、skills)
+140k+ に埋もれる。
+
+* Orchestrator child session での ROI 予測
+
+Child session は worker subprocess per job で *毎回 cold start*
+(prompt cache warm-up は cross-job で効かない想定、要検証)。
+Ultra で -11 372 tokens は fresh manifest として大きい:
+
+- gemma4 / codex-cli の short prompt で manifest >10k はノイズ比率
+  が高い。
+- Orchestrator 並列 10 jobs/min 規模なら session 初手の -11k ×
+  10/min = -110k tok/min の節約可能性。
+
+実測は orchestrator-stats + provider billing log で裏取り必須
+(Phase 1a 後に追検証)。
+
+* 採用決定
+
+- *Main session*: =full= 固定 (env 無指定の default)。
+- *Orchestrator worker*: =ANVIL_PROFILE=ultra= を env に設定して
+  起動する (Phase 1a スコープ、=anvil-worker-init.el= で設定)。
+- =ANVIL_PROFILE=nav= / =core= は middle option として defconst に
+  は残すが default 適用はしない。user が明示的に opt-in するのみ。
+
+* Deferred tool loading との関係
+
+Claude Code の ToolSearch 機構 (deferred loading) が有効な session
+では、client side で manifest が更に絞られる。本測定は server side
+が advertising する量のみを計測。実際に LLM が見る context は
+Claude Code client の戦略によって更に小さい。重複最適化だが、
+anvil-manifest は *MCP server level* で効くので以下で有用:
+
+- ToolSearch 非対応 client (Cline / Continue / Gemini CLI の一部)。
+- Orchestrator child session の provider が MCP spec を raw pass する
+  場合。
+- Server 側で manifest が縮むと全 client に対して再計算コスト削減。
+
+* Methodology
+
+#+begin_src bash
+# 1. Load anvil-manifest into running main daemon
+emacsclient -s /run/user/1000/emacs/server -e \
+  '(progn (load-file ".../anvil-manifest.el") (anvil-manifest-enable))'
+
+# 2. For each profile, query advertised count + token estimate
+emacsclient -s /run/user/1000/emacs/server -e '
+  (mapcar (lambda (profile)
+    (let ((anvil-manifest-profile profile))
+      ... profile ごとに tools-table walker ...))
+    (quote (full core nav ultra lean)))'
+#+end_src
+
+Raw output: =/tmp/manifest-cost-2026-04-20.txt= (保存せず)。
+
+* Follow-ups
+
+- [ ] Orchestrator worker subprocess に =ANVIL_PROFILE=ultra= 注入
+  (Phase 1a)。
+- [ ] Provider billing log で child session の actual token 実測
+  (Phase 1b、orchestrator-stats 拡張で取得)。
+- [ ] tiktoken (python3) での厳密 token 計測を CI に追加 (Phase 2)。
+- [ ] Claude Code client 側 ToolSearch の有無を session 開始時に
+  検出する手段を調査 (重複最適化の定量化)。
