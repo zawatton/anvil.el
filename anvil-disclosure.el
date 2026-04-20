@@ -12,7 +12,7 @@
 ;;; Commentary:
 
 ;; Official Layer-1 (index) / Layer-2 (search) / Layer-3 (get) contract
-;; for anvil's read surface — Doc 28 Phase 1 + Phase 2.  Provides four
+;; for anvil's read surface — Doc 28 Phase 1 + 2 + 3.  Provides five
 ;; new MCP tools:
 ;;
 ;;   org-index-index   — Layer 1 for org-mode headlines.  Slim pointers
@@ -24,10 +24,16 @@
 ;;                       `file://PATH#L<s>-<e>' citation URI reusable
 ;;                       in Layer 3.  Delegates to `anvil-file-read-region'.
 ;;   defs-index        — Layer 1 for elisp symbol definitions.  Slim
-;;                       pointers (:id defs://0/SYM :symbol :file :kind)
-;;                       projected from `anvil-defs-search' (fuzzy).
-;;                       SHA segment is "0" in Phase 2 (no row-level
-;;                       versioning yet); reserved for a future hash.
+;;                       pointers (:id defs://<sha>/SYM :symbol :file
+;;                       :kind) projected from `anvil-defs-search'
+;;                       (fuzzy).  Phase 3+: `<sha>' is the first 8
+;;                       hex chars of sha1(file|line|name), which
+;;                       disambiguates same-name defs across files.
+;;   anvil-uri-fetch   — Cross-layer resolver (Phase 3).  Pass any
+;;                       anvil citation URI (`org://' / `defs://' /
+;;                       `file://' / `journal://') and the right
+;;                       Layer-3 handler is invoked automatically.
+;;                       `http-cache://' is stubbed for Phase 4.
 ;;   disclosure-help   — Returns the 3-layer flow so LLM agents can
 ;;                       discover the contract at runtime.
 ;;
@@ -238,21 +244,39 @@ MCP Parameters:
 
 ;;; Layer-1 defs-index
 
-(defconst anvil-disclosure--defs-sha-placeholder "0"
-  "SHA segment used in `defs://' URIs before Phase 3 row-hashing.
-Reserved so the scheme can be version-bumped later without a
-breaking URI change.  The segment is syntactic — parsers must not
-reason about it semantically.")
+(defcustom anvil-disclosure-defs-sha-length 8
+  "Number of leading hex chars of the per-row sha1 to use in defs:// URIs.
+Smaller is cheaper on the tok-budget but collides faster across
+large codebases.  8 chars = 16 bits of entropy within a given name,
+comfortable for typical elisp corpora."
+  :type 'integer
+  :group 'anvil-disclosure)
+
+(defun anvil-disclosure--defs-row-sha (row)
+  "Return a short per-row sha (hex string) for defs ROW.
+Derived from sha1 over `file|line|name' and truncated to
+`anvil-disclosure-defs-sha-length'.  Stable across sessions so
+citation URIs round-trip.  When file/line/name are missing, the
+hash uses empty-string / 0 defaults so callers still get a
+deterministic URI instead of the literal string \"nil\"."
+  (let* ((name (or (plist-get row :name) ""))
+         (file (or (plist-get row :file) ""))
+         (line (or (plist-get row :line) 0))
+         (digest (secure-hash 'sha1
+                              (format "%s|%s|%s" file line name))))
+    (substring digest 0
+               (max 1 (min (length digest)
+                           anvil-disclosure-defs-sha-length)))))
 
 (defun anvil-disclosure--defs-row-to-pointer (row)
   "Project a `anvil-defs-search' ROW plist into a Layer-1 defs pointer.
-Returns (:id defs://0/NAME :symbol NAME :file PATH :kind KIND)."
+Returns (:id defs://<sha>/NAME :symbol NAME :file PATH :kind KIND).
+The sha segment disambiguates same-name defs in different files."
   (let ((name (plist-get row :name))
         (file (plist-get row :file))
         (kind (plist-get row :kind)))
     (when (and name (stringp name) (not (string-empty-p name)))
-      (list :id (anvil-uri-defs anvil-disclosure--defs-sha-placeholder
-                                name)
+      (list :id (anvil-uri-defs (anvil-disclosure--defs-row-sha row) name)
             :symbol name
             :file (or file "")
             :kind (or kind "")))))
@@ -266,9 +290,9 @@ Returns (:id defs://0/NAME :symbol NAME :file PATH :kind KIND)."
   "Layer-1 slim pointers for elisp definitions.
 QUERY is a substring (fuzzy LIKE match) of the symbol name.
 Returns (:count N :rows ((:id URI :symbol S :file F :kind K) ...))
-where each :id is a `defs://0/SYM' citation URI reusable in Layer 3
-via `elisp-get-function-definition'.  LIMIT defaults to 50 and is
-hard-capped at `anvil-disclosure-layer1-hard-limit'."
+where each :id is a `defs://<sha>/SYM' citation URI reusable in
+Layer 3 via `elisp-get-function-definition'.  LIMIT defaults to 50
+and is hard-capped at `anvil-disclosure-layer1-hard-limit'."
   (require 'anvil-defs)
   (let* ((q   (anvil-disclosure--none-empty query))
          (lim (anvil-disclosure--clamp-limit limit))
@@ -286,6 +310,95 @@ MCP Parameters:
   (anvil-server-with-error-handling
    (format "%S"
            (anvil-disclosure-defs-index query limit))))
+
+;;; Cross-layer resolver (Phase 3)
+
+(declare-function anvil-org--tool-read-by-id "anvil-org" (uuid))
+(declare-function anvil-elisp--get-function-definition "anvil-elisp"
+                  (function))
+(declare-function anvil-file-read "anvil-file"
+                  (path &optional offset limit))
+
+(defun anvil-disclosure--resolve-org (parsed)
+  "Resolver for org:// / journal:// parsed URIs.
+Both schemes end up in `org-read-by-id' — the journal year segment
+is informational only at Layer 3."
+  (require 'anvil-org)
+  (let ((id (plist-get parsed :id)))
+    (unless (and id (stringp id) (not (string-empty-p id)))
+      (error "anvil-uri-fetch: missing org ID in URI"))
+    (list :resolver 'org-read-by-id
+          :body (anvil-org--tool-read-by-id id))))
+
+(defun anvil-disclosure--resolve-file (parsed)
+  "Resolver for file:// parsed URIs.
+Uses the embedded line range (when any) to seed offset/limit so the
+LLM gets the same bounded slice it would have seen in Layer 2."
+  (require 'anvil-file)
+  (let* ((path (plist-get parsed :path))
+         (s    (plist-get parsed :line-start))
+         (e    (plist-get parsed :line-end))
+         (off  (when s (max 0 (1- s))))
+         (lim  (when (and s e) (max 1 (1+ (- e s))))))
+    (unless (and path (stringp path) (not (string-empty-p path)))
+      (error "anvil-uri-fetch: missing path in file:// URI"))
+    (list :resolver 'file-read
+          :body (anvil-file-read path off lim))))
+
+(defun anvil-disclosure--resolve-defs (parsed)
+  "Resolver for defs:// parsed URIs.
+The SHA segment is informational only — Layer 3
+`elisp-get-function-definition' resolves purely by symbol name."
+  (require 'anvil-elisp)
+  (let ((sym (plist-get parsed :symbol)))
+    (unless (and sym (stringp sym) (not (string-empty-p sym)))
+      (error "anvil-uri-fetch: missing symbol in defs:// URI"))
+    (list :resolver 'elisp-get-function-definition
+          :body (anvil-elisp--get-function-definition sym))))
+
+(defun anvil-disclosure--resolve-http-cache (_parsed)
+  "Phase 4 placeholder resolver for http-cache:// URIs."
+  (error "anvil-uri-fetch: http-cache:// scheme not supported yet \
+(Phase 4 of Doc 28)"))
+
+(defconst anvil-disclosure--uri-fetch-dispatch
+  `((org         . ,#'anvil-disclosure--resolve-org)
+    (journal     . ,#'anvil-disclosure--resolve-org)
+    (file        . ,#'anvil-disclosure--resolve-file)
+    (defs        . ,#'anvil-disclosure--resolve-defs)
+    (http-cache  . ,#'anvil-disclosure--resolve-http-cache))
+  "Scheme symbol → Layer-3 resolver function for `anvil-uri-fetch'.
+Each resolver takes the plist returned by `anvil-uri-parse' and
+returns (:resolver SYM :body ...).  Adding a new scheme is a single
+alist entry plus the resolver function.")
+
+;;;###autoload
+(defun anvil-disclosure-uri-fetch (uri)
+  "Dispatch URI to the appropriate Layer-3 tool and return its body.
+Returns (:scheme SYM :uri URI :resolver FN-ID :body RESULT).
+Signals an error when the URI has no recognised anvil scheme or the
+scheme's resolver is not yet implemented."
+  (let* ((parsed (anvil-uri-parse uri)))
+    (unless parsed
+      (error "anvil-uri-fetch: %S is not a recognised anvil citation URI"
+             uri))
+    (let* ((scheme (plist-get parsed :scheme))
+           (fn (cdr (assq scheme anvil-disclosure--uri-fetch-dispatch))))
+      (unless fn
+        (error "anvil-uri-fetch: no resolver registered for scheme %S"
+               scheme))
+      (let ((res (funcall fn parsed)))
+        (append (list :scheme scheme :uri uri) res)))))
+
+(defun anvil-disclosure--tool-uri-fetch (uri)
+  "MCP wrapper for `anvil-disclosure-uri-fetch'.
+
+MCP Parameters:
+  uri - Anvil citation URI (string, required).  One of org://ID,
+        defs://SHA/SYM, file://PATH[#L<s>-<e>], journal://YEAR/ID,
+        http-cache://SHA256."
+  (anvil-server-with-error-handling
+   (format "%S" (anvil-disclosure-uri-fetch uri))))
 
 ;;; disclosure-help
 
@@ -315,11 +428,16 @@ Citation URIs:
 
   org://<ID>                       Layer 3: org-read-by-id
   defs://<sha>/<symbol>            Layer 3: elisp-get-function-definition
-                                   sha is \"0\" in Phase 2 (reserved
-                                   for future row-hash versioning).
+                                   sha = first 8 hex chars of
+                                   sha1(file|line|name) — disambiguates
+                                   same-name defs across files.
   file://<PATH>[#L<n>[-<m>]]       Layer 3: file-read
   journal://<YYYY>/<ID>            Layer 3: org-read-by-id (journal)
-  http-cache://<sha256>            Layer 3: http-cache-get (future)
+  http-cache://<sha256>            Layer 3: http-cache-get (Phase 4)
+
+Cross-layer shortcut: `anvil-uri-fetch <uri>' dispatches any citation
+URI to the right Layer-3 handler automatically.  Prefer it over
+memorising scheme-specific tools when you only have a URI.
 
 Rule of thumb: start at Layer 1.  If nothing relevant matched, do not
 escalate — adjust the query instead.  Never call Layer 3 (e.g.,
@@ -353,9 +471,15 @@ MCP Parameters: (none)"
     (,#'anvil-disclosure--tool-defs-index
      :id "defs-index"
      :description
-     "Layer 1 of anvil progressive disclosure for elisp definitions. Use FIRST when asking \"where is X defined?\". Returns up to 50 slim pointers at ~20 tokens each ({:id defs://0/SYM :symbol :file :kind}). Each URI feeds directly into Layer 3 (`elisp-get-function-definition'). Escalate to Layer 2 (`defs-search') only when you need arity / docstring / obsolete-p metadata to disambiguate."
+     "Layer 1 of anvil progressive disclosure for elisp definitions. Use FIRST when asking \"where is X defined?\". Returns up to 50 slim pointers at ~20 tokens each ({:id defs://<sha>/SYM :symbol :file :kind}). The sha segment is the first 8 hex chars of sha1(file|line|name) so same-name functions in different files get distinct URIs. Each URI feeds directly into Layer 3 (`elisp-get-function-definition') or `anvil-uri-fetch'. Escalate to Layer 2 (`defs-search') only when you need arity / docstring / obsolete-p metadata to disambiguate."
      :read-only t
      :title "Defs Index (Layer 1)")
+    (,#'anvil-disclosure--tool-uri-fetch
+     :id "anvil-uri-fetch"
+     :description
+     "Cross-layer resolver for any anvil citation URI (Doc 28 Phase 3). Pass an org://ID, defs://SHA/SYM, file://PATH[#L<s>-<e>], or journal://YEAR/ID URI and this tool dispatches to the matching Layer-3 handler automatically. Returns (:scheme :uri :resolver :body). Prefer this when you already have a URI — you do not need to remember which Layer-3 tool corresponds to each scheme. http-cache:// will be handled in Phase 4 and currently signals an error."
+     :read-only t
+     :title "URI Fetch (cross-layer)")
     (,#'anvil-disclosure-help-handler
      :id "disclosure-help"
      :description

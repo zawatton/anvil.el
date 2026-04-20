@@ -11,7 +11,8 @@
 ~APPROVED~ (2026-04-20) — Week-3 Ship 3, 競合 token-savior の
 =memory_index= → =memory_search= → =memory_get= 3 層契約を
 anvil-org-index / anvil-defs / anvil-file に移植。
-*Phase 1 + Phase 2 SHIPPED* (develop に merge 済):
+*Phase 1 + 2 + 3 SHIPPED* (Phase 1/2 develop merge 済、Phase 3 feat
+branch):
 - Phase 1: citation URI scheme + =org-index-index= (Layer 1) +
   =disclosure-help= tool + =org-index-search= (Layer 2) /
   =org-read-by-id= (Layer 3) description + URI auto-strip。
@@ -20,9 +21,11 @@ anvil-org-index / anvil-defs / anvil-file に移植。
   =elisp-get-function-definition= の Layer 1/2/3 description 統一 +
   =file://= / =defs://= citation URI auto-strip (file-read,
   elisp-get-function-definition)。
-- 全体 ERT: anvil-uri 15 + anvil-disclosure 26 = 41。全 pass。
-Phase 3 (cross-layer =anvil-uri-fetch= resolver) + Phase 4
-(journal / http-cache) 未着手。
+- Phase 3: =anvil-uri-fetch= cross-layer resolver (scheme →
+  Layer-3 handler 自動 dispatch) + =defs://= SHA row-hash 化
+  (first 8 hex of sha1(file|line|name)、同名 symbol 衝突解消)。
+- 全体 ERT: anvil-uri 15 + anvil-disclosure 36 = 51。全 pass。
+Phase 4 (journal 専用 / http-cache) 未着手。
 
 * Motivation
 
@@ -254,12 +257,32 @@ Ship 内容 (feat/doc-28-phase2-file-defs):
   citation URI が衝突する — Layer 3 dispatch は symbol 名 resolve
   なのでユーザ影響は小 (fn 同名は稀)。
 
-** Phase 3 — cross-layer resolver (~DRAFT~)
+** Phase 3 — cross-layer resolver (~SHIPPED 2026-04-21~)
 
-=anvil-uri-fetch= tool: 任意の citation URI を渡すと、URI の prefix
-を見て適切な Layer 3 tool を自動 dispatch。LLM が URI だけ覚えれば
-良い状態を作る。defs:// の SHA row-hash 化もこの Phase で同時に扱う
-(Phase 2 の "0" placeholder を実 hash に切替)。
+Ship 内容 (feat/doc-28-phase3-uri-fetch):
+
+1. =anvil-uri-fetch= MCP tool 新設。=anvil-uri-parse= で scheme
+   抽出 → =anvil-disclosure--uri-fetch-dispatch= alist で
+   Layer-3 resolver を引く。返り値は =(:scheme :uri :resolver
+   :body)=。新 scheme 追加は alist 1 行 + resolver 1 関数で完了。
+2. defs:// SHA を =anvil-disclosure--defs-row-sha= で生成
+   (sha1 over =file|line|name=、先頭 8 hex char)。
+   =anvil-disclosure-defs-sha-length= defcustom で長さ調整可。
+   同名 symbol (別 file) が別 URI を得るので Phase 2 の衝突リスク
+   を解消。=anvil-elisp--strip-defs-uri= は従来どおり SHA を無視
+   して SYM を解決するので Layer-3 handler 側の変更なし。
+3. =disclosure-help= が =anvil-uri-fetch= の存在と defs:// SHA 仕様
+   を案内するよう更新。
+4. Tool specs に MCP 1 tool 追加 (計 5 tool)。
+5. ERT: 10 件追加 (row-sha determinism + same-name-different-file
+   衝突解消 / uri-fetch dispatch 5 scheme + unknown + printable
+   wrapper)。1 件更新 (elisp-strip-defs-uri で real SHA 互換)。
+
+意図的先送り:
+
+- http-cache:// scheme は Phase 4 (journal 専用ツール + http-cache
+  Layer 3) で扱う。現在は =anvil-disclosure--resolve-http-cache=
+  が explicit error。
 
 ** Phase 4 — journal / http-cache
 

@@ -19,6 +19,8 @@
 (require 'anvil-defs)
 (require 'anvil-file)
 (require 'anvil-uri)
+(require 'anvil-org)
+(require 'anvil-elisp)
 
 (defun anvil-disclosure-test--fake-rows (n)
   "Generate N synthetic org-index rows (plists)."
@@ -227,20 +229,42 @@ rather than leaving a short tail."
      ,@body))
 
 (ert-deftest anvil-disclosure-test-defs-project-basic ()
+  "Each pointer carries a `defs://<sha>/name' URI; sha is deterministic."
   (let* ((rows (anvil-disclosure-test--fake-defs-rows 2))
          (pointers (anvil-disclosure--defs-project-rows rows))
-         (first (car pointers)))
+         (first (car pointers))
+         (expected-sha (anvil-disclosure--defs-row-sha (car rows))))
     (should (= 2 (length pointers)))
-    (should (equal "defs://0/my-fn-01" (plist-get first :id)))
+    (should (equal (format "defs://%s/my-fn-01" expected-sha)
+                   (plist-get first :id)))
     (should (equal "defun" (plist-get first :kind)))))
 
 (ert-deftest anvil-disclosure-test-defs-index-handler ()
   (anvil-disclosure-test--with-fake-defs-search
       (anvil-disclosure-test--fake-defs-rows 3)
-    (let ((res (anvil-disclosure-defs-index "my")))
+    (let* ((res (anvil-disclosure-defs-index "my"))
+           (first (car (plist-get res :rows)))
+           (uri (plist-get first :id)))
       (should (= 3 (plist-get res :count)))
-      (should (equal "defs://0/my-fn-01"
-                     (plist-get (car (plist-get res :rows)) :id))))))
+      (should (string-match-p "\\`defs://[0-9a-f]+/my-fn-01\\'" uri)))))
+
+(ert-deftest anvil-disclosure-test-defs-row-sha-deterministic ()
+  "Same row → same sha; different rows → different sha."
+  (let ((r1 (list :name "foo" :file "/a.el" :line 10))
+        (r2 (list :name "foo" :file "/a.el" :line 10))
+        (r3 (list :name "foo" :file "/b.el" :line 10)))
+    (should (equal (anvil-disclosure--defs-row-sha r1)
+                   (anvil-disclosure--defs-row-sha r2)))
+    (should-not (equal (anvil-disclosure--defs-row-sha r1)
+                       (anvil-disclosure--defs-row-sha r3)))))
+
+(ert-deftest anvil-disclosure-test-defs-row-sha-same-name-different-file ()
+  "Same-name functions in different files get distinct URIs."
+  (let* ((r1 (list :name "f" :file "/a.el" :line 1))
+         (r2 (list :name "f" :file "/b.el" :line 1))
+         (p1 (anvil-disclosure--defs-row-to-pointer r1))
+         (p2 (anvil-disclosure--defs-row-to-pointer r2)))
+    (should-not (equal (plist-get p1 :id) (plist-get p2 :id)))))
 
 (ert-deftest anvil-disclosure-test-defs-index-empty-query ()
   "An empty/blank query returns an empty row list without hitting the DB."
@@ -294,13 +318,94 @@ rather than leaving a short tail."
     (should (null o))
     (should (null l))))
 
-(require 'anvil-elisp)
+;;;; --- Phase 3: cross-layer uri-fetch ------------------------------------
+
+(defmacro anvil-disclosure-test--with-stubbed-layer3 (&rest body)
+  "Stub every Layer-3 handler so `anvil-uri-fetch' can be exercised
+without touching the real org / file / elisp backends.  Returns the
+plist the handler was called with inside :body so the test can
+assert on routing + arguments."
+  `(cl-letf (((symbol-function 'anvil-org--tool-read-by-id)
+              (lambda (uuid) (list :stub 'org :uuid uuid)))
+             ((symbol-function 'anvil-file-read)
+              (lambda (path &optional off lim)
+                (list :stub 'file :path path :off off :lim lim)))
+             ((symbol-function 'anvil-elisp--get-function-definition)
+              (lambda (fn) (list :stub 'elisp :fn fn))))
+     ,@body))
+
+(ert-deftest anvil-disclosure-test-uri-fetch-org ()
+  (anvil-disclosure-test--with-stubbed-layer3
+    (let ((res (anvil-disclosure-uri-fetch "org://abc-123")))
+      (should (eq 'org (plist-get res :scheme)))
+      (should (eq 'org-read-by-id (plist-get res :resolver)))
+      (should (equal (list :stub 'org :uuid "abc-123")
+                     (plist-get res :body))))))
+
+(ert-deftest anvil-disclosure-test-uri-fetch-journal ()
+  "journal:// routes to the same resolver as org:// (ID after the year)."
+  (anvil-disclosure-test--with-stubbed-layer3
+    (let ((res (anvil-disclosure-uri-fetch "journal://2026/id-x")))
+      (should (eq 'journal (plist-get res :scheme)))
+      (should (eq 'org-read-by-id (plist-get res :resolver)))
+      (should (equal "id-x"
+                     (plist-get (plist-get res :body) :uuid))))))
+
+(ert-deftest anvil-disclosure-test-uri-fetch-file-with-range ()
+  "file:// URI range is converted to 0-based offset + inclusive limit."
+  (anvil-disclosure-test--with-stubbed-layer3
+    (let ((res (anvil-disclosure-uri-fetch
+                "file:///tmp/foo.el#L10-14")))
+      (should (eq 'file (plist-get res :scheme)))
+      (should (eq 'file-read (plist-get res :resolver)))
+      (let ((body (plist-get res :body)))
+        (should (equal "/tmp/foo.el" (plist-get body :path)))
+        (should (= 9 (plist-get body :off)))
+        (should (= 5 (plist-get body :lim)))))))
+
+(ert-deftest anvil-disclosure-test-uri-fetch-file-no-range ()
+  "file:// URI without a range passes nil offset/limit through."
+  (anvil-disclosure-test--with-stubbed-layer3
+    (let* ((res (anvil-disclosure-uri-fetch "file:///etc/hosts"))
+           (body (plist-get res :body)))
+      (should (equal "/etc/hosts" (plist-get body :path)))
+      (should (null (plist-get body :off)))
+      (should (null (plist-get body :lim))))))
+
+(ert-deftest anvil-disclosure-test-uri-fetch-defs ()
+  (anvil-disclosure-test--with-stubbed-layer3
+    (let* ((res (anvil-disclosure-uri-fetch
+                 "defs://abcd1234/anvil-server-register-tool"))
+           (body (plist-get res :body)))
+      (should (eq 'defs (plist-get res :scheme)))
+      (should (eq 'elisp-get-function-definition
+                  (plist-get res :resolver)))
+      (should (equal "anvil-server-register-tool"
+                     (plist-get body :fn))))))
+
+(ert-deftest anvil-disclosure-test-uri-fetch-http-cache-errors ()
+  (anvil-disclosure-test--with-stubbed-layer3
+    (should-error (anvil-disclosure-uri-fetch
+                   "http-cache://deadbeef"))))
+
+(ert-deftest anvil-disclosure-test-uri-fetch-unknown-scheme ()
+  (should-error (anvil-disclosure-uri-fetch "gopher://old")))
+
+(ert-deftest anvil-disclosure-test-tool-uri-fetch-printable ()
+  (anvil-disclosure-test--with-stubbed-layer3
+    (let ((s (anvil-disclosure--tool-uri-fetch "org://abc-123")))
+      (should (stringp s))
+      (should (string-match-p ":scheme org" s))
+      (should (string-match-p ":resolver org-read-by-id" s)))))
 
 (ert-deftest anvil-disclosure-test-elisp-strip-defs-uri ()
-  "defs://SHA/SYM → SYM; plain names pass through."
+  "defs://SHA/SYM → SYM; plain names pass through; Phase-3 real SHAs OK."
   (should (equal "anvil-server-register-tool"
                  (anvil-elisp--strip-defs-uri
                   "defs://0/anvil-server-register-tool")))
+  (should (equal "anvil-server-register-tool"
+                 (anvil-elisp--strip-defs-uri
+                  "defs://abcd1234/anvil-server-register-tool")))
   (should (equal "plain-name"
                  (anvil-elisp--strip-defs-uri "plain-name")))
   (should (equal "cl-lib/reduce"

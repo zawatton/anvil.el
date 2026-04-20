@@ -872,7 +872,7 @@ Search the elisp symbol index for defining forms (defun, defvar,
 defmacro, cl-defun, ...).  Exact match by default; pass fuzzy=t
 for substring matching.  Restrict by kind with a comma-separated
 list.  Each row carries :file + :line and can be turned into a
-`defs://0/SYM' citation URI (see also `defs-index' Layer 1 for a
+`defs://<sha>/SYM' citation URI (see also `defs-index' Layer 1 for a
 slim listing).  Escalate to Layer 3 (`elisp-get-function-definition')
 once you picked the definition."
    :read-only t)
