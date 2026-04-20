@@ -1,6 +1,7 @@
 #+title: Persistent Org Index — SQLite-backed Headline/Tag/ID Cache
 #+date: 2026-04-15
 #+property: status DRAFT
+#+property: scope CONVENTION-COUPLED
 
 * STATUS
 ~Phase 1 + 2 + 3 + 4 + 5a (search) SHIPPED~ (2026-04-19) — Phase 5b (tag-list / todo-list MCP tools) と Phase 6 (observability) は deferred。
@@ -295,3 +296,15 @@ CREATE INDEX idx_property_key ON property(key);
 - memory: ~feedback_org_element_cache_during_init.md~ (org-element cache の罠)
 - ~anvil-org.el~ (既存 org tool)
 - Emacs 29+ ~sqlite.el~ API
+
+* Primitive vs Convention
+
+将来 anvil を外部公開する際、以下の境界で分離する:
+
+- *Primitive (GENERIC 化可能)* — SQLite-backed index schema、=filenotify= incremental
+  updater、=org-read-*= MCP tool の index 経由高速化、rebuild / audit CLI。
+  org-mode を重く使う全ユーザに価値がある。
+- *Convention (運用者固有)* — scan 対象の path 想定 (=capture/journals-YYYY.org=,
+  =capture/web/=, =capture/yt/=, =node/= 法令 DB)、ID / tag / filetags の運用慣習、
+  日本語全文検索の tokenizer 選択。公開時は汎用 example に差し替え、
+  現 scan policy は =anvil-org-index-local-policy.el= 等に逃がす。

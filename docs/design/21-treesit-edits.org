@@ -2,6 +2,7 @@
 #+date: 2026-04-19
 #+author: zawatton
 #+property: status SHIPPED
+#+property: scope GENERIC
 
 * STATUS
   :PROPERTIES:

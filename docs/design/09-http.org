@@ -2,6 +2,7 @@
 #+date: 2026-04-18
 #+author: zawatton
 #+property: status DRAFT
+#+property: scope GENERIC
 
 * STATUS
 ~Phase 1a SHIPPED~ (2026-04-18) — =anvil-http.el= (core GET/HEAD +

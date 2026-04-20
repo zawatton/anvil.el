@@ -1,6 +1,7 @@
 #+title: Offload Framework — Futures, Coalescing, Preemption
 #+date: 2026-04-15
 #+property: status PHASE-1-SHIPPED
+#+property: scope GENERIC
 
 * STATUS
 

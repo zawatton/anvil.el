@@ -1,6 +1,7 @@
 #+title: Worker Pool v2 — Read/Write Routing, File Affinity, Batch Sub-Pool
 #+date: 2026-04-15
 #+property: status PHASE-4C-OPT-IN
+#+property: scope GENERIC
 
 * STATUS
 ~Phase 1+2+3+4a+4c(opt-in) SHIPPED 2026-04-16~ — lane split + ~:kind~ +

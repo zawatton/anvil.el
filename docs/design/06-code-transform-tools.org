@@ -2,6 +2,7 @@
 #+date: 2026-04-16
 #+author: zawatton
 #+property: status DRAFT
+#+property: scope GENERIC
 
 * STATUS
 

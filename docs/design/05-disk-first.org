@@ -1,6 +1,7 @@
 #+title: Disk-First Policy — Buffer Divergence Guard
 #+date: 2026-04-15
 #+property: status DRAFT
+#+property: scope CONVENTION-COUPLED
 
 * STATUS
 ~Phase 1+2(full)+3 SHIPPED~ (2026-04-16) — Phase 1 helpers, 全 mutating
@@ -216,3 +217,15 @@ anvil-server-register-tool マクロに新 keyword:
 - memory: ~feedback_my_cc_helpers_utf8_journals.md~
 - memory: ~feedback_windows_junction_not_symlink.md~
 - Emacs ~visited-file-modtime~ / ~verify-visited-file-modtime~ / ~revert-buffer~
+
+* Primitive vs Convention
+
+将来 anvil を外部公開する際、以下の境界で分離する:
+
+- *Primitive (GENERIC 化可能)* — disk-as-truth policy、=file-*= tool の :warnings
+  機構、buffer / disk divergence 検出 helper、=buffer-read= / =buffer-save= /
+  =buffer-list-modified= MCP tools。大きい org / code base を扱う全環境で有効。
+- *Convention (運用者固有)* — init.org の意図的 divergence 事故が設計動機の中核
+  であり、=visited-modtime=0= / undo 無効 / tangle 途中 buffer を想定した guard
+  が一部含まれる。公開時は general example (.emacs / config.org) に書き換え、
+  本件事故の詳細は feedback memory へ退避。

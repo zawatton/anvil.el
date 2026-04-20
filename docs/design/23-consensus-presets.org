@@ -2,6 +2,7 @@
 #+date: 2026-04-19
 #+author: zawatton
 #+property: status DRAFT
+#+property: scope CONVENTION-COUPLED
 
 * STATUS
   :PROPERTIES:
@@ -214,3 +215,15 @@ Existing =orchestrator-consensus-submit= gets a new JSON field
 - A one-liner =anvil-orchestrator-consensus-preset-summary= in
   interactive use prints a table of preset → recent usage count +
   median wall + total cost.
+
+* Primitive vs Convention
+
+将来 anvil を外部公開する際、以下の境界で分離する:
+
+- *Primitive (GENERIC 化可能)* — preset 機構 (fast / cheap / broad / rigorous)、
+  provider combination API、judge 付与 policy、preset alias。multi-LLM を使う
+  全ユーザに価値がある。
+- *Convention (運用者固有)* — 各 preset の具体構成 (codex+ollama/gemma4 を
+  cost-0 前提に cheap を組む、rigorous に法令 DB 参照を含める等)、日本語 output
+  を優先する judge prompt。公開時は preset を =anvil-consensus-presets-default.el=
+  と =anvil-consensus-presets-user.el= に分割し、後者はユーザ実測に依存すると明示。

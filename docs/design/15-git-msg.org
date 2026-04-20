@@ -2,6 +2,7 @@
 #+date: 2026-04-19
 #+author: zawatton
 #+property: status PHASE-1-SHIPPED
+#+property: scope CONVENTION-COUPLED
 
 * STATUS
   :PROPERTIES:
@@ -151,3 +152,15 @@ heuristic hunk clustering by file group.  ERT +5.
 - Memory =feedback_commit_co_authored_by.md~: rule source.
 - Memory =feedback_zawatton_repo_workflow.md~: develop branch + feat
   workflow semantics.
+
+* Primitive vs Convention
+
+将来 anvil を外部公開する際、以下の境界で分離する:
+
+- *Primitive (GENERIC 化可能)* — staged diff + recent commits からの commit message
+  合成、PR body synthesis、blame/why 合成、hunk clustering。汎用 git workflow に
+  価値がある。
+- *Convention (運用者固有)* — Co-Authored-By Claude の強制付与、journal-YYYY.org
+  への MEMO エントリ自動生成、zawatton repo の master 直 push / feat branch +
+  self-PR 慣習、日本語 commit message 想定。公開時は optional hook としてオフ既定、
+  template は =anvil-git-msg-templates/= にユーザ提供分離。

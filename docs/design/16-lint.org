@@ -2,6 +2,7 @@
 #+date: 2026-04-19
 #+author: zawatton
 #+property: status DRAFT
+#+property: scope CONVENTION-COUPLED
 
 * STATUS
   :PROPERTIES:
@@ -158,3 +159,14 @@ scripted.
 - Memory =feedback_anvil_deprecated_path_audit.md~: shape of release
   audit, continuity.
 - ~checkdoc.el~ / ~elint.el~ — inspiration.
+
+* Primitive vs Convention
+
+将来 anvil を外部公開する際、以下の境界で分離する:
+
+- *Primitive (GENERIC 化可能)* — conflict marker / trailing whitespace / TODO
+  stranded / elisp byte-compile warning 集約 / import duplication 等、repo
+  hygiene scanner 一般。
+- *Convention (運用者固有)* — org SCHEDULED 繰返し記法 (=+1w=, =+1m=, =+1y=) 検査、
+  MEMO.md pointer 整合性チェック、auto-memory 肥大化 lint、点検トラッカー table
+  構造 guard。公開時は scanner plugin 方式にして org / memory 系は optional。

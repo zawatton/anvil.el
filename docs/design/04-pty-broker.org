@@ -1,6 +1,7 @@
 #+title: PTY Broker + Headless UI — Get Emacs Out of the PTY Path
 #+date: 2026-04-15
 #+property: status DRAFT
+#+property: scope WINDOWS-ONLY
 
 * STATUS
 ~Phase 1 SHIPPED~ (2026-04-19, develop branch) — Node broker (~pty-broker/anvil-pty-broker.js~)
