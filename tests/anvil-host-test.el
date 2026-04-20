@@ -20,21 +20,27 @@
   "Regression guard for issue #10.
 
 A background / disowned descendant spawned inside the shell command
-must survive `anvil-shell' returning.  Under the Emacs default (PTY
-connection), the spawned shell becomes a session leader and the
-kernel sends SIGHUP to every session member when it exits — which
-kills `wl-copy's background clipboard owner and every `sleep 30 &'
-variant, breaking Wayland clipboard support.  `anvil-host--run'
-forces `:connection-type 'pipe' so this cannot happen.
+must survive `anvil-shell' returning.  On Linux, `setsid --fork' is
+the only reliable way to detach — `& disown' alone keeps the child
+in the shell's session and the kernel SIGHUPs it when the wrapper
+shell exits.  Detail: `anvil-host--run' uses `:connection-type
+'pipe', but `make-process' still calls `setsid()' for its direct
+child, and the child inherits the parent's controlling TTY via fd 0.
+So plain `& disown' descendants remain in bash's (now session-leader)
+session and get SIGHUP when bash returns.  `setsid --fork' forks a
+grandchild into a brand-new session with no controlling TTY, which
+survives.  This is what `wl-copy' / `pbcopy' / `xclip' do internally
+when they spawn their clipboard-holder daemons.
 
-The test works by scheduling a short-delayed background `touch' and
-asserting the marker file appears after the shell has already
-returned.  If PTY SIGHUP propagation is ever re-introduced, the
-background process dies before it can touch the file and the test
-fails."
+The test schedules a short-delayed background `touch' via
+`setsid --fork' and asserts the marker file appears after the shell
+has already returned.  If `anvil-host--run' ever regresses to a mode
+that reaps the whole subprocess tree on exit, the setsid grandchild
+dies before it can touch the file."
   (skip-unless (eq system-type 'gnu/linux))
+  (skip-unless (executable-find "setsid"))
   (let* ((marker (make-temp-file "anvil-host-test-detach-"))
-         (cmd (format "(sleep 0.5; touch %s) & disown"
+         (cmd (format "setsid --fork sh -c 'sleep 0.5; touch %s'"
                       (shell-quote-argument marker))))
     ;; make-temp-file creates the file; delete so the test can
     ;; observe a real re-creation by the detached child.
