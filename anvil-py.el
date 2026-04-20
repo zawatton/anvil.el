@@ -558,6 +558,94 @@ specified) matches.  No-op when the import is already absent."
               file beg end+1 ""
               (format "remove-import import %s" module)))))))))
 
+;;;; --- replace-function helpers (Phase 2b) -------------------------------
+
+(defun anvil-py--line-beginning-at (point)
+  "Return the 1-based point of the line start that contains POINT.
+Does not modify point or match data."
+  (save-excursion (goto-char point) (line-beginning-position)))
+
+(defun anvil-py--common-leading-whitespace (lines)
+  "Return the longest whitespace prefix common to every non-empty LINE.
+LINES is a list of strings; empty / whitespace-only lines are
+excluded from the comparison because `textwrap.dedent' semantics
+ignore them.  Returns an empty string if no non-empty line exists."
+  (let ((candidates (cl-remove-if
+                     (lambda (l) (string-empty-p (string-trim l)))
+                     lines)))
+    (if (null candidates)
+        ""
+      (cl-reduce
+       (lambda (a b)
+         (let ((i 0) (len (min (length a) (length b))))
+           (while (and (< i len) (eq (aref a i) (aref b i)))
+             (cl-incf i))
+           (substring a 0 i)))
+       (mapcar (lambda (l)
+                 (if (string-match "\\`[ \t]*" l)
+                     (match-string 0 l)
+                   ""))
+               candidates)))))
+
+(defun anvil-py--dedent (text)
+  "Strip the common leading whitespace from every line of TEXT.
+Matches Python's `textwrap.dedent' semantics — returns TEXT with
+the longest whitespace prefix shared by all non-empty lines removed
+from every line.  Pure; TEXT is not modified."
+  (let* ((lines (split-string text "\n"))
+         (common (anvil-py--common-leading-whitespace lines)))
+    (if (string-empty-p common)
+        text
+      (mapconcat (lambda (l)
+                   (if (string-prefix-p common l)
+                       (substring l (length common))
+                     l))
+                 lines "\n"))))
+
+(defun anvil-py--reindent (text indent)
+  "Prepend INDENT to every non-empty line of TEXT.
+Empty / whitespace-only lines stay as-is so replacement blocks don't
+grow trailing whitespace that editors would flag."
+  (if (string-empty-p indent)
+      text
+    (mapconcat (lambda (l)
+                 (if (string-empty-p (string-trim l))
+                     l
+                   (concat indent l)))
+               (split-string text "\n")
+               "\n")))
+
+(defun anvil-py--find-replace-target (root name class-filter)
+  "Return the function_definition node matching NAME in ROOT.
+When CLASS-FILTER is a string, only methods whose enclosing class's
+name matches it are considered.  Signals a `user-error' when no
+match exists or when the result is ambiguous without a class
+filter.  CLASS-FILTER may be nil (no filter) or a string."
+  (let ((q (anvil-py--query 'functions))
+        candidates)
+    (dolist (cap (treesit-query-capture root q))
+      (let* ((inner (cdr cap))
+             (nm (anvil-py--node-name inner)))
+        (when (string= nm name)
+          (let ((cls (anvil-py--enclosing-class-name inner)))
+            (when (or (null class-filter)
+                      (and cls (string= cls class-filter)))
+              (push (cons cls inner) candidates))))))
+    (cond
+     ((null candidates)
+      (user-error
+       "anvil-py-replace-function: no def named %S%s"
+       name (if class-filter (format " in class %S" class-filter) "")))
+     ((and (null class-filter) (> (length candidates) 1))
+      (user-error
+       "anvil-py-replace-function: ambiguous %S (matches: %s); \
+pass :class to select"
+       name
+       (mapconcat (lambda (c)
+                    (format "%s" (or (car c) "<top-level>")))
+                  candidates ", ")))
+     (t (cdar (last candidates))))))  ; candidates were pushed reverse
+
 ;;;; --- public edit API (Phase 2a) -----------------------------------------
 
 (cl-defun anvil-py-add-import (file spec &key apply)
@@ -588,6 +676,61 @@ Idempotent: a missing import returns a no-op plan.
 
 Returns the plan unless APPLY is truthy."
   (let ((plan (anvil-py--plan-remove-import file spec)))
+    (if (anvil-treesit-truthy apply)
+        (anvil-treesit-apply-plan plan)
+      plan)))
+
+(cl-defun anvil-py--plan-replace-function (file name new-source class-filter)
+  "Build an edit plan replacing the def named NAME in FILE with NEW-SOURCE.
+Dedents NEW-SOURCE and reindents to the column of the existing def.
+CLASS-FILTER is the enclosing class name or nil.  The swap covers the
+function_definition node only — any decorators attached to it survive.
+Replaces [line-beginning-position(fn-start), fn-end) so the existing
+leading indent is included in the old range and reindented uniformly."
+  (anvil-treesit-with-root file anvil-py--lang root
+    (let* ((fn (anvil-py--find-replace-target root name class-filter))
+           (fn-start (treesit-node-start fn))
+           (fn-end (treesit-node-end fn))
+           (line-beg (anvil-py--line-beginning-at fn-start))
+           (indent (make-string (- fn-start line-beg) ?\s))
+           (dedented (anvil-py--dedent new-source))
+           (replacement (anvil-py--reindent dedented indent))
+           ;; Compare without trailing whitespace differences — an
+           ;; idempotent re-apply (same NEW-SOURCE against an already-
+           ;; replaced def) should be a no-op.
+           (current (with-temp-buffer
+                      (insert-file-contents file)
+                      (buffer-substring-no-properties line-beg fn-end)))
+           (reason (format "replace-function %s%s" name
+                           (if class-filter
+                               (format " (class %s)" class-filter) ""))))
+      (if (string= current replacement)
+          (anvil-treesit-make-noop-plan file reason)
+        (anvil-treesit-make-plan file line-beg fn-end replacement reason)))))
+
+(cl-defun anvil-py-replace-function (file name new-source &key class apply)
+  "Replace the body of the def named NAME in FILE with NEW-SOURCE.
+NEW-SOURCE is the full def including signature — e.g.
+  \"def foo(a, b):\\n    return a + b\"
+and is interpreted as column-0 source: it is dedented (common
+leading whitespace stripped) and reindented to match the column of
+the existing def, so the caller need not know whether they are
+replacing a top-level function or a method.
+
+CLASS (keyword) selects among methods when multiple defs share the
+same name.  Without CLASS, a unique name is required — ambiguous
+names signal a user-error listing the candidates.
+
+Decorators attached to the def are preserved — only the
+function_definition node itself is swapped.  A double-apply with
+the identical NEW-SOURCE is a no-op.
+
+Returns the edit plan unless APPLY is truthy, in which case the plan
+is applied via `anvil-treesit-apply-plan' and the plan with
+:applied-at is returned."
+  (let ((plan (anvil-py--plan-replace-function
+               file name new-source
+               (and class (if (symbolp class) (symbol-name class) class)))))
     (if (anvil-treesit-truthy apply)
         (anvil-treesit-apply-plan plan)
       plan)))
@@ -694,6 +837,24 @@ MCP Parameters:
   (anvil-server-with-error-handling
    (anvil-py-remove-import file (anvil-py--coerce-spec spec) :apply apply)))
 
+(defun anvil-py--tool-replace-function (file name new-source class apply)
+  "MCP wrapper — replace a Python function or method.
+
+MCP Parameters:
+  file       - absolute path to the .py file to edit
+  name       - identifier of the function / method to replace
+  new-source - full replacement def (e.g. \"def foo(a): return a\"),
+               interpreted as column-0 source and auto-reindented
+  class      - optional enclosing class name to disambiguate methods;
+               empty / nil means any class (error if ambiguous)
+  apply      - truthy to write; default returns a preview plan"
+  (anvil-server-with-error-handling
+   (let ((cls (cond ((null class) nil)
+                    ((and (stringp class) (string-empty-p class)) nil)
+                    (t class))))
+     (anvil-py-replace-function file name new-source
+                                :class cls :apply apply))))
+
 (defun anvil-py--tool-surrounding-form (file point kind)
   "MCP wrapper — return the def / class enclosing POINT.
 
@@ -725,7 +886,8 @@ MCP Parameters:
     "py-find-definition"
     "py-surrounding-form"
     "py-add-import"
-    "py-remove-import")
+    "py-remove-import"
+    "py-replace-function")
   "Stable list of MCP tool ids registered by `anvil-py-enable'.")
 
 (defun anvil-py--register-tools ()
@@ -812,7 +974,20 @@ Preview-default; pass :apply t to write via file-batch-across.")
 matches `py-add-import'.  For `from'-imports, only the requested
 names are removed; if the statement is left empty, the whole line
 is dropped.  Idempotent: a missing import returns a no-op plan.
-Preview-default; pass :apply t to write via file-batch-across."))
+Preview-default; pass :apply t to write via file-batch-across.")
+
+  (anvil-server-register-tool
+   (anvil-server-encode-handler #'anvil-py--tool-replace-function)
+   :id "py-replace-function"
+   :server-id anvil-py--server-id
+   :description "Replace a Python function / method body with
+NEW-SOURCE.  NEW-SOURCE is the full def including signature, written
+at column 0 — it is auto-dedented and re-indented to the enclosing
+column, so the same input works for top-level functions and for
+methods.  CLASS disambiguates methods with the same name across
+classes; without CLASS, an ambiguous NAME errors with the candidate
+list.  Decorators attached to the def are preserved.  Idempotent:
+replacing with identical source is a no-op.  Preview-default."))
 
 (defun anvil-py-enable ()
   "Enable the Phase 1a py-* MCP tools."

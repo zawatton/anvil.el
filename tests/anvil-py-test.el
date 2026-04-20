@@ -438,5 +438,132 @@ identity with the original fixture."
         (should (string-match-p "^---" (plist-get plan :diff-preview)))
         (should (string-match-p "\\+from openpyxl" (plist-get plan :diff-preview)))))))
 
+;;;; --- replace-function (Phase 2b) ----------------------------------------
+
+(ert-deftest anvil-py-test-replace-function-top-level ()
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      (anvil-py-replace-function
+       f "plain_func" "def plain_func(a, b):\n    return a * b" :apply t)
+      ;; The body change must survive round-trip through list-functions.
+      (let* ((fns (anvil-py-list-functions f))
+             (pf (cl-find "plain_func" fns :key
+                          (lambda (p) (plist-get p :name))
+                          :test #'string=)))
+        (should pf)
+        (should (string-match-p "return a \\* b"
+                                (with-temp-buffer
+                                  (insert-file-contents f)
+                                  (goto-char (plist-get (plist-get pf :bounds)
+                                                        :start))
+                                  (buffer-substring (point) (min (point-max)
+                                                                 (+ (point) 100))))))))))
+
+(ert-deftest anvil-py-test-replace-function-method-reindents ()
+  "Replacing a method with column-0 source re-indents to the method's
+column; the surrounding class body stays structurally intact."
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      (anvil-py-replace-function
+       f "describe"
+       "def describe(self):\n    return f'renamed {self.name}'"
+       :apply t)
+      (let ((text (with-temp-buffer
+                    (insert-file-contents f) (buffer-string))))
+        (should (string-match-p "    def describe(self):" text))
+        (should (string-match-p "        return f'renamed" text))
+        ;; Sibling class members unchanged.
+        (should (string-match-p "@dataclass" text))))))
+
+(ert-deftest anvil-py-test-replace-function-with-class-filter ()
+  "When a method name also appears elsewhere, :class resolves it."
+  (anvil-py-test--requires-grammar
+    (let ((tmp (make-temp-file "anvil-py-ambig-" nil ".py")))
+      (unwind-protect
+          (progn
+            (with-temp-file tmp
+              (insert "def shared():\n    return 1\n\n"
+                      "class A:\n"
+                      "    def shared(self):\n        return 2\n\n"
+                      "class B:\n"
+                      "    def shared(self):\n        return 3\n"))
+            ;; Without :class, the name resolves to 3 candidates → error.
+            (should-error (anvil-py-replace-function
+                           tmp "shared" "def shared():\n    return 9")
+                          :type 'user-error)
+            ;; With :class A, only one candidate.
+            (anvil-py-replace-function
+             tmp "shared" "def shared(self):\n    return 99"
+             :class "A" :apply t)
+            (let ((text (with-temp-buffer
+                          (insert-file-contents tmp) (buffer-string))))
+              (should (string-match-p "class A:\n    def shared(self):\n        return 99" text))
+              ;; B unchanged.
+              (should (string-match-p "class B:\n    def shared(self):\n        return 3" text))))
+        (ignore-errors (delete-file tmp))))))
+
+(ert-deftest anvil-py-test-replace-function-missing-errors ()
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      (should-error
+       (anvil-py-replace-function f "no_such" "def no_such(): pass")
+       :type 'user-error))))
+
+(ert-deftest anvil-py-test-replace-function-idempotent-identical ()
+  "Replacing with identical source is a no-op plan."
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      ;; Fixture's plain_func is exactly `def plain_func(a, b):\n    return a + b'.
+      (let ((plan (anvil-py-replace-function
+                   f "plain_func" "def plain_func(a, b):\n    return a + b")))
+        (should (null (plist-get plan :ops)))
+        (should (string-match-p "no-op" (plist-get plan :summary)))))))
+
+(ert-deftest anvil-py-test-replace-function-round-trip-byte-identity ()
+  "Replace with new body, replace back with original, file byte-identical."
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      (let ((before (with-temp-buffer
+                      (insert-file-contents f) (buffer-string))))
+        (anvil-py-replace-function
+         f "plain_func" "def plain_func(a, b):\n    return a * b" :apply t)
+        (anvil-py-replace-function
+         f "plain_func" "def plain_func(a, b):\n    return a + b" :apply t)
+        (let ((after (with-temp-buffer
+                       (insert-file-contents f) (buffer-string))))
+          (should (string= before after)))))))
+
+(ert-deftest anvil-py-test-replace-function-preserves-decorators ()
+  "Decorators on a replaced def stay untouched — only the
+function_definition node itself is swapped."
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      ;; static_helper is @staticmethod-decorated in the fixture.
+      (anvil-py-replace-function
+       f "static_helper"
+       "def static_helper(x):\n    return x + 99"
+       :apply t)
+      (let ((text (with-temp-buffer
+                    (insert-file-contents f) (buffer-string))))
+        ;; Decorator line intact.
+        (should (string-match-p "^@staticmethod\ndef static_helper" text))
+        (should (string-match-p "return x \\+ 99" text))))))
+
+(ert-deftest anvil-py-test-replace-function-handles-leading-indent-in-input ()
+  "Caller source with leading indent (e.g. copied from inside a
+class) is dedented before being re-indented to the target column.
+This lets AI callers paste source unchanged without column-0 care."
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      (anvil-py-replace-function
+       f "plain_func"
+       "        def plain_func(a, b):\n            return a ** b"
+       :apply t)
+      (let ((text (with-temp-buffer
+                    (insert-file-contents f) (buffer-string))))
+        ;; plain_func is top-level: 0-column indent after dedent.
+        (should (string-match-p "^def plain_func(a, b):\n    return a \\*\\* b"
+                                text))))))
+
 (provide 'anvil-py-test)
 ;;; anvil-py-test.el ends here
