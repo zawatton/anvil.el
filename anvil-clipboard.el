@@ -10,7 +10,7 @@
 ;;
 ;; Windows: PowerShell Get-Clipboard / Set-Clipboard (UTF-8 強制)
 ;; macOS:   pbpaste / pbcopy
-;; Linux:   xclip / xsel
+;; Linux:   wl-clipboard / xclip / xsel
 ;;
 ;; Public API:
 ;;   (anvil-clipboard-get)        — read
@@ -35,13 +35,17 @@ Returns nil if clipboard is empty or unavailable."
                ('darwin
                 (anvil-shell "pbpaste" '(:coding utf-8 :timeout 5)))
                ('gnu/linux
-                (or (and (executable-find "xclip")
+                (or (and (getenv "WAYLAND_DISPLAY")
+                         (executable-find "wl-paste")
+                         (anvil-shell "wl-paste"
+                                      '(:coding utf-8 :timeout 5)))
+                    (and (executable-find "xclip")
                          (anvil-shell "xclip -selection clipboard -o"
                                       '(:coding utf-8 :timeout 5)))
                     (and (executable-find "xsel")
                          (anvil-shell "xsel --clipboard --output"
                                       '(:coding utf-8 :timeout 5)))
-                    (error "anvil-clipboard: xclip or xsel required on Linux")))
+                    (error "anvil-clipboard: wl-clipboard, xclip or xsel required on Linux")))
                (_ (error "anvil-clipboard: unsupported system-type %s" system-type)))))
     (when (eql (plist-get res :exit) 0)
       (let ((text (plist-get res :stdout)))
@@ -72,6 +76,11 @@ Returns nil if clipboard is empty or unavailable."
                               '(:coding utf-8 :timeout 5)))
                 ('gnu/linux
                  (cond
+                  ((and (getenv "WAYLAND_DISPLAY")
+                        (executable-find "wl-copy"))
+                   (anvil-shell (format "printf '%%s' %s | wl-copy"
+                                        (shell-quote-argument string))
+                                '(:coding utf-8 :timeout 5)))
                   ((executable-find "xclip")
                    (anvil-shell (format "printf '%%s' %s | xclip -selection clipboard"
                                         (shell-quote-argument string))
@@ -80,7 +89,7 @@ Returns nil if clipboard is empty or unavailable."
                    (anvil-shell (format "printf '%%s' %s | xsel --clipboard --input"
                                         (shell-quote-argument string))
                                 '(:coding utf-8 :timeout 5)))
-                  (t (error "anvil-clipboard: xclip or xsel required on Linux"))))
+                  (t (error "anvil-clipboard: wl-clipboard, xclip or xsel required on Linux"))))
                 (_ (error "anvil-clipboard: unsupported system-type %s" system-type)))
             (when tmpfile (ignore-errors (delete-file tmpfile))))))
     (eql (plist-get res :exit) 0)))
