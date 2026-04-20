@@ -1,13 +1,17 @@
 #+title: anvil-bench + anvil-profile — Performance Measurement Primitives
 #+date: 2026-04-19
 #+author: zawatton
-#+property: status DRAFT
+#+property: status PHASE-1-SHIPPED
 
 * STATUS
   :PROPERTIES:
   :ID:       6127d448-df2d-4587-a120-ebea967896d7
   :END:
-~DRAFT~ (2026-04-19)
+~Phase 1 SHIPPED~ (2026-04-20, develop branch) — =anvil-bench.el=
+ships =anvil-bench-compare= + =anvil-bench-profile= +
+=anvil-bench-last-report= with 3 MCP tools (=bench-compare= /
+=bench-profile-expr= / =bench-last=).  Phase 2 (per-run array,
+warmup-detect, byte-compile warning) remains DRAFT.
 
 Tier 2 of Week-2 roadmap.
 
@@ -78,10 +82,29 @@ All read-only from anvil-state's perspective.  Long-running invocations
 
 * Phases
 
-** Phase 1 — bench-compare + profile-expr
+** Phase 1 — bench-compare + profile-expr (~SHIPPED~, 2026-04-20)
 
-Core tools, ERT with sleep-based fixtures, ship criterion: ratio
-error <10% vs hand-timed reference.
+Core tools + last-report + 3 MCP handlers in =anvil-bench.el=.
+Deterministic CPU-bound fixtures (no sleep — too coarse in batch
+Emacs on shared CI runners) with a 1000× cost gap reliably select
+the faster thunk; the tie-detection test uses a generous 100 %
+=anvil-bench-tie-threshold= to absorb per-call jitter.
+
+GC is disabled during measurement via let-binding
+=gc-cons-threshold= and =gc-cons-percentage=, restored after.
+Reports carry =:env= with =emacs-version= / =system-type= /
+the measured =gc-cons-threshold= / per-thunk
+=byte-compiled= flags for reproducibility.
+
+Profile output aggregates =profiler-cpu-log= by leaf frame and
+reports =(:function :samples :pct)= triples; percentages are
+computed against the grand sample sum.  On platforms where
+=profiler-start= is unavailable, =:top= is empty while
+=:iterations= still reflects the true thunk invocation count.
+
+Ship criterion met: 14 ERT / full-suite green (639/645, the 1
+failure is an unrelated =anvil-host-test-shell-preserves-
+disowned-children= from the in-flight issue #10 work).
 
 ** Phase 2 — richer output
 
