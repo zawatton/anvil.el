@@ -1,13 +1,16 @@
 #+title: anvil-git-msg — Commit / PR / Blame Synthesis
 #+date: 2026-04-19
 #+author: zawatton
-#+property: status DRAFT
+#+property: status PHASE-1-SHIPPED
 
 * STATUS
   :PROPERTIES:
   :ID:       e09614a8-fab1-4195-919e-788fd6bf9fa9
   :END:
-~DRAFT~ (2026-04-19)
+~Phase 1 SHIPPED~ (2026-04-20, develop branch) — =anvil-git-msg.el=
+ships =anvil-git-msg-commit= + =anvil-git-msg-pr= with 2 MCP tools
+(=git-commit-message= / =git-pr-body=).  Phase 2 (=git-why= blame,
+=git-commit-split= hunk clustering) remains DRAFT.
 
 Tier 2 of Week-2 roadmap.  Extends anvil-git with commit-message and
 PR-body generators, plus enriched blame.  All changes Claude-side are
@@ -85,17 +88,41 @@ All read-only.  No writes to git history from this module.
 
 * Phases
 
-** Phase 1 — commit-message + pr-body
+** Phase 1 — commit-message + pr-body (~SHIPPED~, 2026-04-20)
 
-Type / scope inference: file paths → directory prefix → conventional
-scope (e.g. touch only =anvil-http.el= → scope=http; touch
-=docs/design/= → scope=docs).  Subject from line-count summary of
-largest change.  Trailers: Co-Authored-By auto-appended for all
-Claude-invoked runs (detect by checking if we're inside anvil MCP
-process).
+Deterministic draft generator — no LLM call.  Reads the staged diff
+via =git diff --cached --name-status= + =--numstat= (already wrapped
+by =anvil-git=), classifies each file into added / modified / etc.,
+and:
 
-ERT 6+: fixture repo, various change patterns, assert scope inference,
-assert Co-Authored-By presence.
+- Type: all-tests → =test=, all-docs → =docs=, any newly added file
+  → =feat=, otherwise =fix=.  Deliberately conservative — users who
+  know they wrote a =refactor= / =chore= override the inferred type.
+- Scope: each file maps to a module name via
+  =anvil-git-msg--module-name-of= (strips the =anvil-= prefix for
+  elisp files, special-cases =docs/=, =.github/=, =benchmarks/=,
+  =pty-broker/=).  Multiple modules collapse to the longest common
+  hyphen-delimited prefix (=orchestrator-routing= and =orchestrator=
+  → =orchestrator=).  Mixed modules with no common prefix leave scope
+  nil (header prints =type: subject= without parens).
+- Subject: the module does NOT guess — it emits the placeholder
+  =<describe>= and expects the caller to swap in a human summary.
+- Trailers: =Co-Authored-By= is appended by default (value lives in
+  =anvil-git-msg-co-authored-by=, settable to nil).
+- Output includes =:suggested-full= — the header + body + trailer
+  string ready for =git commit -F -= after the subject swap.
+
+PR-body generator reads =git log BASE..HEAD= (up to
+=anvil-git-msg-pr-max-commits= = 40), builds a =## Summary=,
+=## Commits=, =## Test Plan= markdown body.  Test-plan bullets are
+derived from the Conventional-Commits types seen in the range (feat
+→ "exercise new commands", fix → "reproduce the bug", etc.).
+
+ERT: 17 tests — type / scope matrix (4), compound + common-prefix +
+override scope (4), Co-Authored-By presence / absence / placeholder
+preservation (3), empty-stage handling (1), PR body structure + empty
+range (2), MCP wrapper flows (3).  All fixture-based with throwaway
+temp repos.
 
 ** Phase 2 — blame + split suggestions
 
