@@ -463,6 +463,59 @@ HEAD responses never touch the cache."
       (if (anvil-http--cache-delete (anvil-http--normalize-url url)) 1 0)
     (or (anvil-http--cache-clear-all) 0)))
 
+(defun anvil-http--url-sha (url)
+  "Return sha256(normalised URL) as hex string.
+Used as the stable identifier of a cached response for Doc 28
+`http-cache://' citation URIs.  Normalisation goes through
+`anvil-http--normalize-url' so capitalisation / fragment / default
+port variants collapse to a single sha."
+  (secure-hash 'sha256 (anvil-http--normalize-url url)))
+
+;;;###autoload
+(cl-defun anvil-http-cache-list (&key limit)
+  "Return live cache entries as plists, sorted by URL.
+Each entry: (:url NORM-URL :sha SHA256 :status S :fetched-at E
+             :body-length N :content-type CT).  Bodies are
+*excluded* to keep the Layer-1 listing cheap — call
+`anvil-http-cache-get' with the sha to pull the body."
+  (anvil-state-enable)
+  (let ((urls (anvil-state-list-keys :ns anvil-http--state-ns
+                                     :limit limit)))
+    (delq nil
+          (mapcar
+           (lambda (url)
+             (let ((entry (anvil-http--cache-get url)))
+               (when entry
+                 (list :url url
+                       :sha (anvil-http--url-sha url)
+                       :status (plist-get entry :status)
+                       :fetched-at (plist-get entry :fetched-at)
+                       :body-length (length (or (plist-get entry :body)
+                                                ""))
+                       :content-type
+                       (plist-get (plist-get entry :headers)
+                                  :content-type)))))
+           urls))))
+
+;;;###autoload
+(defun anvil-http-cache-get (sha)
+  "Return the cached response whose normalised URL hashes to SHA.
+Accepts either a raw sha256 hex string or an `http-cache://SHA'
+citation URI.  Returns the full cache-entry plist (including :body,
+prefixed with :url and :sha) or nil when SHA does not match any
+live entry."
+  (anvil-state-enable)
+  (let ((target (if (and (stringp sha)
+                         (string-prefix-p "http-cache://" sha))
+                    (substring sha (length "http-cache://"))
+                  sha)))
+    (cl-loop for url in (anvil-state-list-keys :ns anvil-http--state-ns)
+             when (equal (anvil-http--url-sha url) target)
+             return (let ((entry (anvil-http--cache-get url)))
+                      (and entry
+                           (append (list :url url :sha target)
+                                   entry))))))
+
 ;;;; --- MCP tool handlers --------------------------------------------------
 
 (defun anvil-http--tool-fetch (url &optional if_newer_than accept

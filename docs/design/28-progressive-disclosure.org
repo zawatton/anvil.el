@@ -11,7 +11,7 @@
 ~APPROVED~ (2026-04-20) — Week-3 Ship 3, 競合 token-savior の
 =memory_index= → =memory_search= → =memory_get= 3 層契約を
 anvil-org-index / anvil-defs / anvil-file に移植。
-*Phase 1 + 2 + 3 SHIPPED* (Phase 1/2 develop merge 済、Phase 3 feat
+*全 Phase SHIPPED* (Phase 1/2 develop merge 済、Phase 3 + 4 feat
 branch):
 - Phase 1: citation URI scheme + =org-index-index= (Layer 1) +
   =disclosure-help= tool + =org-index-search= (Layer 2) /
@@ -24,8 +24,12 @@ branch):
 - Phase 3: =anvil-uri-fetch= cross-layer resolver (scheme →
   Layer-3 handler 自動 dispatch) + =defs://= SHA row-hash 化
   (first 8 hex of sha1(file|line|name)、同名 symbol 衝突解消)。
-- 全体 ERT: anvil-uri 15 + anvil-disclosure 36 = 51。全 pass。
-Phase 4 (journal 専用 / http-cache) 未着手。
+- Phase 4: =journal-index= (Layer 1 for journals) + =http-cache-index=
+  (Layer 1) + =http-cache-get= (Layer 3) + anvil-state-list-keys /
+  anvil-http-cache-list / anvil-http-cache-get helpers + uri-fetch
+  http-cache:// resolver 実装 (Phase 3 placeholder を置換)。
+- 全体 ERT: anvil-uri 15 + anvil-disclosure 48 = 63。全 pass。
+Doc 28 完了。Phase 5 以降は未設計 (deprecated/revisit only)。
 
 * Motivation
 
@@ -284,10 +288,46 @@ Ship 内容 (feat/doc-28-phase3-uri-fetch):
   Layer 3) で扱う。現在は =anvil-disclosure--resolve-http-cache=
   が explicit error。
 
-** Phase 4 — journal / http-cache
+** Phase 4 — journal / http-cache (~SHIPPED 2026-04-21~)
 
-journal (=capture/journals-*.org=) 向け 3 層。http-cache との
-統合で "このキャッシュされた URL の本文を 3 層で読む" ができる。
+Ship 内容 (feat/doc-28-phase4-journal-http-cache):
+
+1. =journal-index= (Layer 1) — org 日誌専用スコープ。=year= (4-digit
+   string or integer) + =query= + =limit= を受け、
+   =anvil-org-index-search= を =:file-like %journals-YYYY%= で走らせ
+   =(:id journal://YEAR/ID :title :year :path)= にプロジェクト。
+   =anvil-disclosure-journal-file-glob= defcustom で prefix カスタマ
+   ズ可。既存 journal:// URI resolver (Phase 3 org-read-by-id 共有)
+   はそのまま活用。
+2. =anvil-state-list-keys (&key ns limit)= 追加 (anvil-state.el)。
+   expired skip + ns 必須。http-cache の enumerate に利用。
+3. =anvil-http-cache-list= / =anvil-http-cache-get= + 内部 helper
+   =anvil-http--url-sha= 追加 (anvil-http.el)。
+   URI 上の =http-cache://<sha256>= は =sha256(anvil-http--normalize-url)=
+   (小文字ホスト + fragment 除去) で生成。cache 側はスキーマ変更
+   なし、=list-keys= を sha 計算で突き合わせる軽量経路。
+4. =http-cache-index= (Layer 1) — cache エントリ一覧、body 除外で
+   軽量化。=query= で URL 部分一致 filter。
+5. =http-cache-get= (Layer 3) — sha or =http-cache://sha= URI で
+   entry 全体 (:body 含) を返す。miss 時 error。
+6. =anvil-uri-fetch= の =http-cache://= resolver を Phase 3
+   placeholder から実装に差し替え。
+7. =disclosure-help= 本文を Phase 4 tool と http-cache URI 規約に
+   追従。tool-specs に MCP 3 tool 追加 (計 8 tool)。
+8. ERT 12 件追加 (journal year extract / row project / year filter
+   / int year / http-cache-index all+filter / http-cache-get hit+
+   miss / uri-fetch http-cache resolves / url-sha normalises /
+   help mentions Phase 4 tools)。既存 "http-cache-errors" test は
+   Phase 4 仕様 (miss → error) に合わせて再解釈。
+
+意図的先送り:
+
+- =journal://YEAR/ID= の YEAR segment は情報用。Layer 3 resolver は
+  ID のみで =org-read-by-id= を呼ぶため、YEAR 不整合 URI も解決可
+  (benign)。
+- http-cache entry のスキーマ変更は見送り (sha は listing 側で都度
+  計算、cache 書き込みコスト unchanged)。数万 entry 規模までは list
+  全走査で許容範囲、超えたら reverse index 追加を検討。
 
 * Testing strategy
 

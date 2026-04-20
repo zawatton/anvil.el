@@ -298,6 +298,31 @@ Expired rows are deleted lazily during the GET that notices them."
            "SELECT DISTINCT ns FROM kv ORDER BY ns")))
 
 ;;;###autoload
+(cl-defun anvil-state-list-keys (&key ns limit)
+  "Return the sorted list of keys under namespace NS.
+With :limit N, return at most N keys.  Expired rows are skipped so
+callers see only live keys; run `anvil-state-vacuum' to physically
+remove them.  Omitting :ns is an error — enumerating the entire DB
+would cross tenant boundaries and is not supported."
+  (unless ns
+    (error "anvil-state-list-keys: :ns is required"))
+  (anvil-state--check-string "NS" ns)
+  (let* ((db (anvil-state--db))
+         (now (truncate (float-time)))
+         (sql (if limit
+                  "SELECT k FROM kv
+                     WHERE ns = ?1
+                       AND (expires_at IS NULL OR expires_at > ?2)
+                     ORDER BY k
+                     LIMIT ?3"
+                "SELECT k FROM kv
+                     WHERE ns = ?1
+                       AND (expires_at IS NULL OR expires_at > ?2)
+                     ORDER BY k"))
+         (params (if limit (list ns now limit) (list ns now))))
+    (mapcar #'car (sqlite-select db sql params))))
+
+;;;###autoload
 (defun anvil-state-count (&optional ns)
   "Return the number of live rows (optionally in NS only).
 Expired rows are counted until `anvil-state-vacuum' physically

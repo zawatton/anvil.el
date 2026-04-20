@@ -12,8 +12,8 @@
 ;;; Commentary:
 
 ;; Official Layer-1 (index) / Layer-2 (search) / Layer-3 (get) contract
-;; for anvil's read surface — Doc 28 Phase 1 + 2 + 3.  Provides five
-;; new MCP tools:
+;; for anvil's read surface — Doc 28 Phase 1–4.  Provides eight new MCP
+;; tools:
 ;;
 ;;   org-index-index   — Layer 1 for org-mode headlines.  Slim pointers
 ;;                       (:id org://ID :title :path) so up to 50 rows
@@ -30,10 +30,22 @@
 ;;                       hex chars of sha1(file|line|name), which
 ;;                       disambiguates same-name defs across files.
 ;;   anvil-uri-fetch   — Cross-layer resolver (Phase 3).  Pass any
-;;                       anvil citation URI (`org://' / `defs://' /
-;;                       `file://' / `journal://') and the right
-;;                       Layer-3 handler is invoked automatically.
-;;                       `http-cache://' is stubbed for Phase 4.
+;;                       anvil citation URI and the right Layer-3
+;;                       handler is invoked automatically.  Covers
+;;                       org / defs / file / journal / http-cache
+;;                       schemes as of Phase 4.
+;;   journal-index     — Layer 1 for org journal files
+;;                       (`capture/journals-YYYY.org').  Filters
+;;                       `anvil-org-index-search' by path so the
+;;                       results are scoped to the journal corpus
+;;                       and returns journal://YEAR/ID URIs.
+;;   http-cache-index  — Layer 1 for cached HTTP responses.  Lists
+;;                       live entries from the anvil-state `http'
+;;                       namespace with
+;;                       (:id http-cache://sha :url :status :...).
+;;   http-cache-get    — Layer 3 for cached HTTP responses.  Takes
+;;                       an http-cache://sha URI (or raw sha256)
+;;                       and returns the full stored body + headers.
 ;;   disclosure-help   — Returns the 3-layer flow so LLM agents can
 ;;                       discover the contract at runtime.
 ;;
@@ -54,6 +66,8 @@
 (declare-function anvil-org-index-search "anvil-org-index")
 (declare-function anvil-file-read-region "anvil-file")
 (declare-function anvil-defs-search "anvil-defs")
+(declare-function anvil-http-cache-list "anvil-http" (&key limit))
+(declare-function anvil-http-cache-get "anvil-http" (sha))
 
 ;;; Customization
 
@@ -356,10 +370,17 @@ The SHA segment is informational only — Layer 3
     (list :resolver 'elisp-get-function-definition
           :body (anvil-elisp--get-function-definition sym))))
 
-(defun anvil-disclosure--resolve-http-cache (_parsed)
-  "Phase 4 placeholder resolver for http-cache:// URIs."
-  (error "anvil-uri-fetch: http-cache:// scheme not supported yet \
-(Phase 4 of Doc 28)"))
+(defun anvil-disclosure--resolve-http-cache (parsed)
+  "Resolver for http-cache:// parsed URIs (Phase 4).
+Hands the sha off to `anvil-disclosure-http-cache-get' which walks
+the anvil-state http namespace and returns the matching cached
+response.  Signals an error when the sha does not map to any live
+entry."
+  (let ((sha (plist-get parsed :sha)))
+    (unless (and sha (stringp sha) (not (string-empty-p sha)))
+      (error "anvil-uri-fetch: missing sha in http-cache:// URI"))
+    (list :resolver 'http-cache-get
+          :body (anvil-disclosure-http-cache-get sha))))
 
 (defconst anvil-disclosure--uri-fetch-dispatch
   `((org         . ,#'anvil-disclosure--resolve-org)
@@ -400,6 +421,147 @@ MCP Parameters:
   (anvil-server-with-error-handling
    (format "%S" (anvil-disclosure-uri-fetch uri))))
 
+;;; Phase 4: journal-index (Layer 1)
+
+(defcustom anvil-disclosure-journal-file-glob "journals-"
+  "Substring anchoring journal file paths.
+`anvil-disclosure-journal-index' combines this with the optional
+YEAR argument to build a SQL LIKE pattern over the org-index
+`file.path' column.  Follows the `capture/journals-YYYY.org'
+convention from the user's Notes workspace."
+  :type 'string
+  :group 'anvil-disclosure)
+
+(defun anvil-disclosure--journal-extract-year (path)
+  "Return the 4-digit YEAR in PATH (matching `journals-YYYY'), or nil."
+  (when (and (stringp path)
+             (string-match "journals-\\([0-9]\\{4\\}\\)" path))
+    (match-string 1 path)))
+
+(defun anvil-disclosure--journal-row-to-pointer (row)
+  "Project a journal ROW into a slim Layer-1 pointer.
+Returns (:id journal://YEAR/ID :title :year :path) and drops rows
+with a missing :org-id or an un-parseable filename."
+  (let* ((id (plist-get row :org-id))
+         (file (plist-get row :file))
+         (year (anvil-disclosure--journal-extract-year file)))
+    (when (and id (stringp id) (not (string-empty-p id)) year)
+      (list :id (anvil-uri-journal year id)
+            :title (or (plist-get row :title) "")
+            :year year
+            :path file))))
+
+;;;###autoload
+(defun anvil-disclosure-journal-index (&optional year query limit)
+  "Layer-1 slim pointers for org journal files.
+YEAR is an optional 4-digit string (or integer) that restricts the
+search to `capture/journals-YEAR.org'; omit to scan every journal.
+QUERY is a title substring (SQL LIKE) and LIMIT caps the row count
+(default 50, hard-capped at `anvil-disclosure-layer1-hard-limit').
+Returns (:count N :truncated BOOL :rows ((:id URI :title T :year Y
+:path P) ...)) — each URI is reusable in `org-read-by-id' or
+`anvil-uri-fetch'."
+  (require 'anvil-org-index)
+  (let* ((yr (cond ((integerp year) (format "%04d" year))
+                   ((and (stringp year)
+                         (not (string-empty-p (string-trim year))))
+                    year)
+                   (t nil)))
+         (pattern (concat "%" anvil-disclosure-journal-file-glob
+                          (or yr "") "%"))
+         (lim (anvil-disclosure--clamp-limit limit))
+         (q   (anvil-disclosure--none-empty query))
+         (res (anvil-org-index-search
+               :title-like q
+               :file-like  pattern
+               :limit      lim))
+         (rows (plist-get res :rows))
+         (pointers (delq nil
+                         (mapcar #'anvil-disclosure--journal-row-to-pointer
+                                 rows))))
+    (list :count     (length pointers)
+          :truncated (plist-get res :truncated)
+          :rows      pointers)))
+
+(defun anvil-disclosure--tool-journal-index
+    (&optional year query limit)
+  "MCP wrapper for `anvil-disclosure-journal-index'.
+
+MCP Parameters:
+  year  - Optional 4-digit year (string or integer-as-string).  Omit
+          to scan every journal file.
+  query - Optional title substring (SQL LIKE; auto-wrapped with %..%).
+  limit - Optional integer string, default 50, hard-capped at 200."
+  (anvil-server-with-error-handling
+   (format "%S"
+           (anvil-disclosure-journal-index year query limit))))
+
+;;; Phase 4: http-cache-index (Layer 1) + http-cache-get (Layer 3)
+
+;;;###autoload
+(defun anvil-disclosure-http-cache-index (&optional query limit)
+  "Layer-1 slim pointers for the anvil-http response cache.
+QUERY is an optional substring matched against the *normalised*
+URL.  LIMIT caps the row count (default 50).  Returns
+(:count N :rows ((:id http-cache://SHA :url :status :fetched-at
+:body-length :content-type) ...))."
+  (require 'anvil-http)
+  (let* ((lim (anvil-disclosure--clamp-limit limit))
+         (q   (anvil-disclosure--none-empty query))
+         (entries (anvil-http-cache-list :limit lim))
+         (filtered (if q
+                       (seq-filter
+                        (lambda (e)
+                          (string-match-p (regexp-quote q)
+                                          (or (plist-get e :url) "")))
+                        entries)
+                     entries))
+         (pointers (mapcar
+                    (lambda (e)
+                      (list :id (anvil-uri-http-cache
+                                 (plist-get e :sha))
+                            :url          (plist-get e :url)
+                            :status       (plist-get e :status)
+                            :fetched-at   (plist-get e :fetched-at)
+                            :body-length  (plist-get e :body-length)
+                            :content-type (plist-get e :content-type)))
+                    filtered)))
+    (list :count (length pointers)
+          :rows  pointers)))
+
+(defun anvil-disclosure--tool-http-cache-index (&optional query limit)
+  "MCP wrapper for `anvil-disclosure-http-cache-index'.
+
+MCP Parameters:
+  query - Optional substring to filter against the normalised URL.
+  limit - Optional integer string, default 50, hard-capped at 200."
+  (anvil-server-with-error-handling
+   (format "%S"
+           (anvil-disclosure-http-cache-index query limit))))
+
+;;;###autoload
+(defun anvil-disclosure-http-cache-get (sha-or-uri)
+  "Return the cached HTTP response body + metadata for SHA-OR-URI.
+Accepts either a raw sha256 hex string or a `http-cache://SHA'
+citation URI.  Returns the full cache entry
+(:url :sha :status :headers :body :fetched-at :final-url ...).
+Signals an error when no cache entry matches."
+  (require 'anvil-http)
+  (let ((entry (anvil-http-cache-get sha-or-uri)))
+    (unless entry
+      (error "anvil-disclosure-http-cache-get: no cached entry for %S"
+             sha-or-uri))
+    entry))
+
+(defun anvil-disclosure--tool-http-cache-get (sha_or_uri)
+  "MCP wrapper for `anvil-disclosure-http-cache-get'.
+
+MCP Parameters:
+  sha_or_uri - sha256 hex string or `http-cache://SHA' citation URI."
+  (anvil-server-with-error-handling
+   (format "%S"
+           (anvil-disclosure-http-cache-get sha_or_uri))))
+
 ;;; disclosure-help
 
 (defconst anvil-disclosure--help-text
@@ -410,7 +572,8 @@ Use one of three layers *in order* — escalating only when the cheaper
 layer matched.  Every layer hands back a citation URI you can feed
 directly into Layer 3.
 
-Layer 1  index   — `org-index-index', `file-outline', `defs-index'
+Layer 1  index   — `org-index-index', `file-outline', `defs-index',
+                   `journal-index', `http-cache-index'
                    ~20 tok/result, up to 50 results.  Answers: does
                    anything match, and where?
 Layer 2  search  — `org-index-search', `defs-search',
@@ -418,11 +581,12 @@ Layer 2  search  — `org-index-search', `defs-search',
                    ~80 tok/row (multi-result) or ~500 tok (snippet).
                    Answers: which one should I pick, or what does a
                    known line look like in context?
-Layer 3  get     — `org-read-by-id', `file-read', `elisp-get-function-definition'
+Layer 3  get     — `org-read-by-id', `file-read',
+                   `elisp-get-function-definition', `http-cache-get'
                    Full body, bounded by the source section / function
-                   / file range.  All three Layer-3 tools accept the
-                   citation URI emitted at Layer 1/2 directly — no
-                   intermediate translation needed.
+                   / file range / cached response.  All Layer-3 tools
+                   accept the citation URI emitted at Layer 1/2
+                   directly — no intermediate translation needed.
 
 Citation URIs:
 
@@ -433,7 +597,10 @@ Citation URIs:
                                    same-name defs across files.
   file://<PATH>[#L<n>[-<m>]]       Layer 3: file-read
   journal://<YYYY>/<ID>            Layer 3: org-read-by-id (journal)
-  http-cache://<sha256>            Layer 3: http-cache-get (Phase 4)
+                                   Layer 1 scan: journal-index.
+  http-cache://<sha256>            Layer 3: http-cache-get.
+                                   Layer 1 scan: http-cache-index.
+                                   sha = sha256(normalised URL).
 
 Cross-layer shortcut: `anvil-uri-fetch <uri>' dispatches any citation
 URI to the right Layer-3 handler automatically.  Prefer it over
@@ -477,9 +644,27 @@ MCP Parameters: (none)"
     (,#'anvil-disclosure--tool-uri-fetch
      :id "anvil-uri-fetch"
      :description
-     "Cross-layer resolver for any anvil citation URI (Doc 28 Phase 3). Pass an org://ID, defs://SHA/SYM, file://PATH[#L<s>-<e>], or journal://YEAR/ID URI and this tool dispatches to the matching Layer-3 handler automatically. Returns (:scheme :uri :resolver :body). Prefer this when you already have a URI — you do not need to remember which Layer-3 tool corresponds to each scheme. http-cache:// will be handled in Phase 4 and currently signals an error."
+     "Cross-layer resolver for any anvil citation URI (Doc 28 Phase 3+4). Pass an org://ID, defs://SHA/SYM, file://PATH[#L<s>-<e>], journal://YEAR/ID, or http-cache://SHA URI and this tool dispatches to the matching Layer-3 handler automatically. Returns (:scheme :uri :resolver :body). Prefer this when you already have a URI — you do not need to remember which Layer-3 tool corresponds to each scheme."
      :read-only t
      :title "URI Fetch (cross-layer)")
+    (,#'anvil-disclosure--tool-journal-index
+     :id "journal-index"
+     :description
+     "Layer 1 of anvil progressive disclosure scoped to org journal files (capture/journals-YYYY.org). Use FIRST when the question is about a journal entry. Combines an optional `year' filter with an optional `query' title substring and returns up to 50 slim pointers at ~20 tok each, each with a journal://YEAR/ID citation URI reusable in Layer 3 (`org-read-by-id' / `anvil-uri-fetch'). Cheaper than scanning the whole journal via `file-read'."
+     :read-only t
+     :title "Journal Index (Layer 1)")
+    (,#'anvil-disclosure--tool-http-cache-index
+     :id "http-cache-index"
+     :description
+     "Layer 1 for the anvil-http response cache. Lists live cached entries with a stable http-cache://<sha256> citation URI, the normalised URL, status, fetched-at, body-length and content-type — *without* the body. Use `query' to filter by URL substring. Call `http-cache-get' (or `anvil-uri-fetch' on the URI) to pull the body."
+     :read-only t
+     :title "HTTP Cache Index (Layer 1)")
+    (,#'anvil-disclosure--tool-http-cache-get
+     :id "http-cache-get"
+     :description
+     "Layer 3 for cached HTTP responses. Accepts a raw sha256 or an http-cache://SHA citation URI and returns the full stored entry (:url :sha :status :headers :body :fetched-at :final-url ...). Errors when the sha does not match any live cache entry."
+     :read-only t
+     :title "HTTP Cache Get (Layer 3)")
     (,#'anvil-disclosure-help-handler
      :id "disclosure-help"
      :description

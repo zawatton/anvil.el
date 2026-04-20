@@ -21,6 +21,8 @@
 (require 'anvil-uri)
 (require 'anvil-org)
 (require 'anvil-elisp)
+(require 'anvil-http)
+(require 'anvil-state)
 
 (defun anvil-disclosure-test--fake-rows (n)
   "Generate N synthetic org-index rows (plists)."
@@ -384,9 +386,15 @@ assert on routing + arguments."
                      (plist-get body :fn))))))
 
 (ert-deftest anvil-disclosure-test-uri-fetch-http-cache-errors ()
+  "http-cache:// with no matching cache entry signals an error.
+In Phase 3 this errored because the scheme was unsupported; Phase 4
+now dispatches to `anvil-disclosure-http-cache-get' which itself
+errors when the sha does not resolve."
   (anvil-disclosure-test--with-stubbed-layer3
-    (should-error (anvil-disclosure-uri-fetch
-                   "http-cache://deadbeef"))))
+    (cl-letf (((symbol-function 'anvil-http-cache-get)
+               (lambda (_sha) nil)))
+      (should-error (anvil-disclosure-uri-fetch
+                     "http-cache://deadbeef")))))
 
 (ert-deftest anvil-disclosure-test-uri-fetch-unknown-scheme ()
   (should-error (anvil-disclosure-uri-fetch "gopher://old")))
@@ -397,6 +405,153 @@ assert on routing + arguments."
       (should (stringp s))
       (should (string-match-p ":scheme org" s))
       (should (string-match-p ":resolver org-read-by-id" s)))))
+
+;;;; --- Phase 4: journal-index -------------------------------------------
+
+(defun anvil-disclosure-test--fake-journal-rows (n)
+  "Generate N synthetic journal rows under capture/journals-2026.org."
+  (cl-loop for i from 1 to n
+           collect (list :file (format "/notes/capture/journals-2026.org")
+                         :line (* i 10)
+                         :level 2
+                         :title (format "NOTE 2026-04-%02d" i)
+                         :todo "NOTE"
+                         :org-id (format "j-%08x" i)
+                         :tags '())))
+
+(ert-deftest anvil-disclosure-test-journal-extract-year ()
+  (should (equal "2026" (anvil-disclosure--journal-extract-year
+                         "/notes/capture/journals-2026.org")))
+  (should (null (anvil-disclosure--journal-extract-year
+                 "/notes/capture/inbox.org"))))
+
+(ert-deftest anvil-disclosure-test-journal-row-to-pointer ()
+  (let* ((row (car (anvil-disclosure-test--fake-journal-rows 1)))
+         (p (anvil-disclosure--journal-row-to-pointer row)))
+    (should (equal "journal://2026/j-00000001" (plist-get p :id)))
+    (should (equal "2026" (plist-get p :year)))))
+
+(ert-deftest anvil-disclosure-test-journal-row-skips-non-journal ()
+  "Rows whose path does not match `journals-YYYY' are dropped."
+  (should (null (anvil-disclosure--journal-row-to-pointer
+                 (list :file "/a/random.org"
+                       :org-id "x"
+                       :title "t")))))
+
+(ert-deftest anvil-disclosure-test-journal-index-filters-year ()
+  "When YEAR is supplied the underlying :file-like carries the year."
+  (let (captured)
+    (cl-letf (((symbol-function 'anvil-org-index-search)
+               (lambda (&rest args)
+                 (setq captured args)
+                 (list :count 2 :truncated nil
+                       :rows (anvil-disclosure-test--fake-journal-rows 2)))))
+      (let ((res (anvil-disclosure-journal-index "2026" nil "10")))
+        (should (= 2 (plist-get res :count)))
+        (should (string-match-p "journals-2026"
+                                (plist-get captured :file-like)))
+        (should (equal "journal://2026/j-00000001"
+                       (plist-get (car (plist-get res :rows)) :id)))))))
+
+(ert-deftest anvil-disclosure-test-journal-index-int-year ()
+  "Integer YEAR is formatted as a 4-digit string."
+  (let (captured)
+    (cl-letf (((symbol-function 'anvil-org-index-search)
+               (lambda (&rest args)
+                 (setq captured args)
+                 (list :count 0 :truncated nil :rows nil))))
+      (anvil-disclosure-journal-index 2025)
+      (should (string-match-p "journals-2025"
+                              (plist-get captured :file-like))))))
+
+;;;; --- Phase 4: http-cache-index / http-cache-get ----------------------
+
+(defmacro anvil-disclosure-test--with-fake-http-cache (entries &rest body)
+  "Stub `anvil-http-cache-list' / `anvil-http-cache-get' to return
+ENTRIES (a list of cache-list plists with :url :sha :body etc)."
+  (declare (indent 1))
+  `(cl-letf (((symbol-function 'anvil-http-cache-list)
+              (lambda (&rest _) ,entries))
+             ((symbol-function 'anvil-http-cache-get)
+              (lambda (sha)
+                (let ((target (if (string-prefix-p "http-cache://" sha)
+                                  (substring sha (length "http-cache://"))
+                                sha)))
+                  (seq-find (lambda (e)
+                              (equal target (plist-get e :sha)))
+                            ,entries)))))
+     ,@body))
+
+(defun anvil-disclosure-test--fake-http-entries ()
+  "Three synthetic cache entries with stable shas."
+  (list (list :url "https://a.example/" :sha "aaa111"
+              :status 200 :fetched-at 1 :body-length 5
+              :content-type "text/plain"
+              :body "body-a" :headers '())
+        (list :url "https://b.example/" :sha "bbb222"
+              :status 200 :fetched-at 2 :body-length 6
+              :content-type "application/json"
+              :body "body-b" :headers '())
+        (list :url "https://c.example/" :sha "ccc333"
+              :status 404 :fetched-at 3 :body-length 0
+              :content-type nil
+              :body "" :headers '())))
+
+(ert-deftest anvil-disclosure-test-http-cache-index-all ()
+  (anvil-disclosure-test--with-fake-http-cache
+      (anvil-disclosure-test--fake-http-entries)
+    (let* ((res (anvil-disclosure-http-cache-index))
+           (first (car (plist-get res :rows))))
+      (should (= 3 (plist-get res :count)))
+      (should (equal "http-cache://aaa111" (plist-get first :id)))
+      (should (= 200 (plist-get first :status))))))
+
+(ert-deftest anvil-disclosure-test-http-cache-index-filter ()
+  (anvil-disclosure-test--with-fake-http-cache
+      (anvil-disclosure-test--fake-http-entries)
+    (let ((res (anvil-disclosure-http-cache-index "b.example")))
+      (should (= 1 (plist-get res :count)))
+      (should (equal "http-cache://bbb222"
+                     (plist-get (car (plist-get res :rows)) :id))))))
+
+(ert-deftest anvil-disclosure-test-http-cache-get-hit ()
+  (anvil-disclosure-test--with-fake-http-cache
+      (anvil-disclosure-test--fake-http-entries)
+    (let ((entry (anvil-disclosure-http-cache-get
+                  "http-cache://bbb222")))
+      (should (equal "https://b.example/" (plist-get entry :url)))
+      (should (equal "body-b" (plist-get entry :body))))))
+
+(ert-deftest anvil-disclosure-test-http-cache-get-miss ()
+  (anvil-disclosure-test--with-fake-http-cache
+      (anvil-disclosure-test--fake-http-entries)
+    (should-error (anvil-disclosure-http-cache-get "deadbeef"))))
+
+(ert-deftest anvil-disclosure-test-uri-fetch-http-cache-resolves ()
+  "Phase 4 swaps the Phase-3 placeholder — dispatch now works."
+  (anvil-disclosure-test--with-fake-http-cache
+      (anvil-disclosure-test--fake-http-entries)
+    (let* ((res (anvil-disclosure-uri-fetch "http-cache://aaa111"))
+           (body (plist-get res :body)))
+      (should (eq 'http-cache (plist-get res :scheme)))
+      (should (eq 'http-cache-get (plist-get res :resolver)))
+      (should (equal "body-a" (plist-get body :body))))))
+
+;;;; --- Phase 4: real sha round-trip ------------------------------------
+
+(ert-deftest anvil-disclosure-test-http-url-sha-stable ()
+  "The helper produces a deterministic 64-hex sha256 string."
+  (let ((sha1 (anvil-http--url-sha "https://EXAMPLE.com/p"))
+        (sha2 (anvil-http--url-sha "https://example.com/p")))
+    (should (= 64 (length sha1)))
+    ;; normalised → same digest despite capitalisation.
+    (should (equal sha1 sha2))))
+
+(ert-deftest anvil-disclosure-test-help-mentions-phase4-tools ()
+  (let ((help (anvil-disclosure-help-handler)))
+    (should (string-match-p "journal-index" help))
+    (should (string-match-p "http-cache-index" help))
+    (should (string-match-p "http-cache-get" help))))
 
 (ert-deftest anvil-disclosure-test-elisp-strip-defs-uri ()
   "defs://SHA/SYM → SYM; plain names pass through; Phase-3 real SHAs OK."
