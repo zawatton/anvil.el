@@ -629,21 +629,62 @@ starting with `anvil-dev--audit-plist-return-exempt-marker'."
      (concat "^" (regexp-quote anvil-dev--audit-plist-return-exempt-marker))
      nil t)))
 
-(defconst anvil-dev--audit-plist-return-regex
-  "(list[ \t\n]+:[a-zA-Z][a-zA-Z0-9-]*"
-  "Regex matching a `(list :keyword ...)' form.
-The scanner deliberately stays shallow (no full sexp parse); a
-file-header opt-out marker is the safety valve for modules that
-intentionally return plists and wrap them at registration.")
+(defconst anvil-dev--audit-sequencing-forms
+  '(let let* progn
+    save-excursion save-restriction save-match-data save-current-buffer
+    unwind-protect
+    when unless
+    with-current-buffer with-temp-buffer with-temp-file
+    anvil-server-with-error-handling)
+  "Forms whose logical terminal value is the last of their body.
+Used by `anvil-dev--audit-terminal-form' to unwrap trivial
+sequencing constructs when deciding whether a `--tool-*' defun
+actually returns a plist literal.")
+
+(defun anvil-dev--audit-terminal-form (form)
+  "Return the logical terminal value of FORM.
+Unwraps `let' / `let*' / `progn' / `save-*' / `unwind-protect' /
+`when' / `unless' / `anvil-server-with-error-handling' /
+`with-current-buffer' / `with-temp-{buffer,file}' recursively so
+that e.g. `(let (...) (list :K ...))' resolves to `(list :K ...)'.
+Non-sequencing cons forms return themselves; atoms return themselves."
+  (if (and (consp form)
+           (memq (car form) anvil-dev--audit-sequencing-forms))
+      (anvil-dev--audit-terminal-form (car (last form)))
+    form))
+
+(defun anvil-dev--audit-defun-terminal-form (defun-form)
+  "Return the logical terminal form of DEFUN-FORM's body.
+DEFUN-FORM is a parsed `(defun NAME ARGS ...BODY)'.  The leading
+docstring and any `(declare ...)' / `(interactive ...)' directives
+are skipped, then `anvil-dev--audit-terminal-form' is applied to
+the last remaining body form."
+  (let ((body (cdddr defun-form)))
+    (while (and body
+                (let ((f (car body)))
+                  (or (stringp f)
+                      (and (consp f)
+                           (memq (car f) '(declare interactive))))))
+      (setq body (cdr body)))
+    (anvil-dev--audit-terminal-form (car (last body)))))
+
+(defun anvil-dev--audit-plist-return-form-p (form)
+  "Non-nil when FORM is a `(list :KEYWORD ...)' literal.
+Used as the end-criterion in the plist-return scanner."
+  (and (consp form)
+       (eq (car form) 'list)
+       (keywordp (cadr form))))
 
 (defun anvil-dev--audit-scan-plist-return-in-files (files)
-  "Scan FILES for `--tool-*' wrappers whose body ends with a plist literal.
+  "Scan FILES for `--tool-*' wrappers whose body terminates in a plist literal.
 
 An MCP tool handler must return a string or nil per the
 `anvil-server' contract; returning a raw Lisp plist trips a
-runtime error on every MCP call (this is exactly the class of bug
-v0.3.1 shipped a hotfix for).  The scanner flags each `--tool-*'
-defun whose last substantive form matches `(list :KEYWORD ...)'.
+runtime error on every MCP call (the class of bug v0.3.1 shipped
+a hotfix for).  The scanner reads each `--tool-*' defun as a
+sexp, unwraps common sequencing forms (let / progn / save-* /
+with-error-handling / with-temp-buffer / ...) and flags the defun
+when the logical terminal form is `(list :KEYWORD ...)'.
 
 Files tagged with `anvil-dev--audit-plist-return-exempt-marker' in
 their first 2 KB are skipped wholesale — the exemption is the
@@ -658,37 +699,23 @@ Returns a list of plists `(:file NAME :line N :defun SYM)'."
         (with-temp-buffer
           (insert-file-contents file)
           (goto-char (point-min))
-          (while (re-search-forward anvil-dev--audit-wrapper-regex nil t)
-            (let* ((name        (match-string 1))
-                   (defun-start (match-beginning 0))
-                   (line        (line-number-at-pos defun-start))
-                   (defun-end
-                    (save-excursion
-                      (goto-char defun-start)
-                      (condition-case nil (progn (forward-sexp) (point))
-                        (error (point-max))))))
+          (while (re-search-forward
+                  "^(defun \\([a-zA-Z0-9-]+--tool-[a-zA-Z0-9-]+\\)"
+                  nil t)
+            (let ((name  (match-string 1))
+                  (start (match-beginning 0))
+                  (line  (line-number-at-pos (match-beginning 0))))
               (when (anvil-dev--audit-wrapper-name-p name)
-                (let (last-hit)
-                  (save-excursion
-                    (goto-char defun-start)
-                    (while (re-search-forward
-                            anvil-dev--audit-plist-return-regex
-                            defun-end t)
-                      (setq last-hit (match-beginning 0))))
-                  (when last-hit
-                    ;; Terminal check: after the (list :K ...) sexp, only
-                    ;; whitespace and close parens remain before the defun
-                    ;; end — i.e. it really is the value the defun returns.
-                    (save-excursion
-                      (goto-char last-hit)
-                      (when (ignore-errors (forward-sexp) t)
-                        (let ((remaining (buffer-substring-no-properties
-                                          (point) defun-end)))
-                          (when (string-match-p "\\`[ \t\n)]*\\'" remaining)
-                            (push (list :file (file-name-nondirectory file)
-                                        :line line
-                                        :defun name)
-                                  findings)))))))))))))
+                (let ((form (save-excursion
+                              (goto-char start)
+                              (ignore-errors (read (current-buffer))))))
+                  (when (and form (consp form) (eq (car form) 'defun))
+                    (let ((term (anvil-dev--audit-defun-terminal-form form)))
+                      (when (anvil-dev--audit-plist-return-form-p term)
+                        (push (list :file (file-name-nondirectory file)
+                                    :line line
+                                    :defun name)
+                              findings)))))))))))
     (nreverse findings)))
 
 (defun anvil-dev--audit-scan-plist-return (root)

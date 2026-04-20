@@ -367,12 +367,13 @@ dependencies."
             (expanded (if (anvil-sexp--truthy all)
                           (macroexpand-all sexp)
                         (macroexpand-1 sexp))))
-       (list :name (symbol-name (plist-get form :name))
-             :expanded (with-output-to-string
-                         (let ((print-level nil)
-                               (print-length nil))
-                           (pp expanded)))
-             :original (prin1-to-string sexp))))))
+       (anvil-server-encode-for-mcp
+        (list :name (symbol-name (plist-get form :name))
+              :expanded (with-output-to-string
+                          (let ((print-level nil)
+                                (print-length nil))
+                            (pp expanded)))
+              :original (prin1-to-string sexp)))))))
 
 
 ;;;; --- edit tool implementations ------------------------------------------
@@ -1104,12 +1105,13 @@ later phase when needed."
          (setq diags (append diags (plist-get bc :diagnostics)))))
      (when do-cd
        (setq diags (append diags (anvil-sexp--run-checkdoc file))))
-     (list :file file
-           :passed (and bc-ok
-                        (null (cl-find-if
-                               (lambda (d) (eq (plist-get d :kind) 'error))
-                               diags)))
-           :diagnostics diags))))
+     (anvil-server-encode-for-mcp
+      (list :file file
+            :passed (and bc-ok
+                         (null (cl-find-if
+                                (lambda (d) (eq (plist-get d :kind) 'error))
+                                diags)))
+            :diagnostics diags)))))
 
 
 ;;;; --- public elisp API (Doc 12 Phase 1) ---------------------------------

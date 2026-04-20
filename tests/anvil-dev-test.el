@@ -641,4 +641,45 @@ picking up the status line itself."
             (should (null (plist-get r :plist-return)))) )
       (delete-directory d t))))
 
+(ert-deftest anvil-dev-test-audit-plist-return-ignores-nested-in-format ()
+  "A `(list :K ...)' nested as an arg of `format' is not flagged
+— the defun's terminal value is the `format' string, not the list."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-foo.el" d)
+           (concat
+            "(defun anvil-foo--tool-outline (path)\n"
+            "  \"Outline.\n\nMCP Parameters:\n  path - x\"\n"
+            "  (anvil-server-with-error-handling\n"
+            "   (let ((items (foo path)))\n"
+            "     (format \"%S\" (list :path path :items items)))))\n"))
+          (let ((r (anvil-dev-release-audit d)))
+            (should (null (plist-get r :plist-return)))) )
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-plist-return-catches-wrapped-let ()
+  "A `(let (...) (list :K ...))' wrapped in `anvil-server-with-error-handling'
+must still be flagged — sequencing forms are unwrapped before the
+terminal check so the real plist return is visible."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-foo.el" d)
+           (concat
+            "(defun anvil-foo--tool-run (id)\n"
+            "  \"Run.\n\nMCP Parameters:\n  id - x\"\n"
+            "  (anvil-server-with-error-handling\n"
+            "   (let* ((raw (foo id)))\n"
+            "     (list :id id :raw raw))))\n"))
+          (let* ((r (anvil-dev-release-audit d))
+                 (hits (plist-get r :plist-return)))
+            (should (= 1 (length hits)))
+            (should (equal "anvil-foo--tool-run"
+                           (plist-get (car hits) :defun)))
+            (should-not (plist-get r :clean-p))) )
+      (delete-directory d t))))
+
 ;;; anvil-dev-test.el ends here
