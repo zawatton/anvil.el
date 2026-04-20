@@ -1,0 +1,235 @@
+#+title: anvil-manifest-profile — Per-Session tools/list Filter
+#+date: 2026-04-20
+#+author: zawatton
+#+property: status DRAFT
+#+property: scope GENERIC
+
+* STATUS
+  :PROPERTIES:
+  :ID:       c6f05c1e-72a6-4e3b-87a6-d0a6a3b7c001
+  :END:
+~DRAFT~ (2026-04-20) — Week-3 Ship 1, 競合 token-savior の
+=TOKEN_SAVIOR_PROFILE= を anvil に移植する。実装 ETA 半日。
+
+* Motivation
+
+anvil は 2026-04 時点で =anvil-bench= / =anvil-browser= / =anvil-orchestrator=
+/ =anvil-worker= 等 20 モジュール、合計 *90+ MCP tool* を advertise している。
+Claude Code は session 開始時に =tools/list= 全体を system prompt に詰める
+ため、per-turn *manifest cost* がじわじわ効いている。
+
+token-savior は同じ痛みに =TOKEN_SAVIOR_PROFILE= で対処している:
+
+| Profile | Advertised | ~Tokens | Use case                         |
+|---------+------------+---------+----------------------------------|
+| full    |        106 |  10 950 | All capabilities                 |
+| core    |         54 |   5 800 | Daily coding, no memory engine   |
+| nav     |         28 |   3 100 | Read-only exploration            |
+| lean    |         59 |   6 620 | Memory engine off                |
+| ultra   |         17 |   2 740 | Hot tools + =ts_extended= lazy   |
+
+=tools/list= payload を絞っても handler は生きているので、explicit call
+はそのまま通る ("hidden but callable")。
+
+anvil の per-session cost を実測してから profile を当てると、Claude の
+context window が 30-50% 広く使えると期待できる。
+
+* Goals
+
+1. =ANVIL_PROFILE= env var + defcustom =anvil-manifest-profile= で
+   tools/list の出力を subset に絞る。
+2. Profile 定義はコード側 (Lisp table) ではなく data (=anvil-manifest-
+   profiles.el= の =defconst=) として分離し、ユーザー定義可能に。
+3. 既存の =anvil-register-tools= マクロに =:profiles= タグを追加、
+   既存 registration を *壊さない* (タグ無しは =full= 扱い)。
+4. =manifest-cost= MCP tool を 1 本提供 — 現在 profile の advertised
+   tools 数と推定 token を返す (Claude 自身が profile 選択できる)。
+5. 全 profile の token 実測値を =tests/manifest-cost-snapshot.el= に
+   記録、CI で regression 検出。
+
+* Non-goals
+
+- 動的 (session 中の) profile 切替: JSON-RPC に profile 変更通知を
+  送る仕組みは MCP 1.0 に無い。env var + 再起動で十分。
+- Per-tool lazy loading: handler は常時 live を維持。advertised が
+  絞られるだけ。
+- User 側 (Claude Code) の =disabled_mcpServers= と重ねる: 競合する
+  なら Claude Code 側を優先。
+- =ultra= profile に相当する "meta-tool + tool-name lookup" (token-
+  savior の =ts_extended=) は Phase 2。Phase 1 は静的 filter のみ。
+
+* Architecture
+
+** Profile 定義
+
+#+begin_src elisp
+;;; anvil-manifest-profiles.el
+(defconst anvil-manifest-profile-ultra
+  '(file-read file-batch org-read-outline org-read-headline
+    org-index-search bench-compare http-fetch offload-submit
+    git-status git-diff-names git-log manifest-cost)
+  "Hot tools only — Claude Code daily driver.")
+
+(defconst anvil-manifest-profile-nav
+  (append anvil-manifest-profile-ultra
+          '(file-outline code-extract-pattern org-index-rebuild
+            defs-search bench-last))
+  "Read-only exploration.")
+
+(defconst anvil-manifest-profile-core
+  (append anvil-manifest-profile-nav
+          '(file-batch-across file-replace-string file-replace-regexp
+            file-ensure-import json-object-add code-add-field-by-map
+            org-update-todo-state org-add-todo org-rename-headline
+            ...)))
+  "Daily coding + edits, no orchestrator / worker UI.")
+
+(defvar anvil-manifest-profile-full :all
+  "Magic sentinel: all registered tools.")
+#+end_src
+
+** Register-tools macro 拡張
+
+#+begin_src elisp
+(anvil-register-tools
+  :module 'anvil-file
+  :tools '((file-read :handler anvil-file-read-handler
+                      :profiles (ultra nav core full))
+           (file-batch :handler anvil-file-batch-handler
+                       :profiles (ultra nav core full))
+           (file-outline :handler anvil-file-outline-handler
+                         :profiles (nav core full))
+           ...))
+#+end_src
+
+タグ無しの既存 registration は ~:profiles '(full)~ として解釈 (後方
+互換)。
+
+** tools/list filter
+
+=anvil-server-handle-tools-list= で =anvil-current-manifest-profile=
+を参照、該当 profile の set に含まれるものだけ返す。profile が
+=:all= (=full=) の場合 filter 無し。
+
+#+begin_src elisp
+(defcustom anvil-manifest-profile
+  (intern (or (getenv "ANVIL_PROFILE") "full"))
+  "Active manifest profile."
+  :type '(choice (const full) (const core) (const nav)
+                 (const ultra) (const lean)))
+
+(defun anvil-current-profile-toolset ()
+  (pcase anvil-manifest-profile
+    ('full :all)
+    ('core anvil-manifest-profile-core)
+    ('nav  anvil-manifest-profile-nav)
+    ('ultra anvil-manifest-profile-ultra)
+    ('lean anvil-manifest-profile-lean)
+    (_ (user-error "Unknown profile: %s" anvil-manifest-profile))))
+#+end_src
+
+** Manifest cost tool
+
+#+begin_src elisp
+(defun anvil-manifest-cost-handler (&optional _args)
+  "Return current profile + advertised tool count + approx tokens."
+  (let* ((advertised (anvil-server-advertised-tools))
+         (schema-tokens (cl-reduce #'+
+                          (mapcar #'anvil-tool-schema-token-count
+                                  advertised)
+                          :initial-value 0)))
+    (list :profile anvil-manifest-profile
+          :advertised-count (length advertised)
+          :approx-tokens schema-tokens
+          :profiles-available '(full core nav ultra lean))))
+#+end_src
+
+~anvil-tool-schema-token-count~ は tool の JSON-Schema を
+=json-encode= して 1 token ≈ 4 chars で概算。厳密でない。
+
+* Public MCP tools
+
+| id              | args   | notes                                            |
+|-----------------+--------+--------------------------------------------------|
+| ~manifest-cost~ | (none) | 現在 profile の advertised 数 + 概算 token       |
+
+他は全て既存 tool の =:profiles= タグ追記のみ。tool 新設は 1 本。
+
+* Phases
+
+** Phase 1 — static profile + manifest-cost (~DRAFT~)
+
+1. =anvil-manifest-profiles.el= 新規追加、4 profile を =defconst=。
+2. =anvil-register-tools= マクロに =:profiles= keyword 対応追加。
+3. 既存 20 モジュールの registration に =:profiles= を付与 (= 90 件
+   × 数秒なので =file-batch-across= で一括編集)。
+4. =anvil-server-handle-tools-list= で filter 適用。
+5. =manifest-cost= MCP tool を =anvil-server-commands.el= に追加。
+6. =tests/anvil-manifest-profile-test.el= で 4 profile × ERT。
+7. =tests/manifest-cost-snapshot.el= で各 profile の advertised 数
+   を固定 (regression 検出)。
+
+** Phase 2 — lazy discovery (=ultra= + meta-tool)
+
+token-savior の =ts_extended= パターン:
+- =ultra= profile では =anvil-extended= meta-tool 1 本のみ advertise。
+- =anvil-extended {tool: "file-outline", args: {...}}= で任意 tool
+  を呼べる (hidden なだけで handler は live)。
+- Claude は =manifest-cost= で =ultra= 検出 → =anvil-extended= で
+  lazy discovery。
+
+ただし Claude Code が tool name を明示的に検索/推論できるかは
+2026-04 時点で未検証。Phase 1 の反応を見てから判断。
+
+** Phase 3 — user-defined profiles
+
+~~/.emacs.d/anvil-profiles.el~ で user override:
+#+begin_src elisp
+(setq anvil-manifest-profile-custom
+      '(file-read file-batch org-read-outline my-custom-tool))
+(setq anvil-manifest-profile 'custom)
+#+end_src
+
+* Testing strategy
+
+- Unit: 4 profile × 「含まれる / 含まれない」assertion。
+- Integration: =anvil-server-handle-tools-list= が profile ごとに
+  期待 count を返す。
+- Token snapshot: =tests/manifest-cost-snapshot.el= に
+  =(ultra 17 2740) (nav 28 3100) ...= 形式で baseline。±10% 超える
+  と fail。
+- Hidden-but-callable: =ultra= profile 下でも =file-batch-across=
+  の explicit call が通ることを確認。
+
+* Platform notes
+
+env var =ANVIL_PROFILE= は Windows (cmd.exe / PowerShell) でも
+=set ANVIL_PROFILE=core= で効く。MSYS/mingw64 も同様。
+
+* Out of scope / future
+
+- Per-conversation profile (MCP に profile 変更通知が無い以上、
+  現状 env var 起動時固定)。
+- tools/list の差分配信 (MCP 1.x にはない)。
+- Profile 自動選択 (session 開始時に conversation 内容から推定) —
+  深掘り価値薄い、ユーザーが設定する方が明確。
+
+* Review Questions
+
+1. Q. Default profile を =full= にすべきか? → A. はい。既存ユーザー
+   が env 設定なしで tool を失うのは破壊的。Opt-in で絞る。
+2. Q. =anvil-manifest-profile-lean= (memory engine 無し) は Doc 29
+   前提の命名。Doc 29 より先に出していい?
+   → 空集合として定義可 (=core= と同一) にしておき、Doc 29 SHIPPED
+   時に差分を足す。
+3. Q. =manifest-cost= の approx token 計算は JSON-encode → ÷ 4 で
+   十分か? 実測 tiktoken との乖離は? → Phase 1 は概算で良い。
+   ±20% でも profile 選択判断には足りる。
+
+* References
+
+- token-savior README: =TOKEN_SAVIOR_PROFILE= の 5 profile 一覧。
+- Memory ~project_anvil_efficiency_bundle.md~: register-tools macro
+  の既存実装。
+- MCP spec: https://modelcontextprotocol.io/ (tools/list response
+  format)。

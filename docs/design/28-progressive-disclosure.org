@@ -1,0 +1,247 @@
+#+title: anvil-progressive-disclosure — 3-Layer Read Contract + Citation URI
+#+date: 2026-04-20
+#+author: zawatton
+#+property: status DRAFT
+#+property: scope GENERIC
+
+* STATUS
+  :PROPERTIES:
+  :ID:       c6f05c1e-72a6-4e3b-87a6-d0a6a3b7c003
+  :END:
+~DRAFT~ (2026-04-20) — Week-3 Ship 3, 競合 token-savior の
+=memory_index= → =memory_search= → =memory_get= 3 層契約を
+anvil-org-index / anvil-defs / anvil-file に移植。実装 ETA 2-3 日。
+
+* Motivation
+
+token-savior は "progressive disclosure" を *契約化* してアドバン
+テージを取っている:
+
+| Layer | Tool            | Tokens/result | When                        |
+|-------+-----------------+---------------+-----------------------------|
+|     1 | =memory_index=  | ~15           | Always first                |
+|     2 | =memory_search= | ~60           | If Layer 1 matched          |
+|     3 | =memory_get=    | ~200          | If Layer 2 confirmed        |
+
+各 Layer 1 結果には citation URI =ts://obs/{id}= が付与されており、
+Layer 3 にそのまま渡せる。
+
+anvil は既に:
+- =anvil-org-index= の =org-index-search= + =org-read-headline= +
+  =org-read-by-id= で *事実上 3 層* を実装している。
+- =anvil-defs= の =defs-search= + =elisp-get-function-definition= で
+  同様の 2 層。
+- =anvil-file= の =file-outline= + =file-read= で 2 層。
+
+しかし:
+- Layer 1 が ~15 tokens/result に収まっていない (org-index-search は
+  headline 全文 + metadata を返すので 50-80 tok)。
+- citation URI の規約が無い (各 tool で返り値の ID 表現がバラバラ)。
+- 3 層運用を LLM に *教える契約* が README / tool description に
+  書かれていない。
+
+結果、Claude は =file-read= から始めて 2000-5000 token 消費する
+ケースが多い。Layer 1 で 15-20 候補を 300 tokens で俯瞰、絞った 1-2
+を Layer 3 で 200 tokens で full 取得、というフローに寄せたい。
+
+* Goals
+
+1. anvil-org-index / anvil-defs / anvil-file に 3 層契約を *公式化*:
+   - Layer 1: =*-index= (~20 tok/item, title + path + citation URI)。
+   - Layer 2: =*-search= (~80 tok/item, title + snippet + citation
+     URI)。
+   - Layer 3: =*-get= / =*-read-by-id= (~200-2000 tok, full body)。
+2. Citation URI の *統一 scheme*:
+   - =org://<ID>= org-mode ID
+   - =defs://<sha>/<symbol>= elisp definition
+   - =file://<path>#L<n>-<m>= file range
+   - 全 Layer の結果に citation URI を *必ず* 含める。
+3. Tool description に 3 層フローを *明示* (token-savior の
+   "Always start at Layer 1. Escalate only if the previous layer
+   paid off" を踏襲)。
+4. Layer 1 の token 見積もりを =tests/disclosure-budget-test.el=
+   で固定、regression 検出。
+5. 3 層すべての tool に =:layer= metadata を付与し、=manifest-cost=
+   (Doc 26) で profile ごとの Layer 分布を可視化。
+
+* Non-goals
+
+- Layer 数を 3 以外に変更可にする (4+ 層は複雑化)。
+- Fuzzy / semantic search を Layer に追加 (Doc 18 anvil-rag 側で扱う)。
+- Citation URI の content addressability (= 内容 hash ベース URI):
+  Phase 2 以降。
+
+* Architecture
+
+** Layer 契約
+
+#+begin_src
+Layer 1: anvil-XX-index
+  Input:  (query? path?)
+  Output: [{:id URI :title TITLE :path PATH}]
+  Cost:   ~20 tokens/result, N ≤ 50
+  Purpose: "Does anything match? Give me pointers."
+
+Layer 2: anvil-XX-search
+  Input:  (query, result-limit?)
+  Output: [{:id URI :title TITLE :snippet SNIPPET :match-count N}]
+  Cost:   ~80 tokens/result, N ≤ 20
+  Purpose: "Show me enough to pick one."
+
+Layer 3: anvil-XX-get / anvil-XX-read-by-id
+  Input:  (id URI)
+  Output: {:id URI :title TITLE :body FULL-BODY :metadata ...}
+  Cost:   bounded by source (org section, function, file range)
+  Purpose: "Give me the full content."
+#+end_src
+
+** Citation URI scheme
+
+各 module で URI prefix と ID 生成を決める:
+
+| Module      | URI scheme            | ID 生成             | Canonical tool    |
+|-------------+-----------------------+---------------------+-------------------|
+| org-index   | =org://<ID>=          | org =:ID:= property | ~org-read-by-id~  |
+| defs        | =defs://<sha>/<sym>=  | anvil-defs DB row   | ~defs-get~        |
+| file        | =file://<path>#L<n>-<m>= | path + line range | ~file-read~       |
+| journal     | =journal://<YYYY>/<ID>= | journal.org ID   | ~journal-get~     |
+| http-cache  | =http://<sha256>=     | cached URL hash     | ~http-cache-get~  |
+
+URI は *必ず再利用可能*。LLM が Layer 1 で得た URI を Layer 3 に
+そのまま渡せば、intermediate 変換なしに full content が返る。
+
+** Tool description の統一 template
+
+#+begin_example
+tool_name: anvil-org-index-search
+
+Layer 1 of anvil progressive disclosure. Use FIRST for any org query.
+Returns up to 50 pointers at ~20 tokens each. Each result includes
+a citation URI (org://<ID>) reusable as-is in Layer 3 tools.
+
+Escalate to Layer 2 (anvil-org-search) only when Layer 1 matched.
+Escalate to Layer 3 (org-read-by-id) only when you need full body.
+
+DO NOT use file-read for org files; org-index-search is ~10x cheaper.
+#+end_example
+
+全 Layer 1/2/3 tool で tool description を上記 template 化。
+
+** 既存 tool との関係
+
+- =org-index-search= (既存) → Layer 1 化する上で出力 format を
+  slim down: =:title + :path + :id= のみ、=:body-snippet= と
+  =:tags= を除去。
+- =org-index-search-with-snippet= (既存を rename) → Layer 2 化:
+  =:snippet 150 chars=.
+- =org-read-by-id= (既存) → Layer 3 の canonical tool。
+- =file-outline= (既存) → Layer 1 of file namespace。
+- =file-read= (既存) → Layer 3 of file namespace。
+- =defs-search= (既存) → Layer 2 化 (現状は Layer 1 相当の slim
+  output なので =defs-index= を新設)。
+
+** Budget snapshot
+
+=tests/disclosure-budget-test.el= で 100-file corpus を作り:
+
+| Tool                | Budget (tokens/result) | Max results |
+|---------------------+------------------------+-------------|
+| org-index-index     | 20                     | 50          |
+| org-index-search    | 80                     | 20          |
+| file-outline        | 30                     | 20          |
+| defs-index          | 20                     | 50          |
+| defs-search         | 80                     | 20          |
+
+超過したら ERT fail。Layer 1 が duty を超えて肥大化することを防ぐ。
+
+* Public MCP tools
+
+新設 / rename:
+
+| id                 | args           | notes                 |
+|--------------------+----------------+-----------------------|
+| ~org-index-index~  | query?, path?  | Layer 1 (slim)        |
+| ~defs-index~       | query?         | Layer 1 (slim)        |
+| ~disclosure-help~  | (none)         | 3 層 flow を返す doc  |
+
+既存 tool の description 更新のみで registration 追加なし:
+=org-read-headline= / =org-read-by-id= / =file-read= / =file-outline=
+/ =defs-search= / =elisp-get-function-definition=。
+
+* Phases
+
+** Phase 1 — URI scheme + org-index 3 層 (~DRAFT~)
+
+1. Citation URI の =defconst= を =anvil-uri.el= に切り出し。
+2. =anvil-org-index-index-handler= 新設 (Layer 1)、既存
+   =org-index-search= を Layer 2 に re-slot。
+3. =disclosure-help= tool 追加 (LLM から flow ガイドが読める)。
+4. Tool description を template 化、README に Layer 表を追記。
+5. Budget test を整備、=org-index-index= が 20 tok/item 以下を
+   守ることを CI で強制。
+
+** Phase 2 — file / defs 3 層化
+
+=file-outline= (既存) が Layer 1、=file-read-snippet= 新設
+(Layer 2)、=file-read= が Layer 3。
+=defs-index= 新設、=defs-search= と =elisp-get-function-definition=
+の 3 層構成。
+
+** Phase 3 — cross-layer resolver
+
+=anvil-uri-fetch= tool: 任意の citation URI を渡すと、URI の prefix
+を見て適切な Layer 3 tool を自動 dispatch。LLM が URI だけ覚えれば
+良い状態を作る。
+
+** Phase 4 — journal / http-cache
+
+journal (=capture/journals-*.org=) 向け 3 層。http-cache との
+統合で "このキャッシュされた URL の本文を 3 層で読む" ができる。
+
+* Testing strategy
+
+- Unit: 各 Layer 1 tool の 1 result が ≤ 20 tokens (schema encode
+  した JSON の char 数 / 4)。
+- Integration: Layer 1 → Layer 3 の round-trip。LLM simulation で
+  URI を受け取り Layer 3 に渡して full body を得る。
+- Golden: 特定 org file の Layer 1 output を snapshot、regression
+  検出。
+- Budget: disclosure-budget-test.el を CI に統合、80% 確信度で
+  budget 遵守。
+
+* Platform notes
+
+- URI の =file://= prefix は Windows で =file:///C:/path= 形式。
+  =url-generic-parse-url= でクロスプラットフォーム parsing。
+- org ID は UUID 使用 (既存 =org-id-uuid= がクロスプラット対応)。
+
+* Out of scope / future
+
+- Content-addressable citation URI (hash ベース): 不変性の保証が
+  必要な用途 (法令 DB snapshot 等) では有用だが、通常運用では org
+  ID で十分。
+- Layer 4 (embedding): Doc 18 anvil-rag でのみ扱う。
+- Auto-layering (tool 選択を LLM に任せない): LLM の判断を奪うと
+  柔軟性を失う。
+
+* Review Questions
+
+1. Q. =org-index-search= を Layer 2 に rename すべきか、それとも
+   =org-index-index= (Layer 1) を新設し =search= は既存通り?
+   → 新設推奨。既存 tool の意味を変えると caller 壊れる。
+2. Q. Budget 20 tok/item は厳しすぎない? =:title + :path + :id=
+   で実測 25-30 tok の懸念。 → Phase 1 実測してから緩める (25 でも
+   可)。重要なのは *上限がある* こと。
+3. Q. Layer 数を 3 に固定して良いか? =org-outline= (headline tree
+   only) を 0.5 層扱いする方が精緻?
+   → 固定推奨。簡潔さ優先、=org-read-outline= は Layer 1 の variant
+   として扱う。
+
+* References
+
+- token-savior README: "Progressive disclosure — memory search"
+  section。https://github.com/Mibayy/token-savior
+- Memory ~project_anvil_org_index.md~: anvil-org-index の既存 tool
+  一覧。
+- MCP spec: tool description は LLM がそのまま読むので instructions
+  を書ける。

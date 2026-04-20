@@ -123,6 +123,32 @@ combinations (presets).
 | 22 | [[file:22-provider-routing.org][Provider Latency Routing]]                    | 10     | 小       | 2    | Ph1 SHIPPED |
 | 23 | [[file:23-consensus-presets.org][Consensus Presets]]                           | 10, 22 | 小       | 2    | Ph1 SHIPPED |
 
+** Week-3 Token Efficiency Wave (Doc 26-29 + Doc 17 Ph3-4, DRAFT, 2026-04-20)
+
+Competitor audit (rtk / context-mode / code-review-graph /
+token-savior) からの取り込み提案。主語は *Claude Code セッション
+1 本あたりの token 効率*。
+
+| #        | Doc                                                                   | 依存   | 想定工数 | Tier | 状態  |
+|----------+-----------------------------------------------------------------------+--------+----------+------+-------|
+| 26       | [[file:26-manifest-profile.org][Manifest Profile (tools/list filter)]] | —      | 小       | 1    | DRAFT |
+| 27       | [[file:27-shell-filter.org][Shell Output Filter + Tee]]                | 08     | 中       | 1    | DRAFT |
+| 28       | [[file:28-progressive-disclosure.org][3-Layer Read Contract + Citation URI]] | 02, 11 | 中       | 1    | DRAFT |
+| 29       | [[file:29-memory-engine.org][Memory Engine (Bayesian + TTL + ROI)]]     | 08     | 大       | 2    | DRAFT |
+| 17 Ph3-4 | [[file:17-session.org][Claude Code Lifecycle Hooks]]                       | 08     | 中       | 2    | DRAFT |
+
+競合対応マトリクス:
+
+| 競合               | 取り込み先      |
+|--------------------+-----------------|
+| rtk                | Doc 27 (shell)  |
+| context-mode       | Doc 17 Ph3      |
+| code-review-graph  | Doc 18 (既存)   |
+| token-savior       | Doc 26 / 28 / 29 |
+
+Tier 1 (26 / 27 / 28) を先行 ship、Tier 2 (29 / 17 Ph3-4) を後続。
+詳細は各 doc の ~Motivation~ / ~Review Questions~ 参照。
+
 * Status Legend
 
 各 doc 冒頭の =STATUS= に以下のいずれかを記す:

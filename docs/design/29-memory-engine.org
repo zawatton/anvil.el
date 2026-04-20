@@ -1,0 +1,257 @@
+#+title: anvil-memory-engine — Bayesian Validity + TTL + ROI + Contradiction
+#+date: 2026-04-20
+#+author: zawatton
+#+property: status DRAFT
+#+property: scope CONVENTION-COUPLED
+
+* STATUS
+  :PROPERTIES:
+  :ID:       c6f05c1e-72a6-4e3b-87a6-d0a6a3b7c004
+  :END:
+~DRAFT~ (2026-04-20) — Week-3 Ship 4, 競合 token-savior の
+"memory engine" を anvil + Claude Code auto-memory に統合する。
+実装 ETA 1 週間。Convention-coupled (auto-memory の file layout に
+食い込む)。
+
+* Motivation
+
+現在の Claude Code auto-memory は file-based + 手動キュレーション:
+
+- =~/.claude/projects/.../memory/= 配下に 1 memory = 1 .md file。
+- =MEMORY.md= に pointer list (= session 開始時に全量 load)。
+- 矛盾 / 陳腐化の検出は =memory-pruner= skill が periodic に走る。
+
+痛みポイント:
+
+1. *陳腐化*: 「昔そうだった」memory が silently 生き残る。=feedback_*=
+   は基本永続化だが =project_*= / =reference_*= は修正すべき。
+2. *矛盾*: 「案 A で実装」した後「案 B に変更」した記録が両方残り、
+   LLM が混乱する。
+3. *優先度*: すべての memory が同 priority で MEMORY.md に並び、
+   コンテキスト先頭 200 行 (truncate limit) 付近に無意味な記録が
+   押し込まれる。
+4. *検証コスト*: 毎回 memory を読んでから file 実体を grep して
+   stale チェック。人間も LLM も高コスト。
+
+token-savior は *Bayesian validity + per-type TTL + ROI + MDL
+distillation* で同じ痛みに対処している。その概念を anvil に移植する。
+
+ただし auto-memory の file layout を捨てて DB に一本化すると、
+git で diff/review できない & 人間が grep できない問題が生じる。
+なので **hybrid**: memory file は source of truth を維持、
+=anvil-state= に *scoring layer* を追加して promote / demote / flag
+を表現する。
+
+* Goals
+
+1. 各 memory に *metadata* を付与: =created=, =accessed-count=,
+   =last-accessed=, =validity-prior=, =ttl-policy=, =contradicts=。
+2. *保存時 contradiction 検出*: 新 memory が既存 memory の内容と
+   矛盾する場合、= 対立候補 =を返して human 判断を仰ぐ (skill から
+   MCP tool 経由)。
+3. *ROI 追跡*: 参照されない memory は =decay-score= を下げ、MEMORY.md
+   表示順で後退。高 ROI は昇格。
+4. *per-type TTL*:
+   - feedback: 永続 (180 d 以上経過で re-validate prompt)。
+   - project: 90 d で =validity-check= flag 必須。
+   - reference: 30 d で URL/path を再検証。
+   - user: 永続 (但し opposing 情報があれば flag)。
+5. *auto-promotion*: skill で =MEMO= として付けた note が 5 回以上
+   AI から参照されたら =feedback= に promote 提案。
+6. *MDL distillation*: 重複内容を検出して「これは既出では?」と
+   skill 実行時に warning。
+7. Claude Code auto-memory の file layout / MEMORY.md index は
+   *維持* (人間が git で読める)。scoring は =anvil-state= 側。
+
+* Non-goals
+
+- Vector embedding での semantic duplicate: Doc 18 anvil-rag の
+  scope。ここは FTS5 + Levenshtein で keyword-based 重複のみ。
+- Memory の全文 DB 化 (file 廃止): git diff を失うので反対。
+- Multi-user memory: anvil は single-user 前提。
+- LLM auto-extraction from tool output (token-savior の
+  =TS_AUTO_EXTRACT=): 保存するか否かは人間判断を維持。誤抽出の
+  cost > 手入力の cost。
+
+* Architecture
+
+** Data model
+
+=anvil-state= namespace =memory-meta= に 1 memory = 1 row:
+
+#+begin_src elisp
+(:file "feedback_journal_org_edit_body_timeout.md"
+ :type feedback                   ; auto-memory type
+ :created "2026-02-11T09:00:00Z"
+ :last-accessed "2026-04-19T21:33:10Z"
+ :access-count 17
+ :validity-prior 0.95             ; 0.0-1.0, 初回 0.9 固定
+ :ttl-policy feedback             ; keyword, per-type TTL lookup
+ :contradicts nil                 ; or list of conflicting files
+ :decay-score 0.87                ; recency * access * type weight
+ :tags ("org-mode" "emacs-eval" "timeout"))
+#+end_src
+
+=validity-prior= は Bayesian update:
+- 参照されて "これは今でも正しい" と human/LLM 確認したら *0.05
+  increment* (cap at 1.0)。
+- Live grep で言及先が消えていたら *0.2 decrement*。
+- opposing memory 保存時に両方とも *0.1 decrement*。
+
+** Contradiction detection
+
+=anvil-memory-save-with-check= 相当の wrapper MCP tool:
+
+1. Draft memory の subject / body を =anvil-org-index-search=
+   + FTS5 で既存 memory に対し hybrid search。
+2. Top 3 similar memories を返却。
+3. 類似度 > 0.7 の場合:
+   - 内容が orthogonal なら duplicate 警告。
+   - 内容が contradicting (LLM 判定) なら *既存 memory の
+     =contradicts= field に draft pointer を登録* し human に flag。
+4. Human 判断で resolve / merge / keep-both を skill から指示。
+
+FTS5 は anvil-sqlite で既にサポート。anvil-memory-index を
+新 sqlite DB ~~/.emacs.d/anvil-memory-index.db~ に per-memory row
+として保持。
+
+** Per-type TTL policy
+
+=defconst anvil-memory-ttl-policies=:
+
+| Type      | Hard TTL | Soft warning | Re-validate trigger          |
+|-----------+----------+--------------+------------------------------|
+| user      | ∞        | -            | opposing memory saved        |
+| feedback  | ∞        | 180d         | 180d 経過 + 5 access         |
+| project   | 90d      | 60d          | hard TTL で auto-flag        |
+| reference | 30d      | 21d          | URL/path を HEAD check       |
+
+=anvil-memory-audit= MCP tool (Periodic、daily cron 推奨):
+- Hard TTL 超過 → =:expired= flag。
+- Soft warning → =:needs-recheck= flag。
+- Reference type → =http-head= で 404 検知。
+- Flag 結果を =memory-audit-report= として org table で返す。
+
+** ROI / decay
+
+毎回 memory が使用されたら =access-count += 1=, =last-accessed= 更新。
+=decay-score= は:
+
+#+begin_src
+decay = 0.4 * recency(last-accessed)
+      + 0.3 * normalize(access-count)
+      + 0.3 * type-weight(type)
+
+recency(t) = exp(-days-since(t) / 30)   ; 30-day half-life
+type-weight: user=1.0, feedback=0.9, project=0.7, reference=0.5
+#+end_src
+
+MEMORY.md の pointer 並びは decay-score 降順で generate (既存
+memory-pruner skill を拡張)。
+
+** Auto-promotion
+
+=MEMO= (= 非永続 note) が 5 回以上 AI から参照されたら:
+- skill 実行時に "promote to feedback?" prompt。
+- 承諾なら file を =feedback_*.md= に rename、metadata 更新、
+  MEMORY.md index 再生成。
+
+=memory-pruner= / =memory-audit= が promotion candidate を検出。
+
+** MDL distillation (Phase 2)
+
+重複 memory の検出だけでなく、複数 memory の *共通項* を抽出して
+新 convention memory を生成する提案機能。token-savior の
+"note ×5 → convention" と類似。
+
+Phase 1 は skeleton のみ、Phase 2 で LLM 呼び出しで distillation。
+
+* Public MCP tools
+
+| id                   | args                              | notes                     |
+|----------------------+-----------------------------------+---------------------------|
+| ~memory-save-check~  | type, file, subject, body         | contradiction 検査        |
+| ~memory-access~      | file                              | access-count +=1 (内部用) |
+| ~memory-audit~       | type?                             | TTL / URL check レポート  |
+| ~memory-promote~     | file, new-type                    | MEMO→feedback 等 rename   |
+| ~memory-decay-score~ | file                              | 現在 decay-score 返却     |
+| ~memory-duplicates~  | file?                             | 類似 memory list          |
+
+既存の auto-memory 保存フロー (system prompt 内 instruction) に
+=memory-save-check= を通すよう skill 側で update。
+
+* Phases
+
+** Phase 1 — metadata + contradiction + audit (~DRAFT~)
+
+1. =anvil-memory-index.db= schema 設計 + 初期化 (全既存 memory を
+   parse して metadata 登録)。
+2. =memory-save-check= tool (FTS5 類似検索 + 矛盾判定 skeleton)。
+3. =memory-audit= tool (TTL 判定 + reference URL HEAD)。
+4. =memory-access= hook (memory file 読み込み時に自動発火)。
+5. memory-pruner skill を metadata 参照するよう update。
+
+** Phase 2 — ROI + promote + MDL
+
+6. =memory-decay-score= 計算、MEMORY.md 並び替え。
+7. =memory-promote= tool + skill プロンプト。
+8. MDL distillation (LLM 呼び出しで重複 memory の統合案生成)。
+
+** Phase 3 — web-viewer
+
+token-savior の htmx viewer 相当。=127.0.0.1:<port>= で memory
+graph を可視化 (feedback / project / reference 別、decay heatmap、
+contradiction 矢印)。opt-in。
+
+** Phase 4 — cross-project memory
+
+現状 memory は project 単位 (=~/.claude/projects/<proj-hash>/=)。
+共通 memory (user 型) を promote して global layer に移す機能。
+
+* Testing strategy
+
+- Unit: TTL policy table × 境界日付で flag 生成確認。
+- Integration: 2 つの opposing memory を保存 → contradiction 検出 +
+  両方の validity-prior decrement。
+- Corpus: 既存 auto-memory 全 60+ ファイルを取り込み、audit を
+  走らせて =:expired= が妥当な件数出ることを確認。
+- Round-trip: memory-access → decay-score 更新 → MEMORY.md 並び順
+  変化を snapshot。
+
+* Platform notes
+
+- SQLite FTS5 は Emacs 29+ の built-in sqlite module で使用可、
+  Windows でも OK (既存 anvil-sqlite で実証済)。
+- =anvil-memory-index.db= は =~/.emacs.d/= 配下で OS 不問。
+- memory file の encoding は UTF-8 固定 (既存 auto-memory 慣習)。
+
+* Out of scope / future
+
+- LLM auto-extraction (tool 出力から観察を勝手に保存): 誤抽出の
+  cost が高く、human-in-the-loop を崩す。
+- Memory sharing (別ユーザーと memory 共有): single-user 前提。
+- PII scrubbing: auto-memory には PII を書かない運用なので不要。
+
+* Review Questions
+
+1. Q. =anvil-memory-index.db= と既存 =anvil-state-db=
+   (Doc 08 =anvil-state=) を同一ファイルに統合すべき?
+   → 分離推奨。memory index は FTS5 前提で sqlite-vec も将来
+   入れる可能性があり、state は軽量 KV。schema を分けて管理。
+2. Q. Contradiction 判定を LLM に委ねるか regex/keyword ベースで
+   初期実装するか? → Phase 1 は keyword + Levenshtein、Phase 2 で
+   LLM (local orchestrator-dispatch)。
+3. Q. MEMORY.md 並び替えは auto commit で良いか? → No。sort 結果を
+   propose するが commit は skill が human 承諾後に行う。
+4. Q. Decay-score weights (0.4/0.3/0.3) は default で良いか?
+   → 初期値として。3 ヶ月実運用してから調整。
+
+* References
+
+- token-savior README: "Memory engine" section (Bayesian validity /
+  contradiction / TTL / ROI の詳細)。
+  https://github.com/Mibayy/token-savior
+- Memory ~project_my_cc_helpers.md~: 旧 memory 管理実装。
+- Memory ~feedback_agent_model_routing.md~: dispatch policy の
+  参考 (contradiction 判定時に使う)。
+- Claude Code auto-memory system prompt (CLAUDE.md 参照)。
