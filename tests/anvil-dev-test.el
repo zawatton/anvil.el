@@ -555,4 +555,90 @@ picking up the status line itself."
               (should (= 3 (plist-get r :passed)))))
         (delete-directory default-directory t)))))
 
+;;;; --- plist-return scanner (v0.3.1-class regression guard) --------------
+
+(ert-deftest anvil-dev-test-audit-flags-plist-return ()
+  "A wrapper whose body ends with `(list :K ...)' is flagged."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-foo.el" d)
+           (concat
+            "(defun anvil-foo--tool-send (id text)\n"
+            "  \"Send.\n\nMCP Parameters:\n  id - x\n  text - y\"\n"
+            "  (foo id text)\n"
+            "  (list :sent (length text)))\n"))
+          (let* ((r (anvil-dev-release-audit d))
+                 (hits (plist-get r :plist-return)))
+            (should (= 1 (length hits)))
+            (should (equal "anvil-foo--tool-send"
+                           (plist-get (car hits) :defun)))
+            (should-not (plist-get r :clean-p))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-allows-string-return ()
+  "A wrapper whose body ends with a string is NOT flagged."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-foo.el" d)
+           (concat
+            "(defun anvil-foo--tool-echo (text)\n"
+            "  \"Echo.\n\nMCP Parameters:\n  text - x\"\n"
+            "  (format \"received: %s\" text))\n"))
+          (let ((r (anvil-dev-release-audit d)))
+            (should (null (plist-get r :plist-return)))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-allows-json-encode-return ()
+  "A wrapper ending in `(json-encode ...)' is NOT flagged."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-foo.el" d)
+           (concat
+            "(defun anvil-foo--tool-probe (id)\n"
+            "  \"Probe.\n\nMCP Parameters:\n  id - x\"\n"
+            "  (json-encode `((id . ,id) (ok . t))))\n"))
+          (let ((r (anvil-dev-release-audit d)))
+            (should (null (plist-get r :plist-return)))) )
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-respects-plist-return-exemption-marker ()
+  "A file tagged `tools-wrapped-at-registration' is not scanned for plist return."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-foo.el" d)
+           (concat
+            ";;; anvil-foo.el --- test -*- lexical-binding: t; -*-\n"
+            ";;; anvil-audit: tools-wrapped-at-registration\n\n"
+            "(defun anvil-foo--tool-send (id text)\n"
+            "  \"Send.\n\nMCP Parameters:\n  id - x\n  text - y\"\n"
+            "  (list :sent (length text)))\n"))
+          (let ((r (anvil-dev-release-audit d)))
+            (should (null (plist-get r :plist-return)))) )
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-plist-return-ignores-non-terminal-list ()
+  "A `(list :K ...)' form that is NOT the last expression is not flagged."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-foo.el" d)
+           (concat
+            "(defun anvil-foo--tool-submit (payload)\n"
+            "  \"Submit.\n\nMCP Parameters:\n  payload - x\"\n"
+            "  (let ((slim (list :payload payload :ok t)))\n"
+            "    (foo slim)\n"
+            "    (format \"submitted %S\" slim)))\n"))
+          (let ((r (anvil-dev-release-audit d)))
+            (should (null (plist-get r :plist-return)))) )
+      (delete-directory d t))))
+
 ;;; anvil-dev-test.el ends here

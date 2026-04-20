@@ -609,6 +609,94 @@ plists `(:file NAME :line N :defun SYM :args ARGS)'."
   (anvil-dev--audit-scan-missing-params-section-in-files
    (anvil-dev--audit-module-files root)))
 
+(defconst anvil-dev--audit-plist-return-exempt-marker
+  ";;; anvil-audit: tools-wrapped-at-registration"
+  "File-header comment that exempts a file from the plist-return scanner.
+Modules that intentionally return plists from `--tool-*' bodies and
+wrap them at registration time (e.g. anvil-orchestrator's
+`anvil-orchestrator--encode-handler' pattern) must include this
+line in the first 2 KB of the file.  See the scanner docstring for
+the one-line comment format.")
+
+(defun anvil-dev--audit-file-exempts-plist-return-p (file)
+  "Return non-nil when FILE carries the plist-return exemption marker.
+The marker must appear within the first 2 KB of the file on a line
+starting with `anvil-dev--audit-plist-return-exempt-marker'."
+  (with-temp-buffer
+    (insert-file-contents file nil 0 2000)
+    (goto-char (point-min))
+    (re-search-forward
+     (concat "^" (regexp-quote anvil-dev--audit-plist-return-exempt-marker))
+     nil t)))
+
+(defconst anvil-dev--audit-plist-return-regex
+  "(list[ \t\n]+:[a-zA-Z][a-zA-Z0-9-]*"
+  "Regex matching a `(list :keyword ...)' form.
+The scanner deliberately stays shallow (no full sexp parse); a
+file-header opt-out marker is the safety valve for modules that
+intentionally return plists and wrap them at registration.")
+
+(defun anvil-dev--audit-scan-plist-return-in-files (files)
+  "Scan FILES for `--tool-*' wrappers whose body ends with a plist literal.
+
+An MCP tool handler must return a string or nil per the
+`anvil-server' contract; returning a raw Lisp plist trips a
+runtime error on every MCP call (this is exactly the class of bug
+v0.3.1 shipped a hotfix for).  The scanner flags each `--tool-*'
+defun whose last substantive form matches `(list :KEYWORD ...)'.
+
+Files tagged with `anvil-dev--audit-plist-return-exempt-marker' in
+their first 2 KB are skipped wholesale — the exemption is the
+supported way for a module to declare that its tool bodies
+intentionally return rich plists because something else encodes
+them at registration time.
+
+Returns a list of plists `(:file NAME :line N :defun SYM)'."
+  (let (findings)
+    (dolist (file files)
+      (unless (anvil-dev--audit-file-exempts-plist-return-p file)
+        (with-temp-buffer
+          (insert-file-contents file)
+          (goto-char (point-min))
+          (while (re-search-forward anvil-dev--audit-wrapper-regex nil t)
+            (let* ((name        (match-string 1))
+                   (defun-start (match-beginning 0))
+                   (line        (line-number-at-pos defun-start))
+                   (defun-end
+                    (save-excursion
+                      (goto-char defun-start)
+                      (condition-case nil (progn (forward-sexp) (point))
+                        (error (point-max))))))
+              (when (anvil-dev--audit-wrapper-name-p name)
+                (let (last-hit)
+                  (save-excursion
+                    (goto-char defun-start)
+                    (while (re-search-forward
+                            anvil-dev--audit-plist-return-regex
+                            defun-end t)
+                      (setq last-hit (match-beginning 0))))
+                  (when last-hit
+                    ;; Terminal check: after the (list :K ...) sexp, only
+                    ;; whitespace and close parens remain before the defun
+                    ;; end — i.e. it really is the value the defun returns.
+                    (save-excursion
+                      (goto-char last-hit)
+                      (when (ignore-errors (forward-sexp) t)
+                        (let ((remaining (buffer-substring-no-properties
+                                          (point) defun-end)))
+                          (when (string-match-p "\\`[ \t\n)]*\\'" remaining)
+                            (push (list :file (file-name-nondirectory file)
+                                        :line line
+                                        :defun name)
+                                  findings)))))))))))))
+    (nreverse findings)))
+
+(defun anvil-dev--audit-scan-plist-return (root)
+  "Scan ROOT for MCP tool wrappers that terminate with a plist literal.
+Returns a list of plists `(:file NAME :line N :defun SYM)'."
+  (anvil-dev--audit-scan-plist-return-in-files
+   (anvil-dev--audit-module-files root)))
+
 (defun anvil-dev--audit-design-doc-status (file)
   "Extract the first non-blank line of FILE's `* STATUS' section.
 Returns the trimmed string or nil when the file has no STATUS
@@ -681,26 +769,30 @@ SCOPE nil returns FILES unchanged.  Non-existent SCOPE returns nil."
 (cl-defun anvil-dev-release-audit (&optional project-dir &key scope)
   "Audit the anvil tree at PROJECT-DIR for pre-release hazards.
 
-Runs three cheap scanners (see the `release audit' section for
+Runs four cheap scanners (see the `release audit' section for
 details) and returns a plist:
 
   :arglist-strip    — list of wrapper plists hit by the Emacs 30
                       underscore-strip regression
   :missing-params   — list of wrapper plists with real args but
                       no `MCP Parameters:' docstring section
+  :plist-return     — list of wrapper plists whose body ends with
+                      a `(list :K ...)' form (MCP contract violation
+                      unless the file opts out via the
+                      `tools-wrapped-at-registration' marker)
   :non-shipped-docs — list of `(:file :status)' plists for design
                       docs whose STATUS line lacks `SHIPPED'
-  :clean-p          — t iff all three scans returned empty
+  :clean-p          — t iff all four scans returned empty
   :root             — absolute directory that was audited
   :scope            — SCOPE value when supplied, else nil
   :audited-at       — ISO timestamp when the scan ran
 
-:SCOPE limits the source scanners (arglist-strip / missing-params)
-to a single file or directory path.  When SCOPE names a regular
-file, only that file is audited; when it names a directory, files
-under it are audited.  The design-docs scanner is always run on
-the project tree — whole-tree doc state is cheap and independent
-of the scope in question."
+:SCOPE limits the source scanners (arglist-strip / missing-params /
+plist-return) to a single file or directory path.  When SCOPE names
+a regular file, only that file is audited; when it names a
+directory, files under it are audited.  The design-docs scanner is
+always run on the project tree — whole-tree doc state is cheap and
+independent of the scope in question."
   (interactive)
   (let* ((root (or project-dir (anvil-dev--audit-default-root)))
          (_    (unless (and root (file-directory-p root))
@@ -715,13 +807,17 @@ of the scope in question."
                           scanner-files))
          (missing-params (anvil-dev--audit-scan-missing-params-section-in-files
                           scanner-files))
+         (plist-return   (anvil-dev--audit-scan-plist-return-in-files
+                          scanner-files))
          (non-shipped    (anvil-dev--audit-scan-design-docs root))
          (clean-p        (and (null arglist-strip)
                               (null missing-params)
+                              (null plist-return)
                               (null non-shipped)))
          (result
           (list :arglist-strip arglist-strip
                 :missing-params missing-params
+                :plist-return plist-return
                 :non-shipped-docs non-shipped
                 :clean-p clean-p
                 :root (file-name-as-directory (expand-file-name root))
@@ -747,6 +843,7 @@ return a one-line string."
   "Render RESULT as a human-readable release audit report."
   (let ((arglist (plist-get result :arglist-strip))
         (params  (plist-get result :missing-params))
+        (plists  (plist-get result :plist-return))
         (docs    (plist-get result :non-shipped-docs))
         (clean-p (plist-get result :clean-p)))
     (concat
@@ -773,6 +870,14 @@ return a one-line string."
                    (plist-get f :line)
                    (plist-get f :defun)
                    (plist-get f :args))))
+        (anvil-dev--audit-format-findings
+         "FAIL plist-return (tool body returns `(list :K ...)'; wrap at\n     registration or opt-out via\n     `;;; anvil-audit: tools-wrapped-at-registration' header)"
+         plists
+         (lambda (f)
+           (format "%s:%d  %s"
+                   (plist-get f :file)
+                   (plist-get f :line)
+                   (plist-get f :defun))))
         (anvil-dev--audit-format-findings
          "WARN design docs not yet SHIPPED (master-gate informational)"
          docs
@@ -835,11 +940,14 @@ any real code lives in it."
    :id "anvil-release-audit"
    :server-id anvil-dev--server-id
    :description
-   "Scan the anvil tree for three pre-release hazard classes:
+   "Scan the anvil tree for four pre-release hazard classes:
 Emacs 30 `_arg' arglist-strip regressions in MCP tool wrappers,
 wrappers with real args but no `MCP Parameters:' docstring
-section, and docs/design/*.org files whose STATUS text lacks
-`SHIPPED'.  Returns a formatted report; `clean' when empty."
+section, wrappers whose body ends with a `(list :K ...)' plist
+literal (MCP string-or-nil contract violation, unless the file
+opts out via `;;; anvil-audit: tools-wrapped-at-registration'),
+and docs/design/*.org files whose STATUS text lacks `SHIPPED'.
+Returns a formatted report; `clean' when empty."
    :read-only t))
 
 (defun anvil-dev-disable ()

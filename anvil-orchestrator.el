@@ -1,4 +1,5 @@
 ;;; anvil-orchestrator.el --- Parallel AI CLI dispatcher for anvil -*- lexical-binding: t; -*-
+;;; anvil-audit: tools-wrapped-at-registration
 
 ;; Copyright (C) 2025-2026 zawatton
 
@@ -46,6 +47,13 @@
 (require 'anvil-server)
 (require 'anvil-state)
 (require 'anvil-git)
+
+(declare-function anvil-orchestrator-select-provider "anvil-orchestrator-routing"
+                  (&rest args))
+(declare-function anvil-orchestrator-routing--register-tools
+                  "anvil-orchestrator-routing")
+(declare-function anvil-orchestrator-routing--unregister-tools
+                  "anvil-orchestrator-routing")
 
 ;;;; --- configuration ------------------------------------------------------
 
@@ -1776,7 +1784,28 @@ Signals `user-error' on missing / malformed fields."
         (user-error "anvil-orchestrator: task :provider missing (%s)"
                     (plist-get task :name)))
       (when (stringp prov)
-        (setq task (plist-put task :provider (intern prov)))))
+        (setq prov (intern prov))
+        (setq task (plist-put task :provider prov)))
+      (when (eq prov 'auto)
+        (require 'anvil-orchestrator-routing)
+        (let* ((policy (plist-get task :policy))
+               (decision (anvil-orchestrator-select-provider
+                          :prompt (plist-get task :prompt)
+                          :policy policy))
+               (chosen (plist-get decision :provider)))
+          (unless chosen
+            (user-error
+             "anvil-orchestrator: :provider auto selected nil (%s) — %s"
+             (plist-get task :name)
+             (plist-get decision :reason)))
+          (setq task (plist-put task :provider chosen))
+          (setq task (plist-put task :routing-policy
+                                (plist-get decision :policy)))
+          (setq task (plist-put task :routing-chose chosen))
+          (setq task (plist-put task :routing-candidates
+                                (plist-get decision :candidates)))
+          (setq task (plist-put task :routing-cold-start
+                                (plist-get decision :cold-start))))))
     (unless (and (stringp (plist-get task :prompt))
                  (not (string-empty-p (plist-get task :prompt))))
       (user-error "anvil-orchestrator: task :prompt missing (%s)"
@@ -2956,7 +2985,7 @@ majority of single-turn responses."
 ;;;###autoload
 (cl-defun anvil-orchestrator-submit-one
     (&key provider prompt model name cwd budget-usd timeout-sec
-          preamble-ref stream on-event)
+          preamble-ref stream on-event policy)
   "Submit a single task and return its task-id (not the batch-id).
 
 A light convenience over `anvil-orchestrator-submit' for the
@@ -2966,6 +2995,10 @@ arguments except :provider and :prompt are optional.  Behaviour
 is identical to passing a one-element list through `submit':
 the task enters the global pool with the same concurrency,
 retry, and budget rules as any other batch.
+
+:provider accepts the sentinel `auto' (Doc 22) to defer selection
+to `anvil-orchestrator-select-provider'.  When used, `:policy'
+overrides the configured default policy for this task only.
 
 :preamble-ref accepts a preamble key string (or list of strings)
 registered via `anvil-orchestrator-preamble-set'; the stored text
@@ -2996,7 +3029,8 @@ event; the callback lives in-memory only and is not persisted."
                        (when preamble-ref
                          (list :preamble-ref preamble-ref))
                        (when stream      (list :stream t))
-                       (when on-event    (list :on-event on-event))))
+                       (when on-event    (list :on-event on-event))
+                       (when policy      (list :policy policy))))
          (batch-id (anvil-orchestrator-submit (list task)))
          (ids      (gethash batch-id anvil-orchestrator--batches)))
     (car ids)))
@@ -3004,7 +3038,7 @@ event; the callback lives in-memory only and is not persisted."
 ;;;###autoload
 (cl-defun anvil-orchestrator-submit-and-collect
     (&key provider prompt model name cwd budget-usd timeout-sec
-          preamble-ref stream on-event
+          preamble-ref stream on-event policy
           (collect-timeout-sec 180) (poll-interval-sec 0.5) full)
   "Submit a single task and wait (non-blocking) for its result.
 
@@ -3039,7 +3073,8 @@ re-collect via `extract-result' later."
                    :timeout-sec timeout-sec
                    :preamble-ref preamble-ref
                    :stream stream
-                   :on-event on-event))
+                   :on-event on-event
+                   :policy policy))
          (deadline (+ (float-time) collect-timeout-sec)))
     (while (let ((task (anvil-orchestrator--task-get task-id)))
              (and task
@@ -3104,16 +3139,21 @@ MCP Parameters:
      (anvil-orchestrator--coerce-truthy-string full))))
 
 (defun anvil-orchestrator--tool-submit-one (provider prompt
-                                            &optional model name)
+                                            &optional model name policy)
   "MCP wrapper for `anvil-orchestrator-submit-one'.
 
 MCP Parameters:
   provider - Provider name string (e.g. \"claude\", \"codex\",
              \"gemini\", \"aider\", \"ollama\").  Coerced to symbol.
+             Pass \"auto\" (Doc 22) to defer selection to the
+             routing layer.
   prompt   - Prompt text string.  Required.
   model    - Optional provider-specific model id override.
   name     - Optional human-readable task label; auto-generated
-             from provider + HHMMSS when omitted."
+             from provider + HHMMSS when omitted.
+  policy   - Optional routing policy name (\"speed\" / \"cost\" /
+             \"balanced\" / \"quality\") used only when
+             provider=\"auto\"."
   (anvil-server-with-error-handling
     (unless (and (stringp provider) (not (string-empty-p provider)))
       (user-error "submit-one: provider required"))
@@ -3123,17 +3163,21 @@ MCP Parameters:
                     :provider (intern provider)
                     :prompt   prompt
                     :model    (and model (not (string-empty-p model)) model)
-                    :name     (and name  (not (string-empty-p name))  name))))
+                    :name     (and name  (not (string-empty-p name))  name)
+                    :policy   (and policy (not (string-empty-p policy))
+                                   (intern policy)))))
       (list :task-id task-id))))
 
 (defun anvil-orchestrator--tool-submit-and-collect
     (provider prompt
      &optional model name cwd budget_usd timeout_sec
-     collect_timeout_sec full)
+     collect_timeout_sec full policy)
   "MCP wrapper for `anvil-orchestrator-submit-and-collect'.
 
 MCP Parameters:
   provider - Provider name string (e.g. \"claude\", \"codex\").
+             Pass \"auto\" (Doc 22) to defer selection to the
+             routing layer.
   prompt   - Prompt text string.  Required.
   model    - Optional provider-specific model id override.
   name     - Optional human-readable task label.
@@ -3149,7 +3193,10 @@ MCP Parameters:
                          the task.
   full                 - Truthy string (\"t\" / \"true\") asks
                          extract-result to re-parse without
-                         summary truncation."
+                         summary truncation.
+  policy               - Optional routing policy name used only
+                         when provider=\"auto\" (\"speed\" /
+                         \"cost\" / \"balanced\" / \"quality\")."
   (anvil-server-with-error-handling
     (unless (and (stringp provider) (not (string-empty-p provider)))
       (user-error "submit-and-collect: provider required"))
@@ -3168,7 +3215,9 @@ MCP Parameters:
        :budget-usd          (num budget_usd)
        :timeout-sec         (num timeout_sec)
        :collect-timeout-sec (or (num collect_timeout_sec) 180)
-       :full (anvil-orchestrator--coerce-truthy-string full)))))
+       :full (anvil-orchestrator--coerce-truthy-string full)
+       :policy (and policy (not (string-empty-p policy))
+                    (intern policy))))))
 
 (defun anvil-orchestrator--tool-tail (task_id &optional stream bytes)
   "MCP wrapper for `anvil-orchestrator-tail'.
@@ -3822,13 +3871,17 @@ Response plist includes :events / :last-seq / :task-status."
   (anvil-orchestrator--restore-from-state)
   (anvil-orchestrator--restore-consensus-from-state)
   (anvil-orchestrator--register-tools)
+  (require 'anvil-orchestrator-routing)
+  (anvil-orchestrator-routing--register-tools)
   (anvil-orchestrator--ensure-pump-timer))
 
 (defun anvil-orchestrator-disable ()
   "Disable the module: unregister tools, cancel the pump timer."
   (interactive)
   (anvil-orchestrator--cancel-pump-timer)
-  (anvil-orchestrator--unregister-tools))
+  (anvil-orchestrator--unregister-tools)
+  (when (featurep 'anvil-orchestrator-routing)
+    (anvil-orchestrator-routing--unregister-tools)))
 
 (provide 'anvil-orchestrator)
 ;;; anvil-orchestrator.el ends here
