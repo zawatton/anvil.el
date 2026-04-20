@@ -108,7 +108,15 @@ These are not loaded by default.  Available modules:
                 (Doc 11 Phase 1+2, requires Emacs 29+)
 - `bisect'    — Test-driven git bisect that pins a failing ERT
                 test to the introducing commit via worktree-
-                isolated emacs --batch steps (Doc 13 Phase 1)"
+                isolated emacs --batch steps (Doc 13 Phase 1)
+- `treesit'   — Tree-sitter shared core for per-language structural
+                editing modules (Doc 21).  Registers no tools
+                itself; language modules depend on it.
+- `py'        — Python read-only structural locators: py-list-imports
+                / py-list-functions / py-list-classes / py-list-methods
+                / py-list-decorators / py-find-definition /
+                py-surrounding-form.  Requires Emacs 29+ treesit and
+                tree-sitter-python grammar (Doc 21 Phase 1a)"
   :type '(repeat symbol)
   :group 'anvil)
 

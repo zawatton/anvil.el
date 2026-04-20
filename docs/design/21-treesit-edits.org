@@ -1,13 +1,16 @@
 #+title: anvil-treesit — Tree-sitter Structural Edits (Python / TypeScript / JavaScript)
 #+date: 2026-04-19
 #+author: zawatton
-#+property: status DRAFT
+#+property: status SHIPPED
 
 * STATUS
   :PROPERTIES:
   :ID:       d157a927-ac3a-4d51-b3d2-f132810ac087
   :END:
-~DRAFT~ (revised 2026-04-20)
+Phase 1a ~SHIPPED~ 2026-04-20 (shared core + Python locators,
+20 tests against =tests/fixtures/py-sample/app.py=).  Phase 1b
+(TS/JS locators), Phase 2 (structural edits), Phase 3 (cross-file
+rename), Phase 4 (extract/inline) still ~DRAFT~.
 
 Sibling of Doc 12 (anvil-sexp, elisp).  Provides tree-sitter-backed
 structural editing for brace-and-keyword languages, with a shared
