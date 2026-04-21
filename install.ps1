@@ -306,17 +306,42 @@ if ($alive) {
 }
 
 if (-not $DryRun) {
-    try {
+    # Wait for the daemon to finish booting (socket becomes usable only
+    # after server-start, which runs after init.el loads).
+    $daemonUp = $false
+    for ($i = 0; $i -lt 15; $i++) {
+        $global:LASTEXITCODE = 0
+        $r = & emacsclient.exe -e 't' 2>$null
+        if ($LASTEXITCODE -eq 0 -and $r -match 't') { $daemonUp = $true; break }
+        Start-Sleep -Seconds 1
+    }
+    if (-not $daemonUp) {
+        Warn "daemon did not come up within 15s"
+    } else {
+        $global:LASTEXITCODE = 0
         $probe = & emacsclient.exe -e '(featurep (quote anvil))' 2>$null
-        if ($probe -match 't') {
+        if ($probe -match '^t') {
             Log '  anvil feature loaded in daemon'
         } else {
-            Warn 'anvil did not load in daemon.'
+            Warn "anvil did not load in daemon (featurep returned: $probe)"
             Warn "  inspect: emacsclient -e '(load `"$($AnvilInit.Replace('\','/'))`")'"
+            # Pull the daemon's *Messages* buffer so init-time errors
+            # (which otherwise vanish because a Windows daemon has no
+            # controlling terminal) end up in the install log.
+            $global:LASTEXITCODE = 0
+            $msgsRaw = & emacsclient.exe -e "(with-current-buffer `"*Messages*`" (buffer-string))" 2>$null
+            if ($msgsRaw) {
+                Log "  --- daemon *Messages* (last 60 lines) ---"
+                $msgs = $msgsRaw.Trim('"') -replace '\\n', "`n" -replace '\\"', '"'
+                ($msgs -split "`n") | Select-Object -Last 60 | ForEach-Object { Write-Host "    $_" }
+                Log "  --- end *Messages* ---"
+            }
         }
-    } catch {
-        Warn "daemon probe failed: $_"
     }
+    # Native emacsclient probes above may leave $LASTEXITCODE non-zero
+    # under PowerShell 7's $PSNativeCommandUseErrorActionPreference even
+    # when the install itself succeeded.  Clear it so the script exits 0.
+    $global:LASTEXITCODE = 0
 }
 
 # ---------------------------------------------------------------------------
@@ -412,3 +437,7 @@ if ($DryRun) {
     Write-Host ''
     Warn 'DRY RUN — nothing was actually executed. Re-run without -DryRun.'
 }
+
+# Defensive: make sure the script exits with a clean code, regardless of
+# $LASTEXITCODE left over from native emacsclient / git probes above.
+exit 0

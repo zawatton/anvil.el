@@ -209,14 +209,18 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
-          # Note: do NOT set $env:HOME here so the output reflects the
-          # real (possibly empty) HOME value that caused the failure.
           $EmacsDir = Join-Path $env:USERPROFILE '.emacs.d'
 
-          Write-Host "--- env ---"
+          Write-Host "--- env (as inherited by this step) ---"
           Write-Host "USERPROFILE=$env:USERPROFILE"
-          Write-Host "HOME=$env:HOME"
+          Write-Host "HOME (inherited)=$env:HOME"
           Write-Host "APPDATA=$env:APPDATA"
+          # Align HOME with where install.ps1 + the daemon agreed, so the
+          # rest of this step can actually talk to the daemon it started.
+          # We already printed the inherited value above, so the real
+          # state at failure time is on record.
+          $env:HOME = $env:USERPROFILE
+          Write-Host "HOME (realigned to USERPROFILE for probes)=$env:HOME"
           Write-Host "PATH head:"
           ($env:PATH -split ';') | Select-Object -First 10 | ForEach-Object { Write-Host "  $_" }
 
