@@ -121,33 +121,53 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $EmacsDir = Join-Path $env:USERPROFILE '.emacs.d'
 
-          if (-not (Test-Path "$EmacsDir\anvil-init.el"))  { throw "anvil-init.el missing" }
-          if (-not (Test-Path "$EmacsDir\anvil-stdio.sh")) { throw "anvil-stdio.sh missing" }
-          if (-not (Test-Path "$EmacsDir\anvil-stdio.cmd")) { throw "anvil-stdio.cmd missing" }
+          Write-Host "[gate 1/7] file presence"
+          if (-not (Test-Path "$EmacsDir\anvil-init.el"))   { throw "anvil-init.el missing at $EmacsDir\anvil-init.el" }
+          if (-not (Test-Path "$EmacsDir\anvil-stdio.sh"))  { throw "anvil-stdio.sh missing at $EmacsDir\anvil-stdio.sh" }
+          if (-not (Test-Path "$EmacsDir\anvil-stdio.cmd")) { throw "anvil-stdio.cmd missing at $EmacsDir\anvil-stdio.cmd" }
+
+          Write-Host "[gate 2/7] init.el loads anvil-init"
           if (-not (Select-String -Path "$EmacsDir\init.el" -SimpleMatch 'anvil-init.el' -Quiet)) {
-              throw "init.el does not load anvil-init"
+              throw "init.el does not load anvil-init (path: $EmacsDir\init.el)"
           }
 
-          # Give the backgrounded daemon a moment to come up.
+          Write-Host "[gate 3/7] daemon wait (up to 30s)"
           $up = $false
-          for ($i = 0; $i -lt 10; $i++) {
+          for ($i = 0; $i -lt 30; $i++) {
               try {
                   $probe = & emacsclient.exe -e 't' 2>$null
-                  if ($probe -match 't') { $up = $true; break }
+                  if ($LASTEXITCODE -eq 0 -and $probe -match 't') {
+                      $up = $true
+                      Write-Host "  daemon responded after $($i + 1)s"
+                      break
+                  }
               } catch {}
               Start-Sleep -Seconds 1
           }
-          if (-not $up) { throw "daemon not responding" }
+          if (-not $up) {
+              Write-Host "  last probe output: $probe"
+              Write-Host "  last exit code:    $LASTEXITCODE"
+              throw "daemon not responding after 30s"
+          }
 
-          $probe = & emacsclient.exe -e '(featurep (quote anvil))'
-          if ($probe -notmatch 't') { throw "anvil feature not loaded (got: $probe)" }
+          Write-Host "[gate 4/7] (featurep 'anvil)"
+          $probe = & emacsclient.exe -e '(featurep (quote anvil))' 2>&1
+          Write-Host "  raw: $probe"
+          if ($probe -notmatch '^t') { throw "anvil feature not loaded (got: $probe)" }
 
-          $probe = & emacsclient.exe -e '(fboundp (quote anvil-server-start))'
-          if ($probe -notmatch 't') { throw "anvil-server-start not bound (got: $probe)" }
+          Write-Host "[gate 5/7] (fboundp 'anvil-server-start)"
+          $probe = & emacsclient.exe -e '(fboundp (quote anvil-server-start))' 2>&1
+          Write-Host "  raw: $probe"
+          if ($probe -notmatch '^t') { throw "anvil-server-start not bound (got: $probe)" }
 
+          Write-Host "[gate 6/7] ~/.claude.json parseable"
           $cfg = Get-Content -Raw -Path "$env:USERPROFILE\.claude.json" | ConvertFrom-Json
-          if (-not $cfg.mcpServers.anvil.command.EndsWith('.cmd')) {
-              throw "mcpServers.anvil.command should point at anvil-stdio.cmd on Windows (got: $($cfg.mcpServers.anvil.command))"
+
+          Write-Host "[gate 7/7] mcpServers.anvil.command ends with .cmd"
+          $cmd = $cfg.mcpServers.anvil.command
+          Write-Host "  command: $cmd"
+          if (-not $cmd.EndsWith('.cmd')) {
+              throw "mcpServers.anvil.command should point at anvil-stdio.cmd on Windows (got: $cmd)"
           }
 
           Write-Host "PASS"
@@ -181,19 +201,50 @@ jobs:
         if: failure() && runner.os == 'Windows'
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Continue'
           $EmacsDir = Join-Path $env:USERPROFILE '.emacs.d'
+
           Write-Host "--- env ---"
           Write-Host "USERPROFILE=$env:USERPROFILE"
-          Get-Command emacs.exe -ErrorAction SilentlyContinue | Format-List
+          Write-Host "HOME=$env:HOME"
+          Write-Host "PATH head:"
+          ($env:PATH -split ';') | Select-Object -First 10 | ForEach-Object { Write-Host "  $_" }
+
+          Write-Host "--- emacs binaries ---"
+          Get-Command emacs.exe, emacsclient.exe, runemacs.exe -ErrorAction SilentlyContinue | Format-List
+          & emacs.exe --version 2>&1 | Select-Object -First 2
+          & emacsclient.exe --version 2>&1 | Select-Object -First 2
+
           Write-Host "--- anvil-init.el ---"
           Get-Content "$EmacsDir\anvil-init.el" -ErrorAction SilentlyContinue
           Write-Host "--- init.el ---"
           Get-Content "$EmacsDir\init.el" -ErrorAction SilentlyContinue
+          Write-Host "--- ~/.emacs ---"
+          Get-Content "$env:USERPROFILE\.emacs" -ErrorAction SilentlyContinue
           Write-Host "--- anvil-stdio.cmd ---"
           Get-Content "$EmacsDir\anvil-stdio.cmd" -ErrorAction SilentlyContinue
           Write-Host "--- ~/.claude.json ---"
           Get-Content "$env:USERPROFILE\.claude.json" -ErrorAction SilentlyContinue
+
+          Write-Host "--- server socket / auth file ---"
+          $serverDir = Join-Path $EmacsDir 'server'
+          if (Test-Path $serverDir) {
+              Get-ChildItem $serverDir | Format-Table Name, Length, LastWriteTime
+          } else {
+              Write-Host "  $serverDir does not exist"
+          }
+
           Write-Host "--- emacs processes ---"
-          Get-Process emacs -ErrorAction SilentlyContinue | Format-Table
+          Get-Process emacs, runemacs -ErrorAction SilentlyContinue | Format-Table Id, ProcessName, StartTime
+
           Write-Host "--- daemon probe ---"
           & emacsclient.exe -e 't' 2>&1
+          Write-Host "  exit: $LASTEXITCODE"
+
+          Write-Host "--- daemon stderr probe (load anvil-init manually) ---"
+          $initPath = ($EmacsDir + '\anvil-init.el').Replace('\','/')
+          & emacsclient.exe -e "(condition-case e (progn (load `"$initPath`") 'loaded) (error (format `"%S`" e)))" 2>&1
+          Write-Host "  exit: $LASTEXITCODE"
+
+          Write-Host "--- loaded features (sample) ---"
+          & emacsclient.exe -e "(seq-take (mapcar #'symbol-name features) 50)" 2>&1
