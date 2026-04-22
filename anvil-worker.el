@@ -465,8 +465,9 @@ Each worker plist carries:
 (defun anvil-worker--server-file (lane index)
   "Return server file path for worker LANE/INDEX."
   (expand-file-name
-   (concat "server/" (anvil-worker--name lane index))
-   user-emacs-directory))
+   (anvil-worker--name lane index)
+   (expand-file-name
+    (if server-use-tcp server-auth-dir server-socket-dir))))
 
 (defun anvil-worker--log (event &optional details)
   "Append EVENT with optional DETAILS to the lifecycle log."
@@ -578,17 +579,20 @@ Emacs server files start with `HOST:PORT PID' on line one."
         (string-to-number (match-string 1))))))
 
 (defun anvil-worker--server-file-stale-p (server-file)
-  "Return non-nil if SERVER-FILE's recorded PID is no longer running.
-A missing PID (unparseable file) is treated as stale too."
-  (let ((pid (anvil-worker--server-file-pid server-file)))
-    (or (null pid)
-        (null (process-attributes pid)))))
+  "Return non-nil if SERVER-FILE no longer points at a live server.
+TCP auth files are checked via the recorded PID.  Local socket
+servers are checked via `server-running-p' on the socket basename."
+  (if server-use-tcp
+      (let ((pid (anvil-worker--server-file-pid server-file)))
+        (or (null pid)
+            (null (process-attributes pid))))
+    (not (server-running-p (file-name-nondirectory server-file)))))
 
 (defun anvil-worker--worker-alive-p (worker)
   "Return non-nil if WORKER plist is reachable.
-Performs the same three checks as `anvil-worker-alive-p'
-(file-exists / PID still alive / bounded `emacsclient' probe)
-and deletes a stale server file as a side-effect."
+Performs the same cheap checks as `anvil-worker--quick-alive-p'
+followed by a bounded `emacsclient' probe, and deletes a stale
+server file as a side-effect."
   (let ((server-file (plist-get worker :server-file)))
     (cond
      ((not (file-exists-p server-file)) nil)
@@ -637,9 +641,10 @@ its server socket before we start firing `emacsclient' at it."
 (defun anvil-worker--quick-alive-p (worker)
   "Fast, non-blocking alive check for WORKER.
 Unlike `anvil-worker--worker-alive-p', this never spawns an
-`emacsclient' probe — it only checks file existence and PID
-liveness.  Returns non-nil when the server file exists AND its
-PID is still running.  Deletes stale server files as a side
+`emacsclient' probe — it only checks file existence plus cheap
+liveness (`server-running-p' for local sockets, PID parsing for
+TCP auth files).  Returns non-nil when the server file exists and
+still points at a live server.  Deletes stale server files as a side
 effect."
   (let ((server-file (plist-get worker :server-file)))
     (cond
@@ -1047,7 +1052,7 @@ cheap enough to poll at interactive rates."
                      (alive  (anvil-worker--quick-alive-p w))
                      (busy   (plist-get w :busy))
                      (sfile  (plist-get w :server-file))
-                     (pid    (and alive
+                     (pid    (and server-use-tcp alive
                                   (anvil-worker--server-file-pid sfile))))
                 (push (format "    %s: %s%s%s"
                               (plist-get w :name)
