@@ -1,7 +1,7 @@
 #+title: anvil-session — Cross-Session Context Handoff for Claude
 #+date: 2026-04-19
 #+author: zawatton
-#+property: status DRAFT
+#+property: status SHIPPED
 #+property: scope GENERIC
 
 * STATUS

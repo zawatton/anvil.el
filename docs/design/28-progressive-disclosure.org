@@ -1,7 +1,7 @@
 #+title: anvil-progressive-disclosure — 3-Layer Read Contract + Citation URI
 #+date: 2026-04-20
 #+author: zawatton
-#+property: status APPROVED
+#+property: status SHIPPED
 #+property: scope GENERIC
 
 * STATUS

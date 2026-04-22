@@ -5,6 +5,189 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-04-22
+
+AI agent workbench release.  Fourteen new design documents (Doc 21-34)
+worth of primitives turn anvil from a tool-per-task module collection
+into a cohesive agent development platform: memory engine, intent-based
+tool discovery + profile filter, structural edits for Python / TS / JS /
+Elisp-CST, shell output compression, session snapshot + Claude Code
+lifecycle hooks.
+
+Test suite: **640 → 1198 passing (+558, +87%)**.  20 new `anvil-*.el`
+modules.  +39,343 / -408 lines across 145 files.
+
+### Added — AI agent core
+
+- **`memory` module (Doc 29)** — Bayesian + TTL + FTS5 auto-memory
+  engine with 16 MCP tools (`memory-scan` / `memory-audit` /
+  `memory-access` / `memory-list` / `memory-search` / `memory-duplicates` /
+  `memory-promote` / `memory-serve-start` etc.).  Indexes
+  `~/.claude/projects/*/memory/*.md` into SQLite, tracks contradictions
+  and URL liveness, surfaces stale rows to `memory-pruner`.  +115 ERT.
+- **`session` module (Doc 17)** — session snapshot / resume plus 5
+  Claude Code lifecycle hooks (PreCompact / SessionStart / PostToolUse
+  / UserPromptSubmit / SessionEnd).  `session-snapshot` captures branch
+  + task summary into anvil-state ns=session (14-day TTL), returns a
+  `preamble-suggested` resume block; `anvil-hook install` wires the
+  hook set into `~/.claude/settings.json`.  +19 ERT.
+- **`shell-filter` module (Doc 27)** — shell output compression with
+  20 bundled filters (git status / git log / git diff / rg / find /
+  pytest / ert-batch / emacs-batch / make / docker-logs / …) + tee +
+  gain statistics.  Raw output stashed under `shell-tee` namespace with
+  TTL so callers can recover on demand.  Depends on `state`.
+- **`disclosure` module (Doc 28)** — 3-layer read contract and citation
+  URI scheme.  `file-outline` / `org-index-index` / `defs-index` /
+  `journal-index` / `http-cache-index` (Layer 1), `file-read-snippet`
+  (Layer 2), `file-read` / `org-read-headline` / `org-read-by-id` /
+  `elisp-get-function-definition` / `http-cache-get` (Layer 3).
+  `disclosure-help` tool prints the contract; `anvil-uri-fetch` is a
+  cross-layer resolver.
+- **`discovery` module (Doc 34)** — intent-based MCP tool discovery
+  (Phase A) + `agent` / `edit` intent-based profiles (Phase B) +
+  orchestrator auto-injection + per-tool usage counter + release-audit
+  `:unused-since` scanner (Phase C).  `anvil-tools-by-intent` returns
+  tools matching intent CSV / layer / query regex, sorted by layer rank
+  and intent overlap.  All 198 registered tools tagged with `:intent` /
+  `:layer` / `:stability` metadata.  +27 ERT across discovery / manifest
+  / orchestrator / dev.
+
+### Added — Token efficiency
+
+- **`manifest` module (Doc 26)** — per-session `tools/list` profile
+  filter driven by `ANVIL_PROFILE`.  Five legacy profiles (`ultra` /
+  `nav` / `core` / `lean` / `full`) advertise curated tool subsets to
+  shrink the manifest token cost; handlers of hidden tools stay
+  callable via explicit `tools/call`.  Phase 1b auto-injects
+  `--mcp-config` into orchestrator child sessions.
+- **Intent-based profiles** (Doc 34 Phase B) — `agent` (orchestrator /
+  session / memory / browser + edit tools, layer=core+workflow) and
+  `edit` (file / org / code / json / db only, layer=core).  Filter by
+  metadata instead of hand-curated ID lists.
+
+### Added — Language-aware structural edits
+
+- **`sexp` module (Doc 12 Phase 1+2)** — reader-based edits for Elisp:
+  `sexp-read-file` / `sexp-surrounding-form` / `sexp-rename-symbol` /
+  `sexp-replace-call` / `sexp-replace-defun` / `sexp-wrap-form` /
+  `sexp-macroexpand` / `sexp-verify`.  +48 ERT.
+- **`sexp-cst` module (Doc 31)** — tree-sitter-elisp CST + runtime
+  `inspect-object` tool for any live Lisp value.  `sexp-cst-read`
+  (comment-preserving CST), `sexp-cst-edit` + `-write` (point-offset
+  replacement with re-parse validation), `sexp-cst-repair` (paren +
+  unterminated-string balancing).  +47 ERT.
+- **`py` module (Doc 21 Phase 1)** — Python structural locators and
+  edits via treesit: `py-list-imports` / `py-list-functions` /
+  `py-list-classes` / `py-list-methods` / `py-list-decorators` /
+  `py-find-definition` / `py-surrounding-form` plus edit tools
+  `py-add-import` / `py-remove-import` / `py-rename-import` /
+  `py-replace-function` / `py-wrap-expr`.  +55 ERT.
+- **`ts` + `js` modules (Doc 21 Phase 2)** — TS/TSX + JS/JSX locators:
+  `ts-list-imports/exports/functions/classes/methods/interfaces/
+  type-aliases/find-definition/surrounding-form` and the `js-*`
+  mirror.  +25 ERT (ts) + ts-test fixtures.
+- **`defs` module (Doc 11)** — SQLite-backed Elisp symbol index.
+  `defs-search` / `defs-references` / `defs-signature` /
+  `defs-who-requires` / `defs-index-rebuild` / `defs-index-status`.
+  +52 ERT.
+
+### Added — Developer workflow
+
+- **`bench` module (Doc 14)** — `bench-compare` / `bench-profile-expr`
+  / `bench-last`.
+- **`bisect` module (Doc 13)** — test-driven git bisect via worktree-
+  isolated `emacs --batch`.  `bisect-test` pins a failing ERT to the
+  introducing commit.  +12 ERT.
+- **`git-msg` module (Doc 15)** — `git-commit-message` (from staged
+  diff) and `git-pr-body` (from branch log).  +17 ERT.
+- **`lint` module (Doc 16)** — repo hygiene scanner with pluggable
+  registry: `conflict-markers` (error), `orphan-ids` (info),
+  `broken-scheduled` (warning).  +13 ERT.
+- **`data` module (Doc 33)** — JSON path-based edits with preview-by-
+  default: `data-get-path` / `data-set-path` / `data-delete-path` /
+  `data-list-keys` for `~/.claude.json`, `package.json`, MCP configs.
+  +28 ERT.
+
+### Added — Orchestrator polish
+
+- **Provider latency routing (Doc 22)** — `orchestrator-routing-select`
+  for per-provider latency-aware dispatch.  +13 ERT.
+- **Consensus presets (Doc 23)** — named provider combinations ship
+  with `orchestrator-consensus-*` family.  +16 ERT.
+- **Orchestrator submit-and-collect** — one-shot dispatch + wait
+  combinator for programmatic callers.
+- **Preamble management** — `orchestrator-preamble-set/-get/-list/
+  -delete/-set-from-file` for reusable system prompts.
+- **Live streaming** — `orchestrator-stream` + `orchestrator-tail`
+  forward provider stdout as MCP events while the task runs.
+- **Cross-session stats** — `orchestrator-stats` aggregates batch
+  history across daemon restarts via anvil-state.
+
+### Added — Tool discovery and counters
+
+- `anvil-tools-by-intent` — intent CSV / layer / query regex / stability
+  filter, deprecated always hidden, experimental opt-in, layer-ranked
+  output.
+- `anvil-tools-usage-report` — per-tool counter summary (days
+  threshold, never-called bucket, unused-since bucket, recency
+  sort).
+- `anvil-dev-release-audit` gains `:unused-since N` scanner —
+  advisory-only Phase C hazard: does not flip `:clean-p`.
+
+### Changed
+
+- **`anvil-server-encode-handler` internals** — replaced `eval +
+  constructed lambda` with `make-symbol + fset + apply-partially +
+  symbol-property` (`anvil-server-raw-handler` /
+  `anvil-server-encode-result`).  `anvil-server-register-tool`
+  normalizes wrappers back to the raw handler for schema generation
+  and docstring validation.  Fixes silent `enable` skip for `sexp` /
+  `py` / `bench` / `git-msg` optional modules (PR #12, @yours57).
+- **`git` MCP handlers** — sentinels `:null` / `:empty-array` →
+  literal strings `"null"` / `"[]"` (visible wire-format change).
+  All 8 git tools now wrapped via `anvil-server-encode-handler` at
+  registration; 6 dedicated ERT.
+- **Worker server files** — path moved from
+  `user-emacs-directory/server/` to `server-auth-dir` /
+  `server-socket-dir`; liveness check uses `server-running-p` for
+  local sockets, PID parsing for TCP auth files.
+- **`anvil-server-tool-filter-function`** — now receives
+  `(TOOL-ID TOOL-PLIST SERVER-ID)` so filters can branch on metadata.
+  `anvil-manifest` uses the full signature for intent-based filtering.
+- **`anvil-server-tool-dispatch-hook`** (new abnormal hook) — runs
+  after each successful handler return with `(TOOL-ID SERVER-ID)`;
+  used by `anvil-discovery` to maintain usage counters without
+  coupling `anvil-server` to `anvil-state`.
+
+### Fixed
+
+- **Encoded handler registration bug** — `anvil-server-encode-handler`
+  previously returned `(lambda (&rest args) ...)` which
+  `anvil-server--generate-schema-from-function` rejected; silently
+  skipped `enable` for `sexp` / `py` / `bench` / `git-msg` and made
+  every re-register via `unload-feature` break.  Fixed via the
+  symbol-backed wrapper path above (PR #12).
+- **JSON encoder on dotted pairs** — `anvil-server--to-json-value`
+  crashed with `listp` error on alist entries like `(cons "k" 1.0)`.
+  New `anvil-server--list-to-json-array` emits `[car, cdr]` for
+  improper lists so `mapcar` can't trip.
+- **`xref_find_apropos`** — missing `(require 'apropos)` made the
+  tool void-function on fresh Emacs installs.
+- **Worker liveness** — Unix-socket workers wrongly reported alive
+  via file existence alone; now goes through `server-running-p`.
+
+### Documentation
+
+- Fourteen new design docs (Doc 21-34).  Six docs (18 / 19 / 20 / 24
+  / 25 / 30) explicitly DEFERRED — out of scope for this release.
+  Doc 32 is an audit memo (rhblind/emacs-mcp-server positioning,
+  informational only).
+- `CLAUDE.md` selection flowchart trimmed (11 rows → 5) — discoverable
+  entries moved to `anvil-tools-by-intent` runtime query; only
+  size/shape heuristics kept.
+- Platform files (`linux.md` / `windows.md`) gained a `tool 探索`
+  section documenting `ANVIL_PROFILE=agent` / `edit` usage.
+
 ## [0.3.1] - 2026-04-19
 
 Hotfix surfaced by the v0.3.0 orchestrator benchmark
