@@ -8,14 +8,15 @@
   :PROPERTIES:
   :ID:       c6f05c1e-72a6-4e3b-87a6-d0a6a3b7c004
   :END:
-~Phase 1a + 1b + 2a + 2b (i/ii/iii) + 3a SHIPPED~ (2026-04-22、
+~Phase 1a + 1b + 2a + 2b (i/ii/iii) + 3a + 3b SHIPPED~ (2026-04-22、
 stacked feat branches) — Week-3 Ship 4、競合 token-savior の
 "memory engine" を anvil + Claude Code auto-memory に統合する。
 非 destructive (metadata layer のみ SQLite、memory =.md= files の
 rename 以外は不変) の foundation + 検出 + ranking & lifecycle +
 tokenizer swap + LLM verdict + MDL distillation + static HTML
-viewer。Phase 3b (TCP server) / 3c (htmx + contradiction graph) /
-Phase 4 (cross-project) はオプション扱い。
+viewer + live TCP server (loopback HTTP + JSON API)。Phase 3c
+(htmx + contradiction graph) / Phase 4 (cross-project) は
+オプション扱い。
 
 *Phase 1a (feat/doc-29-memory-engine-phase1a):* =anvil-memory.el=
 metadata 索引 + scan + per-type TTL audit + access tracker + 4
@@ -77,6 +78,17 @@ name / description、filename、decay (数値 + 3 段階 color bar)、
 access_count、last-accessed。memory body は embed しない (.html 漏洩
 時の session text 保護)。新 MCP tool =memory-export-html=
 (root / out_path / title)。10 ERT (合計 91)。
+
+*Phase 3b (feat/doc-29-memory-engine-phase3b):*
+=anvil-memory-serve-start &key host port root= で localhost
+HTTP/1.0 サーバ起動 (=make-network-process :server t=)。routes:
+=GET /= → Phase 3a HTML、=GET /api/list= → JSON metadata 配列、
+=GET /api/decay-heatmap= → per-type (count, mean_decay) 集計。
+HTTP/1.0 + =Connection: close= で 1 request = 1 socket、
+per-client filter state は client process plist の
+=:request-buffer= に分離。loopback default (=127.0.0.1=)、
+ephemeral port は =:port t=。stop は idempotent。新 MCP tool 2 本
+(=memory-serve-start= / =memory-serve-stop=)。11 ERT (合計 102)。
 
 *module placement:* =anvil-optional-modules= の =memory= (Emacs 29+
 SQLite 依存、opt-in)。=with_urls= audit は =anvil-http= を別途
@@ -429,14 +441,45 @@ read-only flag 付き。
 
 commit: =f3ce484= (test-lock、10 ERT) → =a724206= (impl、+223 行)。
 
-** Phase 3b — live TCP server (~DRAFT~)
+** Phase 3b — live TCP server (~SHIPPED~ 2026-04-22)
 
-=anvil-memory-serve &key port host= で =make-network-process= の
-TCP HTTP server を立て、=/= = Phase 3a HTML 同形、=/api/list= =
-JSON 応答、=/api/decay= = heatmap JSON。lifecycle は
-=anvil-memory-serve-stop= / process sentinel で管理。host は
-=127.0.0.1= default (localhost-only)。pty-broker / worker の
-=make-network-process= pattern を流用。
+=anvil-memory-serve-start &key host port root= で
+=make-network-process :server t= の HTTP/1.0 server 起動。
+stop は idempotent な =anvil-memory-serve-stop= (前回 bind port
+を返す、nil = 既に停止)。defcustom =anvil-memory-serve-host=
+(default =127.0.0.1=) と =anvil-memory-serve-port= (default
+8729、=t= 指定で kernel 任意 free port)。
+
+routes:
+- =GET /= → Phase 3a HTML (live rebuild、decay desc sort)
+- =GET /api/list= → JSON array、row: =file= / =type= / =access_
+  count= / =last_accessed= / =decay_score=
+- =GET /api/decay-heatmap= → JSON array、=type= / =count= /
+  =mean_decay= の per-type 集計
+- other methods → 405、unknown paths → 404、malformed request
+  line → 400、handler error → 500
+
+設計:
+- =Connection: close= + HTTP/1.0 で keep-alive 無し、1 request =
+  1 socket。per-connection filter state (=:request-buffer=) は
+  *client process* の plist に乗るので concurrent でもぶつからない。
+- =--serve-dispatch METHOD PATH= は pure function、REPL
+  debugging 容易。
+- JSON encode は built-in =json.el= (= require 済)。symbol は
+  =(symbol-name type)= で文字列化、=:null= で JSON null。
+- server auth は無し (local only)。non-loopback bind は defcustom
+  docstring で明示警告。
+
+新 MCP tool 2 本: =memory-serve-start= (host / port / root 全
+string coerce、port "0" → ephemeral) / =memory-serve-stop=
+(idempotent、:stopped = was-bound port or nil)。
+
+test fixture で HTTP client を =make-network-process= で書き、
+=:port t= で ephemeral port を受ける (=process-contact proc
+:service= で assigned port を取得)。3s timeout + unwind-protect
+delete-process で hang safe。
+
+commit: =a6ca5f0= (test-lock、11 ERT) → =79fa6a6= (impl、+290 行)。
 
 ** Phase 3c — htmx interactive + contradiction graph (~DRAFT~)
 
