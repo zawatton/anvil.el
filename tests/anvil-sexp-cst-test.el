@@ -887,6 +887,127 @@ wrapper skill that names backups after the originating LLM turn)."
       (ignore-errors (delete-file backup-path)))))
 
 
+;;;; --- sexp-cst-repair (Phase 3a) ----------------------------------------
+
+(defun anvil-sexp-cst-test--repair-available-p ()
+  "Return non-nil when Phase 3a close-paren balancing is live."
+  (and (anvil-sexp-cst-test--available-p 'cst-repair)
+       (fboundp 'anvil-sexp-cst-repair)))
+
+(defun anvil-sexp-cst-test--invoke-repair (&rest args)
+  "Call `anvil-sexp-cst-repair' with ARGS and parse its JSON result."
+  (let ((raw (apply #'anvil-sexp-cst-repair args)))
+    (should (stringp raw))
+    (json-parse-string raw :object-type 'hash-table
+                       :array-type 'array
+                       :null-object :null
+                       :false-object :false)))
+
+(ert-deftest anvil-sexp-cst-test-repair-adds-close-parens ()
+  "Happy path: file with missing `)' at EOF is rescued by appending
+close-parens until tree-sitter reports no ERROR nodes.  The fix
+descriptor reports where and how many parens were added, and
+`repaired-content' ends with the compensating closes."
+  (skip-unless (anvil-sexp-cst-test--repair-available-p))
+  (skip-unless (anvil-sexp-cst-test--grammar-ready-p))
+  (anvil-sexp-cst-test--with-elisp-file path
+      "(defun foo () (+ 1 2"
+    (let* ((obj (anvil-sexp-cst-test--invoke-repair path))
+           (before (anvil-sexp-cst-test--get obj "before"))
+           (after  (anvil-sexp-cst-test--get obj "after"))
+           (fix    (anvil-sexp-cst-test--get obj "fix"))
+           (repaired (anvil-sexp-cst-test--get obj "repaired-content")))
+      (should (equal (anvil-sexp-cst-test--get obj "type") "repair-result"))
+      (should (hash-table-p before))
+      (should (hash-table-p after))
+      (should (hash-table-p fix))
+      (should (stringp repaired))
+      (should (equal (gethash "kind" fix) "close-paren-added"))
+      (should (equal (gethash "added" fix) 2))
+      (should (integerp (gethash "position" fix)))
+      (should (> (gethash "position" fix) 0))
+      (should (eq (gethash "has-error" after) :false))
+      (should (equal (gethash "paren-delta" after) 0))
+      (should (string-suffix-p "))" repaired))
+      (should (> (gethash "bytes" after)
+                 (gethash "bytes" before))))))
+
+(ert-deftest anvil-sexp-cst-test-repair-noop-when-balanced ()
+  "Already-balanced files round-trip as a noop: fix.kind=\"noop\",
+added=0, and `repaired-content' is byte-identical to the source.
+Guards against gratuitous writes when the LLM mis-invokes repair."
+  (skip-unless (anvil-sexp-cst-test--repair-available-p))
+  (skip-unless (anvil-sexp-cst-test--grammar-ready-p))
+  (anvil-sexp-cst-test--with-elisp-file path
+      "(defvar x 1)\n"
+    (let* ((original (anvil-sexp-cst-test--read-file-contents path))
+           (obj (anvil-sexp-cst-test--invoke-repair path))
+           (fix    (anvil-sexp-cst-test--get obj "fix"))
+           (before (anvil-sexp-cst-test--get obj "before"))
+           (after  (anvil-sexp-cst-test--get obj "after"))
+           (repaired (anvil-sexp-cst-test--get obj "repaired-content")))
+      (should (equal (anvil-sexp-cst-test--get obj "type") "repair-result"))
+      (should (equal (gethash "kind" fix) "noop"))
+      (should (equal (gethash "added" fix) 0))
+      (should (equal (gethash "paren-delta" before) 0))
+      (should (equal (gethash "paren-delta" after) 0))
+      (should (eq (gethash "has-error" before) :false))
+      (should (eq (gethash "has-error" after) :false))
+      (should (equal original repaired)))))
+
+(ert-deftest anvil-sexp-cst-test-repair-prepends-open-parens ()
+  "When the file has more `)' than `(', close-paren balancing cannot
+help — instead we prepend enough `(' at point-min to make the counts
+match.  The fix descriptor reports kind=\"open-paren-prepended\" and
+position=1."
+  (skip-unless (anvil-sexp-cst-test--repair-available-p))
+  (skip-unless (anvil-sexp-cst-test--grammar-ready-p))
+  (anvil-sexp-cst-test--with-elisp-file path
+      "(x 1))\n"
+    (let* ((obj (anvil-sexp-cst-test--invoke-repair path))
+           (fix (anvil-sexp-cst-test--get obj "fix"))
+           (after (anvil-sexp-cst-test--get obj "after"))
+           (repaired (anvil-sexp-cst-test--get obj "repaired-content")))
+      (should (equal (anvil-sexp-cst-test--get obj "type") "repair-result"))
+      (should (equal (gethash "kind" fix) "open-paren-prepended"))
+      (should (equal (gethash "added" fix) 1))
+      (should (equal (gethash "position" fix) 1))
+      (should (equal (gethash "paren-delta" after) 0))
+      (should (eq (gethash "has-error" after) :false))
+      (should (string-prefix-p "(" repaired)))))
+
+(ert-deftest anvil-sexp-cst-test-repair-returns-error-when-unfixable ()
+  "Structural damage beyond simple paren imbalance (e.g. an
+unterminated string) must surface as a typed `sexp-cst/repair-failed'
+error rather than silently returning an invalid `repaired-content'.
+This is the guardrail that keeps Phase 3a from over-promising: close-
+paren balancing only helps with the paren-delta family of breaks."
+  (skip-unless (anvil-sexp-cst-test--repair-available-p))
+  (skip-unless (anvil-sexp-cst-test--grammar-ready-p))
+  (anvil-sexp-cst-test--with-elisp-file path
+      "(foo \"unterminated"
+    (let* ((obj (anvil-sexp-cst-test--invoke-repair path))
+           (err (anvil-sexp-cst-test--get obj "error")))
+      (should (hash-table-p err))
+      (should (equal (gethash "kind" err) "sexp-cst/repair-failed"))
+      (should (stringp (gethash "message" err))))))
+
+(ert-deftest anvil-sexp-cst-test-repair-handles-missing-file ()
+  "Non-existent paths return a typed error envelope rather than
+crashing.  Uses the shared `sexp-cst/file-not-found' contract so
+callers can treat all sexp-cst-* tools uniformly."
+  (skip-unless (anvil-sexp-cst-test--repair-available-p))
+  (let* ((raw (anvil-sexp-cst-repair
+               "/no/such/file/zz-anvil-sct-repair-missing.el"))
+         (obj (json-parse-string raw :object-type 'hash-table
+                                 :array-type 'array
+                                 :null-object :null
+                                 :false-object :false))
+         (err (gethash "error" obj)))
+    (should (hash-table-p err))
+    (should (equal (gethash "kind" err) "sexp-cst/file-not-found"))))
+
+
 ;;;; --- meta-test: shape lock file is loaded and TDD-lite gate active -----
 
 (ert-deftest anvil-sexp-cst-test-meta-locks-loaded ()
