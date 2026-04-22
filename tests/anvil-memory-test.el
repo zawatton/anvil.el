@@ -1300,6 +1300,147 @@ forwarded keyword args so tests can assert call counts / contents."
         (should (equal "sonnet" (plist-get (car mock-calls) :model)))))))
 
 
+;;;; --- Phase 3a: HTML export (static viewer) -----------------------------
+
+(defun anvil-memory-test--seed-typed-mix (root)
+  "Populate ROOT with one memory per type for HTML export smoke tests."
+  (anvil-memory-test--write
+   (expand-file-name "user_role.md" root)
+   "---\nname: User Role\ndescription: I am a senior electrical engineer.\n---\n")
+  (anvil-memory-test--write
+   (expand-file-name "feedback_commits.md" root)
+   "---\nname: Commit rule\ndescription: Co-Authored-By every time.\n---\n")
+  (anvil-memory-test--write
+   (expand-file-name "project_anvil.md" root)
+   "---\nname: anvil\ndescription: anvil.el development.\n---\n")
+  (anvil-memory-test--write
+   (expand-file-name "reference_linear.md" root)
+   "---\nname: Linear\ndescription: Bug tracker entry point.\n---\n"))
+
+(ert-deftest anvil-memory-test/export-html-empty-root-returns-valid-html ()
+  "Zero memories → valid HTML stub with no row."
+  (skip-unless (anvil-memory-test--supported-p 'export-html))
+  (anvil-memory-test--with-env
+    (anvil-memory-scan)
+    (let ((html (anvil-memory-export-html root)))
+      (should (stringp html))
+      (should (string-match-p "<!DOCTYPE html>" html))
+      (should (string-match-p "</html>" html))
+      (should-not (string-match-p "feedback_" html)))))
+
+(ert-deftest anvil-memory-test/export-html-includes-memory-files ()
+  "Each indexed memory's basename appears in the emitted HTML."
+  (skip-unless (anvil-memory-test--supported-p 'export-html))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-typed-mix root)
+    (anvil-memory-scan)
+    (let ((html (anvil-memory-export-html root)))
+      (should (string-match-p "user_role\\.md" html))
+      (should (string-match-p "feedback_commits\\.md" html))
+      (should (string-match-p "project_anvil\\.md" html))
+      (should (string-match-p "reference_linear\\.md" html)))))
+
+(ert-deftest anvil-memory-test/export-html-groups-by-type ()
+  "Each memory type gets its own labelled section."
+  (skip-unless (anvil-memory-test--supported-p 'export-html))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-typed-mix root)
+    (anvil-memory-scan)
+    (let ((html (anvil-memory-export-html root)))
+      (should (string-match-p "data-type=\"user\"" html))
+      (should (string-match-p "data-type=\"feedback\"" html))
+      (should (string-match-p "data-type=\"project\"" html))
+      (should (string-match-p "data-type=\"reference\"" html)))))
+
+(ert-deftest anvil-memory-test/export-html-has-decay-attribute ()
+  "Every memory row carries a numeric data-decay attribute."
+  (skip-unless (anvil-memory-test--supported-p 'export-html))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-typed-mix root)
+    (anvil-memory-scan)
+    (let ((html (anvil-memory-export-html root)))
+      (should (string-match-p "data-decay=\"[0-9.]+\"" html)))))
+
+(ert-deftest anvil-memory-test/export-html-orders-by-decay-desc-within-type ()
+  "Within one type, higher decay-score rows precede lower ones."
+  (skip-unless (anvil-memory-test--supported-p 'export-html))
+  (anvil-memory-test--with-env
+    (let* ((low (expand-file-name "feedback_low.md" root))
+           (high (expand-file-name "feedback_high.md" root)))
+      (anvil-memory-test--write low "---\nname: low\n---\n")
+      (anvil-memory-test--write high "---\nname: high\n---\n")
+      (anvil-memory-scan)
+      ;; Bump access on `high' so decay-score surpasses `low'.
+      (dotimes (_ 10) (anvil-memory-access high))
+      (let* ((html (anvil-memory-export-html root))
+             (hi-pos (string-match "feedback_high\\.md" html))
+             (lo-pos (string-match "feedback_low\\.md" html)))
+        (should hi-pos)
+        (should lo-pos)
+        (should (< hi-pos lo-pos))))))
+
+(ert-deftest anvil-memory-test/export-html-escapes-entities ()
+  "Frontmatter containing < / > / & is HTML-escaped in the rendered page."
+  (skip-unless (anvil-memory-test--supported-p 'export-html))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--write
+     (expand-file-name "feedback_escape.md" root)
+     "---\nname: A<B & C>D\ndescription: one & two\n---\n")
+    (anvil-memory-scan)
+    (let ((html (anvil-memory-export-html root)))
+      (should (string-match-p "A&lt;B &amp; C&gt;D" html))
+      (should (string-match-p "one &amp; two" html))
+      ;; Raw markup must not leak.
+      (should-not (string-match-p "A<B &" html)))))
+
+(ert-deftest anvil-memory-test/export-html-writes-file-when-out-path ()
+  "OUT-PATH writes the HTML to disk and the returned string equals the file."
+  (skip-unless (anvil-memory-test--supported-p 'export-html))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-typed-mix root)
+    (anvil-memory-scan)
+    (let* ((out (expand-file-name "out.html" root))
+           (html (anvil-memory-export-html root :out-path out)))
+      (should (file-exists-p out))
+      (should (equal html (with-temp-buffer
+                            (insert-file-contents out)
+                            (buffer-string)))))))
+
+(ert-deftest anvil-memory-test/export-html-is-self-contained ()
+  "Output references no external CSS / JS — opens offline via file://."
+  (skip-unless (anvil-memory-test--supported-p 'export-html))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-typed-mix root)
+    (anvil-memory-scan)
+    (let ((html (anvil-memory-export-html root)))
+      (should-not (string-match-p "<link " html))
+      (should-not (string-match-p "<script[^>]+src=" html)))))
+
+(ert-deftest anvil-memory-test/export-html-honours-title ()
+  "TITLE replaces the default <title> text."
+  (skip-unless (anvil-memory-test--supported-p 'export-html))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-typed-mix root)
+    (anvil-memory-scan)
+    (let ((html (anvil-memory-export-html root :title "custom-title-x")))
+      (should (string-match-p "<title>custom-title-x</title>" html)))))
+
+(ert-deftest anvil-memory-test/export-html-mcp-tool-roundtrip ()
+  "MCP `memory-export-html' returns :html + :written (nil without out-path)."
+  (skip-unless (anvil-memory-test--supported-p 'export-html))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-typed-mix root)
+    (anvil-memory-scan)
+    (let* ((res1 (anvil-memory--tool-export-html root nil))
+           (out (expand-file-name "out.html" root))
+           (res2 (anvil-memory--tool-export-html root out)))
+      (should (stringp (plist-get res1 :html)))
+      (should (null (plist-get res1 :written)))
+      (should (stringp (plist-get res2 :html)))
+      (should (equal out (plist-get res2 :written)))
+      (should (file-exists-p out)))))
+
+
 (provide 'anvil-memory-test)
 
 ;;; anvil-memory-test.el ends here
