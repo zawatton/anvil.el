@@ -209,7 +209,9 @@ Returns a result plist with :file :ok :exit :elapsed-ms :total
                  (apply #'call-process
                         anvil-dev-emacs-bin nil buf nil
                         (append
-                         (list "--batch" "-L" root)
+                         (list "--batch"
+                               "--eval" "(setq load-prefer-newer t)"
+                               "-L" root)
                          (and (file-directory-p tests-dir)
                               (list "-L" tests-dir))
                          (list "-l" "ert" "-l" file
