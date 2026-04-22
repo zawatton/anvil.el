@@ -46,15 +46,15 @@
 (defconst anvil-sexp-cst-supported-types
   '(integer nil symbol string list alist plist hash-table vector cons
             record char-table truncation circular drill byte-cap
-            eieio purge cst-read cst-edit)
+            eieio purge cst-read cst-edit cst-edit-write)
   "Type tags + behaviors that `anvil-inspect-object' handles today.
 Phase 1a/1b/2 chunks extend this list; tests in
 tests/anvil-sexp-cst-test.el gate their `skip-unless' on membership
 here so a half-shipped chunk never breaks CI.  The pseudo-tags
 `truncation', `circular', `drill', `byte-cap', `eieio', `purge',
-`cst-read', `cst-edit' describe emitted *behaviors* rather than
-Emacs runtime types — they live on the same list so each test can
-self-describe its capability gate.")
+`cst-read', `cst-edit', `cst-edit-write' describe emitted *behaviors*
+rather than Emacs runtime types — they live on the same list so
+each test can self-describe its capability gate.")
 
 (defconst anvil-sexp-cst--real-type-tags
   '(integer nil symbol string list alist plist hash-table vector cons
@@ -871,10 +871,14 @@ valid."
                       :end (treesit-node-end node)
                       :text (treesit-node-text node t)))))))))
 
-(defun anvil-sexp-cst--edit-dry-run (file pos new-text)
-  "Internal: open FILE, splice NEW-TEXT over the node at POS, verify.
-Returns a JSON string — either the shape-locked edit-result
-envelope or a typed error (see `anvil-sexp-cst-edit')."
+(defun anvil-sexp-cst--edit-compute (file pos new-text)
+  "Internal: read FILE, splice NEW-TEXT over the node at POS, verify.
+Returns a plist tagged with `:status :ok' + `:plist EDIT-RESULT' on
+success, or `:status :error' + `:kind' + `:message' on any
+failure reachable from here (no-node-at-position /
+parse-error-in-replacement).  Factored out so both the dry-run
+`anvil-sexp-cst-edit' and the on-disk `anvil-sexp-cst-edit-write'
+can share the validation path without re-implementing it."
   (with-temp-buffer
     (insert-file-contents file)
     (let* ((parser (treesit-parser-create 'elisp))
@@ -884,9 +888,9 @@ envelope or a typed error (see `anvil-sexp-cst-edit')."
            (before-bytes (string-bytes before-text)))
       (cond
        ((or (null node) (eq node root))
-        (anvil-sexp-cst--encode-error
-         'error "sexp-cst/no-node-at-position"
-         (format "No named node at position %d" pos)))
+        (list :status :error
+              :kind "sexp-cst/no-node-at-position"
+              :message (format "No named node at position %d" pos)))
        (t
         (let* ((old-start (treesit-node-start node))
                (old-end (treesit-node-end node))
@@ -898,24 +902,32 @@ envelope or a typed error (see `anvil-sexp-cst-edit')."
                (reparse (anvil-sexp-cst--reparse-and-locate
                          new-content (1- old-start))))
           (if (eq (car reparse) 'error)
-              (anvil-sexp-cst--encode-error
-               'error "sexp-cst/parse-error-in-replacement"
-               (cdr reparse))
+              (list :status :error
+                    :kind "sexp-cst/parse-error-in-replacement"
+                    :message (cdr reparse))
             (let* ((after-plist (cdr reparse))
                    (before-plist (list :type (treesit-node-type node)
                                        :start old-start
                                        :end old-end
                                        :text old-text))
-                   (after-bytes (string-bytes new-content))
-                   (result (list :type "edit-result"
+                   (after-bytes (string-bytes new-content)))
+              (list :status :ok
+                    :plist (list :type "edit-result"
                                  :before before-plist
                                  :after after-plist
                                  :file-before-bytes before-bytes
                                  :file-after-bytes after-bytes
-                                 :new-content new-content)))
-              (json-serialize result
-                              :false-object :false
-                              :null-object :null)))))))))
+                                 :new-content new-content))))))))))
+
+(defun anvil-sexp-cst--edit-dry-run (file pos new-text)
+  "Thin JSON wrapper around `--edit-compute' for `anvil-sexp-cst-edit'."
+  (let ((r (anvil-sexp-cst--edit-compute file pos new-text)))
+    (if (eq (plist-get r :status) :error)
+        (anvil-sexp-cst--encode-error
+         'error (plist-get r :kind) (plist-get r :message))
+      (json-serialize (plist-get r :plist)
+                      :false-object :false
+                      :null-object :null))))
 
 ;;;###autoload
 (defun anvil-sexp-cst-edit (file position new-text)
@@ -976,6 +988,100 @@ MCP Parameters:
         "NEW-TEXT argument is required."))
       (t
        (anvil-sexp-cst--edit-dry-run file pos new-text))))))
+
+
+;;;; --- sexp-cst-edit-write (Phase 2b-b, on-disk apply) -------------------
+
+(defun anvil-sexp-cst--make-backup-path (file suffix)
+  "Return a unique backup path for FILE using SUFFIX (or timestamp default).
+Increments a trailing counter when a collision occurs so concurrent
+calls never clobber each other's backups."
+  (let* ((suf (or (and (stringp suffix) (not (string-empty-p suffix)) suffix)
+                  (format-time-string ".%Y%m%dT%H%M%S.bak")))
+         (base (concat file suf))
+         (path base)
+         (n 1))
+    (while (file-exists-p path)
+      (setq path (format "%s.%d" base n))
+      (cl-incf n))
+    path))
+
+;;;###autoload
+(defun anvil-sexp-cst-edit-write (file position new-text &optional backup-suffix)
+  "Apply the node replacement from `anvil-sexp-cst-edit' to disk.
+
+Runs the same validation as the dry-run variant — including the
+full-file re-parse that rejects replacements leaving ERROR nodes
+anywhere in the source.  On success, copies FILE to a backup path
+(default suffix `.<iso-timestamp>.bak', overridable via
+BACKUP-SUFFIX) and writes the patched content back to FILE.  On
+validation failure NOTHING is written — the file, backup, and
+surrounding directory are left untouched.
+
+Returns a JSON string whose top-level type is `\"edit-write\"' on
+success; shape extends the dry-run envelope with a `:backup-path'
+field so callers can rollback via a simple rename.
+
+Typed errors (envelope same as dry-run plus):
+  sexp-cst/backup-failed  — `copy-file' signalled
+  sexp-cst/write-failed   — disk write signalled
+
+MCP Parameters:
+  FILE            Required elisp source path
+  POSITION        Required 1-based point offset
+  NEW-TEXT        Required replacement text
+  BACKUP-SUFFIX   Optional deterministic suffix for the backup file"
+  (anvil-server-with-error-handling
+   (let ((pos (anvil-sexp-cst--coerce-int position nil)))
+     (cond
+      ((not (and file (stringp file) (not (string-empty-p file))))
+       (anvil-sexp-cst--encode-error
+        'error "sexp-cst/missing-file" "FILE argument is required."))
+      ((not (file-exists-p file))
+       (anvil-sexp-cst--encode-error
+        'error "sexp-cst/file-not-found"
+        (format "No such file: %s" file)))
+      ((not (anvil-sexp-cst--grammar-usable-p))
+       (anvil-sexp-cst--encode-error
+        'error "sexp-cst/grammar-unavailable"
+        "tree-sitter-elisp grammar is not loadable in this Emacs session."))
+      ((or (null pos) (not (integerp pos)) (< pos 1))
+       (anvil-sexp-cst--encode-error
+        'error "sexp-cst/position-required"
+        "POSITION must be a positive 1-based point offset."))
+      ((not (and new-text (stringp new-text)))
+       (anvil-sexp-cst--encode-error
+        'error "sexp-cst/missing-new-text"
+        "NEW-TEXT argument is required."))
+      (t
+       (let ((r (anvil-sexp-cst--edit-compute file pos new-text)))
+         (if (eq (plist-get r :status) :error)
+             (anvil-sexp-cst--encode-error
+              'error (plist-get r :kind) (plist-get r :message))
+           (let* ((plist (plist-get r :plist))
+                  (new-content (plist-get plist :new-content))
+                  (backup-path (anvil-sexp-cst--make-backup-path
+                                file backup-suffix)))
+             (condition-case err
+                 (progn
+                   (copy-file file backup-path nil t t)
+                   (with-temp-file file
+                     (set-buffer-file-coding-system 'utf-8-unix)
+                     (insert new-content))
+                   (let* ((out (copy-sequence plist))
+                          (out (plist-put out :type "edit-write"))
+                          (out (plist-put out :backup-path backup-path)))
+                     (json-serialize out
+                                     :false-object :false
+                                     :null-object :null)))
+               (error
+                ;; Best-effort cleanup: if backup exists but write
+                ;; failed, restore from the backup.
+                (when (file-exists-p backup-path)
+                  (ignore-errors (copy-file backup-path file t t t)))
+                (anvil-sexp-cst--encode-error
+                 'error "sexp-cst/write-failed"
+                 (format "Disk write failed: %S" err))))))))))))
 
 
 ;;;; --- module lifecycle --------------------------------------------------
@@ -1062,7 +1168,19 @@ re-parsed full file contains no ERROR nodes.  Output shape:
 Typed errors cover missing input, missing files, grammar unavailability,
 no-node-at-position, and parse-error-in-replacement.  Read-only (does
 not touch disk)."
-   :read-only t))
+   :read-only t)
+  (anvil-server-register-tool
+   #'anvil-sexp-cst-edit-write
+   :id "sexp-cst-edit-write"
+   :server-id anvil-sexp-cst--server-id
+   :description
+   "Apply `sexp-cst-edit' to disk with backup.  Runs the same validation
+(re-parsed file must be free of ERROR nodes); on success copies FILE to
+a backup path (default `.<iso-timestamp>.bak', override via
+BACKUP-SUFFIX) then writes the patched content to FILE.  On validation
+failure the file, backup, and directory are left untouched.  Returns a
+JSON object with `type=\"edit-write\"' + `backup-path' plus the dry-run
+fields (before/after/new-content).  Write tool."))
 
 (defun anvil-sexp-cst--unregister-tools ()
   "Remove every sexp-cst-* MCP tool."
@@ -1070,7 +1188,8 @@ not touch disk)."
                 "sexp-cst-inspect-object-drill"
                 "sexp-cst-inspect-object-purge"
                 "sexp-cst-read"
-                "sexp-cst-edit"))
+                "sexp-cst-edit"
+                "sexp-cst-edit-write"))
     (anvil-server-unregister-tool id anvil-sexp-cst--server-id)))
 
 ;;;###autoload

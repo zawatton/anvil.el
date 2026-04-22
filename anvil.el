@@ -143,8 +143,12 @@ These are not loaded by default.  Available modules:
                 and typed errors.  Phase 2b-a adds `sexp-cst-edit'
                 (dry-run replacement of the node at a point offset;
                 re-parsed for structural integrity before returning
-                the new file content) (Doc 31, requires Emacs 29+
-                and the tree-sitter-elisp grammar for Phase 2 tools)"
+                the new file content).  Phase 2b-b adds
+                `sexp-cst-edit-write' — same validation plus a
+                timestamped backup copy of the original before the
+                patched content lands on disk (Doc 31, requires
+                Emacs 29+ and the tree-sitter-elisp grammar for
+                Phase 2 tools)"
   :type '(repeat symbol)
   :group 'anvil)
 
