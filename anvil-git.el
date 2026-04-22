@@ -419,7 +419,7 @@ Keys: :ref (commit-ish to check out, default \"HEAD\"),
 MCP Parameters:
   path - Directory or file path inside the repo."
   (anvil-server-with-error-handling
-   (or (anvil-git-repo-root path) :null)))
+   (or (anvil-git-repo-root path) "null")))
 
 (defun anvil-git--tool-head-sha (path &optional short)
   "Return HEAD SHA for the repo containing PATH.
@@ -429,7 +429,7 @@ MCP Parameters:
   short - Truthy → return the abbreviated SHA."
   (anvil-server-with-error-handling
    (or (anvil-git-head-sha path (and short (not (equal short ""))))
-       :null)))
+       "null")))
 
 (defun anvil-git--tool-branch-current (path)
   "Return the current branch for PATH, or nil when detached.
@@ -437,7 +437,7 @@ MCP Parameters:
 MCP Parameters:
   path - Directory inside the repo."
   (anvil-server-with-error-handling
-   (or (anvil-git-branch-current path) :null)))
+   (or (anvil-git-branch-current path) "null")))
 
 (defun anvil-git--tool-log (path &optional limit)
   "Return recent commits for repo at PATH.
@@ -451,7 +451,7 @@ MCP Parameters:
                         (string-match "\\`[0-9]+\\'" limit))
                    (string-to-number limit))
                   (t nil))))
-     (or (anvil-git-log path n) :empty-array))))
+     (or (anvil-git-log path n) "[]"))))
 
 (defun anvil-git--tool-diff-names (path &optional from to)
   "Return changed paths between FROM and TO in repo at PATH.
@@ -463,7 +463,7 @@ MCP Parameters:
   (anvil-server-with-error-handling
    (let ((f  (and (stringp from) (not (string-empty-p from)) from))
          (t* (and (stringp to)   (not (string-empty-p to))   to)))
-     (or (anvil-git-diff-names path f t*) :empty-array))))
+     (or (anvil-git-diff-names path f t*) "[]"))))
 
 (defun anvil-git--tool-diff-stats (path &optional rev)
   "Return structured diff counts for repo at PATH.
@@ -489,14 +489,14 @@ MCP Parameters:
 MCP Parameters:
   path - Directory inside the repo."
   (anvil-server-with-error-handling
-   (or (anvil-git-worktree-list path) :empty-array)))
+   (or (anvil-git-worktree-list path) "[]")))
 
 ;;;; --- module lifecycle ---------------------------------------------------
 
 (defun anvil-git--register-tools ()
   "Register git-* MCP tools under `anvil-git--server-id'."
   (anvil-server-register-tool
-   #'anvil-git--tool-repo-root
+   (anvil-server-encode-handler #'anvil-git--tool-repo-root)
    :id "git-repo-root"
    :server-id anvil-git--server-id
    :description
@@ -505,7 +505,7 @@ not inside a repository."
    :read-only t)
 
   (anvil-server-register-tool
-   #'anvil-git--tool-head-sha
+   (anvil-server-encode-handler #'anvil-git--tool-head-sha)
    :id "git-head-sha"
    :server-id anvil-git--server-id
    :description
@@ -514,7 +514,7 @@ short=1 for the abbreviated form."
    :read-only t)
 
   (anvil-server-register-tool
-   #'anvil-git--tool-branch-current
+   (anvil-server-encode-handler #'anvil-git--tool-branch-current)
    :id "git-branch-current"
    :server-id anvil-git--server-id
    :description
@@ -522,7 +522,7 @@ short=1 for the abbreviated form."
    :read-only t)
 
   (anvil-server-register-tool
-   #'anvil-git--tool-log
+   (anvil-server-encode-handler #'anvil-git--tool-log)
    :id "git-log"
    :server-id anvil-git--server-id
    :description
@@ -531,7 +531,7 @@ limit defaults to 20."
    :read-only t)
 
   (anvil-server-register-tool
-   #'anvil-git--tool-diff-names
+   (anvil-server-encode-handler #'anvil-git--tool-diff-names)
    :id "git-diff-names"
    :server-id anvil-git--server-id
    :description
@@ -540,7 +540,7 @@ unstaged-vs-HEAD)."
    :read-only t)
 
   (anvil-server-register-tool
-   #'anvil-git--tool-diff-stats
+   (anvil-server-encode-handler #'anvil-git--tool-diff-stats)
    :id "git-diff-stats"
    :server-id anvil-git--server-id
    :description
@@ -549,7 +549,7 @@ for REV or unstaged-vs-HEAD."
    :read-only t)
 
   (anvil-server-register-tool
-   #'anvil-git--tool-status
+   (anvil-server-encode-handler #'anvil-git--tool-status)
    :id "git-status"
    :server-id anvil-git--server-id
    :description
@@ -558,7 +558,7 @@ as one plist.  Buckets: staged / modified / untracked / unmerged."
    :read-only t)
 
   (anvil-server-register-tool
-   #'anvil-git--tool-worktree-list
+   (anvil-server-encode-handler #'anvil-git--tool-worktree-list)
    :id "git-worktree-list"
    :server-id anvil-git--server-id
    :description
