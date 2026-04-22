@@ -15,8 +15,13 @@ Phase 2b ~SHIPPED~ 2026-04-20 (py-replace-function with dedent /
 reindent, :class disambiguation, decorator-preserving swap, +8
 tests).  Phase 2c ~SHIPPED~ 2026-04-20 (py-rename-import alias
 rename + py-wrap-expr with node-alignment validation + single
-placeholder check, +12 tests).  Phase 1b (TS/JS locators), Phase 3
-(cross-file rename), Phase 4 (extract/inline) still ~DRAFT~.
+placeholder check, +12 tests).  Phase 1b ~SHIPPED~ 2026-04-22
+(anvil-ts.el + anvil-js.el; 16 MCP tools — 9 ts-* + 7 js-*;
+shared internal `anvil-ts--*-lang' helpers; ts/tsx grammar split
+by extension; JS side drops interfaces / type-aliases; +38
+tests across ts-sample / tsx-sample / js-sample / jsx-sample
+fixtures).  Phase 3 (cross-file rename), Phase 4 (extract/inline)
+still ~DRAFT~.
 
 Sibling of Doc 12 (anvil-sexp, elisp).  Provides tree-sitter-backed
 structural editing for brace-and-keyword languages, with a shared
@@ -382,21 +387,30 @@ All writing tools default to ~apply=false~ (preview).
   return the expected lists against fixture files; grammar-missing
   error round-trips cleanly; works on Linux and Windows.
 
-** Phase 1b — TypeScript + JavaScript
+** Phase 1b — TypeScript + JavaScript (~SHIPPED~ 2026-04-22)
 
-Once Phase 1a's core is in production (= has caught a real bug),
-re-use the shared plumbing for the remaining two languages:
+Re-uses Phase 1a's plumbing for the remaining two languages:
 
 - ~anvil-ts.el~ and ~anvil-js.el~ with the same locator surface
   (functions / classes / methods / imports / exports, plus
   interfaces / type-aliases for TS).
-- Entries in ~treesit-language-source-alist~ for ~typescript~,
+- Entries in ~anvil-treesit-language-source-alist~ for ~typescript~,
   ~tsx~, ~javascript~.
-- ERT +15 tests against ~tests/fixtures/ts-sample/~,
-  ~tests/fixtures/tsx-sample/~, ~tests/fixtures/js-sample/~,
-  ~tests/fixtures/jsx-sample/~.
-- *Ship criterion*: ~ts-list-imports~ and ~js-list-imports~ return
-  the expected lists; grammar-missing error round-trips cleanly.
+- ERT 38 tests across ~tests/fixtures/ts-sample/app.ts~,
+  ~tests/fixtures/tsx-sample/app.tsx~, ~tests/fixtures/js-sample/app.js~,
+  ~tests/fixtures/jsx-sample/app.jsx~.
+- *Ship criterion verified*: ~ts-list-imports~ and ~js-list-imports~
+  return the expected lists; grammar-missing error round-trips
+  cleanly with a ~read~-able ~grammar-missing~ plist.
+
+Shipped surface — 16 MCP tools on the shared ~emacs-eval~ server:
+9 ts-* (list-imports / list-exports / list-functions / list-classes /
+list-methods / list-interfaces / list-type-aliases / find-definition /
+surrounding-form) plus 7 js-* (same set minus the two TS-only
+kinds).  Internal helpers ~anvil-ts--*-lang~ take LANG as a
+parameter so anvil-js.el routes ~'javascript~ through the same
+collectors; ts/tsx split is done at the public surface by file
+extension.
 
 ** Phase 2 — structural edits
 

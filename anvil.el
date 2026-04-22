@@ -133,6 +133,20 @@ These are not loaded by default.  Available modules:
                 / py-list-decorators / py-find-definition /
                 py-surrounding-form.  Requires Emacs 29+ treesit and
                 tree-sitter-python grammar (Doc 21 Phase 1a)
+- `ts'        — TypeScript / TSX read-only structural locators:
+                ts-list-imports / ts-list-exports / ts-list-functions
+                / ts-list-classes / ts-list-methods / ts-list-interfaces
+                / ts-list-type-aliases / ts-find-definition /
+                ts-surrounding-form.  Dispatches `.ts' to the typescript
+                grammar and `.tsx' to the tsx grammar.  Requires the
+                tree-sitter-typescript grammar (Doc 21 Phase 1b).
+- `js'        — JavaScript / JSX / MJS / CJS read-only structural
+                locators: js-list-imports / js-list-exports /
+                js-list-functions / js-list-classes / js-list-methods /
+                js-find-definition / js-surrounding-form.  Requires the
+                tree-sitter-javascript grammar.  Shares internal
+                helpers with `ts' so `.ts' must not be handed to JS
+                tools and vice versa (Doc 21 Phase 1b).
 - `manifest'  — Per-session tools/list filter driven by
                 `ANVIL_PROFILE' (ultra / nav / core / lean / full).
                 Handlers remain live regardless of profile; only the
