@@ -27,6 +27,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'json)
 (require 'subr-x)
 (require 'anvil-server)
 (require 'anvil-treesit)
@@ -1011,33 +1012,84 @@ MCP Parameters:
    (or (anvil-py-find-definition file name)
        (list :found nil :name name))))
 
+(defun anvil-py--plist-p (x)
+  "Return non-nil when X looks like a plist."
+  (and (listp x) (keywordp (car-safe x))))
+
+(defun anvil-py--spec-keyword (key)
+  "Normalize SPEC KEY into the keyword form used by the planners."
+  (intern
+   (concat
+    ":"
+    (replace-regexp-in-string
+     "_"
+     "-"
+     (cond
+      ((keywordp key) (substring (symbol-name key) 1))
+      ((symbolp key) (symbol-name key))
+      ((stringp key) key)
+      (t (format "%s" key)))))))
+
+(defun anvil-py--alist-to-plist (alist)
+  "Convert ALIST to a plist with normalized keyword keys."
+  (let (out)
+    (dolist (entry alist)
+      (push (anvil-py--spec-keyword (car entry)) out)
+      (push (cdr entry) out))
+    (nreverse out)))
+
+(defun anvil-py--parse-spec-string (spec)
+  "Parse string SPEC as JSON or Lisp data and return the resulting object."
+  (let ((trimmed (string-trim spec)))
+    (unless (string-empty-p trimmed)
+      (or
+       (condition-case nil
+           (json-parse-string trimmed
+                              :object-type 'plist
+                              :array-type 'list
+                              :null-object nil
+                              :false-object nil)
+         (error nil))
+       (condition-case nil
+           (pcase-let ((`(,obj . ,idx) (read-from-string trimmed)))
+             (when (string-empty-p (string-trim (substring trimmed idx)))
+               obj))
+         (error nil))
+       (user-error "anvil-py: could not parse spec string %S" spec)))))
+
 (defun anvil-py--coerce-spec (spec)
   "Normalize an MCP-bridge SPEC into the elisp plist shape.
-MCP tool calls can arrive with string-valued :kind (\"from\" vs 'from)
-and string-encoded name lists.  Return a plist whose values are ready
-for the elisp planners."
-  (let* ((s (cond ((and spec (listp spec)) (copy-sequence spec))
-                  ((hash-table-p spec)
-                   (let (out)
-                     (maphash (lambda (k v)
-                                (push v out)
-                                (push (intern
-                                       (concat ":"
-                                               (if (keywordp k)
-                                                   (substring
-                                                    (symbol-name k) 1)
-                                                 (format "%s" k))))
-                                      out))
-                              spec)
-                     out))
-                  (t nil)))
-         (kind (plist-get s :kind)))
+MCP tool calls can arrive as a plist, an alist / hash-table decoded
+from JSON, or a JSON / Lisp string representation of either.  Return
+a plist whose values are ready for the elisp planners."
+  (let* ((s (cond
+             ((null spec) nil)
+             ((anvil-py--plist-p spec)
+              (copy-sequence spec))
+             ((hash-table-p spec)
+              (let (out)
+                (maphash (lambda (k v)
+                           (push (cons k v) out))
+                         spec)
+                (anvil-py--alist-to-plist (nreverse out))))
+             ((and (listp spec) (consp spec) (consp (car spec)))
+              (anvil-py--alist-to-plist spec))
+             ((stringp spec)
+              (anvil-py--coerce-spec (anvil-py--parse-spec-string spec)))
+             ((listp spec)
+              (copy-sequence spec))
+             (t
+              (user-error "anvil-py: unsupported spec shape %S" spec))))
+         (kind (plist-get s :kind))
+         (names (plist-get s :names)))
     (when (stringp kind)
       (setq s (plist-put s :kind (intern kind))))
-    (when (stringp (plist-get s :names))
+    (when (vectorp names)
+      (setq s (plist-put s :names (append names nil)))
+      (setq names (plist-get s :names)))
+    (when (stringp names)
       (setq s (plist-put s :names
-                         (split-string (plist-get s :names)
-                                       "[ ,]+" t))))
+                         (split-string names "[ ,]+" t))))
     s))
 
 (defun anvil-py--tool-add-import (file spec apply)
