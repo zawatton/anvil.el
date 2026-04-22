@@ -70,6 +70,11 @@
 ;; without the orchestrator loaded.
 (declare-function anvil-orchestrator-submit-and-collect "anvil-orchestrator")
 
+;; Phase 3b: the live TCP server JSON-encodes memory rows via the
+;; built-in `json' library.  Loaded eagerly because every
+;; `/api/...' route needs it and the dep is ~free (core Emacs).
+(require 'json)
+
 
 ;;;; --- group + defcustoms -------------------------------------------------
 
@@ -100,7 +105,7 @@ indexed in a single DB.  Explicit list overrides auto-detection."
   '(scan audit access list
          search save-check duplicates audit-urls
          decay promote regenerate reindex-fts llm-verdict
-         mdl-distill export-html)
+         mdl-distill export-html serve)
   "Capability tags this module currently provides.
 Tests in tests/anvil-memory-test.el gate their `skip-unless' on
 membership here so a half-shipped feature never breaks CI.")
@@ -1253,6 +1258,230 @@ leaks session text."
     html))
 
 
+;;;; --- Phase 3b: live TCP server ------------------------------------------
+
+(defcustom anvil-memory-serve-host "127.0.0.1"
+  "Host the memory viewer server binds to.
+Loopback-only is the strongly recommended default — there is no
+authentication, so exposing the socket to the network (e.g. by
+setting this to `0.0.0.0') lets anyone on the subnet read the
+metadata index.  Change only if you know what you are doing."
+  :type 'string
+  :group 'anvil-memory)
+
+(defcustom anvil-memory-serve-port 8729
+  "Default port for `anvil-memory-serve-start'.
+Pass `:port t' to let the kernel pick a free ephemeral port
+(useful for tests and for avoiding collisions with other services)."
+  :type '(choice integer (const :tag "Ephemeral (kernel-picked)" t))
+  :group 'anvil-memory)
+
+(defvar anvil-memory--serve-proc nil
+  "Running server process, or nil when the viewer is not live.")
+(defvar anvil-memory--serve-port nil
+  "Port the running server is bound to, or nil when idle.")
+(defvar anvil-memory--serve-host nil
+  "Host the running server is bound to, or nil when idle.")
+(defvar anvil-memory--serve-root nil
+  "Directory the running server scopes its listings to, or nil for all.")
+
+(defun anvil-memory--serve-running-p ()
+  "Non-nil when the memory viewer server is live."
+  (and anvil-memory--serve-proc
+       (process-live-p anvil-memory--serve-proc)))
+
+(defun anvil-memory--http-status-line (code)
+  "Return \"HTTP/1.0 CODE REASON\\r\\n\" for CODE."
+  (let ((reason (pcase code
+                  (200 "OK")
+                  (400 "Bad Request")
+                  (404 "Not Found")
+                  (405 "Method Not Allowed")
+                  (500 "Internal Server Error")
+                  (_   "Status"))))
+    (format "HTTP/1.0 %d %s\r\n" code reason)))
+
+(defun anvil-memory--http-response (status content-type body)
+  "Build an HTTP/1.0 response string from STATUS / CONTENT-TYPE / BODY."
+  (let ((bytes (string-bytes body)))
+    (concat (anvil-memory--http-status-line status)
+            (format "Content-Type: %s\r\n" content-type)
+            (format "Content-Length: %d\r\n" bytes)
+            "Connection: close\r\n"
+            "Cache-Control: no-store\r\n"
+            "\r\n"
+            body)))
+
+(defun anvil-memory--parse-request-line (line)
+  "Parse the first line of an HTTP request into (METHOD PATH), else nil."
+  (when (and line (string-match
+                   "\\`\\([A-Z]+\\) \\([^ ]+\\) HTTP/[0-9.]+\\'" line))
+    (cons (match-string 1 line) (match-string 2 line))))
+
+(defun anvil-memory--serve-list-rows (&optional scope-root)
+  "Return the indexed-memory plists under SCOPE-ROOT (or all when nil)."
+  (let ((rows (anvil-memory-list nil :with-decay t :sort 'decay)))
+    (if (and scope-root (stringp scope-root))
+        (let ((abs (file-name-as-directory (expand-file-name scope-root))))
+          (cl-remove-if-not
+           (lambda (r) (string-prefix-p abs (plist-get r :file)))
+           rows))
+      rows)))
+
+(defun anvil-memory--rows-to-alist (rows)
+  "Coerce memory plists ROWS to alists the `json' library can encode."
+  (mapcar
+   (lambda (r)
+     `((file . ,(plist-get r :file))
+       (type . ,(symbol-name (plist-get r :type)))
+       (access_count . ,(or (plist-get r :access-count) 0))
+       (last_accessed . ,(or (plist-get r :last-accessed) :null))
+       (decay_score . ,(or (plist-get r :decay-score) 0.0))))
+   rows))
+
+(defun anvil-memory--heatmap-aggregate (rows)
+  "Aggregate ROWS into per-type (count, mean decay) alist entries."
+  (let (buckets)
+    (dolist (r rows)
+      (let* ((type (plist-get r :type))
+             (decay (or (plist-get r :decay-score) 0.0))
+             (cell (assq type buckets)))
+        (if cell
+            (setcdr cell (list (1+ (car (cdr cell)))
+                               (+ (cadr (cdr cell)) decay)))
+          (push (cons type (list 1 decay)) buckets))))
+    (mapcar
+     (lambda (cell)
+       (let* ((type (car cell))
+              (count (car (cdr cell)))
+              (sum (cadr (cdr cell))))
+         `((type . ,(symbol-name type))
+           (count . ,count)
+           (mean_decay . ,(if (zerop count) 0.0 (/ sum (float count)))))))
+     (sort buckets
+           (lambda (a b)
+             (let ((ao (cl-position (car a) anvil-memory--html-type-order))
+                   (bo (cl-position (car b) anvil-memory--html-type-order)))
+               (< (or ao 99) (or bo 99))))))))
+
+(defun anvil-memory--serve-dispatch (method path)
+  "Dispatch HTTP METHOD + PATH to a response string."
+  (cond
+   ((not (equal method "GET"))
+    (anvil-memory--http-response
+     405 "text/plain; charset=utf-8"
+     "Only GET is supported by the anvil-memory viewer.\n"))
+   ((equal path "/")
+    (let* ((root (or anvil-memory--serve-root
+                     (car (anvil-memory--effective-roots))
+                     ""))
+           (html (if (and root (stringp root) (not (string-empty-p root)))
+                     (anvil-memory-export-html root)
+                   "<!DOCTYPE html><html><body><p>No indexed \
+memory roots — run <code>memory-scan</code> first.</p></body></html>")))
+      (anvil-memory--http-response 200 "text/html; charset=utf-8" html)))
+   ((equal path "/api/list")
+    (let* ((rows (anvil-memory--serve-list-rows anvil-memory--serve-root))
+           (json-encoding-pretty-print nil)
+           (body (json-encode (anvil-memory--rows-to-alist rows))))
+      (anvil-memory--http-response 200 "application/json; charset=utf-8" body)))
+   ((equal path "/api/decay-heatmap")
+    (let* ((rows (anvil-memory--serve-list-rows anvil-memory--serve-root))
+           (body (json-encode (anvil-memory--heatmap-aggregate rows))))
+      (anvil-memory--http-response 200 "application/json; charset=utf-8" body)))
+   (t
+    (anvil-memory--http-response
+     404 "text/plain; charset=utf-8"
+     (format "Not Found: %s\n" path)))))
+
+(defun anvil-memory--serve-handle-buffer (buf)
+  "Parse BUF (the accumulated request bytes) and return an HTTP response.
+Returns nil when the request is incomplete (no `\\r\\n\\r\\n' yet)
+so the filter can wait for more data."
+  (let ((split (string-match "\r\n\r\n" buf)))
+    (when split
+      (let* ((head (substring buf 0 split))
+             (lines (split-string head "\r\n" t))
+             (parsed (anvil-memory--parse-request-line (car lines))))
+        (if parsed
+            (anvil-memory--serve-dispatch (car parsed) (cdr parsed))
+          (anvil-memory--http-response
+           400 "text/plain; charset=utf-8"
+           "Bad Request\n"))))))
+
+(defun anvil-memory--serve-filter (proc data)
+  "Per-connection filter: buffer bytes, respond, close when request complete."
+  (let ((buf (concat (or (process-get proc :request-buffer) "") data)))
+    (process-put proc :request-buffer buf)
+    (let ((response
+           (condition-case err
+               (anvil-memory--serve-handle-buffer buf)
+             (error
+              (anvil-memory--http-response
+               500 "text/plain; charset=utf-8"
+               (format "Server error: %s\n" (error-message-string err)))))))
+      (when response
+        (ignore-errors (process-send-string proc response))
+        (ignore-errors (delete-process proc))))))
+
+(defun anvil-memory--serve-sentinel (_proc _event)
+  "Sentinel for accepted client processes.  No-op: filter owns teardown."
+  nil)
+
+;;;###autoload
+(cl-defun anvil-memory-serve-start (&key host port root)
+  "Start the local HTTP memory viewer and return its (:port :host :process).
+HOST defaults to `anvil-memory-serve-host' (loopback).  PORT is
+either an integer or `t' (let the kernel pick a free port);
+defaults to `anvil-memory-serve-port'.  ROOT scopes the served
+listings — nil includes every indexed memory root.
+
+Signals `user-error' when a server is already running; call
+`anvil-memory-serve-stop' first if you want to rebind."
+  (when (anvil-memory--serve-running-p)
+    (user-error
+     "anvil-memory-serve: already running on %s:%s"
+     anvil-memory--serve-host anvil-memory--serve-port))
+  (let* ((h (or host anvil-memory-serve-host))
+         (p (or port anvil-memory-serve-port))
+         (proc (make-network-process
+                :name "anvil-memory-serve"
+                :server t
+                :host h
+                :service p
+                :family 'ipv4
+                :coding 'binary
+                :noquery t
+                :filter #'anvil-memory--serve-filter
+                :sentinel #'anvil-memory--serve-sentinel))
+         (assigned (process-contact proc :service)))
+    (setq anvil-memory--serve-proc proc
+          anvil-memory--serve-port (if (integerp assigned) assigned p)
+          anvil-memory--serve-host h
+          anvil-memory--serve-root (and root (stringp root) root))
+    (list :port anvil-memory--serve-port
+          :host h
+          :process proc
+          :root anvil-memory--serve-root)))
+
+;;;###autoload
+(defun anvil-memory-serve-stop ()
+  "Stop the running memory viewer server, if any.
+Returns the port number it was bound to, or nil when nothing was
+running (so the caller can use the return value to distinguish
+`was-running' from `was-idle').  Always safe to call."
+  (interactive)
+  (let ((was anvil-memory--serve-port))
+    (when (and anvil-memory--serve-proc
+               (process-live-p anvil-memory--serve-proc))
+      (ignore-errors (delete-process anvil-memory--serve-proc)))
+    (setq anvil-memory--serve-proc nil
+          anvil-memory--serve-port nil
+          anvil-memory--serve-host nil
+          anvil-memory--serve-root nil)
+    was))
+
+
 ;;;; --- MCP tool handlers --------------------------------------------------
 
 (defun anvil-memory--coerce-type (v)
@@ -1544,6 +1773,48 @@ no external CSS / JS references."
           (html (anvil-memory-export-html root :out-path out :title ttl)))
      (list :html html :written out))))
 
+(defun anvil-memory--tool-serve-start (&optional host port root)
+  "Start the local HTTP memory viewer.
+
+MCP Parameters:
+  host - Optional interface to bind (default \"127.0.0.1\").  Avoid
+         binding to a non-loopback address — the server has no
+         authentication and exposes the metadata index.
+  port - Optional port: digit string or `0' (= ephemeral).  Empty /
+         omitted uses `anvil-memory-serve-port'.
+  root - Optional directory to scope listings to.  Empty / omitted
+         serves every indexed memory root.
+
+Returns (:port :host :root :running t)."
+  (anvil-server-with-error-handling
+   (let* ((h (cond ((null host) nil)
+                   ((and (stringp host) (string-empty-p host)) nil)
+                   (t host)))
+          (p-raw (cond ((null port) nil)
+                       ((integerp port) port)
+                       ((and (stringp port) (string-empty-p port)) nil)
+                       ((stringp port) (string-to-number port))
+                       (t nil)))
+          (p (cond ((null p-raw) nil)
+                   ((and (numberp p-raw) (zerop p-raw)) t)
+                   (t p-raw)))
+          (r (cond ((null root) nil)
+                   ((and (stringp root) (string-empty-p root)) nil)
+                   (t root)))
+          (info (anvil-memory-serve-start :host h :port p :root r)))
+     (list :port (plist-get info :port)
+           :host (plist-get info :host)
+           :root (plist-get info :root)
+           :running t))))
+
+(defun anvil-memory--tool-serve-stop ()
+  "Stop the running memory viewer server (no-op when idle).
+
+Returns (:stopped PORT-OR-NIL) — nil indicates the server was
+already idle so the caller can detect no-ops."
+  (anvil-server-with-error-handling
+   (list :stopped (anvil-memory-serve-stop))))
+
 
 ;;;; --- module lifecycle ---------------------------------------------------
 
@@ -1670,7 +1941,24 @@ last-accessed) is emitted; memory bodies stay on disk so a stray
 .html file never leaks session text.  Pass `out_path' to also
 persist the page alongside the returned HTML string.  Returns
 :html + :written."
-     :read-only t))
+     :read-only t)
+
+    (,(anvil-server-encode-handler #'anvil-memory--tool-serve-start)
+     :id "memory-serve-start"
+     :description
+     "Start the local HTTP memory viewer on 127.0.0.1:<port>.
+Phase 3b: serves the Phase 3a HTML at `/', JSON at
+`/api/list' and `/api/decay-heatmap'.  Opt-in — the server has no
+authentication, bind only to loopback.  `host' / `port' / `root'
+are all optional and coerced from strings.  Returns :port / :host /
+:root / :running.")
+
+    (,(anvil-server-encode-handler #'anvil-memory--tool-serve-stop)
+     :id "memory-serve-stop"
+     :description
+     "Stop the running memory viewer server.  Idempotent — the MCP
+call always succeeds; :stopped is the port number that was being
+served, or nil when the server was already idle."))
   "Spec list consumed by `anvil-server-register-tools'.")
 
 (defun anvil-memory--register-tools ()
