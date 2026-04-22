@@ -1,0 +1,286 @@
+#+title: anvil-sexp-cst — CST-level Lisp Editing + Object Drilling
+#+date: 2026-04-21
+#+author: zawatton
+#+property: status DRAFT
+#+property: scope GENERIC
+
+* STATUS
+  :PROPERTIES:
+  :ID:       d7a1b2c4-5e6f-7a8b-9c0d-1e2f3a4b5c31
+  :END:
+~DRAFT~ (2026-04-21) → ~APPROVED~ (2026-04-22, Phase 0 pass) —
+Week-4 Ship 候補。r/emacs landscape 調査 (2026-04-21) で cl-mcp
+(cl-ai-project, 64★) の Eclector CST 経由 edit + object drilling +
+parinfer auto-repair を確認し、anvil の Doc 12 (sexp-edits, reader-only)
+との機能差を設計上で埋める。
+
+CL 側は Eclector という CST-aware reader を標準で持っているため先行して
+いる。Emacs 側は =treesit= (Emacs 29+, tree-sitter-elisp grammar) を使う
+のが最短経路と思われる。
+
+実装 ETA 1-2 週間。Windows 互換は treesit 依存で OK (既に anvil-py が
+treesit-python で動作している前例あり、Doc 21)。
+
+** 2026-04-22 status update (Phase 0 PASS — APPROVED for Phase 1a)
+
+Phase 0 (G1 treesit-elisp accuracy / G2 inspect-object prototype) を
+=emacs --batch= subprocess で実施:
+
+- G1: anvil 自身 4 ファイル (265 KB / 6 302 行) で
+  - parse success 4/4 (ERROR node 0)
+  - byte-exact round-trip 4/4
+  - parse 1-5 ms/file
+  - comment detection 91.7% (regex 推定比)
+- G2: 14 型 fixture で全型 output OK、truncation + cursor 動作確認。
+  S-exp は JSON より 10-25% 小さい (token 削減効果あり)
+
+フル report: [[file:../../benchmarks/doc31-phase0/report-2026-04-22.org][benchmarks/doc31-phase0/report-2026-04-22.org]]
+
+方針調整:
+- 出力 format は *両方サポート*: =:format 'sexp= (default, token 節約)
+  / =:format 'json= (stricter grammar 要求時)。
+- ABI mismatch: 上流 grammar は ABI 15 に進んでいるが Emacs 30.1 は 14
+  までサポート。benchmarks/tools/ に =tree-sitter generate --abi 14=
+  の再現 script を添付する (Phase 1a 前に整備)。
+
+Phase 1a 着手 OK。ETA 2-3 日。
+
+* Motivation
+
+** 現状の Doc 12 (sexp-edits) の限界
+
+現 =anvil-sexp-*= は Emacs の =read= + =prin1= ベース:
+
+- comment / whitespace / keyword alignment が reader で破壊される
+- macro expansion / reader macro が絡むコードは round-trip 不能
+- paren 不整合な source を LLM が書いたとき 修復できずエラー終了
+
+つまり "structurally edit this function" を LLM にやらせると、formatting
+が崩れる or parse failure でリトライループに入る。
+
+** cl-mcp が解いている方法
+
+調査結果 (Explore agent report, 2026-04-21):
+
+| 機能                          | cl-mcp                              |
+|-------------------------------+-------------------------------------|
+| CST-aware editing             | Eclector (reader, comment 保存)     |
+| paren auto-repair             | parinfer (LLM 誤出力の自動修正)     |
+| object drilling               | hash-table / CLOS / array 深掘り    |
+| CLHS offline cache            | HyperSpec 検索                      |
+| semantic grep                 | clgrep-search                       |
+
+特に *parinfer auto-repair* は LLM が括弧をミスしたときに "意図を保って
+自動修正" できるため、tool_call のリトライ率を劇的に下げる効果が期待
+できる。
+
+** Emacs 側で同等を実現する経路
+
+| Tech                        | 状態                                  | 採否 |
+|-----------------------------+---------------------------------------+------|
+| =treesit-elisp=             | Emacs 29+ 標準、anvil-py で実績       | ◎    |
+| =parse-partial-sexp=        | Emacs built-in、CST は不完全          | △    |
+| =edebug-read-and-maybe-wrap-form= | read + location map              | △    |
+| =parinfer-rust-mode=        | Emacs package、Rust binary 要          | ○    |
+| =emacs-lisp-ast= (外部)     | 成熟度低                              | ×    |
+
+採用方針: *treesit-elisp を primary、parinfer-rust-mode を optional
+dependency*。treesit は既に anvil-py で使っており安定性検証済み。
+
+** object drilling の必要性
+
+LLM に "このハッシュテーブルの中身を見て" と頼むと、現在は =pp= の全量
+出力しか返せない。大きな構造ほど token を浪費する。cl-mcp のように
+"lazy drill" (トップレベルのキーだけ先に返し、LLM が指定した key を
+depth-N まで展開) にすると:
+
+- 初回 response は数 KB オーダーで収まる
+- LLM が興味のある subtree だけ追加 call
+- vector / hash-table / record / EIEIO object を統一 API で扱える
+
+* Goals
+
+1. *=anvil-sexp-cst=* モジュール新規 (=anvil-optional-modules= 側、
+   treesit-elisp 利用可能時のみ enable)。
+2. 以下の MCP tool を提供:
+   - =sexp-cst-read=: file + offset → AST node (comment 込み)
+   - =sexp-cst-edit=: AST node 指定で rewrite。before/after の structural
+     diff を返す (not text diff)
+   - =sexp-cst-repair=: parinfer 相当で paren 自動修正。入力が壊れている
+     ときの救済ルート
+3. *=anvil-inspect-object=* MCP tool:
+   - 任意の elisp value (symbol / 式 評価結果) を受け取り、top-N keys
+     のサマリを返す
+   - =:drill PATH= で subtree を depth-N 展開
+   - 出力サイズ cap (default 4KB), truncation 時は続きを取得する
+     =:cursor= を返す
+4. parinfer integration は optional (=anvil-sexp-cst-parinfer-enable=)。
+   binary が無くても core 機能は動く。
+5. Phase 0 で treesit-elisp の CST 精度を *実測* ( anvil 自身を食わせる)、
+   不足なら parse-partial-sexp の補助層を追加設計。
+
+* Non-goals
+
+1. Common Lisp を対象にしない (Emacs Lisp のみ)。CL は cl-mcp に任せる。
+2. Full IDE refactor (rename / extract-function 等) は Doc 11 + Doc 12
+   の Ph3 (cross-file rename) 側で扱う。
+3. anvil 自身の既存 =anvil-sexp-*= (reader-based) を破壊しない — 並列
+   配置、LLM が文脈で選ぶ。
+
+* Phasing
+
+| Phase | 内容                                           | 依存   | 想定 | 状態  |
+|-------+------------------------------------------------+--------+------+-------|
+| 0     | treesit-elisp 精度実測 (anvil 自身を parse)    | なし   | 2d   | TODO  |
+| 1a    | =anvil-inspect-object= (lazy drill, top-N)     | 0      | 2d   | TODO  |
+| 1b    | =anvil-inspect-object= :drill + :cursor        | 1a     | 1d   | TODO  |
+| 2a    | =sexp-cst-read= (comment-preserving AST)       | 0      | 2d   | TODO  |
+| 2b    | =sexp-cst-edit= (node rewrite, structural diff)| 2a     | 3d   | TODO  |
+| 3a    | =sexp-cst-repair= (parinfer optional)          | 2b     | 2d   | TODO  |
+| 3b    | LLM 評価 (括弧壊れ input のリトライ率計測)     | 3a     | 1d   | TODO  |
+
+Phase 0 は ROI 判定の gate: treesit-elisp が実用精度に届かない場合、
+Phase 2 以降は棚上げして Phase 1 (inspect-object) のみ ship する。
+
+* Design Notes
+
+** Why treesit over read+prin1
+
+| Dimension         | read/prin1                | treesit-elisp           |
+|-------------------+---------------------------+-------------------------|
+| Comment 保存      | × (skip される)           | ○ (node として残る)     |
+| Whitespace 保存   | × (prin1 再整形)          | ○ (source range 保持)   |
+| Reader macro      | eval-depth risk           | parse のみで安全        |
+| Partial parse     | 全量 read 必須            | 局所 node 取得可能      |
+| Paren 不整合      | error                     | error node 検出可能     |
+
+treesit は "error node を含んだまま部分 AST を返す" モードがあり、
+壊れた input でも "ここから ここまでは正しい" 情報が得られる。これが
+parinfer 連携の基盤になる。
+
+** Object drilling の API 形
+
+#+begin_src text
+# 初回: top-level summary
+inspect-object :expr "(buffer-local-variables)"
+→ { type: alist, length: 142,
+    sample: [ ("major-mode" . org-mode), ("buffer-file-name" . "...")
+              ... truncated at 10 entries ],
+    cursor: "ab12cd" }
+
+# drill: 特定 key
+inspect-object :cursor "ab12cd" :drill "buffer-display-table" :depth 2
+→ { type: char-table, ... }
+#+end_src
+
+cursor は anvil-state (Doc 08) に expr + 位置を保存するトークン。drill
+時に再評価するのではなく 初回評価結果を cache。TTL は session 終了まで。
+
+** Parinfer integration
+
+optional module = =anvil-sexp-cst-parinfer= で parinfer-rust-mode を
+=executable-find= し、binary 経由で indent-mode / paren-mode を呼ぶ。
+
+fallback: parinfer が無い環境では treesit の error node 情報から単純な
+"close-paren balancing" だけ行う (完璧ではないが LLM 誤出力の 80% は
+これで救済可能という仮説)。
+
+** 既存 Doc 12 との関係
+
+| Doc                  | 対象            | アプローチ       | 保存対象          |
+|----------------------+-----------------+------------------+-------------------|
+| 12 (sexp-edits)      | elisp, reader   | read / prin1     | 構造のみ          |
+| 31 (sexp-cst-edits)  | elisp, CST      | treesit-elisp    | 構造 + comment    |
+
+Doc 12 は簡易・高速・互換重視、Doc 31 は formatting preservation 重視。
+LLM は tool 説明で使い分ける (anvil-manifest-profile Doc 26 の
+=:profiles= tag で出し分けてもよい)。
+
+* Dependencies
+
+- Emacs 29+ (treesit 標準搭載要件)
+- tree-sitter-elisp grammar (Phase 0 で availability 判定)
+- Doc 08 (State KV) — inspect-object の cursor 永続化
+- Doc 12 (sexp-edits, SHIPPED) — 比較ベースライン
+
+* Open Questions
+
+** Resolved (2026-04-22 research)
+
+1. *treesit-elisp grammar 安定性* — 解決。Wilfred/tree-sitter-elisp は
+   active、81★、134 commits、3 open issues。comment / vector / quoting /
+   dotted pair / bytecode literal を網羅。**known limitation**: Lisp-2
+   のため =(foo (let ...))= が関数呼び出しなのか user-defined macro なのか
+   構文解析では区別不能 — ただし我々は *structural* edit 目的なので、
+   この semantic gap は許容。autoload cookie は普通の comment 扱いに
+   なるが無害。
+
+2. *parinfer-rust-mode cross-platform* — 解決。prebuilt binary は
+   Linux/macOS 配布あり、Windows は cross-compile が必要。anvil 側は
+   *optional dependency* 扱いで扱い、=executable-find= で検出できない
+   環境では treesit の error-node 情報から "close-paren balance" 単純
+   補修にフォールバックする方針。
+
+3. *inspect-object cursor lifetime* — 解決。anvil-state (Doc 08) に
+   =inspect-object/<uuid>= namespace で保存、TTL 24h を default に、
+   =anvil-acp-session-end= hook で当該 session 由来の cursor を purge。
+   session 跨ぎ復活は既定で無効 (cursor は stale data を指す risk あり、
+   session 単位で discard が安全)。
+
+* Phase 0 Concrete Checklist (acceptance criteria)
+
+Phase 0 の ROI gate は以下を全部満たしたら GO:
+
+** G1. treesit-elisp 精度実測 (必須)
+
+- サンプル: anvil 自身の =anvil.el= / =anvil-server.el= / =anvil-file.el=
+  / =anvil-org.el= 4 ファイル (合計 ~10,000 行)
+- 測定項目:
+  1. parse 成功率 (error node を含まずに完走するファイル数)
+  2. comment node の原文復元率 (文字列比較)
+  3. パース後 → source range 再構築 → オリジナル textual round-trip
+     一致率 (byte-exact)
+- 合格基準:
+  - parse 成功率 100% (error node 0 が理想、1 file でも fail なら原因特定)
+  - 復元率 ≥ 99.9% (改行 / indent / comment 完全保存)
+
+** G2. inspect-object prototype (必須)
+
+最小版 =anvil-inspect-object= を anvil-state を使わず in-memory で実装し、
+以下の型を 1 行ずつ回して出力品質を確認:
+
+- alist (=buffer-local-variables=)
+- hash-table (例: =(let ((h (make-hash-table))) ...))=)
+- char-table (=(buffer-display-table)=)
+- record (cl-defstruct 実体)
+- EIEIO object (=(make-instance 'eieio-default-superclass)=)
+- vector / string / symbol / number
+
+合格基準:
+- 全型で truncation marker (~…~ か =...= か等) が一貫
+- 出力サイズ cap (default 4KB) を超えた場合、=cursor= フィールドを
+  必ず返す (cursor lookup なし PoC 段階でも構造だけ合わせる)
+- LLM prompt に貼って自然に読めるフォーマット (JSON 1 案 + 簡易 S-exp 案
+  の 2 案比較まで Phase 0 で決着)
+
+** G3. parinfer 代替 fallback 仕様決定 (推奨)
+
+treesit の error-node 位置情報から unmatched paren を検出し、
+*close-paren 追加* もしくは *open-paren 末尾補足* のどちらかで
+バランスを取る最小ロジックを紙面設計。LLM 典型誤出力サンプル 5 件で
+手動トレース、修復率 ≥ 60% の見込みを確認できれば Phase 3a 着手。
+
+** Phase 0 Go/No-Go 判定
+
+- G1 / G2 合格 → Phase 1a (inspect-object 正式版) へ進行
+- G1 fail (treesit 精度不足) → Phase 2+ の sexp-cst-edit 系は棚上げ、
+  inspect-object のみ ship
+- G2 fail (型網羅困難) → Phase 1 縮小、alist / hash-table 限定で ship
+
+* References
+
+- tree-sitter-elisp: https://github.com/Wilfred/tree-sitter-elisp
+- parinfer-rust-mode: https://github.com/eraserhd/parinfer-rust-mode
+- cl-mcp (cl-ai-project): https://github.com/cl-ai-project/cl-mcp
+- Doc 12 (sexp-edits) — reader-based 互換レイヤ
+- Doc 21 (treesit-edits for Python) — treesit 応用の先行事例

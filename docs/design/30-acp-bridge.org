@@ -1,0 +1,229 @@
+#+title: anvil-acp — Agent Client Protocol Bridge
+#+date: 2026-04-21
+#+author: zawatton
+#+property: status DRAFT
+#+property: scope GENERIC
+
+* STATUS
+  :PROPERTIES:
+  :ID:       d7a1b2c4-5e6f-7a8b-9c0d-1e2f3a4b5c30
+  :END:
+~DRAFT~ (2026-04-21) → ~DEFERRED~ (2026-04-22 after research) —
+Week-4 Ship 候補。r/emacs コメント (theeseuus, 2026-04-21) で指摘された
+landscape の一部として agent-shell (xenodium, 1,060★) が ACP 採用で存在感を
+増している点を受けた設計。anvil を *ACP agent backend* として露出することで、
+agent-shell / Zed / JetBrains / Neovim の ACP 対応 editor 群が anvil の tool
+registry を直接呼び出せる。
+
+MCP と ACP は直交: MCP = model↔tools, ACP = editor↔agent。anvil は MCP
+server として既に tool 層を持っているため、ACP 側では "anvil 自身が 1 個の
+agent として振る舞う" wrapper を書くだけで済む。
+
+実装 ETA 1-2 週間。Windows 互換は stdio/JSON-RPC なので素直に動く想定。
+
+** 2026-04-22 status update (DEFERRED)
+
+spec 精読の結果、MCP-over-ACP (editor 経由で MCP server config を agent に
+渡す機構) は **RFD 段階で stable spec に未採択**。Doc 30 の中核価値である
+"anvil の 90 tool を ACP editor から使える" は Phase 2a の MCP forward
+実装が前提だが、そこが spec 上宙に浮いている。
+
+方針: Doc 30 は *spec wait* で DRAFT 凍結。Doc 31 (CST edits) を先行 ship。
+2026-07 を目処に MCP-over-ACP RFD の merge status を再確認し、その時点で
+Phase 1a から着手するか否かを判定する。
+
+それまでに anvil 側で準備できるのは:
+- agent-shell で使える =anvil-acp-serve= entry point の prototype (MCP
+  forward 無し、anvil 内蔵 tool だけの minimal agent)
+- consensus を ACP tool として expose する API 設計の紙面検討 (Phase 3)
+この 2 点は Doc 31 が落ち着いた後に軽く手を付ける余地あり。
+
+* Motivation
+
+** r/emacs landscape signal (2026-04-21)
+
+theeseuus の MCP-for-Lisp 周辺 landscape リストに ~agent-shell
+(xenodium)~ が含まれ、ACP (Agent Client Protocol, Zed + Google 2025 策定)
+への露出が拡大している事実が確認された:
+
+| Signal                                    | 値                    |
+|-------------------------------------------+-----------------------|
+| agent-shell stars                         | 1,060                 |
+| ACP editor support (as of 2026-04)        | Zed / JetBrains / Neovim / Emacs |
+| ACP spec site                             | agentclientprotocol.com |
+| MCP forwarding in ACP                     | 標準サポート          |
+
+agent-shell は Emacs frontend / anvil は Emacs infrastructure という構造。
+frontend が MCP server を agent 経由で利用するフローに anvil が乗れていないと、
+"anvil の tool registry は MCP client (Claude Code) からしか使えない" と
+いう distribution のボトルネックが残る。
+
+** MCP と ACP の役割分担
+
+#+begin_src text
+[MCP]  Model  ─────→  Tools/Data
+                     (anvil-file / anvil-git / anvil-http / ...)
+
+[ACP]  Editor ─────→  Agent
+       (Emacs/Zed)   (Claude Code / Gemini CLI / Goose / anvil?)
+                      │
+                      └──→ MCP Tools (forwarded)
+#+end_src
+
+ACP agent は通常 *LLM 呼び出しを内包した subprocess* (Claude Code CLI,
+Gemini CLI 等) で、editor からの prompt を受けて自分の判断で MCP tools を
+叩く。anvil を ACP agent 化すると:
+
+- anvil-orchestrator の 5 provider を ACP editor 側から指名できる
+- anvil-consensus (判定投票) を ACP 経由で呼べる
+- anvil の MCP tool 群 (file/git/http/buffer/org/pty-broker) を agent
+  self-use する
+
+つまり anvil の "multi-provider + consensus" という差別化要素を ACP
+editor 群に expose できる。
+
+** なぜ今か
+
+- ACP は 2025-08 に Zed + Google がアナウンス、2026-04 時点で editor 側
+  採用が加速中。*先行期* に入っているので agent 側の選択肢は少ない。
+- agent-shell が Emacs 側 ACP client の事実上の定番になりつつあるが、
+  ACP agent として名指しされているのは Claude Code / Gemini CLI /
+  Goose / Cline 等の *商用 CLI* が中心。OSS Elisp 製 agent は空白。
+- anvil は既に worker pool + orchestrator + streaming を持っており、
+  不足は *protocol wrapper* のみ。追加工数 ROI が高い。
+
+* Goals
+
+1. *=anvil-acp=* モジュールを新規作成。opt-in (=anvil-optional-modules=)。
+2. *ACP spec 準拠の stdio JSON-RPC server* を起動するトップコマンド
+   =anvil-acp-serve= を提供 (=M-x= / CLI 両対応)。
+3. 既存 =anvil-register-tools= をそのまま re-expose — MCP と ACP で
+   tool 定義の二重化を *しない*。
+4. anvil-orchestrator の streaming infra (token delta / status update)
+   を ACP の =session/update= notification に bridge。
+5. *MCP forward* — ACP 仕様の "editor が提供する MCP servers を agent に
+   渡す" 機構をサポート。受け取った MCP server 設定は anvil 内の既存
+   MCP client で透過的に扱う。
+6. Phase 1 minimum: chat + tool-call + streaming deltas。deep agentic
+   loop は Phase 2。
+
+* Non-goals
+
+1. anvil を ACP editor 化しない (agent-shell がその役目)。
+2. ACP spec の full surface を初期から網羅しない — session resume /
+   permission flow 等は Phase 2+。
+3. 既存 MCP server としての anvil を ACP 統合のために破壊しない。
+
+* Phasing
+
+| Phase | 内容                                                  | 依存           | 想定 | 状態  |
+|-------+-------------------------------------------------------+----------------+------+-------|
+| 0     | ACP spec 精読 + agent-shell ↔ Claude Code 挙動観測    | なし           | 2d   | TODO  |
+| 1a    | stdio JSON-RPC server + =initialize= / =authenticate= | 0              | 2d   | TODO  |
+| 1b    | =session/new= + =prompt= + 同期 LLM 応答              | 1a, 10 (orch)  | 3d   | TODO  |
+| 1c    | =session/update= streaming (token deltas)             | 1b             | 2d   | TODO  |
+| 2a    | MCP forward — editor-provided MCP servers を anvil    | 1c             | 3d   | TODO  |
+|       | 内 MCP client が dispatch                             |                |      |       |
+| 2b    | Permission flow (=session/request_permission=)        | 2a             | 2d   | TODO  |
+| 3     | anvil-consensus を ACP tool として expose             | 2b, 10         | 2d   | TODO  |
+
+Phase 0 で *mock client 実証* を挟む: 自作 Node script で anvil-acp の
+stdio を叩き、agent-shell を経由せず protocol 単体で動作検証する。
+
+* Design Notes
+
+** Transport / framing
+
+ACP は MCP と同じく JSON-RPC 2.0 over newline-delimited stdio。anvil
+側は既存の =anvil-mcp-transport= が newline-JSON を扱えるので、stream
+layer は大部分再利用可能。
+
+** Session lifecycle
+
+#+begin_src text
+editor                             anvil-acp
+  │                                    │
+  ├── initialize ────────────────────→ │
+  │←── server capabilities ─────────── ┤
+  ├── session/new ───────────────────→ │ (新 session ID 発行)
+  │←── session ready ───────────────── ┤
+  ├── prompt "..." ──────────────────→ │ (orchestrator submit)
+  │                                    │ ┌─ LLM streaming ─┐
+  │←── session/update (delta) ──────── ┤ │                 │
+  │←── session/update (delta) ──────── ┤ │                 │
+  │←── session/update (tool_call) ──── ┤ │                 │
+  │                                    │ │ tool execution  │
+  │←── session/update (tool_result) ── ┤ │                 │
+  │←── prompt/response (final) ─────── ┤ └─────────────────┘
+#+end_src
+
+session ID は =anvil-orchestrator= の既存 session infra で管理できる
+(Doc 10 Phase 6C の DAG session を再利用)。
+
+** Tool dispatch
+
+editor 側から MCP server を提供された場合、anvil-acp は:
+
+1. MCP server 設定 (stdio command 等) を受け取り、
+2. =anvil-mcp-client= 側で spawn し、
+3. LLM が tool_call を emit したら該当 MCP server へ forward、
+4. 結果を =session/update= で editor に流す。
+
+anvil 内蔵の tool 群 (file / git / http / buffer / org ...) は同じ
+bridge 経由で LLM から見える。MCP と ACP の境界を透過化できるのが
+実装上の肝。
+
+** Provider 選択
+
+ACP agent = 1 LLM という前提が現行 editor には残っているため、Phase
+1 では =anvil-acp-default-provider= (defcustom) で 1 個に固定する。
+
+Phase 3 で anvil-consensus を ACP tool として expose し、LLM が
+自分で "consensus(task)" を呼べば複数 provider の投票結果が返る形に。
+
+* Dependencies
+
+- Doc 10 (AI CLI Orchestrator, SHIPPED) — session infra / streaming
+- Doc 01 (Worker Pool v2, SHIPPED) — LLM subprocess 並列実行
+- Doc 08 (State KV, SHIPPED) — session persistence
+
+* Open Questions
+
+** Resolved (2026-04-22 research)
+
+1. *ACP spec stability* — 解決。formal stability guarantee はまだ無い。
+   version は =initialize= で negotiate、RFD process で改定。agent-shell
+   側は 13 agent を既に吸収しているが、それは各 CLI 固有 adapter 扱い。
+   anvil-acp は =initialize= の ~protocolVersion~ を固定宣言し、不一致な
+   editor には明示エラーを返す方針で十分。
+
+2. *MCP forward envelope* — **spec で未採択**。「MCP-over-ACP: MCP Transport
+   via ACP Channels」は RFD 段階で、stable spec に入っていない。Phase 2a
+   は spec 待ち。当面は anvil 内蔵 tool のみを expose する方針に変更。
+
+3. *agent-shell adapter 要否* — 不要と確認。agent-shell は
+   =agent-shell-<agent>-acp-command= (string list) で spawn するだけ。
+   anvil-acp を spawnable CLI (例: =emacs -Q -L ... -l anvil-acp
+   --batch -f anvil-acp-serve=) として提供すれば、user 側の config
+   追加だけで自動対応する。adapter module 一切不要。
+
+** 新規 open (2026-04-22)
+
+4. *Process 構成* — anvil-acp は (a) 新規 emacs subprocess を毎 session
+   起動するか、(b) 既存 daemon に stdio 経由で bridge するか。(a) は
+   簡単だが毎回 1-2s の起動 cost、(b) は安いが bridge 実装が重い。
+   Phase 0 で両方の PoC 比較を挟む。
+
+5. *Multi-provider 露出* — anvil の強みは "consensus across providers"
+   だが ACP 1 session = 1 provider 前提。consensus は tool として
+   expose (Phase 3) するか、session/mode で切替えるか。両案の UX 検証
+   を Phase 0 後段で実施。
+
+* References
+
+- ACP spec: https://agentclientprotocol.com/
+- agent-shell: https://github.com/xenodium/agent-shell
+- acp.el: https://github.com/xenodium/acp.el
+- Doc 10 AI CLI Orchestrator (anvil 内)
+- r/emacs landscape thread (2026-04-21): theeseuus comment on v0.3.0
+  announcement

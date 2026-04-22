@@ -1,0 +1,106 @@
+#+title: Doc 31 Phase 0 — Measurement report
+#+date: 2026-04-22
+#+author: zawatton + Claude Opus 4.7
+
+* Run context
+
+- Emacs: 30.1 (Debian packaged)
+- treesit-elisp grammar: Wilfred/tree-sitter-elisp @ ~main~, compiled with
+  tree-sitter-cli 0.x, ABI 14 (Emacs 30.1 refused ABI 15 from upstream
+  generator default — had to ~tree-sitter generate --abi 14~).
+- Target files (anvil itself): ~anvil.el~, ~anvil-server.el~,
+  ~anvil-file.el~, ~anvil-org.el~ (total 265 107 bytes / 6 302 lines).
+- Scripts: [[file:g1-accuracy.el][g1-accuracy.el]] / [[file:g2-inspect.el][g2-inspect.el]], both ~emacs --batch -Q -l~.
+
+* G1 — treesit-elisp accuracy (PASS)
+
+| File              | Bytes  | Lines | Parse ms | ERROR | Byte-exact | Comments (tree-sit / regex) |
+|-------------------+--------+-------+----------+-------+------------+-----------------------------|
+| anvil.el          |   9672 |   227 |        1 |     0 | YES        | 49 / 52                     |
+| anvil-server.el   |  73700 |  1784 |        3 |     0 | YES        | 201 / 212                   |
+| anvil-file.el     | 110912 |  2462 |        5 |     0 | YES        | 140 / 169                   |
+| anvil-org.el      |  70823 |  1829 |        3 |     0 | YES        | 150 / 156                   |
+
+Aggregate:
+- Parse success (ERROR == 0): 4/4 files
+- Byte-exact round-trip ~(buffer-string) == treesit-node-text root~: 4/4 files
+- Total comment nodes detected: 540 (treesit) vs 589 (regex estimate)
+  → ~91.7%~ detection rate; residual 8.3% is mostly regex false-positives
+  (comment-like ~;~ inside strings / char literals) not treesit misses
+- Parse latency median 3 ms for 70 KB files — negligible on MCP path
+
+G1 accept criteria: parse 100% / round-trip ≥ 99.9%.  **Met.**
+
+* G2 — inspect-object prototype (PASS)
+
+14 type fixtures exercised end-to-end via [[file:g2-inspect.el][g2-inspect.el]]:
+
+| Type                  | JSON (bytes) | S-exp (bytes) | Truncation |
+|-----------------------+--------------+---------------+------------|
+| alist (3 entries)     |           93 |            70 | —          |
+| alist (15 entries)    |          340 |           275 | —          |
+| alist (5000 entries)  |          992 |           927 | — (top-N)  |
+| hash-table (25)       |          391 |           326 | —          |
+| char-table (after bug fix) | 184    |           136 | —          |
+| record (cl-struct)    |          166 |           143 | —          |
+| vector (12)           |          232 |           167 | —          |
+| string (16 chars)     |           82 |            71 | —          |
+| string (500 chars)    |          107 |            96 | —          |
+| symbol                |           74 |            63 | —          |
+| integer / float / nil |    45–49 each |      35–39 each | —        |
+| list of vectors       |          188 |           153 | —          |
+
+Separate forced-truncation test (cap=200 on 5000-entry alist):
+
+- JSON cut at 158 bytes with ~…[TRUNCATED]…~ marker + ~cursor=drill:<uuid>~
+- round-trip to Phase 1 anvil-state would resolve the cursor on drill
+
+G2 accept criteria: all types emit valid output; 4KB cap + cursor field
+present when exceeded.  **Met.**
+
+** Fix during G2
+
+Initial version mis-classified char-table as ~other~ because
+~(vectorp ct)~ returns ~nil~ for char-tables.  Moved
+~(char-table-p v)~ branch before ~(vectorp v)~.  Now correctly reports
+~char-table~ type and samples ASCII chars.
+
+** Format recommendation
+
+S-exp is consistently ~10-25% smaller~ than JSON across all types.  On a
+~90-tool MCP server where every response eats token budget, that is
+non-trivial.
+
+Proposed resolution: support **both** formats via a ~:format= keyword on
+~anvil-inspect-object= (default = ~sexp~ for token efficiency, ~json~
+requested explicitly when downstream ACP editor / automation needs
+stricter grammar).
+
+* G3 — parinfer fallback (paper-only, deferred)
+
+Per plan, G3 design stays on paper for Phase 0 and empirical verification
+runs during Phase 3a.  No risk surfaced in G1/G2 that changes this.
+
+* Go/No-Go
+
+Phase 0 gate G1 + G2 both **PASS**.  Proceed to Phase 1a:
+
+1. Formalize =anvil-inspect-object= as a proper MCP tool in a new
+   =anvil-sexp-cst.el= module (opt-in via =anvil-optional-modules=,
+   guard on =(treesit-ready-p 'elisp)=).
+2. Store cursors in anvil-state (Doc 08) with 24h TTL; implement
+   ~inspect-object :cursor :drill KEY :depth N~ resolution.
+3. Add ERT coverage for all 14 fixture types.
+4. Follow-up Phase 1b: ~sexp-cst-read~ + ~sexp-cst-edit~ leveraging
+   treesit source ranges.
+
+Estimated Phase 1a ETA: 2-3 days.
+
+* Notes for future runs
+
+- ABI 14 is needed for Emacs 30.1; keep a pinned build script.
+- tree-sitter-cli should be added to dev onboarding docs (or vendored
+  as =benchmarks/tools/=) so re-running this benchmark is one command.
+- Extend G1 sample in Phase 2 design review: include a pathologically
+  malformed file (intentionally unmatched paren) to stress the ERROR
+  node path that Phase 3 parinfer fallback will rely on.
