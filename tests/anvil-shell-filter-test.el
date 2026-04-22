@@ -331,6 +331,202 @@
       (should (= 9900  (plist-get summary :saved-total))))))
 
 
+;;;; --- Phase 2a filter snapshots (10 additional handlers) ----------------
+
+(ert-deftest anvil-shell-filter-test/gh-pr-list-oneline ()
+  "`gh pr list' output reduces to `#NUM TITLE' one-liners."
+  (skip-unless (anvil-shell-filter-test--supported-p 'gh))
+  (let* ((raw (concat
+               "Showing 3 of 3 open pull requests in owner/repo\n"
+               "\n"
+               "ID   TITLE                           BRANCH             CREATED AT\n"
+               "#42  feat: shell filter              feat/shf           about 1 hour ago\n"
+               "#41  fix: cache expiry               fix/cache          about 2 hours ago\n"
+               "#40  docs: update README             docs/readme        about 3 hours ago\n"))
+         (out (anvil-shell-filter-apply 'gh raw)))
+    (should (stringp out))
+    (should (string-match-p "#42 feat: shell filter" out))
+    (should (string-match-p "#41 fix: cache expiry" out))
+    (should (string-match-p "#40 docs: update README" out))
+    (should (< (length out) (length raw)))))
+
+(ert-deftest anvil-shell-filter-test/git-log-graph-preserves-tree-chars ()
+  "`git log --graph' graph characters survive the graph filter."
+  (skip-unless (anvil-shell-filter-test--supported-p 'git-log-graph))
+  (let* ((raw (concat
+               "* commit deadbeefcafebabe1234567890abcdef12345678\n"
+               "|\\  Merge: feedface deadbeef\n"
+               "| | Author: Zaw <z@example.com>\n"
+               "| | Date:   Wed Apr 22 11:00:00 2026 +0900\n"
+               "| |\n"
+               "| |     feat: shell filter skeleton\n"
+               "| |\n"
+               "| * commit feedfacec001d00d9876543210abcdef87654321\n"
+               "|/  Author: Zaw <z@example.com>\n"
+               "|   Date:   Wed Apr 22 10:30:00 2026 +0900\n"
+               "|\n"
+               "|       test: shape-lock filters\n"))
+         (out (anvil-shell-filter-apply 'git-log-graph raw)))
+    (should (stringp out))
+    ;; At least one graph char must survive
+    (should (string-match-p "[*|/\\\\]" out))
+    (should (string-match-p "deadbee" out))
+    (should (string-match-p "shell filter skeleton" out))))
+
+(ert-deftest anvil-shell-filter-test/pip-install-keeps-installed-and-errors ()
+  "`pip install' filter drops Collecting/Downloading lines, keeps results."
+  (skip-unless (anvil-shell-filter-test--supported-p 'pip-install))
+  (let* ((raw (concat
+               "Collecting numpy\n"
+               "  Downloading numpy-1.26.4-cp311.whl (18.3 MB)\n"
+               "     |████████████████████████████████| 18.3 MB 12.3 MB/s\n"
+               "Using cached numpy-1.26.4-cp311.whl (18.3 MB)\n"
+               "Installing collected packages: numpy\n"
+               "Successfully installed numpy-1.26.4\n"
+               "WARNING: You are using pip version 22.0\n"))
+         (out (anvil-shell-filter-apply 'pip-install raw)))
+    (should (string-match-p "Successfully installed numpy-1.26.4" out))
+    (should (string-match-p "WARNING" out))
+    (should-not (string-match-p "Downloading" out))
+    (should-not (string-match-p "Using cached" out))
+    (should (< (length out) (length raw)))))
+
+(ert-deftest anvil-shell-filter-test/npm-install-summary-and-errors ()
+  "`npm install' filter keeps `added N' summary and `npm ERR'/`npm WARN'."
+  (skip-unless (anvil-shell-filter-test--supported-p 'npm-install))
+  (let* ((raw (concat
+               "npm notice Beginning install\n"
+               "npm http fetch GET 200 https://registry.npmjs.org/react\n"
+               "npm http fetch GET 200 https://registry.npmjs.org/react-dom\n"
+               "npm WARN deprecated coffee-script@1.12.7\n"
+               "\n"
+               "added 1234 packages, and audited 1235 packages in 12s\n"
+               "\n"
+               "42 packages are looking for funding\n"
+               "\n"
+               "5 vulnerabilities (2 moderate, 3 high)\n"))
+         (out (anvil-shell-filter-apply 'npm-install raw)))
+    (should (string-match-p "added 1234 packages" out))
+    (should (string-match-p "npm WARN" out))
+    (should (string-match-p "vulnerabilities" out))
+    (should-not (string-match-p "npm http fetch" out))
+    (should (< (length out) (length raw)))))
+
+(ert-deftest anvil-shell-filter-test/docker-ps-summary-when-many ()
+  "`docker ps' collapses to a row count when rows exceed the threshold."
+  (skip-unless (anvil-shell-filter-test--supported-p 'docker-ps))
+  (let* ((raw (concat
+               "CONTAINER ID   IMAGE     COMMAND   CREATED   STATUS    PORTS   NAMES\n"
+               (mapconcat (lambda (i)
+                            (format "abc%03d       alpine    sh        1 min     Up 1 min          cont%d"
+                                    i i))
+                          (number-sequence 1 15) "\n")
+               "\n"))
+         (out (anvil-shell-filter-apply 'docker-ps raw)))
+    (should (stringp out))
+    (should (string-match-p "15" out))
+    (should (< (length out) (length raw)))))
+
+(ert-deftest anvil-shell-filter-test/docker-logs-dedup ()
+  "`docker logs' collapses consecutive duplicate lines with `(xN)'."
+  (skip-unless (anvil-shell-filter-test--supported-p 'docker-logs))
+  (let* ((raw (concat
+               "2026-04-22T10:00:00 GET /api/health 200\n"
+               "2026-04-22T10:00:01 GET /api/health 200\n"
+               "2026-04-22T10:00:02 GET /api/health 200\n"
+               "2026-04-22T10:00:03 POST /api/login 401\n"
+               "2026-04-22T10:00:04 GET /api/health 200\n"))
+         (out (anvil-shell-filter-apply 'docker-logs raw)))
+    ;; 3× consecutive health-check must collapse
+    (should (string-match-p "(x3)\\|×3\\|x3" out))
+    (should (string-match-p "POST /api/login 401" out))
+    (should (< (length out) (length raw)))))
+
+(ert-deftest anvil-shell-filter-test/kubectl-get-summary-when-many ()
+  "`kubectl get pods' collapses to header + count when rows exceed threshold."
+  (skip-unless (anvil-shell-filter-test--supported-p 'kubectl-get))
+  (let* ((raw (concat
+               "NAME          READY   STATUS    RESTARTS   AGE\n"
+               (mapconcat (lambda (i)
+                            (format "pod-%02d       1/1     Running   0          1d" i))
+                          (number-sequence 1 15) "\n")
+               "\n"))
+         (out (anvil-shell-filter-apply 'kubectl-get raw)))
+    (should (string-match-p "NAME\\s-+READY" out))
+    (should (string-match-p "15" out))
+    (should (< (length out) (length raw)))))
+
+(ert-deftest anvil-shell-filter-test/aws-s3-ls-summary-when-many ()
+  "`aws s3 ls' collapses to count when entries exceed threshold."
+  (skip-unless (anvil-shell-filter-test--supported-p 'aws-s3-ls))
+  (let* ((raw (concat
+               (mapconcat
+                (lambda (i)
+                  (format "2026-04-22 10:00:00      1024 file-%02d.txt" i))
+                (number-sequence 1 20) "\n")
+               "\n"))
+         (out (anvil-shell-filter-apply 'aws-s3-ls raw)))
+    (should (stringp out))
+    (should (string-match-p "20" out))
+    (should (< (length out) (length raw)))))
+
+(ert-deftest anvil-shell-filter-test/prettier-drops-checked-keeps-errors ()
+  "`prettier' drops unchanged file lines, keeps errors."
+  (skip-unless (anvil-shell-filter-test--supported-p 'prettier))
+  (let* ((raw (concat
+               "checking formatting...\n"
+               "src/a.js 12ms\n"
+               "src/b.js 8ms\n"
+               "src/c.js 4ms (unchanged)\n"
+               "[error] src/bad.js: SyntaxError: Unexpected token (5:3)\n"
+               "All matched files use Prettier code style!\n"))
+         (out (anvil-shell-filter-apply 'prettier raw)))
+    (should (string-match-p "SyntaxError" out))
+    (should-not (string-match-p "src/a.js 12ms" out))
+    (should (< (length out) (length raw)))))
+
+(ert-deftest anvil-shell-filter-test/ruff-groups-by-code ()
+  "`ruff' groups violations by rule code with a cap per code."
+  (skip-unless (anvil-shell-filter-test--supported-p 'ruff))
+  (let* ((raw (concat
+               "src/a.py:10:5: E501 line too long\n"
+               "src/a.py:12:5: E501 line too long\n"
+               "src/a.py:14:5: E501 line too long\n"
+               "src/a.py:16:5: E501 line too long\n"
+               "src/a.py:18:5: E501 line too long\n"
+               "src/a.py:20:5: E501 line too long\n"
+               "src/b.py:5:1: F401 imported but unused\n"
+               "src/c.py:7:1: W291 trailing whitespace\n"
+               "Found 8 errors.\n"))
+         (out (anvil-shell-filter-apply 'ruff raw)))
+    (should (stringp out))
+    (should (string-match-p "E501" out))
+    (should (string-match-p "F401" out))
+    (should (string-match-p "W291" out))
+    (should (string-match-p "Found 8 errors" out))
+    ;; All 6 E501 occurrences must NOT appear verbatim — filter caps them
+    (should (< (length out) (length raw)))))
+
+
+;;;; --- Phase 2a dispatch extensions ---------------------------------------
+
+(ert-deftest anvil-shell-filter-test/lookup-phase2a-tokens ()
+  "New first-token commands map to their Phase 2a filters."
+  (skip-unless (anvil-shell-filter-test--supported-p 'phase2a-dispatch))
+  (should (eq 'gh            (anvil-shell-filter-lookup "gh pr list")))
+  (should (eq 'gh            (anvil-shell-filter-lookup "gh pr view 42")))
+  (should (eq 'git-log-graph (anvil-shell-filter-lookup "git log --graph --oneline")))
+  (should (eq 'pip-install   (anvil-shell-filter-lookup "pip install numpy")))
+  (should (eq 'pip-install   (anvil-shell-filter-lookup "pip3 install requests")))
+  (should (eq 'npm-install   (anvil-shell-filter-lookup "npm install")))
+  (should (eq 'docker-ps     (anvil-shell-filter-lookup "docker ps -a")))
+  (should (eq 'docker-logs   (anvil-shell-filter-lookup "docker logs my-container")))
+  (should (eq 'kubectl-get   (anvil-shell-filter-lookup "kubectl get pods")))
+  (should (eq 'aws-s3-ls     (anvil-shell-filter-lookup "aws s3 ls s3://bucket/")))
+  (should (eq 'prettier      (anvil-shell-filter-lookup "prettier --write .")))
+  (should (eq 'ruff          (anvil-shell-filter-lookup "ruff check src/"))))
+
+
 (provide 'anvil-shell-filter-test)
 
 ;;; anvil-shell-filter-test.el ends here
