@@ -326,17 +326,23 @@ MCP Parameters:
   (anvil-server-register-tool
    #'anvil-cron--tool-list
    :id "cron-list"
+   :intent '(cron)
+   :layer 'dev
    :description "List all scheduled tasks with status"
    :read-only t
    :server-id anvil-cron--server-id)
   (anvil-server-register-tool
    #'anvil-cron--tool-run
    :id "cron-run"
+   :intent '(cron)
+   :layer 'dev
    :description "Run a scheduled task immediately by ID"
    :server-id anvil-cron--server-id)
   (anvil-server-register-tool
    #'anvil-cron--tool-status
    :id "cron-status"
+   :intent '(cron)
+   :layer 'dev
    :description "Show detailed status of all scheduled tasks"
    :read-only t
    :server-id anvil-cron--server-id)

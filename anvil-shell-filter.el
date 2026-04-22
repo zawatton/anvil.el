@@ -785,6 +785,8 @@ MCP Parameters:
 (defconst anvil-shell-filter--tool-specs
   `((,(anvil-server-encode-handler #'anvil-shell-filter--tool-shell-run)
      :id "shell-run"
+     :intent '(shell)
+     :layer 'io
      :description
      "Run a shell command, compress its stdout through a per-command filter
 (git-status, git-log, git-diff, rg, find, ls, pytest, ert-batch,
@@ -795,6 +797,8 @@ compression.")
 
     (,(anvil-server-encode-handler #'anvil-shell-filter--tool-shell-filter)
      :id "shell-filter"
+     :intent '(shell)
+     :layer 'io
      :description
      "Apply a named filter to a string without running a shell command.  Lets
 callers re-compress output they already have (from a prior
@@ -803,6 +807,8 @@ callers re-compress output they already have (from a prior
 
     (,(anvil-server-encode-handler #'anvil-shell-filter--tool-shell-tee-get)
      :id "shell-tee-get"
+     :intent '(shell)
+     :layer 'io
      :description
      "Fetch raw stdout previously captured by `shell-run' under TEE_ID.
 Retention is governed by `anvil-shell-tee-ttl-sec' (default 1h);
@@ -811,6 +817,8 @@ expired ids return :found nil."
 
     (,(anvil-server-encode-handler #'anvil-shell-filter--tool-shell-gain)
      :id "shell-gain"
+     :intent '(shell admin)
+     :layer 'io
      :description
      "Summarise cumulative raw→compressed savings over the last DAYS days
 (default 7).  Returns raw / compressed / saved byte totals plus an

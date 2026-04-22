@@ -609,6 +609,8 @@ MCP Parameters:
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-data--tool-get-path)
    :id "data-get-path"
+   :intent '(json-edit config file-read)
+   :layer 'core
    :server-id anvil-data--server-id
    :description
    "Read the value at a dotted path inside a JSON file.  Returns
@@ -619,6 +621,8 @@ JSON literals).  Empty PATH returns the whole document.  Read-only."
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-data--tool-set-path)
    :id "data-set-path"
+   :intent '(json-edit config)
+   :layer 'core
    :server-id anvil-data--server-id
    :description
    "Install a JSON value at a dotted path inside a JSON file.
@@ -631,6 +635,8 @@ APPLY is preview-only by default — pass any truthy string (e.g.
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-data--tool-delete-path)
    :id "data-delete-path"
+   :intent '(json-edit config)
+   :layer 'core
    :server-id anvil-data--server-id
    :description
    "Remove a dotted path from a JSON file.  Same preview / apply
@@ -640,6 +646,8 @@ path was already absent."
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-data--tool-list-keys)
    :id "data-list-keys"
+   :intent '(json-edit file-read)
+   :layer 'core
    :server-id anvil-data--server-id
    :description
    "Return the keys (or array indices) of the map / array at the

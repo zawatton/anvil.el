@@ -865,6 +865,8 @@ MCP Parameters: (none)"
   (anvil-server-register-tool
    #'anvil-defs--tool-search
    :id "defs-search"
+   :intent '(elisp-read)
+   :layer 'core
    :server-id anvil-defs--server-id
    :description
    "Layer 2 of anvil progressive disclosure (see `disclosure-help').
@@ -880,6 +882,8 @@ once you picked the definition."
   (anvil-server-register-tool
    #'anvil-defs--tool-references
    :id "defs-references"
+   :intent '(elisp-read)
+   :layer 'core
    :server-id anvil-defs--server-id
    :description
    "List every indexed reference of a symbol.  Filter by ref kind
@@ -891,6 +895,8 @@ excluded at index time, so results are false-positive free.
   (anvil-server-register-tool
    #'anvil-defs--tool-signature
    :id "defs-signature"
+   :intent '(elisp-read)
+   :layer 'core
    :server-id anvil-defs--server-id
    :description
    "Return arity + first-line docstring + location for a symbol.
@@ -900,6 +906,8 @@ Cheaper than `elisp-describe-function'; answers \"how do I call X?\"."
   (anvil-server-register-tool
    #'anvil-defs--tool-who-requires
    :id "defs-who-requires"
+   :intent '(elisp-read)
+   :layer 'core
    :server-id anvil-defs--server-id
    :description
    "Return files that `(require ''FEATURE)'.  Answers module
@@ -909,6 +917,8 @@ reverse-dependency questions."
   (anvil-server-register-tool
    #'anvil-defs--tool-index-rebuild
    :id "defs-index-rebuild"
+   :intent '(elisp-read admin)
+   :layer 'workflow
    :server-id anvil-defs--server-id
    :description
    "Rebuild the defs index from scratch.  Opt-in — full rebuild
@@ -917,6 +927,8 @@ takes seconds on a normal anvil-sized project.")
   (anvil-server-register-tool
    #'anvil-defs--tool-index-status
    :id "defs-index-status"
+   :intent '(elisp-read admin)
+   :layer 'workflow
    :server-id anvil-defs--server-id
    :description
    "Return index schema version, DB path, and file / def / ref /

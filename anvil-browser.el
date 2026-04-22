@@ -707,6 +707,8 @@ in-memory fetch cache."
   (anvil-server-register-tool
    #'anvil-browser--tool-fetch
    :id "browser-fetch"
+   :intent '(browser)
+   :layer 'io
    :server-id anvil-browser--server-id
    :description
    "Open a URL and return a compact accessibility-tree snapshot
@@ -718,6 +720,8 @@ without relaunching Chrome."
   (anvil-server-register-tool
    #'anvil-browser--tool-interact
    :id "browser-interact"
+   :intent '(browser)
+   :layer 'io
    :server-id anvil-browser--server-id
    :description
    "Open a URL and run a JSON array of agent-browser commands
@@ -727,6 +731,8 @@ returning the final post-action accessibility tree.")
   (anvil-server-register-tool
    #'anvil-browser--tool-capture
    :id "browser-capture"
+   :intent '(browser)
+   :layer 'io
    :server-id anvil-browser--server-id
    :description
    "Fetch a URL and save it as an org file under
@@ -736,6 +742,8 @@ Returns the absolute path of the new file.")
   (anvil-server-register-tool
    #'anvil-browser--tool-screenshot
    :id "browser-screenshot"
+   :intent '(browser)
+   :layer 'io
    :server-id anvil-browser--server-id
    :description
    "Open a URL and save a PNG screenshot (optionally scoped to a
@@ -745,6 +753,8 @@ owns cleanup.")
   (anvil-server-register-tool
    #'anvil-browser--tool-close
    :id "browser-close"
+   :intent '(browser admin)
+   :layer 'io
    :server-id anvil-browser--server-id
    :description
    "Close every live agent-browser session and clear the in-memory

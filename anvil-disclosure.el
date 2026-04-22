@@ -625,48 +625,64 @@ MCP Parameters: (none)"
 (defconst anvil-disclosure--tool-specs
   `((,#'anvil-disclosure--tool-org-index-index
      :id "org-index-index"
+     :intent '(meta discovery)
+     :layer 'dev
      :description
      "Layer 1 of anvil progressive disclosure for org-mode headlines. Use FIRST for any org query. Returns up to 50 slim pointers at ~20 tokens each, each with a citation URI (org://ID) reusable as-is in Layer 3 (`org-read-by-id'). Escalate to Layer 2 (`org-index-search') only when Layer 1 matched and you need snippets to disambiguate. DO NOT use `file-read' for org files — org-index-index is 10x cheaper. Both `query' (title substring) and `path' (file-path substring) are optional; omit to enumerate."
      :read-only t
      :title "Org Index (Layer 1)")
     (,#'anvil-disclosure--tool-file-read-snippet
      :id "file-read-snippet"
+     :intent '(file-read structure)
+     :layer 'core
      :description
      "Layer 2 of anvil progressive disclosure for files. Returns a bounded window (default 20 lines, max 100) around `line' in `path' so you can read enough context to decide whether to escalate to Layer 3 `file-read'. Emits a `file://PATH#L<s>-<e>' citation URI that can be fed directly back into `file-read'. Cheaper than reading the whole file when you already know roughly where to look (e.g., from `file-outline' Layer 1 output or from `defs-search')."
      :read-only t
      :title "File Read Snippet (Layer 2)")
     (,#'anvil-disclosure--tool-defs-index
      :id "defs-index"
+     :intent '(elisp-read structure)
+     :layer 'core
      :description
      "Layer 1 of anvil progressive disclosure for elisp definitions. Use FIRST when asking \"where is X defined?\". Returns up to 50 slim pointers at ~20 tokens each ({:id defs://<sha>/SYM :symbol :file :kind}). The sha segment is the first 8 hex chars of sha1(file|line|name) so same-name functions in different files get distinct URIs. Each URI feeds directly into Layer 3 (`elisp-get-function-definition') or `anvil-uri-fetch'. Escalate to Layer 2 (`defs-search') only when you need arity / docstring / obsolete-p metadata to disambiguate."
      :read-only t
      :title "Defs Index (Layer 1)")
     (,#'anvil-disclosure--tool-uri-fetch
      :id "anvil-uri-fetch"
+     :intent '(http)
+     :layer 'io
      :description
      "Cross-layer resolver for any anvil citation URI (Doc 28 Phase 3+4). Pass an org://ID, defs://SHA/SYM, file://PATH[#L<s>-<e>], journal://YEAR/ID, or http-cache://SHA URI and this tool dispatches to the matching Layer-3 handler automatically. Returns (:scheme :uri :resolver :body). Prefer this when you already have a URI — you do not need to remember which Layer-3 tool corresponds to each scheme."
      :read-only t
      :title "URI Fetch (cross-layer)")
     (,#'anvil-disclosure--tool-journal-index
      :id "journal-index"
+     :intent '(meta discovery)
+     :layer 'dev
      :description
      "Layer 1 of anvil progressive disclosure scoped to org journal files (capture/journals-YYYY.org). Use FIRST when the question is about a journal entry. Combines an optional `year' filter with an optional `query' title substring and returns up to 50 slim pointers at ~20 tok each, each with a journal://YEAR/ID citation URI reusable in Layer 3 (`org-read-by-id' / `anvil-uri-fetch'). Cheaper than scanning the whole journal via `file-read'."
      :read-only t
      :title "Journal Index (Layer 1)")
     (,#'anvil-disclosure--tool-http-cache-index
      :id "http-cache-index"
+     :intent '(http admin)
+     :layer 'io
      :description
      "Layer 1 for the anvil-http response cache. Lists live cached entries with a stable http-cache://<sha256> citation URI, the normalised URL, status, fetched-at, body-length and content-type — *without* the body. Use `query' to filter by URL substring. Call `http-cache-get' (or `anvil-uri-fetch' on the URI) to pull the body."
      :read-only t
      :title "HTTP Cache Index (Layer 1)")
     (,#'anvil-disclosure--tool-http-cache-get
      :id "http-cache-get"
+     :intent '(http admin)
+     :layer 'io
      :description
      "Layer 3 for cached HTTP responses. Accepts a raw sha256 or an http-cache://SHA citation URI and returns the full stored entry (:url :sha :status :headers :body :fetched-at :final-url ...). Errors when the sha does not match any live cache entry."
      :read-only t
      :title "HTTP Cache Get (Layer 3)")
     (,#'anvil-disclosure-help-handler
      :id "disclosure-help"
+     :intent '(meta discovery)
+     :layer 'dev
      :description
      "Return the anvil 3-layer progressive-disclosure contract (Layer 1 index → Layer 2 search → Layer 3 get) and the citation URI scheme. Call this once at session start if you are unsure which tool to reach for when reading anvil-managed content."
      :read-only t

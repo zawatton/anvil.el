@@ -563,6 +563,8 @@ so direct Elisp / ERT callers keep the raw plist."
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-pty-broker--tool-spawn)
    :id "pty-spawn"
+   :intent '(pty shell)
+   :layer 'io
    :server-id anvil-pty-broker--server-id
    :description "Spawn a program under the node-pty broker. Requires
 the program to appear in `anvil-pty-broker-allowed-commands'. Returns
@@ -570,22 +572,30 @@ the pty-id string to use with pty-send / pty-read / pty-kill.")
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-pty-broker--tool-send)
    :id "pty-send"
+   :intent '(pty shell)
+   :layer 'io
    :server-id anvil-pty-broker--server-id
    :description "Write TEXT into an existing pty's stdin.")
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-pty-broker--tool-kill)
    :id "pty-kill"
+   :intent '(pty shell admin)
+   :layer 'io
    :server-id anvil-pty-broker--server-id
    :description "Send a signal (default SIGTERM) to an existing pty.")
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-pty-broker--tool-list)
    :id "pty-list"
+   :intent '(pty shell)
+   :layer 'io
    :server-id anvil-pty-broker--server-id
    :description "Return the list of active pty ids."
    :read-only t)
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-pty-broker--tool-read)
    :id "pty-read"
+   :intent '(pty shell)
+   :layer 'io
    :server-id anvil-pty-broker--server-id
    :description "Return buffered output for a pty; consume=t clears
 the buffer so the next read only sees new bytes."
@@ -593,6 +603,8 @@ the buffer so the next read only sees new bytes."
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-pty-broker--tool-read-filtered)
    :id "pty-read-filtered"
+   :intent '(pty shell)
+   :layer 'io
    :server-id anvil-pty-broker--server-id
    :description "Streaming read: returns pty output passed through a
 named shell-filter handler (docker-logs / pytest / git-status / …).

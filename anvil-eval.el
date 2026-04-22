@@ -217,6 +217,8 @@ MCP Parameters: (none)"
   (anvil-server-register-tool
    #'anvil-eval--sync
    :id "emacs-eval"
+   :intent '(eval)
+   :layer 'dev
    :description
    "Evaluate Emacs Lisp expression synchronously and return the result.
 Use for quick operations (< 30s): querying state, small edits,
@@ -225,6 +227,8 @@ reading data. For heavy operations use emacs-eval-async instead."
   (anvil-server-register-tool
    #'anvil-eval--async
    :id "emacs-eval-async"
+   :intent '(eval)
+   :layer 'dev
    :description
    "Evaluate Emacs Lisp expression asynchronously.
 Returns a job ID immediately. Emacs remains responsive during execution.
@@ -234,6 +238,8 @@ Retrieve result with emacs-eval-result tool using the returned job ID."
   (anvil-server-register-tool
    #'anvil-eval--result
    :id "emacs-eval-result"
+   :intent '(eval admin)
+   :layer 'dev
    :description
    "Get the result of an async job started by emacs-eval-async.
 Returns status (running/done/error), elapsed time, and result.
@@ -242,6 +248,8 @@ Poll this until status is 'done' or 'error'."
   (anvil-server-register-tool
    #'anvil-eval--jobs
    :id "emacs-eval-jobs"
+   :intent '(eval admin)
+   :layer 'dev
    :description
    "List all async jobs and their statuses.
 Useful for checking what's running or debugging stuck jobs."

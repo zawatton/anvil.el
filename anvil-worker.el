@@ -1104,12 +1104,16 @@ the human never sees the editor freeze."
   (anvil-server-register-tool
    #'anvil-worker--tool-probe
    :id "anvil-worker-probe"
+   :intent '(worker admin)
+   :layer 'dev
    :description "Per-lane worker status: name, alive/busy, PID, metrics summary"
    :read-only t
    :server-id anvil-worker--server-id)
   (anvil-server-register-tool
    #'anvil-worker--tool-reset-pool
    :id "anvil-worker-reset-pool"
+   :intent '(worker admin)
+   :layer 'dev
    :description "Kill all workers and respawn fresh daemons (recovers stuck pool)"
    :server-id anvil-worker--server-id)
   ;; Defer the heavy work (start-process × N) so it does not block

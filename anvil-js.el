@@ -177,6 +177,8 @@ MCP Parameters:
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-js--tool-list-imports)
    :id "js-list-imports"
+   :intent '(js-read structure)
+   :layer 'core
    :server-id anvil-js--server-id
    :description "List every `import ...' statement in a JavaScript,
 MJS, CJS, or JSX file.  Returns an ordered list of (:kind :text
@@ -187,6 +189,8 @@ source range."
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-js--tool-list-exports)
    :id "js-list-exports"
+   :intent '(js-read structure)
+   :layer 'core
    :server-id anvil-js--server-id
    :description "List every `export ...' statement in a JS / JSX
 file.  Returns (:kind :name :text :bounds); :kind is one of
@@ -196,6 +200,8 @@ file.  Returns (:kind :name :text :bounds); :kind is one of
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-js--tool-list-functions)
    :id "js-list-functions"
+   :intent '(js-read structure)
+   :layer 'core
    :server-id anvil-js--server-id
    :description "List function declarations and named arrow bindings
 in a JS / JSX file.  Returns (:kind :name :async :class-name :bounds);
@@ -206,6 +212,8 @@ in a JS / JSX file.  Returns (:kind :name :async :class-name :bounds);
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-js--tool-list-classes)
    :id "js-list-classes"
+   :intent '(js-read structure)
+   :layer 'core
    :server-id anvil-js--server-id
    :description "List class declarations in a JS / JSX file.
 Returns (:kind 'class :name :bounds) per entry."
@@ -214,6 +222,8 @@ Returns (:kind 'class :name :bounds) per entry."
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-js--tool-list-methods)
    :id "js-list-methods"
+   :intent '(js-read structure)
+   :layer 'core
    :server-id anvil-js--server-id
    :description "List methods defined directly inside the class named
 CLASS-NAME.  Nested classes' methods are excluded.  Returns
@@ -223,6 +233,8 @@ CLASS-NAME.  Nested classes' methods are excluded.  Returns
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-js--tool-find-definition)
    :id "js-find-definition"
+   :intent '(js-read)
+   :layer 'core
    :server-id anvil-js--server-id
    :description "Find the first function or class named NAME in a
 JS / JSX file.  Source-order wins when the name is shared; use
@@ -232,6 +244,8 @@ JS / JSX file.  Source-order wins when the name is shared; use
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-js--tool-surrounding-form)
    :id "js-surrounding-form"
+   :intent '(js-read structure)
+   :layer 'core
    :server-id anvil-js--server-id
    :description "Return the innermost function or class whose source
 range contains the 1-based buffer POINT.  KIND restricts the match

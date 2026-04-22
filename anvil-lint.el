@@ -488,6 +488,8 @@ MCP Parameters: none."
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-lint--tool-lint)
    :id "lint"
+   :intent '(lint)
+   :layer 'dev
    :server-id anvil-lint--server-id
    :description
    "Run anvil hygiene scanners over a scope.  Returns
@@ -500,6 +502,8 @@ families and individual scanners can be added via
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-lint--tool-scanners)
    :id "lint-scanners"
+   :intent '(lint)
+   :layer 'dev
    :server-id anvil-lint--server-id
    :description
    "List the currently registered lint scanners.  Returns a list of

@@ -1325,6 +1325,8 @@ MCP Parameters:
   (anvil-server-register-tool
    #'anvil-org--tool-get-todo-config
    :id "org-get-todo-config"
+   :intent '(org-read admin)
+   :layer 'workflow
    :description
    "Get the TODO keyword configuration from the current Emacs
 Org-mode settings.  Returns information about task state sequences
@@ -1354,6 +1356,8 @@ configuration before creating or updating TODO items."
   (anvil-server-register-tool
    #'anvil-org--tool-get-tag-config
    :id "org-get-tag-config"
+   :intent '(org-read admin)
+   :layer 'workflow
    :description
    "Get tag-related configuration from the current Emacs Org-mode
 settings.  Returns literal Elisp variable values as strings for tag

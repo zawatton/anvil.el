@@ -702,6 +702,8 @@ MCP Parameters:
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-session--tool-snapshot)
    :id "session-snapshot"
+   :intent '(session)
+   :layer 'workflow
    :server-id anvil-session--server-id
    :description
    "Capture the current session state (branch + task-summary + notes)
@@ -712,6 +714,8 @@ or an LLM re-entry prompt.  Write tool.")
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-session--tool-resume)
    :id "session-resume"
+   :intent '(session)
+   :layer 'workflow
    :server-id anvil-session--server-id
    :description
    "Return the stored snapshot plist for NAME, or an error envelope
@@ -720,6 +724,8 @@ when none exists.  Read-only — does not mutate running state."
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-session--tool-list)
    :id "session-list"
+   :intent '(session)
+   :layer 'workflow
    :server-id anvil-session--server-id
    :description
    "Return a JSON array of descriptor plists for every live snapshot
@@ -729,6 +735,8 @@ chars).  Use session-resume for the full payload."
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-session--tool-delete)
    :id "session-delete"
+   :intent '(session admin)
+   :layer 'workflow
    :server-id anvil-session--server-id
    :description
    "Purge the snapshot stored under NAME.  Returns {deleted: bool,
@@ -736,6 +744,8 @@ name}.  Write tool.")
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-session--tool-events-search)
    :id "session-events-search"
+   :intent '(session)
+   :layer 'workflow
    :server-id anvil-session--server-id
    :description
    "Case-insensitive substring hunt across the event log's `summary'
@@ -746,6 +756,8 @@ the result (default 20, oldest matches dropped first).  Read-only."
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-session--tool-events-recent)
    :id "session-events-recent"
+   :intent '(session)
+   :layer 'workflow
    :server-id anvil-session--server-id
    :description
    "Return the last LIMIT events (default 20), newest last.  Optional

@@ -1144,6 +1144,8 @@ MCP Parameters:
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-py--tool-list-imports)
    :id "py-list-imports"
+   :intent '(py-read structure)
+   :layer 'core
    :server-id anvil-py--server-id
    :description "List every `import' / `from X import Y' statement in a
 Python file.  Returns an ordered list of (:kind :text :bounds) plists,
@@ -1153,6 +1155,8 @@ one per statement, text and source range preserved."
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-py--tool-list-functions)
    :id "py-list-functions"
+   :intent '(py-read structure)
+   :layer 'core
    :server-id anvil-py--server-id
    :description "List every function definition in a Python file,
 including async def and decorated def.  Returns (:kind :name :decorated
@@ -1162,6 +1166,8 @@ including async def and decorated def.  Returns (:kind :name :decorated
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-py--tool-list-classes)
    :id "py-list-classes"
+   :intent '(py-read structure)
+   :layer 'core
    :server-id anvil-py--server-id
    :description "List every class definition in a Python file.  Returns
 (:kind :name :decorated :async :bounds) per class."
@@ -1170,6 +1176,8 @@ including async def and decorated def.  Returns (:kind :name :decorated
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-py--tool-list-methods)
    :id "py-list-methods"
+   :intent '(py-read structure)
+   :layer 'core
    :server-id anvil-py--server-id
    :description "List methods defined directly inside the class named
 CLASS-NAME.  Nested classes' methods are excluded; only the first-level
@@ -1179,6 +1187,8 @@ body of a class with that exact name matches."
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-py--tool-list-decorators)
    :id "py-list-decorators"
+   :intent '(py-read structure)
+   :layer 'core
    :server-id anvil-py--server-id
    :description "List every @decorator usage in a Python file with its
 target function / class name.  Multi-decorator targets yield one entry
@@ -1188,6 +1198,8 @@ per decorator, all pointing at the same target."
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-py--tool-find-definition)
    :id "py-find-definition"
+   :intent '(py-read)
+   :layer 'core
    :server-id anvil-py--server-id
    :description "Find the first function or class named NAME in a Python
 file.  When both a function and a class share the name, the first in
@@ -1198,6 +1210,8 @@ exhaustive results."
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-py--tool-surrounding-form)
    :id "py-surrounding-form"
+   :intent '(py-read structure)
+   :layer 'core
    :server-id anvil-py--server-id
    :description "Return the innermost function or class whose source
 range contains the 1-based buffer POINT.  KIND restricts the match to
@@ -1207,6 +1221,8 @@ range contains the 1-based buffer POINT.  KIND restricts the match to
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-py--tool-add-import)
    :id "py-add-import"
+   :intent '(py-edit code-bulk-edit)
+   :layer 'core
    :server-id anvil-py--server-id
    :description "Add an import to a Python file.  SPEC is a plist:
 (:kind 'from :from MODULE :names (NAME ...)) for `from X import ...',
@@ -1218,6 +1234,8 @@ Preview-default; pass :apply t to write via file-batch-across.")
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-py--tool-remove-import)
    :id "py-remove-import"
+   :intent '(py-edit code-bulk-edit)
+   :layer 'core
    :server-id anvil-py--server-id
    :description "Remove an import from a Python file.  SPEC shape
 matches `py-add-import'.  For `from'-imports, only the requested
@@ -1228,6 +1246,8 @@ Preview-default; pass :apply t to write via file-batch-across.")
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-py--tool-rename-import)
    :id "py-rename-import"
+   :intent '(py-edit code-bulk-edit)
+   :layer 'core
    :server-id anvil-py--server-id
    :description "Rename the alias of an existing import statement.
 SPEC shape: (:kind 'import :module M :new-alias S-or-nil) for bare
@@ -1240,6 +1260,8 @@ use sites is out of scope (Phase 3).  Preview-default.")
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-py--tool-replace-function)
    :id "py-replace-function"
+   :intent '(py-edit code-bulk-edit)
+   :layer 'core
    :server-id anvil-py--server-id
    :description "Replace a Python function / method body with
 NEW-SOURCE.  NEW-SOURCE is the full def including signature, written
@@ -1253,6 +1275,8 @@ replacing with identical source is a no-op.  Preview-default.")
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-py--tool-wrap-expr)
    :id "py-wrap-expr"
+   :intent '(py-edit code-bulk-edit)
+   :layer 'core
    :server-id anvil-py--server-id
    :description "Wrap the expression at [START, END) with WRAPPER.
 WRAPPER is a source template containing the placeholder

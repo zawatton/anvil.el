@@ -1076,6 +1076,8 @@ MCP Parameters:
   (anvil-server-register-tool
    #'anvil-dev--tool-self-sync-check
    :id "anvil-self-sync-check"
+   :intent '(dev audit)
+   :layer 'dev
    :server-id anvil-dev--server-id
    :description
    "Report the installed anvil clone's git HEAD + branch + dirty
@@ -1086,6 +1088,8 @@ causes a silent \"old code loaded\" bug after a daemon restart."
   (anvil-server-register-tool
    #'anvil-dev--tool-test-run-all
    :id "anvil-test-run-all"
+   :intent '(dev test)
+   :layer 'dev
    :server-id anvil-dev--server-id
    :description
    "Run every tests/anvil-*-test.el in the anvil checkout via
@@ -1096,6 +1100,8 @@ verification across every test file."
   (anvil-server-register-tool
    #'anvil-dev--tool-scaffold-module
    :id "anvil-scaffold-module"
+   :intent '(dev scaffold)
+   :layer 'dev
    :server-id anvil-dev--server-id
    :description
    "Create a new anvil-NAME.el module plus tests/anvil-NAME-test.el
@@ -1106,6 +1112,8 @@ any real code lives in it."
   (anvil-server-register-tool
    #'anvil-dev--tool-release-audit
    :id "anvil-release-audit"
+   :intent '(dev audit)
+   :layer 'dev
    :server-id anvil-dev--server-id
    :description
    "Scan the anvil tree for five pre-release hazard classes:

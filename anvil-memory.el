@@ -2055,6 +2055,8 @@ Returns (:rows ROWS).  Each row carries :file-a / :file-b /
 (defconst anvil-memory--tool-specs
   `((,(anvil-server-encode-handler #'anvil-memory--tool-scan)
      :id "memory-scan"
+     :intent '(memory admin)
+     :layer 'workflow
      :description
      "(Re-)populate the auto-memory metadata index.  Walks every memory/
 directory under ~/.claude/projects/*/ (or an explicit ROOTS list),
@@ -2065,6 +2067,8 @@ FTS5 body index for every file encountered.")
 
     (,(anvil-server-encode-handler #'anvil-memory--tool-audit)
      :id "memory-audit"
+     :intent '(memory admin)
+     :layer 'workflow
      :description
      "Apply the per-type TTL policy and return flagged rows.  Each entry
 carries :age-days plus a :flag field — `expired' (hard-ttl
@@ -2076,6 +2080,8 @@ first URL of every reference-type row; the row gains :url-status
 
     (,(anvil-server-encode-handler #'anvil-memory--tool-access)
      :id "memory-access"
+     :intent '(memory)
+     :layer 'workflow
      :description
      "Bump access_count and last_accessed for a memory .md file.  Returns
 the new access count; `:found' is nil when the file is not in
@@ -2083,6 +2089,8 @@ the index (run `memory-scan' first in that case).")
 
     (,(anvil-server-encode-handler #'anvil-memory--tool-list)
      :id "memory-list"
+     :intent '(memory)
+     :layer 'workflow
      :description
      "Dump the metadata index, optionally filtered by TYPE.  Intended as
 a Layer-1 slim overview for memory-pruner / audit workflows
@@ -2091,6 +2099,8 @@ rather than for loading memory contents."
 
     (,(anvil-server-encode-handler #'anvil-memory--tool-search)
      :id "memory-search"
+     :intent '(memory)
+     :layer 'workflow
      :description
      "Full-text search the memory FTS5 index.  Returns file / type /
 snippet / rank per hit, ordered by FTS5 rank (best first).  Use
@@ -2099,6 +2109,8 @@ this as Layer 2 before `memory-get'-ish full-body reads."
 
     (,(anvil-server-encode-handler #'anvil-memory--tool-save-check)
      :id "memory-save-check"
+     :intent '(memory)
+     :layer 'workflow
      :description
      "Return top-N indexed memories similar to a draft SUBJECT/BODY.
 FTS5 candidate shortlist plus jaccard overlap scoring (Phase 1b
@@ -2113,6 +2125,8 @@ network-free."
 
     (,(anvil-server-encode-handler #'anvil-memory--tool-duplicates)
      :id "memory-duplicates"
+     :intent '(memory admin)
+     :layer 'workflow
      :description
      "Return every memory pair whose body jaccard similarity exceeds
 THRESHOLD (default 0.6).  O(N^2) over the index — fine up to a
@@ -2122,6 +2136,8 @@ Phase 2."
 
     (,(anvil-server-encode-handler #'anvil-memory--tool-promote)
      :id "memory-promote"
+     :intent '(memory admin)
+     :layer 'workflow
      :description
      "Rename an indexed memory file to reflect NEW_TYPE's prefix and
 update metadata + FTS index accordingly.  Refuses overwrite and
@@ -2131,6 +2147,8 @@ has proven itself across multiple sessions.")
 
     (,(anvil-server-encode-handler #'anvil-memory--tool-regenerate)
      :id "memory-regenerate-index"
+     :intent '(memory admin)
+     :layer 'workflow
      :description
      "Return a `MEMORY.md' body listing memories under ROOT, ordered
 by :decay-score descending.  Lines are `- [NAME](FILE) — DESC'
@@ -2141,6 +2159,8 @@ returned body to disk after human review."
 
     (,(anvil-server-encode-handler #'anvil-memory--tool-reindex-fts)
      :id "memory-reindex-fts"
+     :intent '(memory admin)
+     :layer 'workflow
      :description
      "Rebuild the memory_body_fts virtual table with a chosen tokenizer.
 Phase 2b-i: `trigram' (SQLite 3.34+) is CJK-friendly — Japanese
@@ -2151,6 +2171,8 @@ matching.  Omit tokenizer to use `anvil-memory-fts-tokenizer'
 
     (,(anvil-server-encode-handler #'anvil-memory--tool-mdl-distill)
      :id "memory-mdl-distill"
+     :intent '(memory admin)
+     :layer 'workflow
      :description
      "Propose a unified \"convention memory\" from N indexed memory files.
 Phase 2b-iii: the orchestrator receives each source's body as a
@@ -2164,6 +2186,8 @@ every entry must already be in the metadata index (run
 
     (,(anvil-server-encode-handler #'anvil-memory--tool-export-html)
      :id "memory-export-html"
+     :intent '(memory admin)
+     :layer 'workflow
      :description
      "Render a self-contained HTML snapshot of memories under ROOT.
 Phase 3a: static viewer — no TCP server, no external resources, so
@@ -2179,6 +2203,8 @@ persist the page alongside the returned HTML string.  Returns
 
     (,(anvil-server-encode-handler #'anvil-memory--tool-serve-start)
      :id "memory-serve-start"
+     :intent '(memory admin)
+     :layer 'workflow
      :description
      "Start the local HTTP memory viewer on 127.0.0.1:<port>.
 Phase 3b: serves the Phase 3a HTML at `/', JSON at
@@ -2189,6 +2215,8 @@ are all optional and coerced from strings.  Returns :port / :host /
 
     (,(anvil-server-encode-handler #'anvil-memory--tool-serve-stop)
      :id "memory-serve-stop"
+     :intent '(memory admin)
+     :layer 'workflow
      :description
      "Stop the running memory viewer server.  Idempotent — the MCP
 call always succeeds; :stopped is the port number that was being
@@ -2196,6 +2224,8 @@ served, or nil when the server was already idle.")
 
     (,(anvil-server-encode-handler #'anvil-memory--tool-scan-contradictions)
      :id "memory-scan-contradictions"
+     :intent '(memory admin)
+     :layer 'workflow
      :description
      "Phase 3c: find memory pairs above a jaccard threshold and persist
 them in `memory_contradictions'.  mode=\"keyword\" (default) stores
@@ -2207,6 +2237,8 @@ with canonical (sorted) pair ordering.  Returns :scanned / :stored /
 
     (,(anvil-server-encode-handler #'anvil-memory--tool-contradictions)
      :id "memory-contradictions"
+     :intent '(memory admin)
+     :layer 'workflow
      :description
      "Phase 3c: return every stored contradiction / candidate edge as
 plists with :file-a / :file-b / :verdict / :score / :checked-at.

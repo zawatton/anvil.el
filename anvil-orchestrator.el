@@ -3665,6 +3665,8 @@ MCP Parameters:
 (defconst anvil-orchestrator--preamble-tool-specs
   `((,(anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-preamble-set)
      :id "orchestrator-preamble-set"
+     :intent '(orchestrator preamble)
+     :layer 'workflow
      :description
      "Register reusable context TEXT under KEY (Phase 7b).  Tasks
 referring to the same KEY via :preamble-ref have TEXT prepended
@@ -3673,23 +3675,31 @@ verbatim to their prompt at submit time, so a common preamble
 state rather than being re-typed into every prompt.")
     (,(anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-preamble-get)
      :id "orchestrator-preamble-get"
+     :intent '(orchestrator preamble)
+     :layer 'workflow
      :description
      "Return the preamble text registered under KEY, plus :found
 boolean.  Empty text when KEY is absent."
      :read-only t)
     (,(anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-preamble-list)
      :id "orchestrator-preamble-list"
+     :intent '(orchestrator preamble)
+     :layer 'workflow
      :description
      "List every registered preamble key and its stored text length.
 Read-only snapshot, sorted by key."
      :read-only t)
     (,(anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-preamble-delete)
      :id "orchestrator-preamble-delete"
+     :intent '(orchestrator preamble)
+     :layer 'workflow
      :description
      "Remove the preamble registered under KEY.  Returns
 :deleted t when a row existed, :deleted nil when KEY was absent.")
     (,(anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-preamble-set-from-file)
      :id "orchestrator-preamble-set-from-file"
+     :intent '(orchestrator preamble)
+     :layer 'workflow
      :description
      "Register a preamble whose body lives in a file the daemon
 can read directly.  Saves the caller from loading the file into
@@ -3856,6 +3866,8 @@ cursor line."
   (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-submit)
    :id "orchestrator-submit"
+   :intent '(orchestrator)
+   :layer 'workflow
    :server-id anvil-orchestrator--server-id
    :description
    "Submit a batch of AI CLI tasks (claude today, more providers
@@ -3869,6 +3881,8 @@ default 4000) come back by default.")
   (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-status)
    :id "orchestrator-status"
+   :intent '(orchestrator)
+   :layer 'workflow
    :server-id anvil-orchestrator--server-id
    :description
    "Return the status of a batch or a single task.  For a batch:
@@ -3878,6 +3892,8 @@ counts and slim task summaries (no full stdout / prompt)."
   (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-collect)
    :id "orchestrator-collect"
+   :intent '(orchestrator)
+   :layer 'workflow
    :server-id anvil-orchestrator--server-id
    :description
    "Return the slim task plist list for a batch.  Pass wait=\"t\" to
@@ -3888,6 +3904,8 @@ block until every task reaches a terminal state (done / failed
   (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-cancel)
    :id "orchestrator-cancel"
+   :intent '(orchestrator)
+   :layer 'workflow
    :server-id anvil-orchestrator--server-id
    :description
    "Cancel a running or queued task (SIGTERM, then SIGKILL after
@@ -3896,6 +3914,8 @@ block until every task reaches a terminal state (done / failed
   (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-retry)
    :id "orchestrator-retry"
+   :intent '(orchestrator)
+   :layer 'workflow
    :server-id anvil-orchestrator--server-id
    :description
    "Re-submit a task under a new id (same batch, same prompt /
@@ -3905,6 +3925,8 @@ non-auto-retryable failure.")
   (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-consensus-submit)
    :id "orchestrator-consensus-submit"
+   :intent '(orchestrator consensus)
+   :layer 'workflow
    :server-id anvil-orchestrator--server-id
    :description
    "Dispatch the same prompt to >= 2 providers (cross-model
@@ -3915,6 +3937,8 @@ via `orchestrator-consensus-collect' to get a verdict (unanimous
   (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-consensus-collect)
    :id "orchestrator-consensus-collect"
+   :intent '(orchestrator consensus)
+   :layer 'workflow
    :server-id anvil-orchestrator--server-id
    :description
    "Return the consensus verdict for a consensus id.  Includes
@@ -3926,6 +3950,8 @@ until every fan-out task reaches a terminal state."
   (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-consensus-judge)
    :id "orchestrator-consensus-judge"
+   :intent '(orchestrator consensus)
+   :layer 'workflow
    :server-id anvil-orchestrator--server-id
    :description
    "Run a meta-LLM judge (Phase 4b) over a consensus batch.  The
@@ -3938,6 +3964,8 @@ Returns the judge-task-id; poll with
   (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-consensus-judge-collect)
    :id "orchestrator-consensus-judge-collect"
+   :intent '(orchestrator consensus)
+   :layer 'workflow
    :server-id anvil-orchestrator--server-id
    :description
    "Return the judge task summary for a consensus id.  Pass
@@ -3948,6 +3976,8 @@ state."
   (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-stats)
    :id "orchestrator-stats"
+   :intent '(orchestrator admin)
+   :layer 'workflow
    :server-id anvil-orchestrator--server-id
    :description
    "Return aggregated task statistics from the in-memory task table:
@@ -3958,6 +3988,8 @@ p50/p95, and total cost-usd sum.  Read-only snapshot."
   (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-extract-result)
    :id "orchestrator-extract-result"
+   :intent '(orchestrator)
+   :layer 'workflow
    :server-id anvil-orchestrator--server-id
    :description
    "Return the minimum result plist for a task — summary, cost,
@@ -3971,6 +4003,8 @@ three-tool glue dance (Read stdout-path + python3 json extract
   (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-submit-one)
    :id "orchestrator-submit-one"
+   :intent '(orchestrator)
+   :layer 'workflow
    :server-id anvil-orchestrator--server-id
    :description
    "Submit a single task and return its task-id.  A convenience
@@ -3981,6 +4015,8 @@ DAGs, consensus, or multi-task batches.")
   (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-submit-and-collect)
    :id "orchestrator-submit-and-collect"
+   :intent '(orchestrator)
+   :layer 'workflow
    :server-id anvil-orchestrator--server-id
    :description
    "Submit a single task and block until it finishes (or
@@ -3995,6 +4031,8 @@ single call for short-running tasks.")
   (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-tail)
    :id "orchestrator-tail"
+   :intent '(orchestrator)
+   :layer 'workflow
    :server-id anvil-orchestrator--server-id
    :description
    "Return the last N bytes of a task's stdout or stderr stream.
@@ -4006,6 +4044,8 @@ claude partial output, or to inspect stderr after a failure."
   (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-list-interrupted)
    :id "orchestrator-list-interrupted"
+   :intent '(orchestrator)
+   :layer 'workflow
    :server-id anvil-orchestrator--server-id
    :description
    "List tasks orphaned by a daemon restart (status=failed,
@@ -4016,6 +4056,8 @@ Phase 6C'' DAG resume diagnostic."
   (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-resume-interrupted)
    :id "orchestrator-resume-interrupted"
+   :intent '(orchestrator)
+   :layer 'workflow
    :server-id anvil-orchestrator--server-id
    :description
    "Re-queue every interrupted (daemon-restart orphan) task in
@@ -4033,6 +4075,8 @@ Phase 6C'' DAG resume.")
   (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-stream)
    :id "orchestrator-stream"
+   :intent '(orchestrator)
+   :layer 'workflow
    :server-id anvil-orchestrator--server-id
    :description
    "Return the live stream-event list recorded for TASK_ID

@@ -196,6 +196,8 @@ now?\" without scanning disk."
   (anvil-server-register-tool
    #'anvil-buffer--tool-read
    :id "buffer-read"
+   :intent '(buffer file-read)
+   :layer 'core
    :server-id anvil-buffer--server-id
    :description
    "Read the live text of a named Emacs buffer.  Unlike `file-read',
@@ -206,6 +208,8 @@ unsaved edits — so the buffer's `:modified' flag and divergence
   (anvil-server-register-tool
    #'anvil-buffer--tool-save
    :id "buffer-save"
+   :intent '(buffer file-edit)
+   :layer 'core
    :server-id anvil-buffer--server-id
    :description
    "Write the named buffer's content to its visited file.  Refuses
@@ -216,6 +220,8 @@ visited the file (status `disk-newer' or `both-modified') unless
   (anvil-server-register-tool
    #'anvil-buffer--tool-list-modified
    :id "buffer-list-modified"
+   :intent '(buffer file-read)
+   :layer 'core
    :server-id anvil-buffer--server-id
    :description
    "List every file-visiting buffer that has unsaved edits, with

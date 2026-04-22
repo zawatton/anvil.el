@@ -980,6 +980,8 @@ caller does not have to scan it."
   (anvil-server-register-tool
    #'anvil-elisp--ert-run
    :id "elisp-ert-run"
+   :intent '(elisp-test)
+   :layer 'dev
    :server-id anvil-elisp--server-id
    :description
    "Run ERT tests from a file and return a compact plist instead of
@@ -992,6 +994,8 @@ in tokens than shelling out and parsing stdout."
   (anvil-server-register-tool
    #'anvil-elisp--byte-compile-file
    :id "elisp-byte-compile-file"
+   :intent '(elisp-build)
+   :layer 'dev
    :server-id anvil-elisp--server-id
    :description
    "Byte-compile a single .el file and return a plist:
@@ -1005,6 +1009,8 @@ and warnings are parsed out of the log buffer for you."
   (anvil-server-register-tool
    #'anvil-elisp--describe-function
    :id "elisp-describe-function"
+   :intent '(elisp-read)
+   :layer 'core
    :server-id anvil-elisp--server-id
    :description
    "Get documentation for an Emacs Lisp function or check if it exists. Returns
@@ -1031,6 +1037,8 @@ Error cases:
   (anvil-server-register-tool
    #'anvil-elisp--get-function-definition
    :id "elisp-get-function-definition"
+   :intent '(elisp-read)
+   :layer 'core
    :server-id anvil-elisp--server-id
    :description
    "Layer 3 of anvil progressive disclosure (see `disclosure-help').
@@ -1065,6 +1073,8 @@ Use this tool when you need to:
   (anvil-server-register-tool
    #'anvil-elisp--describe-variable
    :id "elisp-describe-variable"
+   :intent '(elisp-read)
+   :layer 'core
    :server-id anvil-elisp--server-id
    :description
    "Get comprehensive information about an Emacs Lisp variable without
@@ -1117,6 +1127,8 @@ Error cases return error messages for:
   (anvil-server-register-tool
    #'anvil-elisp--info-lookup-symbol
    :id "elisp-info-lookup-symbol"
+   :intent '(elisp-read)
+   :layer 'core
    :server-id anvil-elisp--server-id
    :description
    "Look up Elisp symbols in Info documentation and return the complete
@@ -1159,6 +1171,8 @@ Error cases:
   (anvil-server-register-tool
    #'anvil-elisp--read-source-file
    :id "elisp-read-source-file"
+   :intent '(elisp-read file-read)
+   :layer 'core
    :server-id anvil-elisp--server-id
    :description
    "Read Elisp source files from Emacs system directories or ELPA packages.

@@ -559,6 +559,8 @@ MCP Parameters:
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-ts--tool-list-imports)
    :id "ts-list-imports"
+   :intent '(ts-read structure)
+   :layer 'core
    :server-id anvil-ts--server-id
    :description "List every `import ...' statement in a TypeScript or
 TSX file.  Returns an ordered list of (:kind :text :bounds) plists,
@@ -570,6 +572,8 @@ are included; the caller inspects :text to tell them apart."
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-ts--tool-list-exports)
    :id "ts-list-exports"
+   :intent '(ts-read structure)
+   :layer 'core
    :server-id anvil-ts--server-id
    :description "List every `export ...' statement in a TypeScript or
 TSX file.  Returns (:kind :name :text :bounds) per entry.  :kind is
@@ -581,6 +585,8 @@ re-exports and for anonymous default exports."
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-ts--tool-list-functions)
    :id "ts-list-functions"
+   :intent '(ts-read structure)
+   :layer 'core
    :server-id anvil-ts--server-id
    :description "List function declarations and named arrow bindings
 in a TypeScript or TSX file.  Returns (:kind :name :async :class-name
@@ -593,6 +599,8 @@ passed as callbacks without a name are not included --- name them via
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-ts--tool-list-classes)
    :id "ts-list-classes"
+   :intent '(ts-read structure)
+   :layer 'core
    :server-id anvil-ts--server-id
    :description "List class declarations in a TypeScript or TSX file.
 Returns (:kind 'class :name :bounds) per entry."
@@ -601,6 +609,8 @@ Returns (:kind 'class :name :bounds) per entry."
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-ts--tool-list-methods)
    :id "ts-list-methods"
+   :intent '(ts-read structure)
+   :layer 'core
    :server-id anvil-ts--server-id
    :description "List methods defined directly inside the class named
 CLASS-NAME.  Nested classes' methods are excluded; only the first-
@@ -611,6 +621,8 @@ level body of a class with that exact name matches.  Returns
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-ts--tool-list-interfaces)
    :id "ts-list-interfaces"
+   :intent '(ts-read structure)
+   :layer 'core
    :server-id anvil-ts--server-id
    :description "List TypeScript `interface' declarations in a .ts /
 .tsx file.  Returns (:kind 'interface :name :bounds) per entry.
@@ -621,6 +633,8 @@ JavaScript files have no interfaces --- use `js-list-*' for .js /
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-ts--tool-list-type-aliases)
    :id "ts-list-type-aliases"
+   :intent '(ts-read structure)
+   :layer 'core
    :server-id anvil-ts--server-id
    :description "List TypeScript `type' alias declarations in a .ts /
 .tsx file.  Returns (:kind 'type :name :bounds) per entry."
@@ -629,6 +643,8 @@ JavaScript files have no interfaces --- use `js-list-*' for .js /
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-ts--tool-find-definition)
    :id "ts-find-definition"
+   :intent '(ts-read)
+   :layer 'core
    :server-id anvil-ts--server-id
    :description "Find the first function / class / interface / type
 named NAME in a TypeScript or TSX file.  Source-order wins when the
@@ -639,6 +655,8 @@ results."
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-ts--tool-surrounding-form)
    :id "ts-surrounding-form"
+   :intent '(ts-read structure)
+   :layer 'core
    :server-id anvil-ts--server-id
    :description "Return the innermost function / class / interface /
 type whose source range contains the 1-based buffer POINT.  KIND

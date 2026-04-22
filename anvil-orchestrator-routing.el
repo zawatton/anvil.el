@@ -309,6 +309,8 @@ MCP Parameters:
   (anvil-server-register-tool
    #'anvil-orchestrator-routing--tool-select
    :id "orchestrator-routing-select"
+   :intent '(orchestrator admin)
+   :layer 'workflow
    :server-id anvil-orchestrator-routing--server-id
    :description
    "Dry-run provider selector.  Returns the provider a given policy

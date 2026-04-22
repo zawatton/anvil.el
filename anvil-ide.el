@@ -398,36 +398,48 @@ MCP Parameters:
   (anvil-server-register-tool
    #'anvil-ide--xref-find-references
    :id "xref_find_references"
+   :intent '(ide)
+   :layer 'dev
    :description "Find where a function, variable, or class is used throughout the codebase"
    :read-only t
    :server-id anvil-ide--server-id)
   (anvil-server-register-tool
    #'anvil-ide--xref-find-apropos
    :id "xref_find_apropos"
+   :intent '(ide)
+   :layer 'dev
    :description "Search for functions, variables, or classes by name pattern across the project"
    :read-only t
    :server-id anvil-ide--server-id)
   (anvil-server-register-tool
    #'anvil-ide--project-info
    :id "project_info"
+   :intent '(ide)
+   :layer 'dev
    :description "Get project directory and file count overview"
    :read-only t
    :server-id anvil-ide--server-id)
   (anvil-server-register-tool
    #'anvil-ide--imenu-list-symbols
    :id "imenu_list_symbols"
+   :intent '(ide structure)
+   :layer 'dev
    :description "List all functions, classes, and variables in a file with their locations"
    :read-only t
    :server-id anvil-ide--server-id)
   (anvil-server-register-tool
    #'anvil-ide--treesit-info
    :id "treesit_info"
+   :intent '(ide)
+   :layer 'dev
    :description "Get tree-sitter syntax tree info for a file — node types, ranges, hierarchy"
    :read-only t
    :server-id anvil-ide--server-id)
   (anvil-server-register-tool
    #'anvil-ide--diagnostics
    :id "diagnostics"
+   :intent '(ide)
+   :layer 'dev
    :description "Get flycheck/flymake diagnostics for a file or all project buffers"
    :read-only t
    :server-id anvil-ide--server-id))

@@ -530,6 +530,8 @@ MCP Parameters: (none)"
   (anvil-server-register-tool
    #'anvil-bisect--tool-test
    :id "bisect-test"
+   :intent '(bisect)
+   :layer 'dev
    :server-id anvil-bisect--server-id
    :description
    "Bisect the current git repo for the commit that broke an ERT
@@ -542,6 +544,8 @@ latency for wide ranges.")
   (anvil-server-register-tool
    #'anvil-bisect--tool-cancel
    :id "bisect-cancel"
+   :intent '(bisect admin)
+   :layer 'dev
    :server-id anvil-bisect--server-id
    :description
    "Cancel the in-flight bisect run, if any.  Interrupts the
@@ -550,6 +554,8 @@ current step subprocess and releases its worktree.")
   (anvil-server-register-tool
    #'anvil-bisect--tool-last-result
    :id "bisect-last-result"
+   :intent '(bisect)
+   :layer 'dev
    :server-id anvil-bisect--server-id
    :description
    "Return the plist describing the most recent bisect run, or nil

@@ -1196,6 +1196,8 @@ NEW-FORM may reference positional arguments via %1 %2 etc.  See
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-sexp--tool-read-file)
    :id "sexp-read-file"
+   :intent '(elisp-read structure)
+   :layer 'core
    :server-id anvil-sexp--server-id
    :description
    "List every top-level form in an elisp source file.  Each entry
@@ -1208,6 +1210,8 @@ or comment can leak into the result."
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-sexp--tool-surrounding-form)
    :id "sexp-surrounding-form"
+   :intent '(elisp-read structure)
+   :layer 'core
    :server-id anvil-sexp--server-id
    :description
    "Return the innermost top-level form whose range contains the
@@ -1218,6 +1222,8 @@ operator (e.g. \"defun\")."
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-sexp--tool-macroexpand)
    :id "sexp-macroexpand"
+   :intent '(elisp-read)
+   :layer 'core
    :server-id anvil-sexp--server-id
    :description
    "Macroexpand a named top-level form and return its expansion as a
@@ -1229,6 +1235,8 @@ macros not yet loaded pass through unchanged."
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-sexp--tool-verify)
    :id "sexp-verify"
+   :intent '(elisp-read)
+   :layer 'core
    :server-id anvil-sexp--server-id
    :description
    "Run byte-compile and checkdoc on an elisp file and return
@@ -1240,6 +1248,8 @@ check."
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-sexp--tool-replace-defun)
    :id "sexp-replace-defun"
+   :intent '(code-bulk-edit)
+   :layer 'core
    :server-id anvil-sexp--server-id
    :description
    "Replace the top-level form named NAME in FILE with NEW_FORM
@@ -1250,6 +1260,8 @@ does not parse or when no form matches the given name.")
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-sexp--tool-wrap-form)
    :id "sexp-wrap-form"
+   :intent '(code-bulk-edit)
+   :layer 'core
    :server-id anvil-sexp--server-id
    :description
    "Wrap the sexp surrounding POINT in FILE with WRAPPER source text.
@@ -1260,6 +1272,8 @@ apply=t writes to disk.")
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-sexp--tool-rename-symbol)
    :id "sexp-rename-symbol"
+   :intent '(code-bulk-edit)
+   :layer 'core
    :server-id anvil-sexp--server-id
    :description
    "Rename every reference of OLD to NEW across SCOPE.  Strings
@@ -1272,6 +1286,8 @@ list of files.  Preview by default; apply=t writes.
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-sexp--tool-replace-call)
    :id "sexp-replace-call"
+   :intent '(code-bulk-edit)
+   :layer 'core
    :server-id anvil-sexp--server-id
    :description
    "Replace every (FN_NAME ARGS...) call with NEW_FORM template

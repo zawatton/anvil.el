@@ -1346,6 +1346,8 @@ before trying the later CST tools."
   (anvil-server-register-tool
    #'anvil-inspect-object
    :id "sexp-cst-inspect-object"
+   :intent '(elisp-read structure)
+   :layer 'core
    :server-id anvil-sexp-cst--server-id
    :description
    "Inspect any live Elisp value and return a token-bounded JSON summary
@@ -1358,6 +1360,8 @@ sexp-cst-inspect-object-drill to page past top-limit."
   (anvil-server-register-tool
    #'anvil-inspect-object-drill
    :id "sexp-cst-inspect-object-drill"
+   :intent '(elisp-read structure)
+   :layer 'core
    :server-id anvil-sexp-cst--server-id
    :description
    "Resolve an inspect-object cursor and re-inspect the stored value
@@ -1368,6 +1372,8 @@ case where anvil-state is not loaded.  Read-only."
   (anvil-server-register-tool
    #'anvil-inspect-object-purge
    :id "sexp-cst-inspect-object-purge"
+   :intent '(elisp-read admin)
+   :layer 'core
    :server-id anvil-sexp-cst--server-id
    :description
    "Delete every inspect-object cursor stored for CLIENT-ID.  Returns the
@@ -1376,6 +1382,8 @@ not accumulate across long-running daemons.  Write tool.")
   (anvil-server-register-tool
    #'anvil-sexp-cst-read
    :id "sexp-cst-read"
+   :intent '(elisp-read structure)
+   :layer 'core
    :server-id anvil-sexp-cst--server-id
    :description
    "Parse FILE with tree-sitter-elisp and return a comment-preserving CST
@@ -1389,6 +1397,8 @@ Read-only."
   (anvil-server-register-tool
    #'anvil-sexp-cst-edit
    :id "sexp-cst-edit"
+   :intent '(code-bulk-edit)
+   :layer 'core
    :server-id anvil-sexp-cst--server-id
    :description
    "Replace the named node at POSITION in FILE with NEW-TEXT (dry-run).
@@ -1403,6 +1413,8 @@ not touch disk)."
   (anvil-server-register-tool
    #'anvil-sexp-cst-edit-write
    :id "sexp-cst-edit-write"
+   :intent '(code-bulk-edit)
+   :layer 'core
    :server-id anvil-sexp-cst--server-id
    :description
    "Apply `sexp-cst-edit' to disk with backup.  Runs the same validation
@@ -1415,6 +1427,8 @@ fields (before/after/new-content).  Write tool.")
   (anvil-server-register-tool
    #'anvil-sexp-cst-repair
    :id "sexp-cst-repair"
+   :intent '(code-bulk-edit)
+   :layer 'core
    :server-id anvil-sexp-cst--server-id
    :description
    "Close-paren balance an elisp FILE that fails to parse.  Counts `(' /
