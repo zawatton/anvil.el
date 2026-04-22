@@ -685,6 +685,107 @@ response for every failure mode."
     (should (stringp (gethash "message" err)))))
 
 
+;;;; --- sexp-cst-edit (Phase 2b-a, dry-run) --------------------------------
+
+(defun anvil-sexp-cst-test--edit-available-p ()
+  "Return non-nil when Phase 2b-a edit impl is live and usable."
+  (and (anvil-sexp-cst-test--available-p 'cst-edit)
+       (fboundp 'anvil-sexp-cst-edit)))
+
+(defun anvil-sexp-cst-test--invoke-edit (&rest args)
+  "Call `anvil-sexp-cst-edit' with ARGS and parse its JSON result."
+  (let ((raw (apply #'anvil-sexp-cst-edit args)))
+    (should (stringp raw))
+    (json-parse-string raw :object-type 'hash-table
+                       :array-type 'array
+                       :null-object :null
+                       :false-object :false)))
+
+(ert-deftest anvil-sexp-cst-test-edit-replaces-defun ()
+  "Dry-run edit returns before/after CST node info plus the new full
+file content.  The impl re-parses the modified content through
+treesit and only accepts replacements that leave the file free of
+error nodes."
+  (skip-unless (anvil-sexp-cst-test--edit-available-p))
+  (skip-unless (anvil-sexp-cst-test--grammar-ready-p))
+  (anvil-sexp-cst-test--with-elisp-file path
+      "(defun foo () 1)\n"
+    (let* ((obj (anvil-sexp-cst-test--invoke-edit
+                 path 2 "(defun foo () 42)"))
+           (before (anvil-sexp-cst-test--get obj "before"))
+           (after  (anvil-sexp-cst-test--get obj "after"))
+           (new-content (anvil-sexp-cst-test--get obj "new-content")))
+      (should (hash-table-p before))
+      (should (hash-table-p after))
+      (should (equal (gethash "type" before) "function_definition"))
+      (should (equal (gethash "type" after)  "function_definition"))
+      (should (stringp new-content))
+      (should (string-match-p "42" new-content))
+      (should (integerp (anvil-sexp-cst-test--get obj "file-before-bytes")))
+      (should (integerp (anvil-sexp-cst-test--get obj "file-after-bytes"))))))
+
+(ert-deftest anvil-sexp-cst-test-edit-preserves-surrounding-comments ()
+  "Comments outside the edited node must survive unchanged in
+`new-content'.  This is the structural advantage over the reader-
+based `anvil-sexp-replace-defun' which would drop comments on prin1."
+  (skip-unless (anvil-sexp-cst-test--edit-available-p))
+  (skip-unless (anvil-sexp-cst-test--grammar-ready-p))
+  (anvil-sexp-cst-test--with-elisp-file path
+      ";; keep me\n(defun foo () 1)\n;; and me\n"
+    (let* ((obj (anvil-sexp-cst-test--invoke-edit
+                 path 20 "(defun foo () 99)"))
+           (new-content (anvil-sexp-cst-test--get obj "new-content")))
+      (should (string-match-p ";; keep me" new-content))
+      (should (string-match-p ";; and me" new-content))
+      (should (string-match-p "99" new-content))
+      (should-not (string-match-p "(defun foo () 1)" new-content)))))
+
+(ert-deftest anvil-sexp-cst-test-edit-rejects-unbalanced-replacement ()
+  "NEW-TEXT that introduces an error node anywhere in the re-parsed
+file must be rejected with a typed error.  Protects against LLMs
+sending half-written forms that would silently break the source."
+  (skip-unless (anvil-sexp-cst-test--edit-available-p))
+  (skip-unless (anvil-sexp-cst-test--grammar-ready-p))
+  (anvil-sexp-cst-test--with-elisp-file path
+      "(defun foo () 1)\n"
+    (let* ((obj (anvil-sexp-cst-test--invoke-edit
+                 path 2 "(defun foo () (incomplete"))
+           (err (anvil-sexp-cst-test--get obj "error")))
+      (should (hash-table-p err))
+      (should (equal (gethash "kind" err)
+                     "sexp-cst/parse-error-in-replacement"))
+      (should (stringp (gethash "message" err))))))
+
+(ert-deftest anvil-sexp-cst-test-edit-rejects-missing-position ()
+  "POSITION is mandatory — without one, the handler cannot know
+which node to replace.  Returns `sexp-cst/position-required'
+typed error rather than silently editing at point-min."
+  (skip-unless (anvil-sexp-cst-test--edit-available-p))
+  (skip-unless (anvil-sexp-cst-test--grammar-ready-p))
+  (anvil-sexp-cst-test--with-elisp-file path
+      "(defvar x 1)\n"
+    (let* ((obj (anvil-sexp-cst-test--invoke-edit path nil "(defvar y 2)"))
+           (err (anvil-sexp-cst-test--get obj "error")))
+      (should (hash-table-p err))
+      (should (equal (gethash "kind" err)
+                     "sexp-cst/position-required")))))
+
+(ert-deftest anvil-sexp-cst-test-edit-handles-missing-file ()
+  "Non-existent paths return a typed error even before the grammar
+check — same envelope used by `sexp-cst-read' for consistency."
+  (skip-unless (anvil-sexp-cst-test--edit-available-p))
+  (let* ((raw (anvil-sexp-cst-edit
+               "/no/such/file/zz-anvil-sct-edit-missing.el"
+               1 "(defvar y 2)"))
+         (obj (json-parse-string raw :object-type 'hash-table
+                                 :array-type 'array
+                                 :null-object :null
+                                 :false-object :false))
+         (err (gethash "error" obj)))
+    (should (hash-table-p err))
+    (should (equal (gethash "kind" err) "sexp-cst/file-not-found"))))
+
+
 ;;;; --- meta-test: shape lock file is loaded and TDD-lite gate active -----
 
 (ert-deftest anvil-sexp-cst-test-meta-locks-loaded ()
