@@ -100,8 +100,15 @@ These are not loaded by default.  Available modules:
                    tabulated-list dashboard (Doc 10 Phase 1a)
 - `pty-broker' — node-pty TCP broker for TUI programs; moves PTY
                  handling out of the Emacs daemon to avoid filter
-                 starvation / ConPTY stdin quirks (Doc 04 Phase 1,
-                 requires node + `npm install node-pty')
+                 starvation / ConPTY stdin quirks.  Phase 2b adds
+                 `pty-read-filtered' — streaming read that routes
+                 pty output through a named shell-filter handler
+                 (docker-logs / pytest / …) with a per-pty tail
+                 cursor so consecutive calls see only new bytes.
+                 Soft-deps on `shell-filter'; raw text is returned
+                 when the filter module is not loaded (Doc 04
+                 Phase 1 + Doc 27 Phase 2b, requires node +
+                 `npm install node-pty')
 - `defs'      — SQLite-backed elisp symbol index (defs, refs,
                 requires/provides) with defs-search /
                 defs-references / defs-signature etc.

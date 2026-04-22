@@ -175,9 +175,14 @@ Each element is a program name as passed to `anvil-pty-spawn' (e.g.
     (setq anvil-pty-broker--recv-buf buf)))
 
 (defun anvil-pty-broker--get-pty (id)
-  "Return the plist for pty ID, creating an empty row if absent."
+  "Return the plist for pty ID, creating an empty row if absent.
+The row carries `:output' (accumulated stdout), `:events' (audit
+trail), and `:tail-cursor' (Phase 2b streaming read position — the
+number of bytes of `:output' already consumed by a tail-mode
+reader).  `:tail-cursor' stays 0 until a tail-mode call advances
+it."
   (or (gethash id anvil-pty-broker--ptys)
-      (puthash id (list :output "" :events nil)
+      (puthash id (list :output "" :events nil :tail-cursor 0)
                anvil-pty-broker--ptys)))
 
 (defun anvil-pty-broker--record-event (id ev-plist)
@@ -370,8 +375,83 @@ When CONSUME is non-nil, clear the buffer after reading."
   (let* ((row (gethash id anvil-pty-broker--ptys))
          (out (and row (plist-get row :output))))
     (when (and row consume)
-      (plist-put row :output ""))
+      (plist-put row :output "")
+      (plist-put row :tail-cursor 0))
     (or out "")))
+
+(defun anvil-pty-broker--coerce-filter-sym (filter)
+  "Normalize FILTER to a symbol or nil.  Accepts symbols and strings.
+Empty / `nil' / `false' / `0' strings collapse to nil so MCP callers
+can opt out of filtering per-call without knowing elisp nil."
+  (cond
+   ((null filter) nil)
+   ((symbolp filter) filter)
+   ((stringp filter)
+    (if (or (string-empty-p filter)
+            (member (downcase filter) '("nil" "false" "0")))
+        nil
+      (intern filter)))
+   (t filter)))
+
+(defun anvil-pty-broker--apply-filter (text filter-sym)
+  "Soft-dep on `anvil-shell-filter': fall back to raw TEXT when absent.
+Returns TEXT unchanged when FILTER-SYM is nil or the filter module
+is not loaded — keeps `pty-read-filtered' useful as a tail-cursor
+bookkeeping tool even without the filter catalog."
+  (cond
+   ((null filter-sym) text)
+   ((fboundp 'anvil-shell-filter-apply)
+    (anvil-shell-filter-apply filter-sym text))
+   (t text)))
+
+(defun anvil-pty-read-filtered (id filter &optional tail consume)
+  "Return ID's output, optionally tail-sliced and FILTER-processed.
+
+FILTER is a shell-filter handler name (symbol or string — e.g.
+`docker-logs', `pytest', `git-status').  Pass nil / empty / `false'
+to skip filtering while still using the tail-cursor bookkeeping.
+
+When TAIL is non-nil, only the output appended since the last
+tail-mode call is returned; the cursor then advances to the new
+EOB so the next call sees only fresh chunks.  Without TAIL the
+full `:output' is filtered (matches `anvil-pty-read' semantics).
+
+When CONSUME is non-nil, clears `:output' and resets `:tail-cursor'
+to 0 after reading — matches the CONSUME contract of
+`anvil-pty-read'.
+
+Returns a plist with:
+  :id, :filter (symbol-name or nil), :output (filtered),
+  :raw-size, :filtered-size, :tail-cursor, :consumed.
+
+Signals an error when ID does not name a known pty — Phase 2b
+callers must distinguish `no such pty' from `pty with empty output'."
+  (let ((row (gethash id anvil-pty-broker--ptys)))
+    (unless row
+      (error "anvil-pty-read-filtered: unknown pty id %S" id))
+    (let* ((f (anvil-pty-broker--coerce-filter-sym filter))
+           (full (or (plist-get row :output) ""))
+           (cursor (or (plist-get row :tail-cursor) 0))
+           (slice (if tail
+                      (substring full (min cursor (length full)))
+                    full))
+           (raw-size (length slice))
+           (filtered (anvil-pty-broker--apply-filter slice f))
+           (filtered-size (length filtered)))
+      (when tail
+        (plist-put row :tail-cursor (length full)))
+      (when consume
+        (plist-put row :output "")
+        (plist-put row :tail-cursor 0))
+      (list :id id
+            :filter (and f (symbol-name f))
+            :output filtered
+            :raw-size raw-size
+            :filtered-size filtered-size
+            :tail-cursor (if consume
+                             0
+                           (plist-get row :tail-cursor))
+            :consumed (if consume t :false)))))
 
 ;;;; --- MCP tool wrappers --------------------------------------------------
 
@@ -442,6 +522,39 @@ MCP Parameters:
           :output (anvil-pty-read id consume-p)
           :consumed consume-p)))
 
+(defun anvil-pty-broker--coerce-bool (value)
+  "Coerce MCP-style VALUE to a real boolean.
+t / truthy strings → t, nil / empty / `nil' / `false' / `0' → nil."
+  (cond
+   ((null value) nil)
+   ((eq value t) t)
+   ((stringp value)
+    (not (member (downcase value) '("" "nil" "false" "0"))))
+   (t t)))
+
+(defun anvil-pty-broker--tool-read-filtered (id filter &optional tail consume)
+  "MCP wrapper for `anvil-pty-read-filtered'.
+
+Streams pty output through a named shell-filter handler with
+cursor-based tail semantics — the Phase 2b bridge between
+`anvil-pty-broker' and `anvil-shell-filter'.  Filter availability
+is a soft dependency: when `anvil-shell-filter' is not loaded the
+raw text is returned unchanged.
+
+MCP Parameters:
+  id      - pty id returned by pty-spawn.
+  filter  - shell-filter handler name (e.g. `docker-logs',
+            `pytest').  Empty / nil / `false' skips filtering
+            but still updates the tail cursor when TAIL is set.
+  tail    - When non-nil, return only bytes appended since the
+            previous tail-mode read and advance the cursor.
+  consume - When non-nil, clear `:output' and reset the cursor
+            after this read (matches `pty-read' semantics)."
+  (anvil-pty-read-filtered
+   id filter
+   (anvil-pty-broker--coerce-bool tail)
+   (anvil-pty-broker--coerce-bool consume)))
+
 (defun anvil-pty-broker--register-tools ()
   "Register pty-broker MCP tools.  Idempotent.
 Handlers return plists / strings / nil.  The registration wrapper
@@ -476,11 +589,24 @@ the pty-id string to use with pty-send / pty-read / pty-kill.")
    :server-id anvil-pty-broker--server-id
    :description "Return buffered output for a pty; consume=t clears
 the buffer so the next read only sees new bytes."
+   :read-only t)
+  (anvil-server-register-tool
+   (anvil-server-encode-handler #'anvil-pty-broker--tool-read-filtered)
+   :id "pty-read-filtered"
+   :server-id anvil-pty-broker--server-id
+   :description "Streaming read: returns pty output passed through a
+named shell-filter handler (docker-logs / pytest / git-status / …).
+Set tail=t to receive only bytes appended since the previous tail
+read — the tool tracks a per-pty cursor so consecutive calls see
+non-overlapping slices.  Empty filter skips filtering but still
+advances the cursor.  Soft-deps on anvil-shell-filter; raw text is
+returned when the filter module is not loaded.  (Doc 27 Phase 2b.)"
    :read-only t))
 
 (defun anvil-pty-broker--unregister-tools ()
   "Unregister the pty-broker MCP tools.  Safe when not registered."
-  (dolist (id '("pty-spawn" "pty-send" "pty-kill" "pty-list" "pty-read"))
+  (dolist (id '("pty-spawn" "pty-send" "pty-kill" "pty-list"
+                "pty-read" "pty-read-filtered"))
     (ignore-errors
       (anvil-server-unregister-tool id anvil-pty-broker--server-id))))
 

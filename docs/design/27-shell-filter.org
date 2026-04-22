@@ -243,12 +243,43 @@ detection で既存 =git-log= と =git-log-graph= を分岐。
 
 commit: =f71598a= (test-lock) → =e4947d3= (impl)。
 
-** Phase 2b — streaming (~DRAFT~)
+** Phase 2b — streaming (~SHIPPED~ 2026-04-22)
 
-=anvil-pty-broker-watch= の ring buffer tail に filter を
-適用する tail on filter。pty-broker 側の filter-hook 点を
-決める必要があり、Phase 2a と別 scope に切り出し。実装 ETA
-2-3 日見込み。
+=anvil-pty-read-filtered= を追加、=anvil-pty-broker= の pty row
+に =:tail-cursor= フィールド (consumed byte offset) を導入して
+incremental read を実装。
+
+filter-hook 点は *read-time apply* を採用:
+- pty-broker 内部は常に raw output を保持。filter は
+  =anvil-pty-read-filtered= 呼び出し時に適用。
+- 利点: filter errors が stored data を壊さない / raw は常に
+  retry/replay 可能 / 異なる caller が異なる filter を選べる /
+  既存 =anvil-pty-read= の contract 不変。
+- 欠点: tail slice に対する filter なので、全体 context を要する
+  filter (git-status summary 等) とは相性悪い。streaming に
+  向く filter (docker-logs dedup / pytest progress / make 等)
+  を想定。
+
+API:
+- Elisp: =(anvil-pty-read-filtered ID FILTER &optional TAIL CONSUME)=
+- MCP tool: =pty-read-filtered= (id, filter, tail, consume)
+- anvil-shell-filter への soft dep — 未 load 時は raw passthrough。
+
+Tail semantics:
+- =TAIL= nil → 全 =:output= に filter 適用 (one-shot)
+- =TAIL= t → =cursor..EOB= slice だけ、呼び出し後 cursor を EOB へ
+- =CONSUME= t → =:output= を "" へ、=:tail-cursor= を 0 へ reset
+
+5 ERT 実装:
+- =read-filtered-applies-filter= (docker-logs で compressed <
+  raw)
+- =read-filtered-tail-advances-cursor= (chunk 追加後 tail 読みで
+  新 slice のみ)
+- =read-filtered-nil-filter-passthrough= (filter=nil で raw)
+- =read-filtered-missing-pty-signals= (unknown id でエラー)
+- =read-filtered-consume-resets-cursor= (CONSUME 動作)
+
+commit: =7c86a8a= (test-lock) → Phase 2b impl (develop)。
 
 ** Phase 3 — user-defined filter
 
