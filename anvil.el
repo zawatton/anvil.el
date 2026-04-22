@@ -92,6 +92,15 @@ These are not loaded by default.  Available modules:
 - `state'     — Persistent SQLite-backed KV store shared across modules
                 (ns / TTL / Lisp prin1 values, requires Emacs 29+,
                 Doc 08 Phase 1)
+- `session'   — Session snapshot / resume + Claude Code lifecycle
+                hook dispatch.  `session-snapshot' captures branch
+                + task-summary + notes into anvil-state ns=session
+                (TTL 14d) and returns a `preamble-suggested' resume
+                block; `session-resume' / -list / -delete round out
+                the primitive set.  Phase 3 hooks (PreCompact,
+                SessionStart, PostToolUse, UserPromptSubmit,
+                SessionEnd) and the anvil-hook install command ship
+                under the same module (Doc 17, requires `state')
 - `http'      — HTTP client via `url-retrieve-synchronously' with a
                 state-backed ETag/TTL cache (Doc 09 Phase 1a)
 - `orchestrator' — Parallel AI CLI dispatcher (claude today, more

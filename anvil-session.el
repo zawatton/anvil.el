@@ -217,5 +217,121 @@ nil).  The full payload remains accessible via `session-resume'."
   (anvil-state-delete name :ns anvil-session--snapshot-ns))
 
 
+;;;; --- MCP tool wrappers --------------------------------------------------
+
+(defun anvil-session--tool-snapshot (name &optional task-summary notes
+                                          branch base-branch)
+  "MCP wrapper for `anvil-session-snapshot'.
+
+MCP Parameters:
+  name          - Non-empty snapshot identifier (string).
+  task-summary  - Optional human-readable \"what was I doing\".
+  notes         - Optional list of bullet strings (JSON array); a
+                  single string wraps to `(list …)' automatically.
+  branch        - Optional override for autodetected git branch.
+  base-branch   - Optional base branch (default
+                  `anvil-session-default-base-branch')."
+  (let ((notes-list
+         (cond ((null notes) nil)
+               ((stringp notes)
+                (if (string-empty-p notes) nil (list notes)))
+               ((vectorp notes) (append notes nil))
+               ((listp notes) notes)
+               (t (list (format "%s" notes))))))
+    (anvil-session-snapshot
+     name
+     :branch (and (stringp branch) (not (string-empty-p branch)) branch)
+     :base-branch (and (stringp base-branch)
+                       (not (string-empty-p base-branch)) base-branch)
+     :task-summary (and (stringp task-summary)
+                        (not (string-empty-p task-summary)) task-summary)
+     :notes notes-list)))
+
+(defun anvil-session--tool-resume (name)
+  "MCP wrapper for `anvil-session-resume'.
+
+MCP Parameters:
+  name - Snapshot identifier to fetch.  Returns nil when absent
+         (MCP layer turns nil into a JSON null)."
+  (or (anvil-session-resume name)
+      (list :error (format "anvil-session: no snapshot named %S" name))))
+
+(defun anvil-session--tool-list ()
+  "MCP wrapper for `anvil-session-list'.  Returns a vector of
+descriptor plists so the JSON encoder renders an array rather
+than an object.
+
+MCP Parameters: none."
+  (apply #'vector (anvil-session-list)))
+
+(defun anvil-session--tool-delete (name)
+  "MCP wrapper for `anvil-session-delete'.
+
+MCP Parameters:
+  name - Snapshot identifier to purge.  Returns {:deleted t} on
+         success, {:deleted :false} when the row did not exist."
+  (list :deleted (if (anvil-session-delete name) t :false)
+        :name name))
+
+
+;;;; --- module lifecycle ---------------------------------------------------
+
+(defun anvil-session--register-tools ()
+  "Register every session-* MCP tool under the shared server-id."
+  (anvil-server-register-tool
+   (anvil-server-encode-handler #'anvil-session--tool-snapshot)
+   :id "session-snapshot"
+   :server-id anvil-session--server-id
+   :description
+   "Capture the current session state (branch + task-summary + notes)
+into a named plist under anvil-state ns=session (TTL 14d).  Returns
+the stored snapshot including `preamble-suggested' — a self-
+contained resume block callers can drop into orchestrator-preamble
+or an LLM re-entry prompt.  Write tool.")
+  (anvil-server-register-tool
+   (anvil-server-encode-handler #'anvil-session--tool-resume)
+   :id "session-resume"
+   :server-id anvil-session--server-id
+   :description
+   "Return the stored snapshot plist for NAME, or an error envelope
+when none exists.  Read-only — does not mutate running state."
+   :read-only t)
+  (anvil-server-register-tool
+   (anvil-server-encode-handler #'anvil-session--tool-list)
+   :id "session-list"
+   :server-id anvil-session--server-id
+   :description
+   "Return a JSON array of descriptor plists for every live snapshot
+(name + created-at + branch + task-summary-head, head capped at 80
+chars).  Use session-resume for the full payload."
+   :read-only t)
+  (anvil-server-register-tool
+   (anvil-server-encode-handler #'anvil-session--tool-delete)
+   :id "session-delete"
+   :server-id anvil-session--server-id
+   :description
+   "Purge the snapshot stored under NAME.  Returns {deleted: bool,
+name}.  Write tool."))
+
+(defun anvil-session--unregister-tools ()
+  "Remove every session-* MCP tool from the shared server."
+  (dolist (id '("session-snapshot" "session-resume"
+                "session-list"     "session-delete"))
+    (ignore-errors
+      (anvil-server-unregister-tool id anvil-session--server-id))))
+
+;;;###autoload
+(defun anvil-session-enable ()
+  "Register session-* MCP tools and open the anvil-state backing store."
+  (interactive)
+  (anvil-state-enable)
+  (anvil-session--register-tools))
+
+(defun anvil-session-disable ()
+  "Unregister session-* MCP tools."
+  (interactive)
+  (anvil-session--unregister-tools))
+
+
 (provide 'anvil-session)
 ;;; anvil-session.el ends here
