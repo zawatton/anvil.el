@@ -845,44 +845,14 @@ MCP Parameters:
 
 ;;; ERT test runner — compact result for LLM consumption
 
-(defun anvil-elisp--ert-registered-tests ()
-  "Return an alist of every symbol currently holding an ERT test."
+(defun anvil-elisp--ert-registered-names ()
+  "Return a list of every symbol currently holding an ERT test."
   (let (acc)
     (mapatoms
      (lambda (sym)
-       (let ((test (get sym 'ert--test)))
-         (when test
-           (push (cons sym test) acc)))))
+       (when (get sym 'ert--test)
+         (push sym acc))))
     acc))
-
-(defun anvil-elisp--ert-updated-tests (before)
-  "Return tests added or redefined since BEFORE.
-BEFORE is an alist produced by `anvil-elisp--ert-registered-tests'."
-  (let (acc)
-    (mapatoms
-     (lambda (sym)
-       (let ((test (get sym 'ert--test)))
-         (when test
-           (unless (eq test (alist-get sym before nil nil #'eq))
-             (push test acc))))))
-    (nreverse acc)))
-
-(defun anvil-elisp--ert-select-file-tests (selector file-tests)
-  "Return tests matching SELECTOR from FILE-TESTS."
-  (cond
-   ((or (eq selector t) (null selector))
-    file-tests)
-   ((symbolp selector)
-    (let ((test (get selector 'ert--test)))
-      (if (memq test file-tests) (list test) nil)))
-   ((and (fboundp 'ert-test-p) (ert-test-p selector))
-    (if (memq selector file-tests) (list selector) nil))
-   (t
-    (cl-remove-if-not
-     (lambda (test) (memq test file-tests))
-     (condition-case nil
-         (ert-select-tests selector file-tests)
-       (error file-tests))))))
 
 (defun anvil-elisp--ert-fresh-feature (file)
   "Infer the feature symbol to unload before FILE is reloaded.
@@ -968,11 +938,22 @@ isolation matters."
          (start (float-time))
          (passed 0) (failed 0) (skipped 0)
          (failures nil)
-         (before (anvil-elisp--ert-registered-tests)))
+         (before (anvil-elisp--ert-registered-names)))
     (load path nil t)
-    (let* ((file-tests (anvil-elisp--ert-updated-tests before))
+    (let* ((after   (anvil-elisp--ert-registered-names))
+           (added   (cl-remove-if (lambda (n) (memq n before)) after))
            (tests
-            (anvil-elisp--ert-select-file-tests sel file-tests)))
+            (cond
+             ((or (eq sel t) (null sel))
+              (mapcar (lambda (n) (get n 'ert--test)) added))
+             ((stringp sel)
+              (mapcar (lambda (n) (get n 'ert--test))
+                      (cl-remove-if-not
+                       (lambda (n) (string-match-p sel (symbol-name n)))
+                       added)))
+             ((symbolp sel)
+              (when (memq sel added) (list (get sel 'ert--test))))
+             (t (mapcar (lambda (n) (get n 'ert--test)) added)))))
       (dolist (test tests)
         (let ((result (ert-run-test test)))
           (cond
