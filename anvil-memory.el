@@ -99,7 +99,8 @@ indexed in a single DB.  Explicit list overrides auto-detection."
 (defconst anvil-memory-supported
   '(scan audit access list
          search save-check duplicates audit-urls
-         decay promote regenerate reindex-fts llm-verdict)
+         decay promote regenerate reindex-fts llm-verdict
+         mdl-distill)
   "Capability tags this module currently provides.
 Tests in tests/anvil-memory-test.el gate their `skip-unless' on
 membership here so a half-shipped feature never breaks CI.")
@@ -963,6 +964,111 @@ installed and the number of bodies repopulated.  Raises a
     (list :tokenizer tok :rebuilt rebuilt)))
 
 
+;;;; --- Phase 2b-iii: MDL distillation ------------------------------------
+
+(defun anvil-memory--distill-prompt (files bodies)
+  "Build the MDL distillation prompt from FILES and BODIES (aligned lists).
+Each source is emitted as a labelled `--- FILE: path ---' block so
+the parser / the LLM can attribute the draft back to the inputs."
+  (let ((blocks
+         (cl-loop for f in files
+                  for b in bodies
+                  concat (format "--- FILE: %s ---\n%s\n" f (or b "")))))
+    (format "You are asked to propose ONE \"convention memory\" file that \
+unifies the %d existing auto-memory entries below.
+
+Output requirements:
+- Start with a YAML frontmatter block containing at least:
+    name         (short title)
+    description  (one line, <= 140 chars)
+    type         (user / feedback / project / reference)
+- Follow the frontmatter with a concise body (<=50 lines) that captures
+  the common principle.
+- Do NOT emit anything except the proposed memory file content.
+- The draft must be general enough to replace all sources without losing
+  load-bearing detail.  Only include what the sources collectively justify.
+- Preserve the dominant language of the sources (Japanese OK).
+
+Sources (%d):
+%s
+Proposed convention memory:"
+            (length files) (length files) blocks)))
+
+(defun anvil-memory--file-indexed-p (db path)
+  "Non-nil when PATH appears in memory_meta on DB."
+  (and path
+       (stringp path)
+       (let ((rows (sqlite-select
+                    db "SELECT 1 FROM memory_meta WHERE file = ?1"
+                    (list path))))
+         (and rows t))))
+
+;;;###autoload
+(cl-defun anvil-memory-mdl-distill
+    (files &key provider model timeout-sec)
+  "Propose a unified convention memory that covers FILES.
+FILES is a non-empty list of memory .md paths, each of which must
+already be indexed (`memory-scan' first).  Each file's body is
+read fresh off disk and sent — alongside a path label — to
+`anvil-orchestrator-submit-and-collect'.  Defaults come from
+`anvil-memory-llm-provider' / `-llm-model' / `-llm-timeout-sec'.
+
+Returns a plist:
+  :draft    — proposed memory content (frontmatter + body) on success
+  :sources  — FILES verbatim (caller preserves order)
+  :error    — string when the orchestrator failed / timed out
+
+The function is read-only: it never writes to disk, rescans the
+index, or mutates the sources.  The caller (memory-pruner skill /
+human) decides whether to accept the draft."
+  (unless (and files (listp files))
+    (user-error "anvil-memory-mdl-distill: FILES must be a non-empty list"))
+  (let* ((db (anvil-memory--db)))
+    (dolist (f files)
+      (unless (anvil-memory--file-indexed-p db f)
+        (user-error
+         "anvil-memory-mdl-distill: %S is not in the memory index" f))))
+  (let* ((bodies (mapcar (lambda (f)
+                           (or (anvil-memory--get-body f)
+                               (and (file-readable-p f)
+                                    (anvil-memory--read-body-utf8 f))
+                               ""))
+                         files))
+         (prompt (anvil-memory--distill-prompt files bodies))
+         (prov (or provider anvil-memory-llm-provider))
+         (mdl  (or model anvil-memory-llm-model))
+         (tout (or timeout-sec anvil-memory-llm-timeout-sec))
+         (result (condition-case err
+                     (anvil-orchestrator-submit-and-collect
+                      :provider prov
+                      :prompt prompt
+                      :model mdl
+                      :timeout-sec tout
+                      :collect-timeout-sec tout)
+                   (error (list :status 'failed
+                                :error (error-message-string err)
+                                :pending nil))))
+         (status (plist-get result :status))
+         (pending (plist-get result :pending))
+         (summary (plist-get result :summary))
+         (err-msg (plist-get result :error)))
+    (cond
+     (pending
+      (list :draft nil
+            :sources files
+            :error "orchestrator pending (timeout)"))
+     ((eq status 'done)
+      (list :draft (or summary "")
+            :sources files
+            :error nil))
+     (t
+      (list :draft nil
+            :sources files
+            :error (format "orchestrator %s: %s"
+                           (or status 'unknown)
+                           (or err-msg "no error message")))))))
+
+
 ;;;; --- MCP tool handlers --------------------------------------------------
 
 (defun anvil-memory--coerce-type (v)
@@ -1202,6 +1308,35 @@ Returns (:tokenizer SYM :rebuilt N)."
                    tokenizer)))))
      (anvil-memory-reindex-fts tok))))
 
+(defun anvil-memory--tool-mdl-distill (files &optional provider model)
+  "Propose a unified convention memory that covers FILES.
+
+MCP Parameters:
+  files    - Colon-separated absolute paths of indexed memory .md
+             files (`:' chosen for POSIX path safety).  Each path
+             must be in the metadata index (scan first).
+  provider - Optional orchestrator provider id (defaults to
+             `anvil-memory-llm-provider').
+  model    - Optional model slug (defaults to
+             `anvil-memory-llm-model').
+
+Returns (:draft STR :sources LIST :error STR-OR-NIL).  Read-only:
+the proposal is returned, never written to disk — callers (the
+memory-pruner skill / a human reviewer) decide adoption."
+  (anvil-server-with-error-handling
+   (let* ((paths (cond ((null files) nil)
+                       ((listp files) files)
+                       ((and (stringp files) (string-empty-p files)) nil)
+                       ((stringp files) (split-string files ":" t))
+                       (t nil)))
+          (prov (cond ((null provider) nil)
+                      ((and (stringp provider) (string-empty-p provider)) nil)
+                      (t provider)))
+          (mdl (cond ((null model) nil)
+                     ((and (stringp model) (string-empty-p model)) nil)
+                     (t model))))
+     (anvil-memory-mdl-distill paths :provider prov :model mdl))))
+
 
 ;;;; --- module lifecycle ---------------------------------------------------
 
@@ -1300,7 +1435,20 @@ Phase 2b-i: `trigram' (SQLite 3.34+) is CJK-friendly — Japanese
 substring queries (3+ chars) that miss under `unicode61' start
 matching.  Omit tokenizer to use `anvil-memory-fts-tokenizer'
 (defaults to `auto', which picks trigram when available).  Returns
-:tokenizer / :rebuilt."))
+:tokenizer / :rebuilt.")
+
+    (,(anvil-server-encode-handler #'anvil-memory--tool-mdl-distill)
+     :id "memory-mdl-distill"
+     :description
+     "Propose a unified \"convention memory\" from N indexed memory files.
+Phase 2b-iii: the orchestrator receives each source's body as a
+labelled block and returns a draft (frontmatter + body) that
+covers them.  Read-only — the draft is returned, never written to
+disk, so the memory-pruner skill / a human decides whether to
+accept it.  Pass files as a colon-separated absolute-path list;
+every entry must already be in the metadata index (run
+`memory-scan' first).  Returns :draft / :sources / :error."
+     :read-only t))
   "Spec list consumed by `anvil-server-register-tools'.")
 
 (defun anvil-memory--register-tools ()
