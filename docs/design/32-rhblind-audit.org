@@ -1,0 +1,168 @@
+#+title: rhblind/emacs-mcp-server 競合 audit
+#+date: 2026-04-22
+#+author: zawatton
+#+property: status AUDIT
+#+property: scope INFORMATIONAL
+
+* STATUS
+  :PROPERTIES:
+  :ID:       d1c4e0f2-8f44-4f7c-bc1a-rhblind22a001
+  :END:
+~AUDIT~ (2026-04-22) — 調査 memo のみ、コード変更なし。Tier 1 競合取り込み
+(Doc 26-29) とは独立した単発 assessment。
+
+* Snapshot (2026-04-22 時点)
+
+| 項目             | 値                                    |
+|------------------+---------------------------------------|
+| URL              | [[https://github.com/rhblind/emacs-mcp-server]]            |
+| 概要             | Pure ELISP MCP server for Emacs       |
+| Stars            | 68                                    |
+| Forks            | 8                                     |
+| Open issues      | 9                                     |
+| Created          | 2025-08-15 (anvil より 2 ヶ月古い)    |
+| Last push        | 2026-04-20 (2 日前 — active)          |
+| Version          | 0.6.0                                 |
+| Emacs            | 27.1+                                 |
+| Platform         | Unix-like のみ (Unix domain socket)   |
+| Transport        | Unix socket (TCP は "planned")        |
+| External deps    | =socat= (Claude Desktop 連携時)       |
+| Author           | Rolf Håvard Blindheim + Claude Code   |
+
+* 露出している MCP tool
+
+わずか 2 本:
+
+| Tool              | 用途                                     |
+|-------------------+------------------------------------------|
+| =eval-elisp=      | 任意 elisp を safe wrapper 経由で eval |
+| =get-diagnostics= | flycheck/flymake の error/warning 収集   |
+
+それだけ。ファイル編集 / buffer 操作 / org-mode / git / process / browser
+/ orchestrator — すべて *無し*。
+
+* 設計思想
+
+**pure-elisp server** を売りにしている:
+
+- 外部ブリッジを挟まず Emacs 内に JSON-RPC 2.0 server を立てる
+- =socat= は MCP client (stdio) → socket のためだけの薄いラッパー
+- =mcp-server.el= + =mcp-server-transport-unix.el= + =mcp-server-transport-tcp.el=
+  (TCP は planned stub) + =mcp-server-security.el= + =mcp-server-tools.el=
+  のモジュラー構成
+
+**security-first**:
+
+- =mcp-server-security-dangerous-functions= に ~40 関数の blocklist
+  (=eval=, =shell-command=, =delete-file= 等)
+- =mcp-server-safe-eval= が form を再帰 traverse → blocklist hit で reject
+- minibuffer 経由の "(y)es, (n)o, (!)always" permission prompt
+- 1000 件 rotating audit log
+- sensitive file pattern + sensitive buffer pattern
+
+**認めている制約** (README から直接):
+
+- let-binding 位置の静的解析不完全
+- =intern= 経由の dynamic function 呼び出しで blocklist 回避可能
+- macro expansion 前の form だけ解析 — 内側が見えない
+
+* anvil vs rhblind 比較
+
+| 軸             | rhblind/emacs-mcp-server   | anvil.el                       |
+|----------------+----------------------------+--------------------------------|
+| Platform       | Unix のみ                  | Linux / macOS / *Windows*      |
+| Emacs          | 27.1+                      | 28.2+                          |
+| Tool 数        | 2                          | ~90                            |
+| Transport      | Unix socket + TCP(planned) | stdio (bash wrapper)           |
+| 外部依存       | socat                      | bash (Windows は Git Bash)     |
+| Security       | blocklist + prompt + cache | allowed-file list / read-only  |
+| Concurrency    | 記載なし (おそらく serial) | pool / offload / orchestrator  |
+| Org            | ✗                          | 読/書/refile/ID/rename/index   |
+| Git            | ✗                          | 8 tools + worktree             |
+| Browser        | ✗                          | playwright 連携 + pool         |
+| Orchestrator   | ✗                          | 5 provider + consensus + judge |
+| Byte compile   | ✗                          | make test-all + ERT            |
+| Install        | manual                     | install.sh / install.ps1       |
+| Distributed    | なし                       | anvil-pty-broker (Node.js TCP) |
+
+* 脅威 assessment
+
+**market overlap**: *低い* — 想定 user 像が違う。
+
+- rhblind: 「安全に elisp を LLM に投げたい」「既存 Emacs の diagnostics が
+  欲しい」ライト user 向け。pure-elisp で Windows 非対応、tool 2 本に
+  絞ることが *feature* (攻撃面 minimization)。
+- anvil: 「LLM に Emacs を workbench として使わせる」heavy user 向け。
+  org / git / browser / orchestrator まで広げる "workbench MCP server"。
+
+**star 差**: rhblind 68 / anvil 現況 (要実測)。competitor_uptake の theeseuus
+sampling で rhblind は r/emacs 界隈で認知されているが、市場を奪い合う対象
+ではなく「異なる niche」。
+
+**リスク**: 記号 AI 文脈で "pure-elisp MCP" narrative が強く浸透すると、
+「anvil は bash wrapper 挟んでる (= pure ではない)」批判が来る可能性。
+ただ実利で言えば bash wrapper は Windows 互換の reason で意図的選択。
+
+**機会**: rhblind の security approach は anvil が軽視してきた領域。
+allowlist 側をちゃんと整備する reference にできる (ただし anvil は
+eval 系を既に narrow に絞っている前提あり)。
+
+* 採れる action (優先順)
+
+** P0 (やらない)
+
+- rhblind の丸ごと機能移植 → 意味なし。target user 違う。
+- rhblind の pure-elisp 路線に合わせる → anvil の Windows 対応 /
+  orchestrator の subprocess 路線と真っ向対立。
+
+** P1 (検討)
+
+1. *README.org に positioning 比較 section を 1 段落追加*
+   - 「anvil は workbench 志向、rhblind/emacs-mcp-server は secure eval
+     gateway 志向、用途が違う」と明示
+   - theeseuus discussion で「何で anvil 選ぶ?」と聞かれた時の答えに
+     なる。書いておくと判断時間を節約できる
+   - 工数: 15 min
+
+2. *anvil-security.el という軽量 module を検討* (未実装、draft のみ)
+   - =anvil-get-allowed-files= に allowed-tool / read-only-mode /
+     dangerous-function blocklist を足す
+   - ただし anvil の多くの tool は既に *特定操作* に絞っているので
+     rhblind 型の generic elisp eval 防衛は不要
+   - 価値: 疑り深い user への disclosure material
+   - 工数: design 30 min、impl 2-3h (Phase 分割必要)
+
+3. *rhblind の audit log pattern 採用検討*
+   - 1000 件 rotating audit log は単純で有用
+   - anvil-state に appendix log として乗せられる
+   - 工数: 30 min
+
+** P2 (棚上げ)
+
+- TCP transport — rhblind は planned。anvil は stdio bridge で十分、
+  TCP への需要が来るまで保留。anvil-pty-broker が既に TCP 化 pattern
+  を持っているので必要になれば参照できる。
+- permission prompt — anvil は headless (Claude Code 経由) 前提、
+  minibuffer prompt は合わない。
+
+* Recommendation
+
+**単発 audit として close、active follow-up なし**。
+
+- rhblind は market niche が違うので追随不要
+- README 比較段落 (P1-1) は Doc 26-29 Tier 1 SHIPPED 後に軽く着手
+- 定期 watch: 半期 (次 review は 2026-10 を目処) で version 差分 + feature
+  追加を確認。それまでは ping なし
+
+* 参考: 最終確認した事実 (2026-04-22)
+
+- sock 名: =~/.config/emacs/.local/cache/emacs-mcp-server.sock=
+- Protocol version: =2024-11-05=
+- Tool registration: =mcp-server-tools-list= / =mcp-server-tools-call= による
+  self-registration (anvil の =anvil-register-tools= と同じ pattern)
+- 最新 commit 2026-04-20、0.6.0 (8 ヶ月で 68 star)
+
+* 関連 memory
+
+- [[file:~/.claude/projects/-home-madblack-21-Cowork-Notes/memory/project_rhblind_audit_pending.md][project_rhblind_audit_pending.md]] — この audit で解消、memory 側も close 予定
+- [[file:~/.claude/projects/-home-madblack-21-Cowork-Notes/memory/project_anvil_competitor_uptake.md][project_anvil_competitor_uptake.md]] — Tier 1 5 本とは独立扱い
