@@ -183,7 +183,16 @@ These are not loaded by default.  Available modules:
                 ends inside a `\"'-literal, the missing quote is
                 appended before paren balancing runs (Doc 31,
                 requires Emacs 29+ and the tree-sitter-elisp grammar
-                for Phase 2/3 tools)"
+                for Phase 2/3 tools)
+- `lint'      — Repo hygiene scanner family.  Phase 1 ships a
+                pluggable registry plus three org scanners:
+                conflict-markers (error) detects unresolved git
+                merge markers, orphan-ids (info) flags `:ID:'
+                properties no `[[id:...]]' link points at, and
+                broken-scheduled (warning) catches SCHEDULED /
+                DEADLINE timestamps with unparseable repeaters.
+                Run via `lint' / `lint-scanners' MCP tools or
+                `M-x anvil-lint' (Doc 16 Phase 1)"
   :type '(repeat symbol)
   :group 'anvil)
 
