@@ -1,0 +1,83 @@
+#+title: STORY — Background behind Anvil
+#+author: zawatton
+
+*Languages:* English / [[file:STORY.ja.org][日本語]]
+
+This is the backstory behind [[file:README.org][anvil.el]] — how it grew out of a one-person
+electrical-maintenance practice in Japan, and the three-phase
+evolution of the Claude workflow that led to building it.
+
+* Background
+
+I run a one-person electrical engineering firm in Japan.
+Industrial maintenance, around 40 customer sites.
+Work circumstances mean Windows is my daily driver, but I've been a long-time Emacs user.
+
+For client reasons, my work depends heavily on Microsoft Office.
+I use Excel for inspection reports, and Emacs (org-mode) for casual notes and scheduling.
+
+(Side note: I've cycled through plenty of note-taking apps over the years, and finally settled on Emacs.)
+
+Over the past several months, my workflow has evolved through three phases of using Claude.
+
+* Phase 1 — Claude Desktop (Claude Cowork)
+
+Anthropic's local-file agent dramatically streamlined my work.
+The ability to edit Excel files and operate web browsers directly let me streamline — and even automate — document organization, report drafting, and accounting tasks.
+
+But as I kept pushing for more efficiency and exploring what else was possible, I quickly hit the contract plan limit (MAX plan, $200/month), and that became its own problem.
+
+* Phase 2 — Claude Code (CLI)
+
+I gradually shifted from the Claude Desktop app to a Claude Code workflow in Windows Terminal. The experience was excellent.
+
+Shell and git integration got far smoother, and automation kept advancing — but I started to feel the limits of Excel-based reports.
+(Mainly in terms of communicating with Claude. Things like "which cell in this Excel inspection report should be edited, and how.")
+
+What ChatGPT, Claude, and other generative AIs are best at is working with text.
+
+So I started wanting to manage inspection report data in org files (plain text) using Emacs (org-mode), the editor I was already using.
+(Excel files would still serve purely as the print-format layer.)
+
+If I did that, I could collaborate with the generative AI in the file format it's best at. With that in mind, I steadily kept converting my data over to org.
+
+For me personally, switching to org files made data editing dramatically easier.
+All customers managed in a single org file, sortable section by section.
+Anyone who's used org-mode can picture what I mean.
+
+But what about Claude Code?
+It can't edit a large org file the way a human edits it inside Emacs.
+And token consumption seemed to grow. Claude Code appears to read the entire file content every time and write back the full revised content.
+
+To top it off, on Windows there's a file-mount problem: when editing a roughly 1.2 MB org file, content at the end keeps getting lost.
+
+
+Was the move to an org-based workflow for collaboration with Claude a mistake?
+If only Claude could use Emacs's convenient features...
+
+Wait — couldn't Emacs itself make that possible?
+
+
+That was the starting point for Anvil's development.
+
+* Phase 3 — Through Anvil, into Emacs itself
+
+And so the third phase: I built Anvil and brought Emacs up as an MCP server that Claude Code can call into.
+
+Now the agent talks to the running Emacs image itself, through typed MCP tools.
+Org structure, heading-level edits, dispatch of long-running operations — all handled on the Emacs side, then passed across.
+
+The 1.2 MB org file truncation is no longer an issue.
+For Emacs, a large org file is a familiar friend — it edits accurately by line and by heading.
+
+Some examples of what this enabled in the past few weeks:
+
+- Refiling 29 sub-tasks across a 1,200-line =todo.org= in a single atomic =file-batch= call — under one second.
+- Renaming =zawatton21= → =zawatton= across 39 files in 7 repositories with one elisp loop through =emacs-eval= — one round trip.
+- Dispatching OCR and PDF rasterization for inspection reports to =anvil-worker= — even during scans, the interactive Emacs doesn't freeze.
+
+
+The problems I had — "I can't edit large org files," "Excel makes communication awkward," "token consumption is ballooning" — are probably ones that you, as an Emacs user, have run into in some similar form.
+
+Humans build tools, and then build the next thing using those tools — let's use Anvil to forge Emacs into the AI's strongest tool!!
+With Emacs, that is possible.
