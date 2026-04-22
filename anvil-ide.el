@@ -50,7 +50,10 @@
 (declare-function treesit-node-child-count "treesit" (node))
 (declare-function treesit-node-check "treesit" (node property))
 (declare-function treesit-parser-list "treesit" (&optional buffer language))
+(declare-function treesit-parser-create "treesit" (language &optional buffer no-reuse tag))
 (declare-function treesit-parser-root-node "treesit" (parser))
+(autoload 'anvil-treesit-language-for-file "anvil-treesit" nil nil)
+(autoload 'anvil-treesit-ensure-grammar "anvil-treesit" nil nil)
 
 ;; Flycheck declarations
 (defvar flycheck-current-errors)
@@ -232,6 +235,32 @@ LEVEL is indentation level, MAX-DEPTH is the limit."
                                 child (1+ level) max-depth)))))
       result)))
 
+(defun anvil-ide--treesit-parse-integer (value name minimum)
+  "Parse VALUE as an integer MCP parameter named NAME.
+VALUE may already be an integer or a decimal string.
+MINIMUM is the inclusive lower bound."
+  (let ((n (cond
+            ((null value) nil)
+            ((integerp value) value)
+            ((and (stringp value)
+                  (string-match-p "\\`[0-9]+\\'" value))
+             (string-to-number value))
+            (t
+             (user-error "%s must be an integer, got %S" name value)))))
+    (when (and n (< n minimum))
+      (user-error "%s must be >= %d, got %S" name minimum value))
+    n))
+
+(defun anvil-ide--treesit-ensure-parser (file-path)
+  "Return a tree-sitter parser for the current buffer visiting FILE-PATH.
+If no parser exists yet, infer the language from FILE-PATH and create
+one after verifying the grammar is installed."
+  (or (car (treesit-parser-list))
+      (let ((lang (anvil-treesit-language-for-file file-path)))
+        (when lang
+          (anvil-treesit-ensure-grammar lang)
+          (treesit-parser-create lang)))))
+
 (defun anvil-ide--treesit-info (file-path &optional line column whole_file include_ancestors include_children)
   "Get tree-sitter syntax tree information for FILE-PATH.
 
@@ -243,22 +272,24 @@ MCP Parameters:
   include_ancestors - include parent node hierarchy
   include_children - include child nodes"
   (anvil-server-with-error-handling
-   (if (not (treesit-available-p))
+   (if (not (and (fboundp 'treesit-available-p)
+                 (treesit-available-p)))
        "Tree-sitter is not available in this Emacs build"
-     (let ((target-buffer (or (find-buffer-visiting file-path)
-                              (find-file-noselect file-path))))
+     (let* ((line-number (anvil-ide--treesit-parse-integer line "line" 1))
+            (column-number (anvil-ide--treesit-parse-integer column "column" 0))
+            (target-buffer (or (find-buffer-visiting file-path)
+                               (find-file-noselect file-path))))
        (with-current-buffer target-buffer
-         (let* ((parsers (treesit-parser-list))
-                (parser (car parsers)))
+         (let ((parser (anvil-ide--treesit-ensure-parser file-path)))
            (if (not parser)
                (format "No tree-sitter parser available for %s" file-path)
              (let* ((root-node (treesit-parser-root-node parser))
                     (pos (cond (whole_file nil)
-                               (line (save-excursion
-                                       (goto-char (point-min))
-                                       (forward-line (1- line))
-                                       (move-to-column (or column 0))
-                                       (point)))
+                               (line-number (save-excursion
+                                              (goto-char (point-min))
+                                              (forward-line (1- line-number))
+                                              (move-to-column (or column-number 0))
+                                              (point)))
                                (t (point))))
                     (node (if whole_file root-node (treesit-node-at pos parser)))
                     (results '()))
