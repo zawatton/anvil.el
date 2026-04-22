@@ -44,7 +44,7 @@
   "Server ID under which sexp-cst-* MCP tools are registered.")
 
 (defconst anvil-sexp-cst-supported-types
-  '(integer nil symbol)
+  '(integer nil symbol string list alist plist)
   "Type tags that `anvil-inspect-object' renders in the current build.
 Phase 1a chunks extend this list; tests in
 tests/anvil-sexp-cst-test.el gate their `skip-unless' on membership
@@ -157,6 +157,89 @@ letting the key default to absent keeps the contract terse."
      :entries (vector (list :k "=" :v name)))))
 
 
+;;;; --- sequence helpers (shared by chunk 2+) -----------------------------
+
+(defconst anvil-sexp-cst--repr-cap 60
+  "Per-value character cap on `prin1'-style reprs emitted in entries.
+Entry values are already a terse summary; this second cap keeps a
+single deeply-nested child from blowing the 4 KB output budget.")
+
+(defun anvil-sexp-cst--repr (v)
+  "Return a short printed representation of V, capped at
+`anvil-sexp-cst--repr-cap' characters with a trailing ellipsis when cut."
+  (let ((s (format "%S" v)))
+    (if (> (length s) anvil-sexp-cst--repr-cap)
+        (concat (substring s 0 (- anvil-sexp-cst--repr-cap 3)) "...")
+      s)))
+
+
+;;;; --- string / list / alist / plist handlers (chunk 2) ------------------
+
+(defun anvil-sexp-cst--inspect-string (s)
+  "Render string S as shape-lock JSON.
+`length' is the character count.  A single `slice' entry carries
+up to 40 leading characters so a downstream LLM sees actual content."
+  (anvil-sexp-cst--encode
+   'string
+   :length (length s)
+   :entries
+   (vector
+    (list :k "slice"
+          :v (anvil-sexp-cst--repr
+              (if (> (length s) 40) (substring s 0 40) s))))))
+
+(defun anvil-sexp-cst--inspect-list (lst)
+  "Render proper list LST as shape-lock JSON.
+Entries use the index as key and `anvil-sexp-cst--repr' for value.
+Caps at `anvil-sexp-cst-top-limit' elements; chunk 4 wires the
+remainder to a drill cursor."
+  (let* ((len (length lst))
+         (take (min len anvil-sexp-cst-top-limit))
+         (head (cl-subseq lst 0 take))
+         (entries (cl-loop for cell in head
+                           for i from 0
+                           collect (list :k (number-to-string i)
+                                         :v (anvil-sexp-cst--repr cell)))))
+    (anvil-sexp-cst--encode
+     'list
+     :length len
+     :entries (apply #'vector entries))))
+
+(defun anvil-sexp-cst--inspect-alist (al)
+  "Render alist AL as shape-lock JSON.
+Each entry is ((KEY-REPR . VAL-REPR)) → {k, v}; keys are run
+through `anvil-sexp-cst--repr' so symbols surface readably
+while still round-tripping via `read'."
+  (let* ((len (length al))
+         (take (min len anvil-sexp-cst-top-limit))
+         (head (cl-subseq al 0 take))
+         (entries (cl-loop for cell in head
+                           collect (list :k (anvil-sexp-cst--repr (car-safe cell))
+                                         :v (anvil-sexp-cst--repr (cdr-safe cell))))))
+    (anvil-sexp-cst--encode
+     'alist
+     :length len
+     :entries (apply #'vector entries))))
+
+(defun anvil-sexp-cst--inspect-plist (pl)
+  "Render plist PL as shape-lock JSON.
+Plist `length' is the raw element count (not pair count) — matches
+`length' semantics the shape-lock test enforces.  Entries are paired
+with the plist key as JSON `k' and the following value's repr as `v'."
+  (let* ((len (length pl))
+         (pairs (cl-loop for (k v) on pl by #'cddr
+                         collect (cons k v)))
+         (take (min (length pairs) anvil-sexp-cst-top-limit))
+         (head (cl-subseq pairs 0 take))
+         (entries (cl-loop for cell in head
+                           collect (list :k (anvil-sexp-cst--repr (car cell))
+                                         :v (anvil-sexp-cst--repr (cdr cell))))))
+    (anvil-sexp-cst--encode
+     'plist
+     :length len
+     :entries (apply #'vector entries))))
+
+
 ;;;; --- dispatcher --------------------------------------------------------
 
 (defun anvil-sexp-cst--inspect-dispatch (value)
@@ -173,6 +256,10 @@ so the MCP client sees a typed error rather than undefined shape."
       ('integer (anvil-sexp-cst--inspect-integer value))
       ('nil     (anvil-sexp-cst--inspect-nil))
       ('symbol  (anvil-sexp-cst--inspect-symbol value))
+      ('string  (anvil-sexp-cst--inspect-string value))
+      ('list    (anvil-sexp-cst--inspect-list value))
+      ('alist   (anvil-sexp-cst--inspect-alist value))
+      ('plist   (anvil-sexp-cst--inspect-plist value))
       (_
        ;; Unreachable — guard above rejects unlisted tags.
        (signal 'anvil-server-tool-error
