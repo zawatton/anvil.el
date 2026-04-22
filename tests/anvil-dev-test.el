@@ -436,6 +436,67 @@ Non-git `call-process' calls still signal exit-status 1."
             (should (null (plist-get r :non-shipped-docs)))))
       (delete-directory d t))))
 
+(ert-deftest anvil-dev-test-audit-accepts-shipped-on-later-line ()
+  "STATUS first line `~DRAFT~ → ~SHIPPED~' style passes — keyword
+appears anywhere in the body, not only on the first line."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "docs/design/17-session.org" d)
+           (concat
+            "* STATUS\n"
+            "~DRAFT~ (2026-04-19, extended 2026-04-20 with Phase 3-4) →\n"
+            "~SHIPPED~ (2026-04-22, develop branch).\n"))
+          (let ((r (anvil-dev-release-audit d)))
+            (should (null (plist-get r :non-shipped-docs)))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-accepts-deferred-as-non-blocker ()
+  "DEFERRED specs are intentional non-blockers and must not appear
+in the master-merge gate report."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "docs/design/30-acp.org" d)
+           (concat
+            "* STATUS\n"
+            "~DRAFT~ (2026-04-21) → ~DEFERRED~ (2026-04-22 after research).\n"))
+          (let ((r (anvil-dev-release-audit d)))
+            (should (null (plist-get r :non-shipped-docs)))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-accepts-audit-research-memo ()
+  "AUDIT memos are research-only, treated as non-blockers."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "docs/design/32-rhblind.org" d)
+           "* STATUS\n~AUDIT~ (2026-04-22) — research memo only.\n")
+          (let ((r (anvil-dev-release-audit d)))
+            (should (null (plist-get r :non-shipped-docs)))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-rejects-lowercase-shipped-narrative ()
+  "Lowercase `shipped' inside narrative prose must not pass the gate.
+Only the all-caps status keyword counts."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "docs/design/20-pty2.org" d)
+           (concat
+            "* STATUS\n"
+            "~DRAFT~ (2026-04-19)\n\n"
+            "Extends the shipped Phase 1 broker with TUI semantics.\n"))
+          (let* ((r (anvil-dev-release-audit d))
+                 (docs (plist-get r :non-shipped-docs)))
+            (should (= 1 (length docs)))
+            (should (equal "20-pty2.org" (plist-get (car docs) :file)))))
+      (delete-directory d t))))
+
 (ert-deftest anvil-dev-test-audit-skips-properties-drawer ()
   "The status extractor must skip the :PROPERTIES: drawer before
 picking up the status line itself."

@@ -825,41 +825,64 @@ Returns a list of plists `(:sha SHA :issue N :subject STR)'."
     (nreverse findings)))
 
 (defun anvil-dev--audit-design-doc-status (file)
-  "Extract the first non-blank line of FILE's `* STATUS' section.
-Returns the trimmed string or nil when the file has no STATUS
-heading or the section is empty.  The org heading and the
-PROPERTIES drawer are skipped; `~...~' verbatim delimiters are
-stripped so the caller sees the plain status text."
+  "Return cons (FIRST-LINE . FULL-BODY) of FILE's `* STATUS' section.
+FIRST-LINE is the first non-blank, non-drawer line trimmed and stripped of
+`~...~' verbatim delimiters (used as the human-readable summary in
+reports).  FULL-BODY is the whole STATUS section text used to detect
+status keywords that may appear on a later line such as
+`DRAFT → SHIPPED' progressions.  Returns nil when the file has no
+STATUS heading."
   (with-temp-buffer
     (insert-file-contents file)
     (goto-char (point-min))
     (when (re-search-forward "^\\* STATUS" nil t)
       (forward-line 1)
-      (let ((end (save-excursion
-                   (or (and (re-search-forward "^\\* " nil t)
-                            (match-beginning 0))
-                       (point-max)))))
-        (catch 'found
-          (while (< (point) end)
-            (let ((line (buffer-substring-no-properties
-                         (line-beginning-position)
-                         (line-end-position))))
-              (unless (or (string-match-p "\\`[[:space:]]*\\'" line)
-                          (string-match-p "\\`[[:space:]]*:PROPERTIES:" line)
-                          (string-match-p "\\`[[:space:]]*:ID:" line)
-                          (string-match-p "\\`[[:space:]]*:END:" line))
-                (throw 'found
-                       (string-trim
-                        (replace-regexp-in-string "\\`[[:space:]]*~\\|~[[:space:]]*\\'"
-                                                  "" line)))))
-            (forward-line 1))
-          nil)))))
+      (let* ((start (point))
+             (end (save-excursion
+                    (or (and (re-search-forward "^\\* " nil t)
+                             (match-beginning 0))
+                        (point-max))))
+             (body (buffer-substring-no-properties start end))
+             first-line)
+        (save-excursion
+          (goto-char start)
+          (catch 'found
+            (while (< (point) end)
+              (let ((line (buffer-substring-no-properties
+                           (line-beginning-position)
+                           (line-end-position))))
+                (unless (or (string-match-p "\\`[[:space:]]*\\'" line)
+                            (string-match-p "\\`[[:space:]]*:PROPERTIES:" line)
+                            (string-match-p "\\`[[:space:]]*:ID:" line)
+                            (string-match-p "\\`[[:space:]]*:END:" line))
+                  (setq first-line
+                        (string-trim
+                         (replace-regexp-in-string
+                          "\\`[[:space:]]*~\\|~[[:space:]]*\\'" "" line)))
+                  (throw 'found nil)))
+              (forward-line 1))))
+        (when first-line (cons first-line body))))))
+
+(defun anvil-dev--audit-status-shipped-p (body)
+  "Return non-nil when STATUS BODY counts as non-blocking for master gate.
+Looks for the all-caps status keywords `SHIPPED' (work merged),
+`DEFERRED' (postponed by decision), or `AUDIT' (research-only memo)
+anywhere in the body, with case-sensitive matching so that incidental
+narrative words like \"the shipped Phase 1 broker\" do not satisfy
+the gate.  Multi-step progressions like `~DRAFT~ → ~APPROVED~ →
+~SHIPPED~' therefore pass once the final keyword appears anywhere
+in the body."
+  (and body
+       (let ((case-fold-search nil))
+         (string-match-p "\\bSHIPPED\\b\\|\\bDEFERRED\\b\\|\\bAUDIT\\b" body))))
 
 (defun anvil-dev--audit-scan-design-docs (root)
-  "Scan ROOT/docs/design/*.org for STATUS lines that do not contain `SHIPPED'.
+  "Scan ROOT/docs/design/*.org for STATUS sections that block master merge.
+A doc is blocking when its STATUS body contains none of `SHIPPED',
+`DEFERRED', or `AUDIT' (i.e. still DRAFT / APPROVED / mid-phase).
 Returns a list of plists `(:file NAME :status LINE)' in lexical
-order, surfacing DRAFT / APPROVED / partial-phase docs so the
-reader can judge the master-integration gate criterion."
+order, where LINE is the human-readable first line of STATUS used
+in reports."
   (let ((design-dir (expand-file-name "docs/design" root))
         findings)
     (when (file-directory-p design-dir)
@@ -872,8 +895,8 @@ reader can judge the master-integration gate criterion."
                ((null status)
                 (push (list :file base :status "(no STATUS section)")
                       findings))
-               ((not (string-match-p "SHIPPED" status))
-                (push (list :file base :status status) findings))))))))
+               ((not (anvil-dev--audit-status-shipped-p (cdr status)))
+                (push (list :file base :status (car status)) findings))))))))
     (nreverse findings)))
 
 (defun anvil-dev--audit-filter-by-scope (files scope)
