@@ -8,10 +8,19 @@
   :PROPERTIES:
   :ID:       c6f05c1e-72a6-4e3b-87a6-d0a6a3b7c002
   :END:
-~DRAFT~ (2026-04-20) — Week-3 Ship 2, 競合 rtk (Rust Token Killer)
-由来。Emacs 内 shell 呼び出し (=shell-command= / =call-process= /
-=anvil-pty-broker=) の出力を per-command 戦略で圧縮、失敗時は raw
-を =anvil-state= に tee。実装 ETA 3-5 日。
+~Phase 1 SHIPPED~ (2026-04-22, feat/doc-27-shell-filter-phase1) —
+Week-3 Ship 2 ship、競合 rtk (Rust Token Killer) 由来の per-command
+出力圧縮 + =anvil-state= tee + gain 累計。Phase 2 以降 (streaming,
+user-defined filter, 業務固有 filter) は DRAFT 維持。
+
+*実装された範囲:* 10 filter (=git-status= / =git-log= / =git-diff= /
+=rg= / =find= / =ls= / =pytest= / =ert-batch= / =emacs-batch= /
+=make=) + 4 MCP tool (=shell-run= / =shell-filter= / =shell-tee-get=
+/ =shell-gain=) + tee (TTL 1h)、gain 日次累計。19 shape-locked ERT
+を TDD-lock してから impl、全 pass。
+
+*module placement:* =anvil-optional-modules= (=anvil-state= 依存
+のため default 非搭載、opt-in)。
 
 * Motivation
 
@@ -197,14 +206,22 @@ hook を足したもの。
 
 * Phases
 
-** Phase 1 — 10 filter + tee + gain (~DRAFT~)
+** Phase 1 — 10 filter + tee + gain (~SHIPPED~ 2026-04-22)
 
-最低限の 10 filter:
+10 filter SHIPPED:
 =git-status= / =git-log= / =git-diff= / =rg= / =find= / =ls= /
 =pytest= / =ert-batch= / =emacs-batch= / =make=。
 
 + =shell-run= / =shell-filter= / =shell-tee-get= / =shell-gain= の
 4 MCP tool。
+
+=anvil-shell-filter-lookup= は =git SUB= を =git-status= /
+=git-log= / =git-diff= に振り分ける 2-token dispatch。=auto=
+未知 token は raw passthrough。=shell-tee= / =shell-gain= の 2
+namespace を =anvil-state= 上に占有、TTL 1h で自動 prune。
+
+commit: =939e4f1= (test-lock) → =59ef084= (impl) →
+=a74f7f3= (MCP encode-handler fix)。
 
 ** Phase 2 — 10 filter 追加 + streaming
 
