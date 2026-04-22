@@ -1,0 +1,345 @@
+#+title: anvil-discovery — Intent-based MCP Tool Discovery
+#+date: 2026-04-22
+#+author: zawatton
+#+property: status DRAFT
+#+property: scope GENERIC
+
+* STATUS
+  :PROPERTIES:
+  :ID:       019dafb1-0000-7000-0000-tool-discovery-doc34
+  :END:
+~DRAFT~ (2026-04-22) — Phase A / B / C に分割。
+Phase A は単独 ship 可能、Phase B は A の metadata を流用、Phase C は B 運用後に着手。
+
+Week-4 の主題「module 臨界点対策」の 1 本目。
+tool 数 ~90 を整理せず、*選び方* を runtime 側に移す approach。
+
+* Motivation
+
+anvil は 2026-04 時点で *90+ MCP tool* を advertise している (see Doc 26)。
+Doc 26 の profile filter は tools/list の *volume* を制御するが、session 内で
+Claude が「今やりたい X にどの tool が対応するか」を判断するには依然
+CLAUDE.md の手書きフローチャート + memory 参照が必要で、毎 session 冒頭で
+同じ探索を繰り返している。
+
+真の問題は tool 数ではなく *intent-based discovery の不在*:
+
+- Doc 26 manifest: *volume reduction* — session prompt の token 削減
+- 本 doc (34): *semantic discovery* — 「X 用の tool はどれか」を runtime で問い合わせ可能に
+
+両者は直交する。Doc 26 + Doc 34 が揃って初めて「advertise する分は少なく、
+欲しい時は discover できる」の両立が成立する。
+
+観測された反復探索パターン (session transcript より):
+- 「org の section を読みたい」→ CLAUDE.md 再読 → ~org-read-headline~ 発見
+- 「巨大ファイルから反復 block を抽出」→ 既存 tool 失念 → 結局 Read + Grep で組立て
+- 「JSON 辞書に key/value 追加」→ ~json-object-add~ を思い出すまで Edit 経由
+- 「同じ import を N ファイルへ」→ ~file-batch-across~ の存在を忘れて 1 つずつ
+
+どれも tool 自体は存在し、解決パターンは CLAUDE.md に書かれている。
+ただ、その *選択フローチャート* が自然言語でしか表現されていないため、
+Claude が毎回 text 全体を読み直している。
+
+* Design Principles
+
+1. *metadata-driven, not text-driven* — tool の intent / layer は register 時に
+   コード内 data として付与、runtime から query 可能に
+2. *backward compatible* — 既存の ~anvil-server-register-tool{,s}~ 呼び出しは
+   無変更で動く。新 key は optional
+3. *loose vocabulary initially* — intent 語彙は自由 symbol で始め、Phase D
+   以降で自然収束後に辞書化
+4. *no tool deletion* — 本 doc の範囲では削除・統合は行わない (Phase C の
+   usage データ後に別 doc で判断)
+5. *avoids facade bloat* — high-level verb facade (anvil-do-edit 等) は
+   痛みが見えるまで保留
+
+* Non-goals
+
+- tool の削除・統合 (Phase C の usage 計測後、別 doc で判断)
+- CLAUDE.md の「選択フローチャート」節の即時削除 (Phase A+B 運用 2-4 週後に
+  置換検討、本 doc では削除しない)
+- intent 語彙の事前確定 (自然発生後に収束)
+- facade verb 層 (anvil-do-*) の導入 (来期判断)
+
+* Phase A — ~anvil-discovery~ module + ~anvil-tools-by-intent~
+
+** Scope
+
+- 新モジュール ~anvil-discovery.el~ (optional module、default 非 enable)
+- ~anvil-server-register-tool~ を拡張し ~:intent~ / ~:layer~ / ~:stability~
+  を plist で受け取り、既存 ~anvil-server--tools~ hash に蓄積
+- MCP tool ~anvil-tools-by-intent~ を 1 本追加
+- core 20-30 本に tag 付与 (初回 batch)
+
+** Metadata 拡張
+
+~anvil-server-register-tool~ の offload 系 key pass-through リストに 3 key
+を追加:
+
+#+begin_src elisp
+(dolist (k '(:offload :offload-require :offload-load-path
+             :offload-inherit-load-path :offload-timeout :resumable
+             :intent :layer :stability))    ; ← 追加
+  (when (plist-member properties k)
+    (setq tool (plist-put tool k (plist-get properties k)))))
+#+end_src
+
+新 key の意味:
+
+| Key         | 型                 | 既定値          | 例                                  |
+|-------------+--------------------+-----------------+-------------------------------------|
+| :intent     | list of symbol     | ~'(general)~    | ~'(file-edit batch)~                |
+| :layer      | symbol             | ~'core~         | ~'core~ / ~'io~ / ~'workflow~ / ~'dev~ |
+| :stability  | symbol             | ~'stable~       | ~'stable~ / ~'experimental~ / ~'deprecated~ |
+
+plist 格納だけなので既存 tool への影響ゼロ。
+未指定 tool はすべて既定値にフォールバック。
+
+** ~anvil-tools-by-intent~ MCP tool
+
+Signature:
+
+#+begin_src elisp
+(defun anvil-discovery-tools-by-intent-handler (query intent layer include-experimental)
+  "Return MCP tools matching INTENT / LAYER / QUERY.
+
+MCP Parameters:
+  query                 - Optional regex over tool id or description (string)
+  intent                - Optional intent symbol or comma-separated list
+  layer                 - Optional layer: core / io / workflow / dev
+  include-experimental  - If \"true\", include :stability experimental
+                          (deprecated は常に除外)"
+  ...)
+#+end_src
+
+Return shape (JSON):
+
+#+begin_src js
+[
+  {
+    "id": "file-batch",
+    "layer": "core",
+    "intent": ["file-edit"],
+    "stability": "stable",
+    "description": "Execute multiple file operations in a single call...",
+    "server_id": "default"
+  },
+  ...
+]
+#+end_src
+
+Matching 論理 (AND):
+- intent 指定時: tool の ~:intent~ list と 1 つでも共通があれば hit
+- layer 指定時: 完全一致
+- query 指定時: ~:id~ または ~:description~ に regex match
+- ~:stability deprecated~ は常に除外
+- ~:stability experimental~ は ~include-experimental=true~ の時のみ含める
+
+Sort 順:
+1. layer 順 (core > io > workflow > dev)
+2. intent 完全一致度 (query 指定 intent と tool intent の intersection 数)
+3. id アルファベット順
+
+Empty 結果の扱い: 空配列を返す (error にしない)。
+query が regex として壊れている場合のみ ~anvil-server-tool-throw~。
+
+** Storage
+
+新 registry は作らず、既存 ~anvil-server--tools~ hash をそのまま利用。
+~anvil-discovery-tools-by-intent-handler~ は server-id を巡回して
+(~maphash~) metadata を読み出すだけの pure reader。
+
+Phase C で usage counter を導入する際は別 table (~anvil-discovery--usage~)
+を追加するので、本 Phase では不要。
+
+** 初回 tagging batch (core 20-30 tool)
+
+Phase A merge 直後の follow-up PR ~chore/tag-core-tools~ で以下を付与:
+
+| Module            | Tools                                                                  | :intent                     | :layer |
+|-------------------+------------------------------------------------------------------------+-----------------------------+--------|
+| anvil-file (edit) | file-batch, file-batch-across, file-replace-string, file-replace-regexp | ~(file-edit)~               | core   |
+|                   | file-insert-at-line, file-delete-lines, file-append, file-ensure-import | ~(file-edit)~               | core   |
+| anvil-file (read) | file-outline, file-read                                                | ~(file-read structure)~     | core   |
+| anvil-file (code) | code-extract-pattern, code-add-field-by-map                            | ~(code-bulk-edit)~          | core   |
+| anvil-file (json) | json-object-add                                                        | ~(json-edit config)~        | core   |
+| anvil-org-index   | org-read-outline, org-read-headline, org-read-by-id, org-index-search  | ~(org-read)~                | core   |
+| anvil-org-index   | org-index-rebuild                                                      | ~(org-read admin)~          | workflow |
+| anvil-org-edit    | org-edit-body, org-add-todo, org-update-todo-state, org-rename-headline | ~(org-edit)~                | core   |
+| anvil-sqlite      | sqlite-query                                                           | ~(db-read)~                 | core   |
+| anvil-git         | git-status, git-log, git-branch-current, git-diff-names, git-head-sha  | ~(git read)~                | workflow |
+| anvil-git         | git-diff-stats, git-commit-message, git-pr-body                        | ~(git compose)~             | workflow |
+| anvil-http        | http-fetch, http-head                                                  | ~(http)~                    | io     |
+| anvil-bench       | bench-compare, bench-last, bench-profile-expr                          | ~(bench)~                   | dev    |
+| anvil-manifest    | manifest-cost                                                          | ~(meta token)~              | dev    |
+
+~28 本、Phase A の merge とは別 PR で段階導入。
+残り ~60 本は既定値でフォールバック (~'(general)~ / core / stable)、
+新規登録または必要に応じて順次 tagging。
+
+** Testing
+
+ERT (新規 ~anvil-discovery-test.el~):
+
+1. metadata 伝搬: register 後、tool plist に ~:intent~ 等が入ることを確認
+2. query 論理:
+   - intent 一致で hit
+   - layer filter
+   - query regex (正常・破損)
+   - stability experimental (include/exclude)
+   - stability deprecated は常に除外
+3. sort 順: layer 優先、intent intersection スコア、id tie-break
+4. 既存 tool 未変更: tag 無し tool は default 値で hit する
+
+Integration smoke test (memory の 2026-04-22 教訓):
+- MCP 経由で ~anvil-tools-by-intent~ 呼び出し、dispatcher encoding 往復
+- register-tools スペックに新 key が混入しても ~anvil-server-register-tools~
+  のバリデーションを通る (plist 長 even チェック)
+
+* Phase B — Intent-based profile (~anvil-manifest~ 拡張)
+
+** Scope
+
+Doc 26 manifest に *intent/layer ベースの profile* を追加。
+既存の ID-list ベース profile (~ultra~ / ~nav~ / ~core~ / ~lean~) は無変更。
+純粋に追加のみ。
+
+** 新 profile 定義
+
+~anvil-manifest.el~ に 2 profile を追加:
+
+#+begin_src elisp
+(defconst anvil-manifest-profile-agent
+  '(:intent-include (orchestrator session memory browser
+                     file-edit file-read org-read org-edit)
+    :layer-include (core workflow)
+    :stability-exclude (experimental deprecated))
+  "Agent workload: orchestrator-driven long-running tasks.")
+
+(defconst anvil-manifest-profile-edit
+  '(:intent-include (file-edit file-read org-read org-edit
+                     code-bulk-edit json-edit structure)
+    :layer-include (core)
+    :stability-exclude (experimental deprecated))
+  "Daily editing: file / code / org, no meta / io / dev.")
+#+end_src
+
+既存 ~anvil-manifest-profile~ defcustom の選択肢に ~agent~ / ~edit~ を追加。
+
+** Filter 論理
+
+~anvil-manifest--profile-toolset~ を拡張し plist-style profile を判定:
+
+#+begin_src elisp
+(defun anvil-manifest--profile-toolset (profile)
+  (pcase profile
+    ('full :all)
+    ((or 'core 'nav 'ultra 'lean)
+     ;; 既存: ID list を返す
+     (symbol-value (intern (format "anvil-manifest-profile-%s" profile))))
+    ((or 'agent 'edit)
+     ;; 新: plist filter spec を返す
+     (symbol-value (intern (format "anvil-manifest-profile-%s" profile))))
+    (_ (user-error "unknown profile %S" profile))))
+#+end_src
+
+~anvil-manifest--visible-p~ で toolset の形状を判別し branch:
+- ~:all~ → 全公開
+- list of string → 既存 ID match
+- plist → intent/layer/stability filter
+
+** 後方互換性
+
+- default ~ANVIL_PROFILE=full~ — 既存動作と完全一致
+- 既存 4 profile 無変更
+- 新 2 profile は opt-in のみ
+- Phase A の tag 付与が未完の tool も既定値で filter 対象になるため、
+  初期段階では意図通りに filter されない可能性あり → 運用側で tag 追加
+  が必要になるが、これは受容可能な漸進コスト
+
+** Testing
+
+- 既存の ~anvil-manifest-test~ 16 本が無変更で pass
+- 新 ERT:
+  - ~agent~ profile で expected tools が hit、excluded が miss
+  - ~edit~ profile で layer=core のみ hit
+  - plist profile と ID list profile の共存
+  - 未 tag tool の既定値挙動 (~'(general)~ / core / stable)
+
+* Phase C — Usage-based prune audit
+
+Phase B 運用 1-2 週後、実データを元に着手。
+
+** Scope
+
+- ~anvil-state~ に ~(tool-name, date, count)~ counter
+- MCP tool dispatch (~anvil-server--dispatch~) で register-tool plist の
+  ~:id~ を key に日次インクリメント
+- ~anvil-dev-release-audit~ に ~:unused-since DAYS~ scanner 追加
+- 新 MCP tool ~anvil-discovery-usage-report~
+  - Input: ~:days N~ (default 14)
+  - Output: tool 毎の ~:last-called~ / ~:total-count-n-days~
+
+** 出力例
+
+#+begin_src js
+{
+  "unused_since_14_days": ["bench-profile-expr", "elisp-info-lookup-symbol"],
+  "low_usage": [
+    {"id": "py-list-decorators", "calls_14d": 2},
+    ...
+  ],
+  "deprecation_candidates": ["..."]
+}
+#+end_src
+
+自動削除は行わない。ユーザ判断で deprecation → 削除の phase は別 PR。
+
+** 非目標 (Phase C)
+
+- 横断的な tool 削除 (Phase D 候補)
+- ~:intent~ 語彙の辞書化 (Phase D 候補)
+- facade verb layer (保留)
+
+* Migration Plan
+
+| Step | 内容                                                     | 状態 |
+|------+----------------------------------------------------------+------|
+|    1 | Phase A merge (feat/tool-discovery → develop)            | 未   |
+|    2 | core 20-30 tag 付け (chore/tag-core-tools → develop)    | 未   |
+|    3 | 1-2 週運用、intent 語彙の自然収束観察                    | 未   |
+|    4 | Phase B merge (feat/profile-filter → develop)            | 未   |
+|    5 | 2-4 週運用、CLAUDE.md 選択フローチャート節を tool 呼び出し指示に置換 | 未   |
+|    6 | Phase C (feat/usage-audit → develop)                     | 未   |
+|    7 | Doc 34 SHIPPED / develop → master 候補 (Doc gate 判断)    | 未   |
+
+* Platform Notes
+
+- Windows 固有の問題なし。純粋な Elisp / hash-table 操作
+- 大規模 registry (~90 tool) でも ~maphash~ は ms 単位、性能問題なし
+- byte-compile 後の stale .elc 罠 (memory ~feedback_stale_elc_silent_wrong_result.md~) は
+  既存 ~load-prefer-newer t~ で既に対策済
+
+* Backward Compatibility
+
+- 既存の ~anvil-server-register-tool~ / ~anvil-server-register-tools~ 呼び出しは
+  100% 互換
+- 既存 manifest profile (~ultra~ / ~nav~ / ~core~ / ~lean~ / ~full~) は無変更
+- Phase A は opt-in module (anvil-optional-modules 経由)
+- Phase B は opt-in profile (既定 ~full~ = 従来動作)
+- Phase A / B を同時 enable しなくても単独で機能する
+
+* Review Questions
+
+1. ~anvil-discovery~ モジュール名で良いか、~anvil-registry~ / ~anvil-toolinfo~ 等の方が筋が良いか
+2. ~:intent~ 語彙の自然発生を許容する期間 (2 週 / 4 週 / 2 ヶ月)
+3. Phase C の usage counter を anvil-state に相乗りさせるか、専用 sqlite table にするか
+4. CLAUDE.md の「選択フローチャート」節置換 vs 併記、どちらで運用するか
+5. 新 profile ~agent~ / ~edit~ は Doc 26 Phase 1b の orchestrator 自動注入対象に含めるか
+
+* References
+
+- Doc 26 [[file:26-manifest-profile.org][Manifest Profile (tools/list filter)]] — token volume 削減
+- Doc 28 [[file:28-progressive-disclosure.org][Progressive Disclosure]] — file-outline / file-read-snippet で read の階層化
+- Memory ~project_anvil_efficiency_bundle.md~ — ~register-tools~ macro の役割
+- Memory ~feedback_mcp_schema_dispatcher_sync.md~ — MCP 経由 integration test の必要性
