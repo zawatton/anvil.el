@@ -556,6 +556,134 @@ shutdown path session-end hooks will invoke."
                        "inspect-object/cursor-expired"))))))
 
 
+;;;; --- sexp-cst-read (Phase 2a) ------------------------------------------
+
+(defun anvil-sexp-cst-test--grammar-ready-p ()
+  "Return non-nil when tree-sitter-elisp grammar is loadable.
+Phase 2a tests that exercise a live parser skip when the grammar
+is missing — makes the suite portable to machines that haven't run
+`benchmarks/tools/regenerate-abi14.sh' yet."
+  (and (fboundp 'treesit-ready-p)
+       (ignore-errors (treesit-ready-p 'elisp t))))
+
+(defun anvil-sexp-cst-test--cst-available-p ()
+  "Return non-nil when the Phase 2a impl is live and usable."
+  (and (anvil-sexp-cst-test--available-p 'cst-read)
+       (fboundp 'anvil-sexp-cst-read)))
+
+(defmacro anvil-sexp-cst-test--with-elisp-file (var content &rest body)
+  "Write CONTENT to a temp .el file, bind its path to VAR for BODY.
+Deletes the file on exit."
+  (declare (indent 2))
+  `(let ((,var (make-temp-file "anvil-sct-" nil ".el" ,content)))
+     (unwind-protect (progn ,@body)
+       (ignore-errors (delete-file ,var)))))
+
+(defun anvil-sexp-cst-test--invoke-read (&rest args)
+  "Call `anvil-sexp-cst-read' with ARGS and parse the JSON result."
+  (let ((raw (apply #'anvil-sexp-cst-read args)))
+    (should (stringp raw))
+    (json-parse-string raw :object-type 'hash-table
+                       :array-type 'array
+                       :null-object :null
+                       :false-object :false)))
+
+(ert-deftest anvil-sexp-cst-test-cst-read-parses-small-file ()
+  "Happy path: a two-form file reports type=source_file with child
+nodes in the same order as the source text."
+  (skip-unless (anvil-sexp-cst-test--cst-available-p))
+  (skip-unless (anvil-sexp-cst-test--grammar-ready-p))
+  (anvil-sexp-cst-test--with-elisp-file path
+      "(defvar x 1)\n(defun f () x)\n"
+    (let* ((obj (anvil-sexp-cst-test--invoke-read path))
+           (children (anvil-sexp-cst-test--get obj "children")))
+      (should (equal (anvil-sexp-cst-test--get obj "type") "source_file"))
+      (should (integerp (anvil-sexp-cst-test--get obj "start")))
+      (should (integerp (anvil-sexp-cst-test--get obj "end")))
+      (should (or (vectorp children) (listp children)))
+      (should (>= (length children) 2)))))
+
+(ert-deftest anvil-sexp-cst-test-cst-read-preserves-comments ()
+  "Comments must survive as dedicated `comment' nodes.  This is the
+core value proposition of the CST read path over the reader-based
+`anvil-sexp-*'."
+  (skip-unless (anvil-sexp-cst-test--cst-available-p))
+  (skip-unless (anvil-sexp-cst-test--grammar-ready-p))
+  (anvil-sexp-cst-test--with-elisp-file path
+      ";; header comment\n(defvar x 1)\n"
+    (let* ((obj (anvil-sexp-cst-test--invoke-read path))
+           (children (append (anvil-sexp-cst-test--get obj "children") nil))
+           (types (mapcar (lambda (c) (gethash "type" c)) children)))
+      (should (member "comment" types))
+      ;; The comment node must carry its original text (including leading ;;).
+      (let ((comment-node (cl-find-if (lambda (c)
+                                        (equal (gethash "type" c) "comment"))
+                                      children)))
+        (should comment-node)
+        (should (string-match-p "header comment"
+                                (gethash "text" comment-node)))))))
+
+(ert-deftest anvil-sexp-cst-test-cst-read-at-offset ()
+  "POSITION zooms to the smallest named node enclosing that offset;
+without POSITION the root is returned.  Locks the contract that
+POSITION is 1-based point semantics (matches Emacs `point' /
+`buffer-substring', not 0-based byte offset), so LLM callers can
+use `point-max' / numeric literals transparently."
+  (skip-unless (anvil-sexp-cst-test--cst-available-p))
+  (skip-unless (anvil-sexp-cst-test--grammar-ready-p))
+  (anvil-sexp-cst-test--with-elisp-file path
+      "(defvar a 1)\n(defun f () (+ a 1))\n"
+    ;; Offset inside the defun body (point position, not byte):
+    (let* ((offset 20)   ; roughly inside "(defun f () ...)"
+           (obj (anvil-sexp-cst-test--invoke-read path offset)))
+      ;; The returned node must enclose the offset and must not be the
+      ;; root source_file (something narrower was selected).
+      (should (<= (anvil-sexp-cst-test--get obj "start") offset))
+      (should (>= (anvil-sexp-cst-test--get obj "end") offset))
+      (should-not (equal (anvil-sexp-cst-test--get obj "type")
+                         "source_file")))))
+
+(ert-deftest anvil-sexp-cst-test-cst-read-depth-cap ()
+  "Recursion below `anvil-sexp-cst-read-max-depth' is truncated:
+deeper children are pruned to an empty array and `truncated' = t on
+the last node retained.  The original source text remains
+reconstructible through the parent node's `text' field."
+  (skip-unless (anvil-sexp-cst-test--cst-available-p))
+  (skip-unless (anvil-sexp-cst-test--grammar-ready-p))
+  (anvil-sexp-cst-test--with-elisp-file path
+      "(a (b (c (d (e (f 42))))))\n"
+    (let* ((anvil-sexp-cst-read-max-depth 2)
+           (obj (anvil-sexp-cst-test--invoke-read path)))
+      (should (equal (anvil-sexp-cst-test--get obj "type") "source_file"))
+      ;; Depth-0 (root) → depth-1 (outermost list) → depth-2 is the cap;
+      ;; any node emitted at the cap boundary must mark truncated=t.
+      (let ((any-truncated nil))
+        (cl-labels ((walk (node)
+                      (when (hash-table-p node)
+                        (when (eq (gethash "truncated" node) t)
+                          (setq any-truncated t))
+                        (let ((kids (gethash "children" node)))
+                          (when (or (vectorp kids) (listp kids))
+                            (seq-doseq (k kids) (walk k)))))))
+          (walk obj))
+        (should any-truncated)))))
+
+(ert-deftest anvil-sexp-cst-test-cst-read-file-not-found ()
+  "Missing files must be reported via a typed error envelope rather
+than crashing the tool call — MCP clients must get a structured
+response for every failure mode."
+  (skip-unless (anvil-sexp-cst-test--cst-available-p))
+  (let* ((raw (anvil-sexp-cst-read "/no/such/file/zz-anvil-sct-missing.el"))
+         (obj (json-parse-string raw :object-type 'hash-table
+                                 :array-type 'array
+                                 :null-object :null
+                                 :false-object :false))
+         (err (gethash "error" obj)))
+    (should (hash-table-p err))
+    (should (equal (gethash "kind" err) "sexp-cst/file-not-found"))
+    (should (stringp (gethash "message" err)))))
+
+
 ;;;; --- meta-test: shape lock file is loaded and TDD-lite gate active -----
 
 (ert-deftest anvil-sexp-cst-test-meta-locks-loaded ()
