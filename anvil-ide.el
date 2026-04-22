@@ -84,6 +84,77 @@
 
 ;;; xref tools
 
+(defun anvil-ide--normalize-path (path)
+  "Return PATH as an absolute canonical path when possible."
+  (when (stringp path)
+    (let ((expanded (expand-file-name path)))
+      (if (file-exists-p expanded)
+          (file-truename expanded)
+        expanded))))
+
+(defun anvil-ide--normalize-directory (path)
+  "Return PATH as an absolute canonical directory name when possible."
+  (let ((normalized (anvil-ide--normalize-path path)))
+    (when normalized
+      (file-name-as-directory normalized))))
+
+(defun anvil-ide--xref-scope-root (buffer file-path)
+  "Return the directory root used to scope xref results for FILE-PATH.
+Prefer BUFFER's project root.  Fall back to the directory containing
+FILE-PATH when no project is available."
+  (or (when-let* ((proj (anvil-ide--project-for-buffer buffer))
+                  (root (project-root proj)))
+        (anvil-ide--normalize-directory root))
+      (let ((dir (file-name-directory (expand-file-name file-path))))
+        (when dir
+          (anvil-ide--normalize-directory dir)))))
+
+(defun anvil-ide--xref-location-file (location)
+  "Return LOCATION's backing file path, or nil."
+  (let ((marker (ignore-errors (xref-location-marker location))))
+    (or (and (markerp marker)
+             (let ((buffer (marker-buffer marker)))
+               (and (buffer-live-p buffer)
+                    (with-current-buffer buffer
+                      (buffer-file-name)))))
+        (let ((group (xref-location-group location)))
+          (and (stringp group) group)))))
+
+(defun anvil-ide--xref-item-in-scope-p (item scope-root)
+  "Return non-nil when xref ITEM belongs to SCOPE-ROOT."
+  (if (not scope-root)
+      t
+    (when-let* ((file (anvil-ide--xref-location-file
+                       (xref-item-location item)))
+                (normalized-file (anvil-ide--normalize-path file)))
+      (file-in-directory-p normalized-file scope-root))))
+
+(defun anvil-ide--xref-format-item (item)
+  "Format xref ITEM as a single `file:line: summary' string."
+  (let* ((location (xref-item-location item))
+         (file (or (anvil-ide--xref-location-file location)
+                   (xref-location-group location)))
+         (marker (ignore-errors (xref-location-marker location)))
+         (line (if (markerp marker)
+                   (with-current-buffer (marker-buffer marker)
+                     (save-excursion
+                       (goto-char marker)
+                       (line-number-at-pos)))
+                 0))
+         (summary (xref-item-summary item)))
+    (format "%s:%d: %s" file line summary)))
+
+(defun anvil-ide--xref-format-items (items scope-root empty-message)
+  "Format xref ITEMS filtered to SCOPE-ROOT, or return EMPTY-MESSAGE."
+  (let ((filtered
+         (cl-remove-if-not
+          (lambda (item)
+            (anvil-ide--xref-item-in-scope-p item scope-root))
+          items)))
+    (if filtered
+        (mapconcat #'anvil-ide--xref-format-item filtered "\n")
+      empty-message)))
+
 (defun anvil-ide--xref-find-references (identifier file-path)
   "Find references to IDENTIFIER using FILE-PATH as context.
 
@@ -94,23 +165,17 @@ MCP Parameters:
    (let ((target-buffer (or (find-buffer-visiting file-path)
                             (find-file-noselect file-path))))
      (with-current-buffer target-buffer
-       (let ((backend (xref-find-backend)))
+       (let ((backend (xref-find-backend))
+             (scope-root (anvil-ide--xref-scope-root
+                          target-buffer file-path)))
          (if (not backend)
              (format "No xref backend available for %s" file-path)
            (let ((xref-items (xref-backend-references backend identifier)))
              (if xref-items
-                 (mapconcat
-                  (lambda (item)
-                    (let* ((location (xref-item-location item))
-                           (file (xref-location-group location))
-                           (marker (xref-location-marker location))
-                           (line (with-current-buffer (marker-buffer marker)
-                                   (save-excursion
-                                     (goto-char marker)
-                                     (line-number-at-pos))))
-                           (summary (xref-item-summary item)))
-                      (format "%s:%d: %s" file line summary)))
-                  xref-items "\n")
+                 (anvil-ide--xref-format-items
+                  xref-items
+                  scope-root
+                  (format "No references found for '%s'" identifier))
                (format "No references found for '%s'" identifier)))))))))
 
 (defun anvil-ide--xref-find-apropos (pattern file-path)
@@ -123,7 +188,9 @@ MCP Parameters:
    (let ((target-buffer (or (find-buffer-visiting file-path)
                             (find-file-noselect file-path))))
      (with-current-buffer target-buffer
-       (let ((backend (xref-find-backend)))
+       (let ((backend (xref-find-backend))
+             (scope-root (anvil-ide--xref-scope-root
+                          target-buffer file-path)))
          (cond
           ((not backend)
            (format "No xref backend available for %s" file-path))
@@ -136,18 +203,10 @@ MCP Parameters:
           (t
            (let ((xref-items (xref-backend-apropos backend pattern)))
              (if xref-items
-                 (mapconcat
-                  (lambda (item)
-                    (let* ((location (xref-item-location item))
-                           (file (xref-location-group location))
-                           (marker (xref-location-marker location))
-                           (line (with-current-buffer (marker-buffer marker)
-                                   (save-excursion
-                                     (goto-char marker)
-                                     (line-number-at-pos))))
-                           (summary (xref-item-summary item)))
-                      (format "%s:%d: %s" file line summary)))
-                  xref-items "\n")
+                 (anvil-ide--xref-format-items
+                  xref-items
+                  scope-root
+                  (format "No symbols found matching '%s'" pattern))
                (format "No symbols found matching '%s'" pattern))))))))))
 
 ;;; Project info
