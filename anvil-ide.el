@@ -26,6 +26,7 @@
 ;;; Code:
 
 (require 'anvil-server)
+(require 'apropos)
 (require 'xref)
 (require 'cl-lib)
 (require 'imenu)
