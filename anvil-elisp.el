@@ -911,6 +911,7 @@ from the test file persist after the call.  Intended for tight
 feedback loops during development — use a batch subprocess when
 isolation matters."
   (let* ((path (expand-file-name file))
+         (path-dir (file-name-directory path))
          (sel  (cond
                 ((null selector) t)
                 ((and (stringp selector) (string-empty-p selector)) t)
@@ -939,7 +940,11 @@ isolation matters."
          (passed 0) (failed 0) (skipped 0)
          (failures nil)
          (before (anvil-elisp--ert-registered-names)))
-    (load path nil t)
+    (let ((load-path (if (and path-dir
+                              (not (member path-dir load-path)))
+                         (cons path-dir load-path)
+                       load-path)))
+      (load path nil t))
     (let* ((after   (anvil-elisp--ert-registered-names))
            (added   (cl-remove-if (lambda (n) (memq n before)) after))
            (tests

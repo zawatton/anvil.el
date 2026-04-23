@@ -61,6 +61,25 @@
             (should (stringp (plist-get (car fails) :condition)))))
       (ignore-errors (delete-file tmp)))))
 
+(ert-deftest anvil-tools-test-ert-run-adds-test-file-directory-to-load-path ()
+  "Test files can `require' sibling helpers from their own directory."
+  (let* ((dir (make-temp-file "anvil-ert-path-" t))
+         (helper (expand-file-name "tmp-helper.el" dir))
+         (test-file (expand-file-name "tmp-helper-test.el" dir)))
+    (unwind-protect
+        (progn
+          (anvil-new-tools-test--write
+           helper
+           "(provide 'tmp-helper)\n(defun tmp-helper-answer () 42)\n")
+          (anvil-new-tools-test--write
+           test-file
+           "(require 'ert)\n(require 'tmp-helper)\n(ert-deftest anvil-tools-tmp-helper-test () (should (= 42 (tmp-helper-answer))))\n")
+          (let* ((out (anvil-elisp--ert-run test-file nil))
+                 (res (anvil-new-tools-test--read-plist out)))
+            (should (= 1 (plist-get res :passed)))
+            (should (= 0 (plist-get res :failed)))))
+      (ignore-errors (delete-directory dir t)))))
+
 (ert-deftest anvil-tools-test-ert-fresh-feature-strips-test-suffix ()
   "Helper infers a feature symbol by stripping the trailing `-test'."
   (should (eq 'anvil-worker
