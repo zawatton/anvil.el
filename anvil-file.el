@@ -153,8 +153,9 @@ Returns nil if no matches found (does not error)."
 ;;;; --- file: write --------------------------------------------------------
 
 (defun anvil-file-replace-regexp (path pattern replacement &optional max-count)
-  "In PATH, replace occurrences of PATTERN (regexp) with REPLACEMENT.
+  "In PATH, replace occurrences of PATTERN (Emacs regexp) with REPLACEMENT.
 If MAX-COUNT is non-nil, stop after that many replacements.
+PATTERN capture groups use Emacs regexp syntax `\\(...\\)'.
 REPLACEMENT may use \\1 \\2 etc. for capture groups.
 Returns (:replaced N :file PATH :warnings LIST).  Errors if 0
 replacements were made.  :warnings surfaces pre-write divergence
@@ -1571,8 +1572,9 @@ without modifying the file.
 PATH is the absolute path to the file.
 
 SPEC is a plist:
-  :block-start    REGEXP — Required.  Marks the start of each block.
-                  If group 1 is present, its capture becomes the block's :id.
+  :block-start    REGEXP — Required.  Emacs regexp marking the start of
+                  each block.  If group 1 is present, its capture becomes
+                  the block's :id.
   :block-end      One of:
                     `next-block-start' (default) — block ends right before
                       the next `:block-start' match (or EOF).
@@ -1582,7 +1584,8 @@ SPEC is a plist:
                       regexp match after `:block-start'.
   :fields         List of field plists.  Each plist:
                     :name STRING   — output key (required)
-                    :regexp REGEXP — must capture value in group 1 (required)
+                    :regexp REGEXP — Emacs regexp; must capture value in
+                                     group 1 (required)
                     :required BOOL — when t, missing field skips the block
                                      (or errors, per :on-missing-required)
   :max-blocks     NUMBER — stop after returning this many records (optional)
@@ -2093,14 +2096,16 @@ MCP Parameters:
 
 SPEC-JSON is a JSON object describing the extraction.  Keys mirror the
 elisp `anvil-code-extract-pattern' SPEC plist (kebab-case in elisp,
-snake_case or kebab-case accepted in JSON):
+snake_case or kebab-case accepted in JSON).  Regexp values use Emacs
+regexp syntax, so capture groups must be written as `\\(...\\)'.
+`fields' must be a JSON array of objects:
 
   {
-    \"block-start\":  \"if \\\\(.*\\\\) \\\\{\",
+    \"block-start\":  \"^ITEM \\\\([0-9]+\\\\)\",
     \"block-end\":    \"brace-balance\",
     \"fields\": [
-      {\"name\": \"name\",  \"regexp\": \"name *= *\\\"(.*)\\\"\"},
-      {\"name\": \"price\", \"regexp\": \"price *= *(\\\\d+)\", \"required\": true}
+      {\"name\": \"name\",  \"regexp\": \"name *= *\\\"\\\\([^\\\"]*\\\\)\\\"\"},
+      {\"name\": \"price\", \"regexp\": \"price *= *\\\\([0-9]+\\\\)\", \"required\": true}
     ],
     \"max-blocks\": 100,
     \"on-missing-required\": \"skip-block\"
@@ -2134,6 +2139,8 @@ MCP Parameters:
                           block-end-raw))))
           (fields-raw (funcall get "fields"))
           (fields
+           ;; A non-array `fields' value currently bubbles up as a less clear
+           ;; low-level type error here; tightening that message is follow-up.
            (mapcar
             (lambda (f)
               (let ((name (or (alist-get 'name f)
@@ -2314,8 +2321,9 @@ Pass max-count \"1\" to assert exactly one match."
    :intent '(file-edit)
    :layer 'core
    :description
-   "Replace regexp matches in a file.  The replacement string may use
-\\\\1 \\\\2 for capture groups.  Errors if no match found.
+   "Replace Emacs regexp matches in a file.  Patterns use Emacs regexp
+syntax, including `\\(...\\)' capture groups; the replacement string may
+use \\\\1 \\\\2 for capture groups.  Errors if no match found.
 Safe for files over 1.2MB."
    :server-id anvil-file--server-id)
 
@@ -2458,7 +2466,9 @@ runs each `fields' regexp inside the body and captures group 1 as the
 field's value.  Read-only — the file is never modified.  Returns plist
 with :matches (each :id :start-line :end-line :fields) :total :returned
 :skipped.  Targets legacy code migration / data extraction where reading
-the entire file would be wasteful.  Brace-balance skips strings."
+the entire file would be wasteful.  Regexp values use Emacs regexp
+syntax, and `fields' must be a JSON array of {name, regexp, required?}
+objects.  Brace-balance skips strings."
    :read-only t
    :offload t
    :server-id anvil-file--server-id)
