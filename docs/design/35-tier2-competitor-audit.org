@@ -1,0 +1,175 @@
+#+title: Tier 2 competitor audit (2026-04-23 web capture batch)
+#+date: 2026-04-23
+#+author: zawatton
+#+property: status AUDIT
+#+property: scope INFORMATIONAL
+
+* STATUS
+  :PROPERTIES:
+  :ID:       d1c4e0f2-8f44-4f7c-bc1a-tier2-2026-04-23
+  :END:
+~AUDIT~ (2026-04-23) — 2026-04-23 の Web 要約バッチから抽出した Tier 2
+候補 8 件の一括 audit。コード変更なし、方針メモのみ。Doc 26-29 の
+Tier 1 取り込み + Doc 32 の rhblind 単発 audit と同列の INFORMATIONAL
+扱い。
+
+* Scope
+
+2026-04-23 に capture/web/ に保存した 18 記事のうち、Tier 1 (即 action)
+と Tier 3 (情報のみ) を除いた 8 件を対象とする。
+
+| 記事 basename (=capture/web/web_20260423_*.org=)           | 分類後 |
+|---------------------------------------------------------+-------|
+| x_sumika45379_insforge_skills_token_reduction           | audit |
+| x_deronin_10_github_replaces_paid_ai                    | audit |
+| x_heynavtoor_10_github_replace_engineers                | audit |
+| x_milesdeutscher_claude_perfect_memory                  | TBD   |
+| x_so_ainsight_10_github_token_killers                   | 既対応 |
+| smartnews_gemini_cli_subagents                          | 除外  |
+| smartnews_obsidian_gemini_cli_study                     | 除外  |
+| smartnews_note_first_200chars                           | 除外  |
+
+「除外」= ツールではなく feature / tutorial / writing technique。
+「既対応」= Doc 26-29 で既に audit 済み、本 doc では重複回避。
+「TBD」= 具体的 tool 名/URL がスレッド本体取得まで特定不可。
+
+* Audit #1: Insforge Skills
+
+**Source:** [[file:../../capture/web/web_20260423_x_sumika45379_insforge_skills_token_reduction.org][x_sumika45379]]
+(オリジナル: [[https://x.com/sumika45379/status/2046786103232078195]])
+
+| 項目         | 値                                        |
+|------------+-------------------------------------------|
+| Claim      | Claude Code のトークン消費を 1/3 に削減  |
+| 手段         | 「コンテキスト設計層」の CLI で context 削減 |
+| GitHub URL | **未確認** (要 upstream fetch)            |
+| 既知情報      | OSS CLI、Claude Code backend に挿入する 設計  |
+
+**anvil 既存機能との重複 (要確認):**
+
+| anvil 既存                                | 機能範囲                             |
+|-----------------------------------------+--------------------------------------|
+| =anvil-manifest= (Doc 26)                | profile 分離で tools/list を絞り込み |
+| =anvil-discovery= / Doc 34               | tool-by-intent 検索 + usage counter |
+| =anvil-disclosure= (Doc 28)              | file-outline → snippet → full 3 層  |
+| =anvil-shell-filter= (Doc 27)            | PTY 出力 filter + gain + tee         |
+
+**暫定判断:**  重複度中〜高。Insforge Skills が「Claude Skills (=.claude/skills/= の
+markdown procedure)」registry に近いか、独自 pre-processor か、実装スタック次第で
+脅威/参考度が変わる。GitHub URL 確定前は adopt 不可。
+
+**Next step:** URL 確認 → README 1 段読む → 30 分 sanity-check → 必要なら独立 audit doc 化。
+
+* Audit #2: Open WebUI
+
+**Source:** [[file:../../capture/web/web_20260423_x_deronin_10_github_replaces_paid_ai.org][x_deronin]]
+(オリジナル: [[https://x.com/deronin_/status/2046903404279009472]])
+
+| 項目         | 値                                                       |
+|------------+----------------------------------------------------------|
+| Claim      | ChatGPT Plus ($20/mo) 代替                               |
+| GitHub URL | [[https://github.com/open-webui/open-webui]]             |
+| 機能         | ローカル/自前 Web UI、Ollama / OpenAI / Anthropic / Groq 対応 |
+| 追加要素       | マルチユーザ認証 + RAG + Web 検索 + 画像生成                        |
+
+**anvil 既存機能との比較:**
+
+| 軸         | Open WebUI                       | anvil                              |
+|----------+----------------------------------+------------------------------------|
+| UI       | Web (Svelte + FastAPI)           | Emacs + Claude Code CLI (headless) |
+| 対象 user | チャット user + RAG user         | Emacs / LLM 開発者                 |
+| Provider | Ollama 中心 + 主要商用 API       | anvil-orchestrator で 5 provider  |
+| 認証       | マルチユーザ + チームワークスペース             | N/A (1 人運用)                     |
+| RAG      | Web 検索 + upload doc            | anvil-org-index + anvil-memory-engine |
+
+**暫定判断:**  **orthogonal**。Open WebUI は「非エンジニアも含む LLM Web UI」
+が target、anvil は「Emacs 内で LLM workbench」。事務所 1 人運用では
+マルチユーザ機能は不要、置換対象ではない。
+
+**Next step:** 採用しない。定期 watch 不要。
+
+* Audit #3: OpenHands
+
+**Source:** [[file:../../capture/web/web_20260423_x_heynavtoor_10_github_replace_engineers.org][x_heynavtoor]]
+(オリジナル: [[https://x.com/heynavtoor/status/2046838684260188406]])
+
+| 項目         | 値                                                       |
+|------------+----------------------------------------------------------|
+| Claim      | ジュニア開発者を置換する自律エージェント                         |
+| GitHub URL | [[https://github.com/All-Hands-AI/OpenHands]] (旧 OpenDevin) |
+| 動作         | GitHub Issue 読む → コード修正 → テスト実行 → PR 作成 を自律ループ    |
+| 実行層       | Docker sandbox、Browser / Terminal / File tools          |
+
+**anvil 既存機能との比較:**
+
+| 軸         | OpenHands                       | anvil                                    |
+|----------+---------------------------------+------------------------------------------|
+| 役割       | 自律 agent framework (ループ本体)    | tools workbench (MCP サーバ)               |
+| 抽象レベル   | "agent"（目標 → 行動 → 観察 ループ） | "tool"（関数呼び出し）                        |
+| LLM routing | 単一 model 前提                    | anvil-orchestrator で 5 provider + judge |
+| Sandbox  | Docker 標準装備                    | なし（host 実行）                         |
+| 実行領域       | OSS コード + Issue 自動化             | Emacs + org-mode + 事務所業務              |
+
+**暫定判断:**  **orthogonal / 補完**。OpenHands は anvil の「上」に立つ agent
+framework。概念的には OpenHands 内の tool provider として anvil を繋ぐ
+ことは可能だが、現時点では事務所業務と OpenHands の OSS 開発 target が
+ずれる (事務所業務は「Issue → PR」型ワークフローではない)。
+
+**Next step:** anvil-orchestrator が agent loop 層まで欲しくなった時点で
+参照。現時点では採用しない。
+
+* TBD: Claude Perfect Memory (Miles Deutscher)
+
+**Source:** [[file:../../capture/web/web_20260423_x_milesdeutscher_claude_perfect_memory.org][x_milesdeutscher]]
+(オリジナル: [[https://x.com/milesdeutscher/status/2047038993028800824]])
+
+| 項目       | 値                                                  |
+|----------+-----------------------------------------------------|
+| Claim    | Claude に "perfect memory" を付けると 10 倍賢くなる |
+| 実装主体   | =@aiedge_= (引用元アカウント) — 詳細はスレッド本体         |
+| 推測スタック | mem0 / Letta / Zep / graphiti / Supermemory?        |
+
+**anvil 既存:**
+- =anvil-memory-engine= (Doc 29) が develop/master SHIPPED 済、16 MCP tool + 115 ERT
+- Claude Code 標準の auto-memory (=.claude/memory/*.md=) も併用
+
+**暫定判断:**  URL/GitHub が特定できないと比較不可。同趣旨の自前実装
+(Doc 29) があるので、adopt 前提ではなく「比較対象として参照」扱い。
+
+**Next step:** スレッド本体を fetch → 実装スタックを同定 → Doc 29 に比較節追加
+検討。優先度 中。
+
+* 除外した 4 件 (audit 対象外)
+
+| 記事                               | 除外理由                                   |
+|-----------------------------------+---------------------------------------|
+| smartnews_gemini_cli_subagents    | Gemini CLI 自体の機能 (3rd-party tool ではない) |
+| smartnews_obsidian_gemini_cli_study | Obsidian 学習 tutorial (ツール紹介ではない)  |
+| smartnews_note_first_200chars     | note 記事の書き方 (writing technique)   |
+| x_so_ainsight_10_github_token_killers | Doc 26-29 の Tier 1 audit で既に対応済 |
+
+* Recommendation
+
+**DRAFT の段階で active adoption なし**。
+
+- *Audit #1 Insforge Skills* — GitHub URL 未確定、確定後に個別 audit 判断
+- *Audit #2 Open WebUI* — orthogonal、**採用しない**、watch 不要
+- *Audit #3 OpenHands* — orthogonal / 補完、**現時点採用しない**、
+  anvil-orchestrator 拡張 (agent loop 層) に着手する時点で参照
+- *TBD Claude Perfect Memory* — スレッド本体 fetch 後に Doc 29 併合検討
+
+本 doc は「Tier 2 水準の調査対象を見失わないための索引」であって、
+Phase 分解を伴う実装 doc ではない。Phase/SHIPPED ラベルは不要。
+
+* Action items (次 session 以降)
+
+- [ ] Insforge Skills の GitHub URL を =@sumika45379= スレッドから特定
+- [ ] =@aiedge_= Perfect Memory の実装スタック (mem0 / Letta / Zep / 等) 同定
+- [ ] 必要に応じて Insforge / Perfect Memory の個別 audit doc (Doc 36 / Doc 37) 起こし
+
+* 関連 doc / memory
+
+- [[file:32-rhblind-audit.org][Doc 32 rhblind audit]] — 同じ INFORMATIONAL 系列の単発 audit
+- [[file:../../capture/web/web_index.org][capture/web/web_index.org]] — 2026-04-23 batch 索引
+- [[file:~/.claude/projects/-home-madblack-21-Cowork-Notes/memory/project_anvil_competitor_uptake.md][project_anvil_competitor_uptake.md]] — Tier 1 進捗
+- [[file:~/.claude/projects/-home-madblack-21-Cowork-Notes/memory/project_anvil_memory_engine_phase1a.md][project_anvil_memory_engine_phase1a.md]] — Doc 29 SHIPPED 状況
