@@ -1840,6 +1840,100 @@ ROOT-VAR is the temp memory root.  Binds `port' (int) and `info'
         (should (plist-member r :verdict))))))
 
 
+
+;;;; --- Phase 4: multi-provider effective-roots ---------------------------
+
+(ert-deftest anvil-memory-test/expand-provider-pattern-glob ()
+  "`--expand-provider-pattern' expands `*' globs and drops non-existent hits."
+  (skip-unless (anvil-memory-test--supported-p 'scan))
+  (let* ((sandbox (make-temp-file "anvil-memp-" t))
+         (proj-a (expand-file-name "projects/a/memory" sandbox))
+         (proj-b (expand-file-name "projects/b/memory" sandbox)))
+    (unwind-protect
+        (progn
+          (make-directory proj-a t)
+          (make-directory proj-b t)
+          (let* ((pattern (expand-file-name "projects/*/memory" sandbox))
+                 (hits (anvil-memory--expand-provider-pattern pattern)))
+            (should (= 2 (length hits)))
+            (should (cl-every #'file-directory-p hits))
+            (should (member (file-name-as-directory proj-a)
+                            (mapcar #'file-name-as-directory hits)))
+            (should (member (file-name-as-directory proj-b)
+                            (mapcar #'file-name-as-directory hits)))))
+      (ignore-errors (delete-directory sandbox t)))))
+
+(ert-deftest anvil-memory-test/expand-provider-pattern-fixed-missing ()
+  "Fixed paths that do not exist return nil (silent skip)."
+  (skip-unless (anvil-memory-test--supported-p 'scan))
+  (let ((missing (expand-file-name
+                  (format "anvil-memp-missing-%d" (random 100000))
+                  temporary-file-directory)))
+    (should-not (anvil-memory--expand-provider-pattern missing))))
+
+(ert-deftest anvil-memory-test/effective-roots-multi-provider ()
+  "`--effective-roots' aggregates every provider whose path exists."
+  (skip-unless (anvil-memory-test--supported-p 'scan))
+  (let* ((sandbox (make-temp-file "anvil-memp-" t))
+         (claude-a (expand-file-name "claude/projects/a/memory" sandbox))
+         (claude-b (expand-file-name "claude/projects/b/memory" sandbox))
+         (codex    (expand-file-name "codex/memories" sandbox))
+         (gemini   (expand-file-name "gemini/memories" sandbox)))
+    (unwind-protect
+        (progn
+          (make-directory claude-a t)
+          (make-directory claude-b t)
+          (make-directory codex t)
+          ;; gemini intentionally NOT created; must be skipped silently.
+          (let* ((anvil-memory-roots nil)
+                 (anvil-memory-provider-paths
+                  `((claude . ,(expand-file-name
+                                "claude/projects/*/memory" sandbox))
+                    (codex  . ,codex)
+                    (gemini . ,gemini)))
+                 (roots (anvil-memory--effective-roots))
+                 (norm (mapcar #'file-name-as-directory roots)))
+            (should (= 3 (length roots)))
+            (should (member (file-name-as-directory claude-a) norm))
+            (should (member (file-name-as-directory claude-b) norm))
+            (should (member (file-name-as-directory codex) norm))
+            (should-not (member (file-name-as-directory gemini) norm))))
+      (ignore-errors (delete-directory sandbox t)))))
+
+(ert-deftest anvil-memory-test/effective-roots-dedupes-symlinked ()
+  "Two providers pointing at the same physical dir yield one entry."
+  (skip-unless (anvil-memory-test--supported-p 'scan))
+  (let* ((sandbox (make-temp-file "anvil-memp-" t))
+         (shared  (expand-file-name "shared/memory" sandbox)))
+    (unwind-protect
+        (progn
+          (make-directory shared t)
+          (let* ((anvil-memory-roots nil)
+                 (anvil-memory-provider-paths
+                  `((p1 . ,shared) (p2 . ,shared)))
+                 (roots (anvil-memory--effective-roots)))
+            (should (= 1 (length roots)))
+            (should (equal (file-name-as-directory (car roots))
+                           (file-name-as-directory shared)))))
+      (ignore-errors (delete-directory sandbox t)))))
+
+(ert-deftest anvil-memory-test/effective-roots-roots-wins ()
+  "Explicit `anvil-memory-roots' still overrides provider auto-detect."
+  (skip-unless (anvil-memory-test--supported-p 'scan))
+  (let* ((sandbox (make-temp-file "anvil-memp-" t))
+         (explicit (expand-file-name "explicit/memory" sandbox))
+         (codex    (expand-file-name "codex/memories" sandbox)))
+    (unwind-protect
+        (progn
+          (make-directory explicit t)
+          (make-directory codex t)
+          (let* ((anvil-memory-roots (list explicit))
+                 (anvil-memory-provider-paths `((codex . ,codex)))
+                 (roots (anvil-memory--effective-roots)))
+            (should (equal (list explicit) roots))))
+      (ignore-errors (delete-directory sandbox t)))))
+
+
 (provide 'anvil-memory-test)
 
 ;;; anvil-memory-test.el ends here

@@ -94,11 +94,34 @@
 
 (defcustom anvil-memory-roots nil
   "List of directories to scan for .md memory files.
-When nil, `anvil-memory-scan' auto-detects every memory/ directory
-under ~/.claude/projects/*/ so all project-local auto-memories are
-indexed in a single DB.  Explicit list overrides auto-detection."
+When nil, `anvil-memory-scan' auto-detects the memory directories
+declared in `anvil-memory-provider-paths' (Claude Code, Codex CLI,
+Gemini CLI, Continue, Aider, Cline, Cursor, …) so auto-memory from
+any provider the user has installed lands in a single DB.  An
+explicit list overrides auto-detection."
   :type '(choice (const :tag "Auto-detect" nil)
                  (repeat directory))
+  :group 'anvil-memory)
+
+(defcustom anvil-memory-provider-paths
+  '((claude   . "~/.claude/projects/*/memory")
+    (codex    . "~/.codex/memories")
+    (gemini   . "~/.gemini/memories")
+    (continue . "~/.continue/memories")
+    (aider    . "~/.aider/memories")
+    (cline    . "~/.cline/memories")
+    (cursor   . "~/.cursor/memories")
+    (windsurf . "~/.windsurf/memories")
+    (zed      . "~/.config/zed/memories"))
+  "Per-provider memory directory patterns used when
+`anvil-memory-roots' is nil.  Each entry is a cons (PROVIDER .
+PATTERN).  PATTERN may be an absolute path or contain `*' globs
+(e.g. ~/.claude/projects/*/memory); `~' is expanded.  Patterns
+that do not match any existing directory are skipped silently, so
+adding a provider the user has not installed costs nothing.
+Providers added later can be registered by pushing a new pair
+onto this alist; built-ins stay in the list for defaults."
+  :type '(alist :key-type symbol :value-type string)
   :group 'anvil-memory)
 
 (defconst anvil-memory-supported
@@ -342,20 +365,33 @@ already present with a matching tokenizer."
 
 ;;;; --- scan ---------------------------------------------------------------
 
+(defun anvil-memory--expand-provider-pattern (pattern)
+  "Return the list of existing directories matched by PATTERN.
+PATTERN is a string that may contain `*' globs (e.g.
+~/.claude/projects/*/memory); `~' is expanded via
+`expand-file-name'.  Non-existent expansions are dropped so
+unused providers cost nothing at scan time."
+  (let ((expanded (expand-file-name pattern)))
+    (if (string-match-p "\\*" expanded)
+        (cl-remove-if-not #'file-directory-p
+                          (file-expand-wildcards expanded))
+      (and (file-directory-p expanded) (list expanded)))))
+
 (defun anvil-memory--effective-roots ()
   "Return the list of memory directories to scan.
-`anvil-memory-roots' wins when non-nil; otherwise every
-`memory/' subdirectory under `~/.claude/projects/*/' is returned."
+`anvil-memory-roots' wins when non-nil; otherwise every directory
+matched by `anvil-memory-provider-paths' is returned.  Results are
+deduplicated while preserving provider order so two providers
+sharing a symlinked directory are indexed once."
   (cond
    (anvil-memory-roots
     (cl-remove-if-not #'file-directory-p anvil-memory-roots))
    (t
-    (let ((projects-dir (expand-file-name "~/.claude/projects")))
-      (when (file-directory-p projects-dir)
-        (cl-loop for sub in (directory-files projects-dir t "\\`[^.]")
-                 for memdir = (expand-file-name "memory" sub)
-                 when (file-directory-p memdir)
-                 collect memdir))))))
+    (cl-delete-duplicates
+     (cl-loop for (_provider . pattern) in anvil-memory-provider-paths
+              append (anvil-memory--expand-provider-pattern pattern))
+     :test #'equal
+     :from-end t))))
 
 (defun anvil-memory--read-body-utf8 (path)
   "Return the UTF-8 decoded body of PATH as a string."
