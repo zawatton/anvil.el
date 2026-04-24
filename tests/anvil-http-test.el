@@ -251,6 +251,102 @@ in a fake url-retrieve."
     (anvil-http--tool-fetch "https://example.com/" nil nil "42" nil)
     (should (= 42 (plist-get (car anvil-http-test--calls) :timeout)))))
 
+;;;; --- Phase 1b: selector / json-path extract -----------------------------
+
+(defvar anvil-http-test--html-fixture
+  "<html><body>
+  <h1>Hello</h1>
+  <div class=\"greet\">Welcome</div>
+  <div id=\"main\">Main content</div>
+  <p class=\"note\">alpha</p>
+  <p class=\"note\">beta</p>
+</body></html>"
+  "Minimal HTML payload exercised by the selector tests.")
+
+(defun anvil-http-test--make-resp (ct body)
+  "Return a minimal response plist with content-type CT and body BODY."
+  (list :status 200
+        :headers (list :content-type ct)
+        :body body
+        :from-cache nil
+        :cached-at nil
+        :final-url "https://example.com/"
+        :elapsed-ms 1))
+
+(ert-deftest anvil-http-test-phase1b-select-html-libxml-tag ()
+  "libxml path: `h1' selector extracts the heading text only."
+  (skip-unless (fboundp 'libxml-parse-html-region))
+  (let* ((resp (anvil-http-test--make-resp
+                "text/html; charset=utf-8" anvil-http-test--html-fixture))
+         (out (anvil-http--apply-extract resp "h1" nil)))
+    (should (eq 'selector (plist-get out :extract-mode)))
+    (should (eq 'libxml (plist-get out :extract-engine)))
+    (should (string-match-p "\\`Hello" (plist-get out :body)))
+    (should-not (plist-get out :extract-miss))))
+
+(ert-deftest anvil-http-test-phase1b-select-html-libxml-tag-class ()
+  "libxml path: `p.note' picks every paragraph with class note."
+  (skip-unless (fboundp 'libxml-parse-html-region))
+  (let* ((resp (anvil-http-test--make-resp
+                "text/html" anvil-http-test--html-fixture))
+         (out (anvil-http--apply-extract resp "p.note" nil))
+         (body (plist-get out :body)))
+    (should (string-match-p "alpha" body))
+    (should (string-match-p "beta" body))
+    (should-not (string-match-p "Welcome" body))
+    (should (eq 'libxml (plist-get out :extract-engine)))))
+
+(ert-deftest anvil-http-test-phase1b-select-html-fallback ()
+  "Regex fallback runs when libxml-p reports nil and still matches
+the shared subset (`#main')."
+  (cl-letf (((symbol-function 'anvil-http--libxml-p)
+             (lambda () nil)))
+    (let* ((resp (anvil-http-test--make-resp
+                  "text/html" anvil-http-test--html-fixture))
+           (out (anvil-http--apply-extract resp "#main" nil)))
+      (should (eq 'regex-subset (plist-get out :extract-engine)))
+      (should (equal "Main content" (plist-get out :body)))
+      (should-not (plist-get out :extract-miss)))))
+
+(ert-deftest anvil-http-test-phase1b-select-html-miss ()
+  "Selector that matches nothing → `:extract-miss' t, full body preserved."
+  (let* ((resp (anvil-http-test--make-resp
+                "text/html" anvil-http-test--html-fixture))
+         (out (anvil-http--apply-extract resp "nosuch" nil)))
+    (should (eq t (plist-get out :extract-miss)))
+    (should (eq 'selector (plist-get out :extract-mode)))
+    (should (string-match-p "Welcome" (plist-get out :body)))))
+
+(ert-deftest anvil-http-test-phase1b-select-json-nested ()
+  "json-path walks nested keys; the extracted node is re-serialized."
+  (let* ((body "{\"data\":{\"count\":42,\"label\":\"ok\"}}")
+         (resp (anvil-http-test--make-resp "application/json" body))
+         (out (anvil-http--apply-extract resp nil "data.count")))
+    (should (eq 'json-path (plist-get out :extract-mode)))
+    (should (equal "42" (plist-get out :body)))
+    (should-not (plist-get out :extract-miss))))
+
+(ert-deftest anvil-http-test-phase1b-select-json-wildcard ()
+  "`items[*].id' flattens an array; result round-trips as a JSON array."
+  (let* ((body "{\"items\":[{\"id\":\"a\"},{\"id\":\"b\"},{\"id\":\"c\"}]}")
+         (resp (anvil-http-test--make-resp "application/json" body))
+         (out (anvil-http--apply-extract resp nil "items[*].id"))
+         (decoded (json-parse-string (plist-get out :body)
+                                     :array-type 'array)))
+    (should (equal 3 (length decoded)))
+    (should (equal "a" (aref decoded 0)))
+    (should (equal "c" (aref decoded 2)))))
+
+(ert-deftest anvil-http-test-phase1b-extract-content-type-mismatch ()
+  "Selector supplied but body is JSON → mismatch engine + extract-miss."
+  (let* ((resp (anvil-http-test--make-resp
+                "application/json" "{\"a\":1}"))
+         (out (anvil-http--apply-extract resp "h1" nil)))
+    (should (eq t (plist-get out :extract-miss)))
+    (should (eq 'selector (plist-get out :extract-mode)))
+    (should (eq 'content-type-mismatch
+                (plist-get out :extract-engine)))))
+
 ;;;; --- live smoke test ----------------------------------------------------
 
 (ert-deftest anvil-http-test-live-example-com ()

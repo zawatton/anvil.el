@@ -33,8 +33,22 @@
 ;;     (`Retry-After' honoured for 429)
 ;;   * `url-max-redirections' clamped to 5, http/https-only
 ;;
-;; Phase 1b+ (not in this sub-phase): selector / json-path extract,
-;; body-overflow to disk, header-filter, batch fetch, robots.txt.
+;; Phase 1b (selector / json-path extract) is live as of the
+;; release containing this comment:
+;;   * `:selector' kwarg on `anvil-http-get' (and `selector' MCP
+;;     parameter on `http-fetch') evaluates a simple CSS-subset
+;;     against text/html (and application/xhtml+xml) responses.
+;;     libxml + dom.el is the primary path; a regex-subset
+;;     fallback handles ports without libxml.
+;;   * `:json-path' kwarg / `json_path' MCP parameter walks a
+;;     dotted path through `application/json' responses.  Wildcard
+;;     segment `[*]' flattens an array.
+;;   * When extraction is requested but nothing matches, the full
+;;     body is still returned together with `:extract-miss t' so
+;;     callers never receive a silent empty payload.
+;;
+;; Phase 1c+ (not yet in this file): body-overflow to disk,
+;; header-filter, batch fetch, robots.txt.
 
 ;;; Code:
 
@@ -43,6 +57,7 @@
 (require 'url)
 (require 'url-http)
 (require 'url-util)
+(require 'dom)
 (require 'anvil-server)
 (require 'anvil-state)
 
@@ -350,11 +365,286 @@ a cache entry plist (or nil).  ACCEPT is a short-hand MIME string."
         :final-url (plist-get entry :final-url)
         :elapsed-ms elapsed-ms))
 
+;;;; --- content-extract helpers (Phase 1b) --------------------------------
+
+(defun anvil-http--libxml-p ()
+  "Return non-nil when this Emacs build bundles libxml2.
+libxml is bundled with most Linux / macOS builds; a handful of
+Windows builds ship without it.  The selector pipeline falls back
+to the regex subset when this returns nil."
+  (fboundp 'libxml-parse-html-region))
+
+(defun anvil-http--extract-target-from-content-type (ct)
+  "Classify Content-Type string CT as `html', `json', `xml', or nil.
+Matches the MIME type case-insensitively and ignores parameters
+after a semicolon (e.g. charset=utf-8).  XHTML is treated as HTML
+so libxml's HTML parser handles it; pure text/xml and
+application/xml use the XML parser when libxml is available."
+  (cond
+   ((not (stringp ct)) nil)
+   ((string-match-p "\\`\\(?:[[:space:]]*\\)\\(?:text/html\\|application/xhtml\\+xml\\)\\b"
+                    (downcase ct))
+    'html)
+   ((string-match-p "\\`\\(?:[[:space:]]*\\)application/json\\b" (downcase ct))
+    'json)
+   ((string-match-p "\\`\\(?:[[:space:]]*\\)\\(?:application/xml\\|text/xml\\)\\b"
+                    (downcase ct))
+    'xml)
+   (t nil)))
+
+(defun anvil-http--parse-selector (s)
+  "Parse CSS-subset selector S into an internal form.
+Returns one of:
+
+  (:tag SYMBOL)
+  (:class STRING)
+  (:id STRING)
+  (:tag-class SYMBOL STRING)
+  (:tag-id SYMBOL STRING)
+
+or nil for anything outside the subset (combinators, pseudo
+classes, attribute selectors).  Both libxml and fallback engines
+share the same subset so test expectations stay backend-agnostic."
+  (let ((s (and (stringp s) (string-trim s))))
+    (cond
+     ((or (null s) (string-empty-p s)) nil)
+     ((string-match "\\`#\\([A-Za-z][A-Za-z0-9_-]*\\)\\'" s)
+      (list :id (match-string 1 s)))
+     ((string-match "\\`\\.\\([A-Za-z][A-Za-z0-9_-]*\\)\\'" s)
+      (list :class (match-string 1 s)))
+     ((string-match "\\`\\([A-Za-z][A-Za-z0-9]*\\)#\\([A-Za-z][A-Za-z0-9_-]*\\)\\'" s)
+      (list :tag-id (intern (downcase (match-string 1 s))) (match-string 2 s)))
+     ((string-match "\\`\\([A-Za-z][A-Za-z0-9]*\\)\\.\\([A-Za-z][A-Za-z0-9_-]*\\)\\'" s)
+      (list :tag-class (intern (downcase (match-string 1 s))) (match-string 2 s)))
+     ((string-match "\\`[A-Za-z][A-Za-z0-9]*\\'" s)
+      (list :tag (intern (downcase s))))
+     (t nil))))
+
+(defun anvil-http--dom-select (dom parts)
+  "Return DOM nodes matching selector PARTS (from `--parse-selector').
+Uses dom.el primitives; `dom-by-class' / `dom-by-id' take regex
+strings, so `\\\\b' word-boundary anchors match the class/id exactly."
+  (pcase parts
+    (`(:tag ,tag) (dom-by-tag dom tag))
+    (`(:class ,cls) (dom-by-class dom (format "\\b%s\\b" (regexp-quote cls))))
+    (`(:id ,id) (dom-by-id dom (format "\\`%s\\'" (regexp-quote id))))
+    (`(:tag-class ,tag ,cls)
+     (seq-filter (lambda (el) (eq (dom-tag el) tag))
+                 (dom-by-class dom (format "\\b%s\\b" (regexp-quote cls)))))
+    (`(:tag-id ,tag ,id)
+     (seq-filter (lambda (el) (eq (dom-tag el) tag))
+                 (dom-by-id dom (format "\\`%s\\'" (regexp-quote id)))))
+    (_ nil)))
+
+(defun anvil-http--select-html-libxml (html selector)
+  "Return text from HTML matching SELECTOR via libxml + dom.el.
+Matches are joined with a blank-line separator.  Returns nil if the
+selector is outside the supported subset or nothing matched."
+  (let ((parts (anvil-http--parse-selector selector)))
+    (when (and parts (fboundp 'libxml-parse-html-region))
+      (let* ((dom (with-temp-buffer
+                    (insert html)
+                    (libxml-parse-html-region (point-min) (point-max))))
+             (nodes (and dom (anvil-http--dom-select dom parts))))
+        (when nodes
+          (let ((texts (delq nil
+                             (mapcar (lambda (n)
+                                       (let ((s (string-trim (or (dom-text n) ""))))
+                                         (and (not (string-empty-p s)) s)))
+                                     nodes))))
+            (when texts (mapconcat #'identity texts "\n\n"))))))))
+
+(defun anvil-http--strip-tags (html)
+  "Return HTML with tags removed and whitespace collapsed.
+Enough for the regex-subset fallback; not a substitute for a real
+HTML-to-text renderer (no entity decoding beyond amp/lt/gt/quot)."
+  (let* ((s (replace-regexp-in-string "<[^>]+>" "" html))
+         (s (replace-regexp-in-string "&amp;" "&" s))
+         (s (replace-regexp-in-string "&lt;" "<" s))
+         (s (replace-regexp-in-string "&gt;" ">" s))
+         (s (replace-regexp-in-string "&quot;" "\"" s))
+         (s (replace-regexp-in-string "[ \t]+" " " s))
+         (s (replace-regexp-in-string "\n[ \t]*\n[ \t\n]*" "\n\n" s)))
+    (string-trim s)))
+
+(defun anvil-http--select-html-fallback (html selector)
+  "Regex-subset selector for builds without libxml.
+Supports the same subset as `--parse-selector' but without
+combinators.  Nested tags of the same name can trip the lazy
+match; libxml is the recommended path when available."
+  (let* ((parts (anvil-http--parse-selector selector))
+         (case-fold-search t)
+         (rx nil)
+         (group 1))
+    (pcase parts
+      (`(:tag ,tag)
+       (setq rx (format "<%s\\b[^>]*>\\(\\(?:.\\|\n\\)*?\\)</%s>"
+                        (symbol-name tag) (symbol-name tag))))
+      (`(:id ,id)
+       (setq rx (format "<\\([A-Za-z][A-Za-z0-9]*\\)\\b[^>]*\\bid=[\"']%s[\"'][^>]*>\\(\\(?:.\\|\n\\)*?\\)</\\1>"
+                        (regexp-quote id)))
+       (setq group 2))
+      (`(:class ,cls)
+       (setq rx (format "<\\([A-Za-z][A-Za-z0-9]*\\)\\b[^>]*\\bclass=[\"'][^\"']*\\b%s\\b[^\"']*[\"'][^>]*>\\(\\(?:.\\|\n\\)*?\\)</\\1>"
+                        (regexp-quote cls)))
+       (setq group 2))
+      (`(:tag-class ,tag ,cls)
+       (setq rx (format "<%s\\b[^>]*\\bclass=[\"'][^\"']*\\b%s\\b[^\"']*[\"'][^>]*>\\(\\(?:.\\|\n\\)*?\\)</%s>"
+                        (symbol-name tag) (regexp-quote cls) (symbol-name tag))))
+      (`(:tag-id ,tag ,id)
+       (setq rx (format "<%s\\b[^>]*\\bid=[\"']%s[\"'][^>]*>\\(\\(?:.\\|\n\\)*?\\)</%s>"
+                        (symbol-name tag) (regexp-quote id) (symbol-name tag)))))
+    (when rx
+      (let ((pos 0) (acc nil))
+        (while (string-match rx html pos)
+          (let* ((content (match-string group html))
+                 (text (and content (anvil-http--strip-tags content))))
+            (when (and text (not (string-empty-p text)))
+              (push text acc)))
+          (setq pos (match-end 0)))
+        (when acc (mapconcat #'identity (nreverse acc) "\n\n"))))))
+
+(defun anvil-http--split-json-path (path)
+  "Tokenize dotted-path PATH.
+Segments are (:key STRING), (:index INT), or (:wildcard).  Supports
+forms like `items[0].title', `data.results[*].id', and plain
+`users.0.name' where digits following a dot become an index."
+  (let ((i 0) (n (length path)) (tokens nil))
+    (while (< i n)
+      (let ((ch (aref path i)))
+        (cond
+         ((eq ch ?.) (cl-incf i))
+         ((eq ch ?\[)
+          (let* ((end (string-match "\\]" path i))
+                 (inner (and end (substring path (1+ i) end))))
+            (unless end
+              (error "anvil-http: unterminated [] in json-path %S" path))
+            (push (cond
+                   ((equal inner "*") (list :wildcard))
+                   ((string-match-p "\\`-?[0-9]+\\'" inner)
+                    (list :index (string-to-number inner)))
+                   (t (list :key inner)))
+                  tokens)
+            (setq i (1+ end))))
+         (t
+          (let* ((end (or (string-match "[.[]" path i) n))
+                 (seg (substring path i end)))
+            (push (if (string-match-p "\\`-?[0-9]+\\'" seg)
+                      (list :index (string-to-number seg))
+                    (list :key seg))
+                  tokens)
+            (setq i end))))))
+    (nreverse tokens)))
+
+(defun anvil-http--json-walk (node segments)
+  "Walk NODE by SEGMENTS produced by `--split-json-path'.
+NODE uses hash-tables for objects and vectors for arrays.  Returns
+the located sub-tree, or nil on a miss.  `(:wildcard)' flattens an
+array; following segments are mapped over its elements."
+  (cond
+   ((null segments) node)
+   ((null node) nil)
+   (t
+    (pcase (car segments)
+      (`(:key ,k)
+       (when (hash-table-p node)
+         (let ((val (gethash k node)))
+           (anvil-http--json-walk val (cdr segments)))))
+      (`(:index ,idx)
+       (when (and (vectorp node)
+                  (>= idx 0) (< idx (length node)))
+         (anvil-http--json-walk (aref node idx) (cdr segments))))
+      (`(:wildcard)
+       (when (vectorp node)
+         (let ((results
+                (delq nil
+                      (mapcar (lambda (el)
+                                (anvil-http--json-walk el (cdr segments)))
+                              (append node nil)))))
+           (vconcat results))))
+      (_ nil)))))
+
+(defun anvil-http--select-json-dotted (json-string path)
+  "Parse JSON-STRING and walk dotted PATH.
+Returns the located sub-tree serialized back to JSON (so Claude
+sees the same format it sent), or nil on parse error / miss."
+  (condition-case _
+      (let* ((node (json-parse-string
+                    json-string
+                    :object-type 'hash-table
+                    :array-type 'array
+                    :null-object :null
+                    :false-object :false))
+             (segments (anvil-http--split-json-path path))
+             (result (and segments (anvil-http--json-walk node segments))))
+        (when result
+          (json-serialize result
+                          :null-object :null
+                          :false-object :false)))
+    (error nil)))
+
+(defun anvil-http--plist-put! (plist &rest kvs)
+  "Return PLIST with KVS (flat key/value list) applied via `plist-put'."
+  (let ((p (copy-sequence plist)))
+    (while kvs
+      (setq p (plist-put p (car kvs) (cadr kvs)))
+      (setq kvs (cddr kvs)))
+    p))
+
+(defun anvil-http--apply-extract (response selector json-path)
+  "Post-process RESPONSE with SELECTOR / JSON-PATH when supplied.
+Both nil → RESPONSE is returned unchanged.  When extraction runs,
+the returned plist always carries `:extract-mode' (symbol) and
+`:extract-engine' (symbol) for observability; `:body' is replaced
+only on a successful match and `:extract-miss t' is set on a
+no-match or content-type mismatch so callers never see an empty
+string they can't distinguish from \"server returned empty body\"."
+  (if (and (null selector) (null json-path))
+      response
+    (let* ((headers (plist-get response :headers))
+           (ct (plist-get headers :content-type))
+           (target (anvil-http--extract-target-from-content-type ct))
+           (body (plist-get response :body)))
+      (cond
+       ((and selector (memq target '(html xml)) (stringp body))
+        (let* ((engine (if (anvil-http--libxml-p) 'libxml 'regex-subset))
+               (extracted
+                (if (eq engine 'libxml)
+                    (anvil-http--select-html-libxml body selector)
+                  (anvil-http--select-html-fallback body selector))))
+          (if (and extracted (not (string-empty-p extracted)))
+              (anvil-http--plist-put! response
+                                      :body extracted
+                                      :extract-mode 'selector
+                                      :extract-engine engine)
+            (anvil-http--plist-put! response
+                                    :extract-miss t
+                                    :extract-mode 'selector
+                                    :extract-engine engine))))
+       ((and json-path (eq target 'json) (stringp body))
+        (let ((extracted (anvil-http--select-json-dotted body json-path)))
+          (if extracted
+              (anvil-http--plist-put! response
+                                      :body extracted
+                                      :extract-mode 'json-path
+                                      :extract-engine 'json)
+            (anvil-http--plist-put! response
+                                    :extract-miss t
+                                    :extract-mode 'json-path
+                                    :extract-engine 'json))))
+       (t
+        (anvil-http--plist-put! response
+                                :extract-miss t
+                                :extract-mode (cond (selector 'selector)
+                                                    (json-path 'json-path))
+                                :extract-engine 'content-type-mismatch))))))
+
 ;;;; --- public Elisp API ---------------------------------------------------
 
 ;;;###autoload
 (cl-defun anvil-http-get (url &key headers accept timeout-sec
-                              no-cache cache-ttl-sec if-newer-than)
+                              no-cache cache-ttl-sec if-newer-than
+                              selector json-path)
   "GET URL and return a response plist.
 
 Keyword args:
@@ -364,13 +654,24 @@ Keyword args:
   :no-cache        skip cache reads AND writes
   :cache-ttl-sec   override `anvil-http-cache-ttl-sec'
   :if-newer-than   unix epoch int; sends If-Modified-Since
+  :selector        CSS-subset selector (tag, .class, #id, tag.class,
+                   tag#id) evaluated against text/html bodies; libxml
+                   is the primary engine, a regex-subset fallback runs
+                   on Emacs builds without libxml
+  :json-path       Dotted path (e.g. `data.results[0].id',
+                   `items[*].name') applied to application/json bodies
 
 Returns (:status :headers :body :from-cache :cached-at :final-url
-:elapsed-ms)."
+:elapsed-ms).  When :selector or :json-path is supplied the plist
+also carries :extract-mode and :extract-engine; on a no-match or
+content-type mismatch :extract-miss t is set and :body is the full
+original response so callers can tell \"nothing matched\" apart from
+\"server returned an empty body\"."
   (anvil-http--check-url url)
   (anvil-state-enable)
   (anvil-http--metrics-bump :requests)
-  (let* ((norm-url (anvil-http--normalize-url url))
+  (anvil-http--apply-extract
+   (let* ((norm-url (anvil-http--normalize-url url))
          (ttl (or cache-ttl-sec anvil-http-cache-ttl-sec))
          (now (float-time))
          (cached (unless no-cache (anvil-http--cache-get norm-url))))
@@ -426,7 +727,8 @@ Returns (:status :headers :body :from-cache :cached-at :final-url
           (anvil-http--metrics-bump :errors)
           (anvil-http--metrics-log url elapsed-ms status 'error)
           (signal 'anvil-server-tool-error
-                  (list (format "anvil-http: HTTP %d for %s" status url)))))))))
+                  (list (format "anvil-http: HTTP %d for %s" status url))))))))
+   selector json-path))
 
 (defun anvil-http--merge-headers (base override)
   "Shallow-merge two header plists, OVERRIDE winning on clashes."
@@ -519,7 +821,8 @@ live entry."
 ;;;; --- MCP tool handlers --------------------------------------------------
 
 (defun anvil-http--tool-fetch (url &optional if_newer_than accept
-                                   timeout_sec no_cache)
+                                   timeout_sec no_cache
+                                   selector json_path)
   "GET URL through `anvil-http-get' and return the response plist.
 
 MCP Parameters:
@@ -531,13 +834,28 @@ MCP Parameters:
   timeout_sec  - Optional request timeout override (integer seconds).
   no_cache     - Non-nil skips cache on both read and write (any truthy
                   value).
+  selector     - Optional CSS-subset selector (tag, .class, #id,
+                  tag.class, tag#id) applied to text/html bodies.
+                  Server-side extraction — typical 20-50x token
+                  savings vs returning the full page.  libxml + dom.el
+                  is the primary engine; a regex-subset fallback runs
+                  on Emacs builds without libxml.
+  json_path    - Optional dotted JSON path (e.g. `data.results[0].id',
+                  `items[*].name') applied to application/json bodies.
+                  Wildcard `[*]' flattens arrays.
 
 Returns (:status :headers :body :from-cache :cached-at :final-url
 :elapsed-ms).  Same-URL calls within `anvil-http-cache-ttl-sec'
 seconds are served from the cache without any network round-trip.
 Otherwise conditional GET (If-None-Match / If-Modified-Since) is
 performed and a 304 revalidates the cached body with zero body
-transfer."
+transfer.
+
+When selector / json_path is supplied the response plist also
+carries :extract-mode and :extract-engine; on a no-match or
+content-type mismatch :extract-miss t is set and :body is the full
+original response, so callers can tell `no match' apart from
+`server returned an empty body'."
   (anvil-server-with-error-handling
    (let ((if-newer (cond ((null if_newer_than) nil)
                          ((integerp if_newer_than) if_newer_than)
@@ -552,12 +870,18 @@ transfer."
                          (string-to-number timeout_sec))
                         (t nil)))
          (accept* (and (stringp accept) (not (string-empty-p accept)) accept))
-         (no-c (and no_cache (not (equal no_cache "")))))
+         (no-c (and no_cache (not (equal no_cache ""))))
+         (sel (and (stringp selector) (not (string-empty-p selector))
+                   selector))
+         (jp (and (stringp json_path) (not (string-empty-p json_path))
+                  json_path)))
      (anvil-http-get url
                      :accept accept*
                      :timeout-sec timeout
                      :no-cache no-c
-                     :if-newer-than if-newer))))
+                     :if-newer-than if-newer
+                     :selector sel
+                     :json-path jp))))
 
 (defun anvil-http--tool-head (url &optional timeout_sec)
   "HEAD URL and return (:status :headers :final-url :elapsed-ms).
@@ -634,7 +958,15 @@ cache awareness.  Within `anvil-http-cache-ttl-sec' the cached entry
 is served without any network call; otherwise a conditional GET
 revalidates via If-None-Match / If-Modified-Since and a 304 is
 served from cache with zero body transfer.  Retries 5xx / 408 / 429
-with exponential backoff (honours Retry-After on 429)."
+with exponential backoff (honours Retry-After on 429).
+
+Optional `selector' (CSS subset — tag, .class, #id, tag.class,
+tag#id) evaluates server-side against text/html bodies; `json_path'
+walks a dotted path (supports `[N]' index and `[*]' wildcard) through
+application/json bodies.  Either cuts token cost dramatically vs
+returning the full body.  On a no-match the full body is still
+returned together with `extract_miss: true' so the caller can
+distinguish that from an empty payload."
    :read-only t)
 
   (anvil-server-register-tool
@@ -665,10 +997,17 @@ removes just that entry; without, flushes every cached response."))
 
 ;;;###autoload
 (defun anvil-http-enable ()
-  "Register http-* MCP tools and open the anvil-state backing store."
+  "Register http-* MCP tools and open the anvil-state backing store.
+Also logs whether libxml is available so the HTML-selector engine
+is obvious from a daemon startup log — the regex-subset fallback
+handles the same selector subset but without combinators /
+pseudo-classes."
   (interactive)
   (anvil-state-enable)
-  (anvil-http--register-tools))
+  (anvil-http--register-tools)
+  (message "anvil-http: enabled; HTML selector engine = %s"
+           (if (anvil-http--libxml-p) "libxml (primary)"
+             "regex-subset (libxml not built-in)")))
 
 (defun anvil-http-disable ()
   "Unregister http-* MCP tools."

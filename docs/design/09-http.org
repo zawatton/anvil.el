@@ -1,7 +1,7 @@
 #+title: HTTP Client — url-retrieve Wrapper with ETag/TTL Cache
 #+date: 2026-04-18
 #+author: zawatton
-#+property: status DRAFT
+#+property: status PHASE-1A-1B-SHIPPED
 #+property: scope GENERIC
 
 * STATUS
@@ -10,9 +10,19 @@ ETag/TTL cache via =anvil-state=) + =tests/anvil-http-test.el= (15
 pass / 1 live skipped) + README section + =anvil-optional-modules=
 registration。byte-compile clean。commit =4d6a398=。
 
-Phase 1b-1e (selector / json-path extract, body-overflow, batch
-fetch, robots.txt) は次スロット。Review Questions Q1-Q10 resolved の
-ままキープ。
+~Phase 1b SHIPPED~ (2026-04-24) — server-side extract on
+=http-fetch=。libxml + dom.el primary + regex-subset fallback for
+CSS subset (tag / .class / #id / tag.class / tag#id) against
+=text/html= bodies; dotted =json_path= (=a.b.c=, =items[0]=,
+=data.results[*].id=) against =application/json= bodies。ERT
++7 (libxml あり/無し分岐 + miss + content-type mismatch)、
+tests/anvil-http-test.el 22 pass / 1 live skipped、byte-compile
+clean、release-audit clean。=anvil-http-enable= は libxml 有無を
+message で告知する。feat branch =feat/doc-09-http-phase1b=。
+
+Phase 1c-1e (body-overflow to disk, header-filter minimal, batch
+fetch, robots.txt) は次スロット。Review Questions Q1-Q10 resolved
+のままキープ。
 
 * Goal
 
@@ -611,7 +621,7 @@ Phase 1b〜1d は *独立に並ぶ* (依存なし)。1a 完了後、体力とユ
 ここまでで Reddit =.json= 直叩き / 単純 API 取得 / 公開 docs polling が
 動く。anvil-browser との棲み分けが確立する。
 
-** Phase 1b — Server-side extract (所要 2 日)
+** Phase 1b — Server-side extract (所要 2 日、SHIPPED 2026-04-24)
 
 1. libxml 判定 helper (=anvil-http--libxml-p=)
 2. =anvil-http--select-html-libxml= (dom.el + matcher)
