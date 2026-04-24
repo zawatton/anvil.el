@@ -347,6 +347,101 @@ the shared subset (`#main')."
     (should (eq 'content-type-mismatch
                 (plist-get out :extract-engine)))))
 
+;;;; --- Phase 1c: overflow + header-filter ---------------------------------
+
+(defmacro anvil-http-test--with-overflow-dir (dir-var &rest body)
+  "Bind DIR-VAR to a fresh temp dir and delete it after BODY."
+  (declare (indent 1))
+  `(let ((,dir-var (make-temp-file "anvil-http-overflow-" t)))
+     (unwind-protect
+         (let ((anvil-http-overflow-dir ,dir-var))
+           ,@body)
+       (ignore-errors (delete-directory ,dir-var t)))))
+
+(ert-deftest anvil-http-test-phase1c-overflow-spill ()
+  "Body over `anvil-http-max-inline-body-bytes' spills to a hashed
+tempfile; response carries head slice + overflow metadata."
+  (anvil-http-test--with-overflow-dir dir
+    (anvil-http-test--with-stub
+        (list (anvil-http-test--response
+               200
+               (list :content-type "text/plain")
+               (make-string 250000 ?a)))
+      (let* ((anvil-http-max-inline-body-bytes 200000)
+             (anvil-http-overflow-head-bytes 64)
+             (r (anvil-http-get "https://example.com/big")))
+        (should (eq t (plist-get r :body-truncated)))
+        (should (= 64 (length (plist-get r :body))))
+        (should (= 250000 (plist-get r :total-bytes)))
+        (should (stringp (plist-get r :body-overflow-path)))
+        (should (file-exists-p (plist-get r :body-overflow-path)))
+        (should (= 64 (length (make-string 64 ?a))))
+        (should (stringp (plist-get r :body-sha256)))
+        (should (eq 'overflow (plist-get r :body-mode)))))))
+
+(ert-deftest anvil-http-test-phase1c-body-mode-full ()
+  "`body-mode full' inlines the body even when over threshold."
+  (anvil-http-test--with-stub
+      (list (anvil-http-test--response
+             200
+             (list :content-type "text/plain")
+             (make-string 250000 ?a)))
+    (let* ((anvil-http-max-inline-body-bytes 1000)
+           (r (anvil-http-get "https://example.com/big" :body-mode 'full)))
+      (should-not (plist-get r :body-truncated))
+      (should-not (plist-get r :body-overflow-path))
+      (should (= 250000 (length (plist-get r :body)))))))
+
+(ert-deftest anvil-http-test-phase1c-body-mode-meta-only ()
+  "`body-mode meta-only' drops :body entirely; metadata survives."
+  (anvil-http-test--with-stub
+      (list (anvil-http-test--response
+             200
+             (list :content-type "text/plain" :etag "\"w1\"")
+             "hello"))
+    (let ((r (anvil-http-get "https://example.com/m" :body-mode 'meta-only)))
+      (should (null (plist-get r :body)))
+      (should (eq 'meta-only (plist-get r :body-mode)))
+      (should (= 200 (plist-get r :status)))
+      ;; ETag must survive so the caller can pass it back next time.
+      (should (equal "\"w1\"" (plist-get (plist-get r :headers) :etag))))))
+
+(ert-deftest anvil-http-test-phase1c-header-filter-minimal ()
+  "Default header-filter keeps only `anvil-http-minimal-header-keys'."
+  (anvil-http-test--with-stub
+      (list (anvil-http-test--response
+             200
+             (list :content-type "application/json"
+                   :etag "\"abc\""
+                   :server "nginx/1.19"
+                   :x-cache "HIT"
+                   :date "Thu, 01 Jan 1970 00:00:00 GMT")
+             "{\"x\":1}"))
+    (let* ((anvil-http-header-filter-default 'minimal)
+           (r (anvil-http-get "https://example.com/j"))
+           (h (plist-get r :headers)))
+      (should (equal "application/json" (plist-get h :content-type)))
+      (should (equal "\"abc\"" (plist-get h :etag)))
+      (should (null (plist-get h :server)))
+      (should (null (plist-get h :x-cache)))
+      (should (null (plist-get h :date))))))
+
+(ert-deftest anvil-http-test-phase1c-header-filter-all ()
+  "`header-filter all' opt-out returns every header the server sent."
+  (anvil-http-test--with-stub
+      (list (anvil-http-test--response
+             200
+             (list :content-type "application/json"
+                   :server "nginx/1.19"
+                   :x-ratelimit-limit "60")
+             "{}"))
+    (let* ((anvil-http-header-filter-default 'minimal)
+           (r (anvil-http-get "https://example.com/j"
+                              :header-filter 'all))
+           (h (plist-get r :headers)))
+      (should (equal "nginx/1.19" (plist-get h :server)))
+      (should (equal "60" (plist-get h :x-ratelimit-limit))))))
+
 ;;;; --- live smoke test ----------------------------------------------------
 
 (ert-deftest anvil-http-test-live-example-com ()

@@ -47,8 +47,21 @@
 ;;     body is still returned together with `:extract-miss t' so
 ;;     callers never receive a silent empty payload.
 ;;
-;; Phase 1c+ (not yet in this file): body-overflow to disk,
-;; header-filter, batch fetch, robots.txt.
+;; Phase 1c (overflow + header-filter) is live as of the release
+;; containing this comment:
+;;   * `:body-mode' kwarg / `body_mode' MCP parameter: `auto'
+;;     (default) spills bodies over `anvil-http-max-inline-body-bytes'
+;;     (200KB) to a hashed tempfile and returns only a head slice +
+;;     `:body-overflow-path' / `:body-sha256' / `:total-bytes'.
+;;     `full' inlines regardless of size, `head-only' drops the tail
+;;     without spilling, `meta-only' drops the body entirely.
+;;   * `:header-filter' kwarg / `header_filter' MCP parameter:
+;;     `minimal' (default) keeps only the 7 keys Claude actually
+;;     uses (Content-Type, Content-Length, ETag, Last-Modified,
+;;     Content-Encoding, Location, Retry-After); `all' returns the
+;;     full response header set.
+;;
+;; Phase 1d+ (not yet in this file): batch fetch, robots.txt.
 
 ;;; Code:
 
@@ -122,6 +135,51 @@ Actual wait is `base * 2^attempt' unless the server sent a
 Non-listed schemes are refused with a user-error to block SSRF to
 file:// / javascript:// etc."
   :type '(repeat string)
+  :group 'anvil-http)
+
+(defcustom anvil-http-max-inline-body-bytes 200000
+  "Byte threshold above which response bodies are spilled to disk.
+Measured via `string-bytes' (UTF-8 encoding).  Larger bodies have
+their :body replaced with a head slice and :body-overflow-path
+pointing at a temp file the caller can `file-read' when the
+remainder is actually needed.  Set to 0 to disable (always
+inline, regardless of size)."
+  :type 'integer
+  :group 'anvil-http)
+
+(defcustom anvil-http-overflow-head-bytes 2048
+  "Characters retained in :body when a response overflows.
+Character count, not byte count — multibyte bodies will re-encode
+slightly smaller than this value suggests.  A small-but-non-trivial
+default (2048) lets Claude see a preview before deciding whether to
+pull the rest via `file-read'."
+  :type 'integer
+  :group 'anvil-http)
+
+(defcustom anvil-http-overflow-dir nil
+  "Directory where overflow bodies are spilled.
+nil (default) uses `temporary-file-directory'.  Files are named
+`anvil-http-<sha-prefix>.bin' so identical bodies dedupe
+automatically."
+  :type '(choice (const :tag "temporary-file-directory" nil) directory)
+  :group 'anvil-http)
+
+(defcustom anvil-http-minimal-header-keys
+  '(:content-type :content-length :etag :last-modified
+    :content-encoding :location :retry-after)
+  "Response headers kept when the active header-filter is `minimal'.
+The defaults cover the 7 keys Claude actually needs for
+content/length decisions, cache validators, redirect debug, and
+backoff hints.  Everything else costs tokens for no gain."
+  :type '(repeat keyword)
+  :group 'anvil-http)
+
+(defcustom anvil-http-header-filter-default 'minimal
+  "Default header-filter mode for anvil-http responses.
+`minimal' keeps only `anvil-http-minimal-header-keys'.  `all'
+returns every response header verbatim.  A per-call
+`:header-filter' argument always wins over this default."
+  :type '(choice (const minimal) (const all))
   :group 'anvil-http)
 
 (defvar anvil-http--metrics
@@ -639,12 +697,132 @@ string they can't distinguish from \"server returned empty body\"."
                                                     (json-path 'json-path))
                                 :extract-engine 'content-type-mismatch))))))
 
+;;;; --- body-mode / header-filter helpers (Phase 1c) -----------------------
+
+(defun anvil-http--overflow-dir ()
+  "Return the effective overflow spool directory.
+Falls back to `temporary-file-directory' when the defcustom is
+unset, so callers never need to `or'-chain."
+  (or anvil-http-overflow-dir temporary-file-directory))
+
+(defun anvil-http--spill-to-disk (body)
+  "Write BODY to an overflow file and return (:path :sha256 :total-bytes).
+Filename includes a 16-char prefix of the sha256 so identical
+payloads dedupe automatically — a second caller with the same body
+observes the file already present and skips the write.  The file
+is written in binary (`no-conversion') so a round-trip via
+`file-read' returns exactly what came off the wire."
+  (let* ((sha (secure-hash 'sha256 body))
+         (short (substring sha 0 16))
+         (dir (anvil-http--overflow-dir))
+         (path (expand-file-name
+                (format "anvil-http-%s.bin" short) dir)))
+    (unless (file-exists-p path)
+      (let ((coding-system-for-write 'no-conversion))
+        (with-temp-file path
+          (set-buffer-multibyte nil)
+          (insert body))))
+    (list :path path
+          :sha256 sha
+          :total-bytes (string-bytes body))))
+
+(defun anvil-http--head-slice (body n)
+  "Return the first N characters of BODY (or all of BODY if shorter)."
+  (if (and (stringp body) (> (length body) n))
+      (substring body 0 n)
+    body))
+
+(defun anvil-http--apply-body-mode (response mode)
+  "Apply body-mode MODE to RESPONSE and return the transformed plist.
+
+MODE values:
+  nil / `auto'  Default.  Spill to disk and return a head slice when
+                `:body' exceeds `anvil-http-max-inline-body-bytes';
+                shorter bodies pass through.
+  `full'        Return `:body' unchanged regardless of size.
+  `head-only'   Keep the head slice and drop the tail; no spill file
+                is created (use when the caller explicitly does not
+                want the remainder).
+  `meta-only'   Drop `:body' entirely; useful for cheap probes.
+
+When spilling, the response gains :body-truncated t,
+:total-bytes INT, :body-overflow-path STR, :body-sha256 HEX, and
+:body-mode `overflow' so the caller can tell the response was
+overflowed (vs merely short)."
+  (let* ((body (plist-get response :body))
+         (size (and (stringp body) (string-bytes body))))
+    (pcase (or mode 'auto)
+      ('full response)
+      ('meta-only
+       (let ((r (copy-sequence response)))
+         (setq r (plist-put r :body nil))
+         (plist-put r :body-mode 'meta-only)))
+      ('head-only
+       (let* ((head (anvil-http--head-slice
+                     body anvil-http-overflow-head-bytes))
+              (r (copy-sequence response)))
+         (setq r (plist-put r :body head))
+         (setq r (plist-put r :body-truncated t))
+         (setq r (plist-put r :total-bytes size))
+         (plist-put r :body-mode 'head-only)))
+      (_
+       (cond
+        ((null body) response)
+        ((or (null size)
+             (<= anvil-http-max-inline-body-bytes 0)
+             (<= size anvil-http-max-inline-body-bytes))
+         response)
+        (t
+         (let* ((spill (anvil-http--spill-to-disk body))
+                (head (anvil-http--head-slice
+                       body anvil-http-overflow-head-bytes))
+                (r (copy-sequence response)))
+           (setq r (plist-put r :body head))
+           (setq r (plist-put r :body-truncated t))
+           (setq r (plist-put r :total-bytes (plist-get spill :total-bytes)))
+           (setq r (plist-put r :body-overflow-path (plist-get spill :path)))
+           (setq r (plist-put r :body-sha256 (plist-get spill :sha256)))
+           (plist-put r :body-mode 'overflow))))))))
+
+(defun anvil-http--apply-header-filter (response filter)
+  "Restrict RESPONSE :headers to the minimal set when FILTER is `minimal'.
+FILTER nil falls back to `anvil-http-header-filter-default'.  `all'
+is a no-op.  When `minimal', only keys in
+`anvil-http-minimal-header-keys' that actually have a value are
+returned; missing keys are omitted (not nil-valued)."
+  (let* ((f (or filter anvil-http-header-filter-default))
+         (headers (plist-get response :headers)))
+    (pcase f
+      ('all response)
+      ('minimal
+       (let (filtered)
+         (dolist (key anvil-http-minimal-header-keys)
+           (let ((val (plist-get headers key)))
+             (when val
+               (setq filtered (plist-put filtered key val)))))
+         (let ((r (copy-sequence response)))
+           (plist-put r :headers filtered))))
+      (_ response))))
+
+(defun anvil-http--coerce-symbol-arg (arg)
+  "Accept a symbol or string ARG and return the canonical symbol or nil.
+MCP parameters arrive as strings; Elisp callers pass symbols.  An
+empty string or nil collapses to nil so callers can just forward
+user input without a pre-check."
+  (cond
+   ((null arg) nil)
+   ((symbolp arg) arg)
+   ((and (stringp arg) (string-empty-p arg)) nil)
+   ((stringp arg) (intern arg))
+   (t nil)))
+
 ;;;; --- public Elisp API ---------------------------------------------------
 
 ;;;###autoload
 (cl-defun anvil-http-get (url &key headers accept timeout-sec
                               no-cache cache-ttl-sec if-newer-than
-                              selector json-path)
+                              selector json-path
+                              body-mode header-filter)
   "GET URL and return a response plist.
 
 Keyword args:
@@ -660,18 +838,29 @@ Keyword args:
                    on Emacs builds without libxml
   :json-path       Dotted path (e.g. `data.results[0].id',
                    `items[*].name') applied to application/json bodies
+  :body-mode       nil / `auto' (default: spill to disk + head slice
+                   when body exceeds `anvil-http-max-inline-body-bytes'),
+                   `full' (always inline), `head-only' (drop tail, no
+                   spill), `meta-only' (drop body entirely)
+  :header-filter   nil (uses `anvil-http-header-filter-default'),
+                   `minimal' (only `anvil-http-minimal-header-keys'),
+                   `all' (full response headers)
 
 Returns (:status :headers :body :from-cache :cached-at :final-url
 :elapsed-ms).  When :selector or :json-path is supplied the plist
 also carries :extract-mode and :extract-engine; on a no-match or
 content-type mismatch :extract-miss t is set and :body is the full
-original response so callers can tell \"nothing matched\" apart from
-\"server returned an empty body\"."
+original response.  When :body-mode triggers overflow the plist
+also carries :body-truncated, :total-bytes, :body-overflow-path,
+and :body-sha256 so callers can `file-read' the remainder only
+when actually needed."
   (anvil-http--check-url url)
   (anvil-state-enable)
   (anvil-http--metrics-bump :requests)
-  (anvil-http--apply-extract
-   (let* ((norm-url (anvil-http--normalize-url url))
+  (anvil-http--apply-header-filter
+   (anvil-http--apply-body-mode
+    (anvil-http--apply-extract
+     (let* ((norm-url (anvil-http--normalize-url url))
          (ttl (or cache-ttl-sec anvil-http-cache-ttl-sec))
          (now (float-time))
          (cached (unless no-cache (anvil-http--cache-get norm-url))))
@@ -728,7 +917,9 @@ original response so callers can tell \"nothing matched\" apart from
           (anvil-http--metrics-log url elapsed-ms status 'error)
           (signal 'anvil-server-tool-error
                   (list (format "anvil-http: HTTP %d for %s" status url))))))))
-   selector json-path))
+     selector json-path)
+    body-mode)
+   header-filter))
 
 (defun anvil-http--merge-headers (base override)
   "Shallow-merge two header plists, OVERRIDE winning on clashes."
@@ -822,7 +1013,8 @@ live entry."
 
 (defun anvil-http--tool-fetch (url &optional if_newer_than accept
                                    timeout_sec no_cache
-                                   selector json_path)
+                                   selector json_path
+                                   body_mode header_filter)
   "GET URL through `anvil-http-get' and return the response plist.
 
 MCP Parameters:
@@ -843,6 +1035,17 @@ MCP Parameters:
   json_path    - Optional dotted JSON path (e.g. `data.results[0].id',
                   `items[*].name') applied to application/json bodies.
                   Wildcard `[*]' flattens arrays.
+  body_mode    - Optional body size strategy:
+                  `auto' (default) spills >200KB bodies to a temp file
+                  and returns a 2KB head slice + :body-overflow-path;
+                  `full' inlines regardless of size;
+                  `head-only' keeps the head slice only (no spill);
+                  `meta-only' drops the body entirely.
+  header_filter - Optional header pruning:
+                  `minimal' (default) keeps only Content-Type,
+                  Content-Length, ETag, Last-Modified, Content-Encoding,
+                  Location, Retry-After;
+                  `all' returns every response header.
 
 Returns (:status :headers :body :from-cache :cached-at :final-url
 :elapsed-ms).  Same-URL calls within `anvil-http-cache-ttl-sec'
@@ -855,7 +1058,12 @@ When selector / json_path is supplied the response plist also
 carries :extract-mode and :extract-engine; on a no-match or
 content-type mismatch :extract-miss t is set and :body is the full
 original response, so callers can tell `no match' apart from
-`server returned an empty body'."
+`server returned an empty body'.
+
+When body_mode triggers overflow the plist also carries
+:body-truncated t, :total-bytes INT, :body-overflow-path STR, and
+:body-sha256 HEX — the caller can `file-read' the overflow path
+with offset/limit to pull only the slice it actually needs."
   (anvil-server-with-error-handling
    (let ((if-newer (cond ((null if_newer_than) nil)
                          ((integerp if_newer_than) if_newer_than)
@@ -874,14 +1082,18 @@ original response, so callers can tell `no match' apart from
          (sel (and (stringp selector) (not (string-empty-p selector))
                    selector))
          (jp (and (stringp json_path) (not (string-empty-p json_path))
-                  json_path)))
+                  json_path))
+         (bm (anvil-http--coerce-symbol-arg body_mode))
+         (hf (anvil-http--coerce-symbol-arg header_filter)))
      (anvil-http-get url
                      :accept accept*
                      :timeout-sec timeout
                      :no-cache no-c
                      :if-newer-than if-newer
                      :selector sel
-                     :json-path jp))))
+                     :json-path jp
+                     :body-mode bm
+                     :header-filter hf))))
 
 (defun anvil-http--tool-head (url &optional timeout_sec)
   "HEAD URL and return (:status :headers :final-url :elapsed-ms).
@@ -966,7 +1178,15 @@ walks a dotted path (supports `[N]' index and `[*]' wildcard) through
 application/json bodies.  Either cuts token cost dramatically vs
 returning the full body.  On a no-match the full body is still
 returned together with `extract_miss: true' so the caller can
-distinguish that from an empty payload."
+distinguish that from an empty payload.
+
+Optional `body_mode' controls large-body handling — the default
+`auto' spills bodies over `anvil-http-max-inline-body-bytes'
+(200KB) to a temp file and returns a head slice plus
+`body_overflow_path'; `full' inlines regardless, `meta-only' drops
+the body.  Optional `header_filter' prunes response headers —
+`minimal' (default) keeps only the 7 keys Claude actually uses,
+`all' returns everything."
    :read-only t)
 
   (anvil-server-register-tool

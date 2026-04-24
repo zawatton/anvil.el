@@ -1,7 +1,7 @@
 #+title: HTTP Client — url-retrieve Wrapper with ETag/TTL Cache
 #+date: 2026-04-18
 #+author: zawatton
-#+property: status PHASE-1A-1B-SHIPPED
+#+property: status PHASE-1A-1B-1C-SHIPPED
 #+property: scope GENERIC
 
 * STATUS
@@ -20,9 +20,23 @@ tests/anvil-http-test.el 22 pass / 1 live skipped、byte-compile
 clean、release-audit clean。=anvil-http-enable= は libxml 有無を
 message で告知する。feat branch =feat/doc-09-http-phase1b=。
 
-Phase 1c-1e (body-overflow to disk, header-filter minimal, batch
-fetch, robots.txt) は次スロット。Review Questions Q1-Q10 resolved
-のままキープ。
+~Phase 1c SHIPPED~ (2026-04-24) — body-overflow + header-filter。
+200KB 超の body は sha256-hashed tempfile に spill (deduped by
+content hash)、response には head slice (既定 2KB) + overflow
+metadata (=:body-overflow-path=, =:body-sha256=, =:total-bytes=,
+=:body-truncated=) のみ inline 返却。=:body-mode= kwarg で
+=auto= (既定, overflow) / =full= (size 無視で inline) / =head-only=
+(spill 無しで先頭だけ) / =meta-only= (body 落とす) を選択可能。
+=:header-filter= kwarg で =minimal= (既定、Content-Type /
+Content-Length / ETag / Last-Modified / Content-Encoding /
+Location / Retry-After の 7 keys のみ) と =all= (フル返却)
+を切替。MCP 引数 =body_mode= / =header_filter= 追加。ERT +5
+(overflow / full / meta-only / minimal / all)、tests 27 pass /
+1 live skipped、byte-compile clean。feat branch
+=feat/doc-09-http-phase1c=。
+
+Phase 1d-1e (batch fetch, robots.txt) は次スロット。Review
+Questions Q1-Q10 resolved のままキープ。
 
 * Goal
 
@@ -630,7 +644,7 @@ Phase 1b〜1d は *独立に並ぶ* (依存なし)。1a 完了後、体力とユ
 5. =http-fetch= tool に =selector= / =json_path= 引数追加
 6. ERT +6 (libxml あり/無し分岐、miss ケース含む)
 
-** Phase 1c — Overflow + header filter (所要 1 日)
+** Phase 1c — Overflow + header filter (所要 1 日、SHIPPED 2026-04-24)
 
 1. =anvil-http--spill-to-disk= (sha256 base + tempfile)
 2. =:body-mode= 引数 dispatch
