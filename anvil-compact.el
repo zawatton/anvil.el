@@ -411,16 +411,18 @@ blank labels."
 ;;;; --- additionalContext JSON output ---------------------------------------
 
 (defun anvil-compact--json-additional-context (event body)
-  "Return a JSON string for Claude Code `additionalContext' output.
-EVENT is the Claude hook-event name (string, e.g.
-\"UserPromptSubmit\" or \"SessionStart\").  BODY is the text to
-inject.  The result is a single-line JSON object matching Claude
-Code 2026-04's hook-output contract."
-  (json-encode
-   `((hookSpecificOutput
-      .
-      ((hookEventName . ,event)
-       (additionalContext . ,body))))))
+  "Return BODY as the hook's additional-context payload.
+Claude Code accepts either plain stdout (prepended as context) or
+the structured `hookSpecificOutput' JSON form.  We emit plain
+text because the `scripts/anvil-hook' shell wrapper transports
+elisp-returned strings through `prin1' escaping; plain text
+survives `printf %b' unescape round-trip cleanly while JSON
+output with embedded `\\\"' does not.
+
+EVENT is accepted for future-proofing but currently unused —
+plain stdout is hook-event-agnostic."
+  (ignore event)
+  (if (stringp body) body ""))
 
 
 ;;;; --- hook entries --------------------------------------------------------

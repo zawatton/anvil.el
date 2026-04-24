@@ -263,23 +263,19 @@
   (anvil-compact-test--with-fresh-state
     (should (equal "" (anvil-compact-on-user-prompt "sid")))))
 
-(ert-deftest anvil-compact-test-on-user-prompt-flag-emits-json ()
+(ert-deftest anvil-compact-test-on-user-prompt-flag-emits-nudge ()
+  "Flag-set path emits plain-text preamble + /compact instruction
+so the shell hook wrapper can forward it verbatim."
   (anvil-compact-test--with-fresh-state
     (anvil-compact--state-put "sid" "pending-nudge" t)
     (anvil-compact-snapshot-capture "sid"
                                     :task-summary "implement Phase 1"
                                     :percent 50)
-    (let* ((out (anvil-compact-on-user-prompt "sid"))
-           (parsed (json-parse-string out :object-type 'alist
-                                          :array-type 'list
-                                          :null-object nil
-                                          :false-object nil)))
-      (let* ((hso (alist-get 'hookSpecificOutput parsed))
-             (ctx (alist-get 'additionalContext hso)))
-        (should (equal "UserPromptSubmit" (alist-get 'hookEventName hso)))
-        (should (string-match-p "auto-compact" ctx))
-        (should (string-match-p "/compact" ctx))
-        (should (string-match-p "implement Phase 1" ctx))))))
+    (let ((out (anvil-compact-on-user-prompt "sid")))
+      (should (stringp out))
+      (should (string-match-p "auto-compact" out))
+      (should (string-match-p "/compact" out))
+      (should (string-match-p "implement Phase 1" out)))))
 
 (ert-deftest anvil-compact-test-on-user-prompt-clears-flag ()
   (anvil-compact-test--with-fresh-state
@@ -296,22 +292,17 @@
   (anvil-compact-test--with-fresh-state
     (should (equal "" (anvil-compact-on-session-start "sid")))))
 
-(ert-deftest anvil-compact-test-on-session-start-emits-json-preamble ()
+(ert-deftest anvil-compact-test-on-session-start-emits-preamble ()
+  "Session-start emits the snapshot preamble as plain text."
   (anvil-compact-test--with-fresh-state
     (anvil-compact-snapshot-capture "sid"
                                     :task-summary "cross-session task"
                                     :branch "feat/x"
                                     :percent 50)
-    (let* ((out (anvil-compact-on-session-start "sid"))
-           (parsed (json-parse-string out :object-type 'alist
-                                          :array-type 'list
-                                          :null-object nil
-                                          :false-object nil)))
-      (let* ((hso (alist-get 'hookSpecificOutput parsed))
-             (ctx (alist-get 'additionalContext hso)))
-        (should (equal "SessionStart" (alist-get 'hookEventName hso)))
-        (should (string-match-p "cross-session task" ctx))
-        (should (string-match-p "feat/x" ctx))))))
+    (let ((out (anvil-compact-on-session-start "sid")))
+      (should (stringp out))
+      (should (string-match-p "cross-session task" out))
+      (should (string-match-p "feat/x" out)))))
 
 
 ;;;; --- MCP tool wrappers --------------------------------------------------
@@ -410,24 +401,11 @@
                                      :branch ""
                                      :files nil
                                      :todos nil))
-    (let* ((out (anvil-compact-on-session-start "sid"))
-           (parsed (json-parse-string out :object-type 'alist
-                                          :array-type 'list
-                                          :null-object nil
-                                          :false-object nil)))
-      (let* ((hso (alist-get 'hookSpecificOutput parsed))
-             (ctx (alist-get 'additionalContext hso)))
-        (should (string-match-p "queued restore" ctx))
-        ;; Queue was popped, next call falls through to latest snapshot
-        (let* ((out2 (anvil-compact-on-session-start "sid"))
-               (parsed2 (json-parse-string out2 :object-type 'alist
-                                                :array-type 'list
-                                                :null-object nil
-                                                :false-object nil)))
-          (should (string-match-p "latest snapshot"
-                                  (alist-get 'additionalContext
-                                             (alist-get 'hookSpecificOutput
-                                                        parsed2)))))))))
+    (let ((out (anvil-compact-on-session-start "sid")))
+      (should (string-match-p "queued restore" out))
+      ;; Queue was popped, next call falls through to latest snapshot
+      (let ((out2 (anvil-compact-on-session-start "sid")))
+        (should (string-match-p "latest snapshot" out2))))))
 
 (ert-deftest anvil-compact-test-user-prompt-falls-back-to-queue ()
   "When no pending-nudge flag, UserPromptSubmit should pop a queued
@@ -440,14 +418,8 @@ restore (PostCompact path)."
                                      :branch ""
                                      :files nil
                                      :todos nil))
-    (let* ((out (anvil-compact-on-user-prompt "sid"))
-           (parsed (json-parse-string out :object-type 'alist
-                                          :array-type 'list
-                                          :null-object nil
-                                          :false-object nil)))
-      (let ((ctx (alist-get 'additionalContext
-                            (alist-get 'hookSpecificOutput parsed))))
-        (should (string-match-p "queued via post-compact" ctx))))))
+    (let ((out (anvil-compact-on-user-prompt "sid")))
+      (should (string-match-p "queued via post-compact" out)))))
 
 
 ;;;; --- Phase 2: event log embedding -------------------------------------

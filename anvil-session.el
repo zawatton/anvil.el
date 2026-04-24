@@ -470,8 +470,9 @@ the shell wrapper does not crash the Claude hook pipeline."
          (let ((nudge (when (fboundp 'anvil-compact-on-user-prompt)
                         (funcall (intern "anvil-compact-on-user-prompt")
                                  session-id))))
-           (when (and (stringp nudge) (not (string-empty-p nudge)))
-             nudge))))
+           (if (and (stringp nudge) (not (string-empty-p nudge)))
+               nudge
+             ""))))
       ('session-end
        (let ((session-id (or (nth 0 args) "unknown")))
          (anvil-session-log-event session-id 'session-end
