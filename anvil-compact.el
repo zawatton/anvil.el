@@ -171,6 +171,25 @@ structures (plists / alists / strings) round-trip cleanly."
   (anvil-state-delete (anvil-compact--state-key session-id "pending-nudge")
                       :ns anvil-compact--state-ns))
 
+
+;;;; --- Phase 3a: observability event emission ----------------------------
+
+(defun anvil-compact--log-event (session-id kind summary)
+  "Append a compact-cycle event to anvil-session-events when loaded.
+Silently no-ops when anvil-session is not available so the core
+anvil-compact flow does not depend on events for correctness.
+SESSION-ID is the Claude Code session id; KIND is a short symbol
+under the `compact' namespace (e.g. `compact.trigger');
+SUMMARY is a digest string (<= 200 chars enforced by the log
+layer).  Returns the row plist or nil."
+  (when (and (fboundp 'anvil-session-log-event)
+             (stringp session-id)
+             (not (string-empty-p session-id)))
+    (condition-case nil
+        (funcall (intern "anvil-session-log-event")
+                 session-id kind :summary summary)
+      (error nil))))
+
 (defun anvil-compact--queue-push (session-id value)
   "Append VALUE to the restore-queue for SESSION-ID.
 The queue is FIFO — `--queue-pop' returns the oldest item first.
@@ -435,14 +454,26 @@ the most recent captured-at + any event-log updates since Stop.
 Returns the refreshed snapshot plist or nil when no snapshot is
 parked."
   (let ((existing (anvil-compact-snapshot-get session-id)))
-    (when existing
-      (anvil-compact-snapshot-capture
-       session-id
-       :task-summary (plist-get existing :task-summary)
-       :branch (plist-get existing :branch)
-       :files (plist-get existing :files)
-       :todos (plist-get existing :todos)
-       :percent (plist-get existing :percent)))))
+    (cond
+     (existing
+      (let ((refreshed
+             (anvil-compact-snapshot-capture
+              session-id
+              :task-summary (plist-get existing :task-summary)
+              :branch (plist-get existing :branch)
+              :files (plist-get existing :files)
+              :todos (plist-get existing :todos)
+              :percent (plist-get existing :percent))))
+        (anvil-compact--log-event
+         session-id 'compact.pre
+         (format "pct=%d refreshed=1"
+                 (or (plist-get refreshed :percent) 0)))
+        refreshed))
+     (t
+      (anvil-compact--log-event
+       session-id 'compact.pre
+       "pct=0 refreshed=0 (no prior snapshot)")
+      nil))))
 
 (defun anvil-compact-on-post-compact (session-id)
   "PostCompact-hook entry point — enqueue snapshot for next turn.
@@ -453,13 +484,23 @@ nil when no snapshot was parked (which would be unusual but not
 an error — e.g. the harness auto-compact ran without a prior
 anvil-compact trigger)."
   (let ((snap (anvil-compact-snapshot-get session-id)))
-    (when snap
+    (cond
+     (snap
       (anvil-compact--queue-push session-id snap)
       (anvil-compact--state-put session-id "last-compact-percent"
                                 (or (plist-get snap :percent) 0))
       (anvil-compact--state-put session-id "last-compact-time"
                                 (float-time))
-      snap)))
+      (anvil-compact--log-event
+       session-id 'compact.post
+       (format "pct=%d enqueued=1"
+               (or (plist-get snap :percent) 0)))
+      snap)
+     (t
+      (anvil-compact--log-event
+       session-id 'compact.post
+       "pct=0 enqueued=0 (no snapshot was parked)")
+      nil))))
 
 (cl-defun anvil-compact-on-stop (session-id
                                  &key
@@ -487,14 +528,31 @@ the Stop hook itself does not need to emit additional context."
                    :percent pct
                    :task-in-progress task-in-progress
                    :last-compact-percent last)))
-    (when (plist-get dec :trigger)
+    (cond
+     ((plist-get dec :trigger)
       (anvil-compact--state-put session-id "pending-nudge" t)
       (anvil-compact-snapshot-capture session-id
                                       :task-summary task-summary
                                       :files files
                                       :todos todos
                                       :branch branch
-                                      :percent pct))
+                                      :percent pct)
+      (anvil-compact--log-event
+       session-id 'compact.trigger
+       (format "pct=%d reason=trigger task=%s" pct
+               (or task-summary ""))))
+     (t
+      (let* ((reason (plist-get dec :reason))
+             (reason-str (cond
+                          ((symbolp reason)
+                           (let ((n (symbol-name reason)))
+                             (if (string-prefix-p ":" n)
+                                 (substring n 1)
+                               n)))
+                          (t (format "%s" reason)))))
+        (anvil-compact--log-event
+         session-id 'compact.skipped
+         (format "pct=%d reason=%s" pct reason-str)))))
     (list :decision (plist-get dec :reason)
           :percent  pct)))
 
@@ -528,6 +586,8 @@ Priority (highest first):
                       (or (and (stringp (plist-get snap :task-summary))
                                (plist-get snap :task-summary))
                           "現タスク"))))
+        (anvil-compact--log-event
+         session-id 'compact.nudge (format "pct=%d" pct))
         (anvil-compact--json-additional-context
          "UserPromptSubmit"
          (concat preamble "\n\n" body))))
@@ -539,6 +599,10 @@ Priority (highest first):
                               "[anvil-compact restore]")))
             (if (string-empty-p preamble)
                 ""
+              (anvil-compact--log-event
+               session-id 'compact.restore
+               (format "source=user-prompt-queue pct=%d"
+                       (or (plist-get queued :percent) 0)))
               (anvil-compact--json-additional-context
                "UserPromptSubmit" preamble)))))))))
 
@@ -554,8 +618,137 @@ present.  Returns JSON additionalContext or an empty string."
       (let ((preamble (anvil-compact-snapshot-format snap)))
         (if (or (null preamble) (string-empty-p preamble))
             ""
+          (anvil-compact--log-event
+           session-id 'compact.restore
+           (format "source=session-start-%s pct=%d"
+                   (if queued "queue" "fallback")
+                   (or (plist-get snap :percent) 0)))
           (anvil-compact--json-additional-context
            "SessionStart" preamble))))))
+
+
+;;;; --- Phase 3a: stats aggregation ---------------------------------------
+
+(defconst anvil-compact--stats-kinds
+  '("compact.trigger" "compact.skipped" "compact.snapshot"
+    "compact.nudge" "compact.restore" "compact.pre" "compact.post")
+  "Event kinds consumed by `anvil-compact-stats'.
+Matched against `:kind' strings (anvil-session stores kind as a
+string regardless of the original symbol input to log-event).")
+
+(defun anvil-compact--stats-parse-percent (summary)
+  "Extract the `pct=N' integer from a compact-event SUMMARY.
+Returns nil when no percent token is present.  Used to aggregate
+per-percent distributions."
+  (when (and (stringp summary)
+             (string-match "pct=\\([0-9]+\\)" summary))
+    (string-to-number (match-string 1 summary))))
+
+(defun anvil-compact--stats-increment (alist key)
+  "Return ALIST with the integer value at KEY incremented by 1.
+Creates the entry with value 1 if absent.  Non-destructive."
+  (let ((cell (assoc key alist)))
+    (if cell
+        (cons (cons key (1+ (cdr cell))) (assoc-delete-all key alist))
+      (cons (cons key 1) alist))))
+
+(cl-defun anvil-compact-stats (&key session-id since-ts)
+  "Aggregate compact-cycle events into a metrics plist.
+Without SESSION-ID, spans every session in the event log.  With
+SESSION-ID, restricts to that one session.  SINCE-TS (float-time),
+when supplied, drops events older than that timestamp so callers
+can scope to e.g. the last hour.
+
+Returns:
+  :scanned       total compact.* events considered
+  :by-kind       alist (KIND . COUNT)
+  :triggers      count of compact.trigger events
+  :skipped       count of compact.skipped events
+  :nudges        count of compact.nudge events
+  :restores      count of compact.restore events
+  :posts         count of compact.post events
+  :compliance    RESTORES / NUDGES as a float (nil when nudges=0).
+                 A value near 1.0 suggests Claude followed nudges;
+                 well under 1.0 suggests the model is ignoring them.
+  :skip-reasons  alist of `compact.skipped' summary → count,
+                 exposing the distribution between below-threshold /
+                 in-progress / cooldown so threshold tuning has a
+                 data-backed rationale.
+  :trigger-pct   alist (percent . count) for compact.trigger
+  :last-trigger  plist `(:ts TS :session-id SID :summary S)' for
+                 the most recent compact.trigger, or nil.
+  :session-ids   distinct session-ids observed
+  :since-ts      SINCE-TS echoed back or nil
+  :audited-at    ISO timestamp when the aggregation ran."
+  (unless (fboundp 'anvil-session--all-events)
+    (user-error "anvil-compact-stats requires anvil-session to be loaded"))
+  (let* ((pool (if session-id
+                   (funcall (intern "anvil-session--session-events")
+                            session-id)
+                 (funcall (intern "anvil-session--all-events"))))
+         (compact-events
+          (cl-remove-if-not
+           (lambda (r)
+             (let ((kind (plist-get r :kind))
+                   (ts (plist-get r :ts)))
+               (and (stringp kind)
+                    (member kind anvil-compact--stats-kinds)
+                    (or (null since-ts) (>= (or ts 0) since-ts)))))
+           pool))
+         (by-kind '())
+         (skip-reasons '())
+         (trigger-pct '())
+         (session-ids '())
+         last-trigger)
+    (dolist (e compact-events)
+      (let* ((kind (plist-get e :kind))
+             (sid  (plist-get e :session-id))
+             (summary (plist-get e :summary))
+             (ts   (plist-get e :ts)))
+        (setq by-kind (anvil-compact--stats-increment by-kind kind))
+        (when (and sid (not (member sid session-ids)))
+          (push sid session-ids))
+        (cond
+         ((equal kind "compact.skipped")
+          (let ((reason
+                 (if (and (stringp summary)
+                          (string-match "reason=\\([a-z-]+\\)"
+                                        summary))
+                     (match-string 1 summary)
+                   "unknown")))
+            (setq skip-reasons
+                  (anvil-compact--stats-increment skip-reasons reason))))
+         ((equal kind "compact.trigger")
+          (let ((pct (anvil-compact--stats-parse-percent summary)))
+            (when pct
+              (setq trigger-pct
+                    (anvil-compact--stats-increment trigger-pct pct))))
+          (when (or (null last-trigger)
+                    (> (or ts 0) (or (plist-get last-trigger :ts) 0)))
+            (setq last-trigger
+                  (list :ts ts :session-id sid :summary summary)))))))
+    (let* ((scanned   (length compact-events))
+           (triggers  (or (cdr (assoc "compact.trigger" by-kind)) 0))
+           (skipped   (or (cdr (assoc "compact.skipped" by-kind)) 0))
+           (nudges    (or (cdr (assoc "compact.nudge"   by-kind)) 0))
+           (restores  (or (cdr (assoc "compact.restore" by-kind)) 0))
+           (posts     (or (cdr (assoc "compact.post"    by-kind)) 0))
+           (compliance (when (> nudges 0)
+                         (/ (float restores) (float nudges)))))
+      (list :scanned      scanned
+            :by-kind      by-kind
+            :triggers     triggers
+            :skipped      skipped
+            :nudges       nudges
+            :restores     restores
+            :posts        posts
+            :compliance   compliance
+            :skip-reasons skip-reasons
+            :trigger-pct  trigger-pct
+            :last-trigger last-trigger
+            :session-ids  (nreverse session-ids)
+            :since-ts     since-ts
+            :audited-at   (format-time-string "%Y-%m-%dT%H:%M:%S%z")))))
 
 
 ;;;; --- MCP tools -----------------------------------------------------------
@@ -616,6 +809,27 @@ MCP Parameters:
     (or (anvil-compact-snapshot-format
          (anvil-compact-snapshot-get session_id))
         "")))
+
+(defun anvil-compact--tool-stats (session_id since_ts)
+  "Return aggregated compact-cycle metrics as a plist.
+
+MCP Parameters:
+  session_id - optional Claude Code session id.  Empty string =
+               span every session in the event log.
+  since_ts   - optional cutoff in seconds-since-epoch.  Empty
+               string or 0 means no cutoff (full history)."
+  (anvil-server-with-error-handling
+    (let ((sid (and (stringp session_id)
+                    (not (string-empty-p session_id))
+                    session_id))
+          (since (cond
+                  ((numberp since_ts)
+                   (when (> since_ts 0) since_ts))
+                  ((and (stringp since_ts)
+                        (not (string-empty-p since_ts)))
+                   (let ((n (string-to-number since_ts)))
+                     (when (> n 0) n))))))
+      (anvil-compact-stats :session-id sid :since-ts since))))
 
 (defun anvil-compact--tool-hook (session_id stage transcript_path)
   "Unified hook entry: dispatch STAGE for SESSION_ID.
@@ -706,7 +920,21 @@ PostCompact.  Empty string when no snapshot is parked."
 relevant to auto-compact (stop / user-prompt / session-start).
 Hook wrappers (scripts/anvil-hook) can forward any of these
 events here instead of wiring each one individually."
-   :read-only nil))
+   :read-only nil)
+  (anvil-server-register-tool
+   #'anvil-compact--tool-stats
+   :id "compact-stats"
+   :intent '(session compact observe)
+   :layer 'core
+   :server-id anvil-compact--server-id
+   :description
+   "Aggregate auto-compact lifecycle events (trigger / skipped /
+nudge / restore / pre / post) from anvil-session-events.  Returns
+a metrics plist with per-kind counts, skipped-reason breakdown,
+trigger-percent distribution, compliance (restores / nudges), and
+the most recent trigger.  Use to validate the 45% threshold and
+nudge-obedience assumptions before tuning."
+   :read-only t))
 
 ;;;###autoload
 (defun anvil-compact-disable ()
@@ -720,6 +948,8 @@ events here instead of wiring each one individually."
   (anvil-server-unregister-tool "compact-restore"
                                 anvil-compact--server-id)
   (anvil-server-unregister-tool "compact-hook"
+                                anvil-compact--server-id)
+  (anvil-server-unregister-tool "compact-stats"
                                 anvil-compact--server-id))
 
 (provide 'anvil-compact)

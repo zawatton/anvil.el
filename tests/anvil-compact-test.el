@@ -479,4 +479,178 @@ restore (PostCompact path)."
     (anvil-compact--tool-hook "sid" "post-compact" "")
     (should (= 1 (anvil-compact--queue-length "sid")))))
 
+
+;;;; --- Phase 3a: observability events + compact-stats -------------------
+
+(require 'anvil-session)
+
+(defun anvil-compact-test--compact-events (session-id)
+  "Return the list of compact.* events for SESSION-ID in chrono order.
+Each entry is the event plist stored by `anvil-session-log-event'."
+  (cl-remove-if-not
+   (lambda (r)
+     (let ((k (plist-get r :kind)))
+       (and (stringp k) (string-prefix-p "compact." k))))
+   (anvil-session--session-events session-id)))
+
+(ert-deftest anvil-compact-test-log-event-no-session-is-nop ()
+  "Empty session id should not write an event row."
+  (anvil-compact-test--with-fresh-state
+    (anvil-compact--log-event "" 'compact.trigger "x")
+    (should (null (anvil-session--all-events)))))
+
+(ert-deftest anvil-compact-test-on-stop-trigger-emits-event ()
+  (anvil-compact-test--with-fresh-state
+    (let ((p (make-temp-file "anvil-compact-")))
+      (unwind-protect
+          (progn
+            (with-temp-file p (insert (make-string 50000 ?x)))
+            (let ((anvil-compact-trigger-percent 10)
+                  (anvil-compact-cooldown-percent 0)
+                  (anvil-compact-context-tokens-max 1000)
+                  (anvil-compact-bytes-per-token 1))
+              (anvil-compact-on-stop
+               "sid-trg" :transcript-path p :task-summary "x")
+              (let* ((events (anvil-compact-test--compact-events "sid-trg"))
+                     (kinds (mapcar (lambda (e) (plist-get e :kind))
+                                    events)))
+                (should (member "compact.trigger" kinds))
+                (should-not (member "compact.skipped" kinds)))))
+        (ignore-errors (delete-file p))))))
+
+(ert-deftest anvil-compact-test-on-stop-below-threshold-emits-skipped ()
+  (anvil-compact-test--with-fresh-state
+    (anvil-compact-on-stop "sid-skip" :transcript-path nil)
+    (let* ((events (anvil-compact-test--compact-events "sid-skip"))
+           (kinds (mapcar (lambda (e) (plist-get e :kind)) events))
+           (summary (plist-get (car events) :summary)))
+      (should (member "compact.skipped" kinds))
+      (should-not (member "compact.trigger" kinds))
+      (should (string-match-p "reason=below-threshold" summary)))))
+
+(ert-deftest anvil-compact-test-on-user-prompt-nudge-emits-event ()
+  (anvil-compact-test--with-fresh-state
+    (anvil-compact--state-put "sid-n" "pending-nudge" t)
+    (anvil-compact-snapshot-capture "sid-n"
+                                    :task-summary "x" :percent 50)
+    (anvil-compact-on-user-prompt "sid-n")
+    (let ((kinds (mapcar (lambda (e) (plist-get e :kind))
+                         (anvil-compact-test--compact-events "sid-n"))))
+      (should (member "compact.nudge" kinds)))))
+
+(ert-deftest anvil-compact-test-on-user-prompt-queue-restore-emits-event ()
+  (anvil-compact-test--with-fresh-state
+    (anvil-compact--queue-push "sid-r"
+                               (list :captured-at "t" :percent 50
+                                     :task-summary "x" :branch ""
+                                     :files nil :todos nil))
+    (anvil-compact-on-user-prompt "sid-r")
+    (let* ((events (anvil-compact-test--compact-events "sid-r"))
+           (kinds (mapcar (lambda (e) (plist-get e :kind)) events)))
+      (should (member "compact.restore" kinds)))))
+
+(ert-deftest anvil-compact-test-on-session-start-emits-restore-event ()
+  (anvil-compact-test--with-fresh-state
+    (anvil-compact-snapshot-capture "sid-s" :task-summary "x" :percent 50)
+    (anvil-compact-on-session-start "sid-s")
+    (let ((summaries (mapcar (lambda (e) (plist-get e :summary))
+                             (anvil-compact-test--compact-events "sid-s"))))
+      (should (cl-some (lambda (s) (string-match-p "session-start-fallback" s))
+                       summaries)))))
+
+(ert-deftest anvil-compact-test-on-pre-compact-emits-event ()
+  (anvil-compact-test--with-fresh-state
+    (anvil-compact-snapshot-capture "sid-p" :task-summary "x" :percent 50)
+    (anvil-compact-on-pre-compact "sid-p")
+    (let ((kinds (mapcar (lambda (e) (plist-get e :kind))
+                         (anvil-compact-test--compact-events "sid-p"))))
+      (should (member "compact.pre" kinds)))))
+
+(ert-deftest anvil-compact-test-on-post-compact-emits-event ()
+  (anvil-compact-test--with-fresh-state
+    (anvil-compact-snapshot-capture "sid-pc" :task-summary "x" :percent 50)
+    (anvil-compact-on-post-compact "sid-pc")
+    (let ((kinds (mapcar (lambda (e) (plist-get e :kind))
+                         (anvil-compact-test--compact-events "sid-pc"))))
+      (should (member "compact.post" kinds)))))
+
+
+;;;; --- stats aggregation ------------------------------------------------
+
+(ert-deftest anvil-compact-test-stats-empty-log-returns-zeros ()
+  (anvil-compact-test--with-fresh-state
+    (let ((s (anvil-compact-stats)))
+      (should (= 0 (plist-get s :scanned)))
+      (should (= 0 (plist-get s :triggers)))
+      (should (null (plist-get s :compliance))))))
+
+(ert-deftest anvil-compact-test-stats-counts-by-kind ()
+  (anvil-compact-test--with-fresh-state
+    ;; Seed events directly via log-event to avoid cross-function churn
+    (anvil-session-log-event "sid" 'compact.trigger :summary "pct=50")
+    (anvil-session-log-event "sid" 'compact.trigger :summary "pct=55")
+    (anvil-session-log-event "sid" 'compact.skipped
+                             :summary "reason=below-threshold pct=10")
+    (anvil-session-log-event "sid" 'compact.skipped
+                             :summary "reason=cooldown pct=50")
+    (anvil-session-log-event "sid" 'compact.nudge :summary "pct=50")
+    (anvil-session-log-event "sid" 'compact.restore
+                             :summary "source=user-prompt-queue pct=50")
+    (let ((s (anvil-compact-stats)))
+      (should (= 6 (plist-get s :scanned)))
+      (should (= 2 (plist-get s :triggers)))
+      (should (= 2 (plist-get s :skipped)))
+      (should (= 1 (plist-get s :nudges)))
+      (should (= 1 (plist-get s :restores)))
+      (should (= 1.0 (plist-get s :compliance)))
+      (should (equal 1 (cdr (assoc "below-threshold"
+                                   (plist-get s :skip-reasons)))))
+      (should (equal 1 (cdr (assoc 50
+                                   (plist-get s :trigger-pct))))))))
+
+(ert-deftest anvil-compact-test-stats-scoped-to-session ()
+  (anvil-compact-test--with-fresh-state
+    (anvil-session-log-event "sid-A" 'compact.trigger :summary "pct=50")
+    (anvil-session-log-event "sid-B" 'compact.trigger :summary "pct=60")
+    (let ((s (anvil-compact-stats :session-id "sid-A")))
+      (should (= 1 (plist-get s :scanned)))
+      (should (equal '("sid-A") (plist-get s :session-ids))))))
+
+(ert-deftest anvil-compact-test-stats-since-ts-drops-older-events ()
+  (anvil-compact-test--with-fresh-state
+    (let ((now (float-time)))
+      (anvil-session-log-event "sid" 'compact.trigger
+                               :summary "pct=50"
+                               :ts (- now 1000))
+      (anvil-session-log-event "sid" 'compact.trigger
+                               :summary "pct=55"
+                               :ts now)
+      (let* ((s (anvil-compact-stats :since-ts (- now 10)))
+             (last (plist-get s :last-trigger)))
+        (should (= 1 (plist-get s :scanned)))
+        (should (equal "pct=55" (plist-get last :summary)))
+        (should (numberp (plist-get last :ts)))))))
+
+(ert-deftest anvil-compact-test-stats-compliance-nil-when-no-nudges ()
+  (anvil-compact-test--with-fresh-state
+    (anvil-session-log-event "sid" 'compact.trigger :summary "pct=50")
+    (let ((s (anvil-compact-stats)))
+      (should (null (plist-get s :compliance))))))
+
+
+;;;; --- MCP compact-stats tool -------------------------------------------
+
+(ert-deftest anvil-compact-test-tool-stats-accepts-empty-strings ()
+  (anvil-compact-test--with-fresh-state
+    (anvil-session-log-event "sid" 'compact.trigger :summary "pct=50")
+    (let ((s (anvil-compact--tool-stats "" "")))
+      (should (= 1 (plist-get s :triggers))))))
+
+(ert-deftest anvil-compact-test-tool-stats-session-scope ()
+  (anvil-compact-test--with-fresh-state
+    (anvil-session-log-event "sid-A" 'compact.trigger :summary "pct=50")
+    (anvil-session-log-event "sid-B" 'compact.trigger :summary "pct=50")
+    (let ((s (anvil-compact--tool-stats "sid-A" "")))
+      (should (= 1 (plist-get s :triggers))))))
+
 ;;; anvil-compact-test.el ends here
