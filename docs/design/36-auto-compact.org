@@ -1,0 +1,259 @@
+#+title: anvil-compact — autonomous /compact orchestration
+#+date: 2026-04-24
+#+author: zawatton
+#+property: status DRAFT
+#+property: scope CONVENTION-COUPLED
+
+* STATUS
+  :PROPERTIES:
+  :ID:       d1c4e0f2-8f44-4f7c-bc1a-auto-compact-36
+  :END:
+~DRAFT~ (2026-04-24) — autonomous Claude Code 運用で context
+使用率が aggressive 閾値 (既定 35%) を越えた時、タスク segment
+boundary を検出して Claude 自身に =/compact= を打たせ、snapshot
+継続性で post-compact に作業を復元する。Claude Code 2026-04 の
+ハードコード 83.5% auto-compact より大幅に前倒し、long task の
+token 消費を 30-50% 削減することを狙う。
+
+* Motivation
+
+Claude Code 2026-04 時点で:
+
+- auto-compact 閾値 83.5% はハードコード、settings.json で変更不可
+- hook から =/compact= 直接発火は不可 (PreCompact/PostCompact は
+  observe/block のみ)
+- hook output の JSON にも slash command 発火フィールドなし
+
+一方で:
+
+- Claude 自身は会話中に =/compact= を slash command として打てる
+- hook は =transcript_path= を stdin JSON で受け取れる
+- hook output の =additionalContext= に任意文字列を injection 可能
+
+この 3 つを組合せれば **Claude に「今 =/compact= を打て」と指示する** 経路は成立する。
+本 doc はその指示経路と、post-compact 継続性のための snapshot 保存機構を
+Phase 分解して整理する。
+
+* Design overview
+
+** 動作サイクル
+
+#+begin_example
+[turn N] Claude reply 完了 → Stop hook 発火
+   ├─ compact-estimate: transcript_path → tokens, percent
+   ├─ compact-should-trigger:
+   │    percent >= threshold (35%)
+   │    && (percent - last_compact) >= cooldown (25%)
+   │    && in_progress task == 0        (segment boundary)
+   │  → decision plist
+   └─ decision == :trigger:
+        anvil-state (ns=compact) に:
+          - pending-nudge = t
+          - snapshot = <task/file/branch/plan>
+
+[turn N+1 前] UserPromptSubmit hook 発火
+   ├─ pending-nudge == t なら:
+   │    additionalContext =
+   │      "[auto-compact] 使用率 X%。次ターンで
+   │       `/compact 続行: <snapshot 要約>` を実行せよ。"
+   └─ flag を false に
+
+[Claude reply] /compact <指示> を実行
+
+[harness] compact 実施
+   ├─ PreCompact hook: 保険として snapshot を再ダンプ (冪等)
+   └─ PostCompact hook: restore-queue に snapshot を enqueue
+
+[次 turn 冒頭] Claude は:
+   - /compact summary
+   - snapshot (anvil 経由で context injection 済)
+   を見て作業継続
+#+end_example
+
+** なぜこの形にするか
+
+- *Stop hook を segment boundary として使う*: autonomous 運用では
+  user prompt がしばらく来ない場合があるので、UserPromptSubmit だけ
+  では trigger 判定が遅延する。Stop は Claude reply ごとに発火して
+  segment boundary の素直な signal になる
+- *flag と nudge を 2 phase に分割*: Stop 内で additionalContext を
+  emit しても hook 発火時点で次ターン prompt が無ければ届かない。
+  flag を立てておき、次 prompt 時に消費する方が確実
+- *=in_progress= == 0 判定*: mid-reasoning で compact すると
+  Claude が task 復帰に失敗しやすい。TaskList の in_progress=0 を
+  AND 条件にすることで「思考の切れ目」で発火
+- *cooldown 25%*: compact 直後 (通常 ~15% に落ちる) は追加成長が
+  わずかでも閾値越えを繰り返すリスク。次回 trigger は前回 percent
+  + 25% 以上の成長を要求する
+
+* Phases
+
+** Phase 1 — minimum viable trigger + snapshot
+
+*Scope*: 測定 / trigger 判定 / Stop flag / snapshot / UserPromptSubmit
+nudge。auto-compact の発火自体を成立させる最小構成。
+
+*MCP tools (5 本)*:
+
+| tool                         | 役割                                           |
+|------------------------------+------------------------------------------------|
+| =compact-estimate=           | transcript_path → {tokens, percent, turns}     |
+| =compact-should-trigger=     | percent + task-state + cooldown → decision     |
+| =compact-snapshot=           | task/file/branch/TODO を anvil-state にダンプ  |
+| =compact-restore=            | snapshot を additionalContext 用 string へ     |
+| =compact-hook=               | CLI entry (=--stage= で Stop/submit/start 分岐) |
+
+*Hooks* (既存 =anvil-session install-settings= に追加):
+
+| event               | 目的                                          |
+|---------------------+-----------------------------------------------|
+| Stop                | trigger 判定 → flag + snapshot               |
+| UserPromptSubmit    | flag 読み → additionalContext emit           |
+| SessionStart        | cross-session restore                         |
+
+*Defcustom*:
+
+- =anvil-compact-trigger-percent= (default 35)
+- =anvil-compact-cooldown-percent= (default 25)
+- =anvil-compact-snapshot-include-files= (default t)
+- =anvil-compact-snapshot-include-todos= (default t)
+
+*State schema* (=anvil-state= namespace =compact=):
+
+| key                        | value                           |
+|----------------------------+---------------------------------|
+| =pending-nudge=            | boolean                         |
+| =last-compact-percent=     | 最終 compact 時の percent       |
+| =last-compact-time=        | 最終 compact 時刻 (float-time)  |
+| =snapshot=                 | plist (task/file/branch/TODO)   |
+| =restore-queue=            | list of snapshot for next turn  |
+
+*ERT target*: ~20 本
+- estimate の byte→token 概算精度
+- should-trigger の 8 分岐 (threshold 上下、cooldown 効く/効かない、task 有無)
+- snapshot/restore round-trip
+- hook stdin parse
+- hook stdout JSON shape
+
+*Shipping gate*: =make test-all= 0 failed、ERT green、=anvil-release-audit= clean。
+release notes に「35% aggressive trigger は opt-in」明記。
+
+** Phase 2 — PreCompact/PostCompact + richer snapshot
+
+*Scope*: harness の auto-compact にも復元機構を効かせる。snapshot
+quality の底上げ。
+
+- PreCompact hook: snapshot を最新化 (Stop 以降に変化した状態を拾う)
+- PostCompact hook: restore-queue に enqueue
+- SessionStart hook: restore-queue → additionalContext (Phase 1 でも作るが、Phase 2 で
+  PostCompact との連携を完成させる)
+- snapshot に *anvil-memory-engine* の recent-N-turn semantic summary を含める
+  (=anvil-orchestrator-submit-and-collect= を single-shot で呼ぶ、opt-in)
+- snapshot に *anvil-session* の最近 N event log を含める
+  (tool 呼び出しパターンを保存、post-compact での「何してたか」再現)
+
+*ERT target*: +~10 本 (合計 ~30)
+
+*Shipping gate*: 実運用 3 セッション以上で compact cycle を観測、
+token 削減率をレポート (手動計測 OK、Phase 3 で自動化)。
+
+** Phase 3 — observability + auto-tuning
+
+*Scope*: 閾値調整の根拠を与える。
+
+- =anvil-session-events= に compact cycle を専用 event type で記録
+  (=compact.trigger= / =compact.snapshot= / =compact.restore=)
+- =compact-stats= MCP tool: 直近 N session の:
+  - 発火回数
+  - 1 cycle あたり平均 token 削減
+  - nudge → Claude 遵守率 (snapshot 後 X turn 以内に実 compact 起きたか)
+- =compact-history= tabulated-list UI (=M-x anvil-compact-history=)
+- 不遵守 / thrashing を検知したら threshold を自動 suggest (tune ヒント出力、
+  自動変更はしない)
+
+*ERT target*: +~10 本 (合計 ~40)
+
+*Shipping gate*: Doc 36 complete、README に section 追加、v0.5 release
+candidate の目玉 feature として盛り込み。
+
+* CLAUDE.md addition
+
+導入側 (Cowork/Notes の CLAUDE.md) に 1 段落追加する。Phase 1 ship 時に
+install-settings が =.claude/CLAUDE.md.d/anvil-compact.md= (partial) を
+配置し、既存 CLAUDE.md に include 指示を出す想定。
+
+#+begin_example
+## auto-compact 運用 (anvil-compact)
+
+autonomous 運用時、context 使用率が 35% を越え、タスクの一段落が
+来ると hook から `[auto-compact]` system note が届きます。その
+ターンで次を実行:
+
+1. `/compact 続行: <note に記載された snapshot 要約>` を打つ
+2. compact 完了後、snapshot context を元に作業を継続
+
+snapshot 内容は anvil-state ns=compact に保存済みで、新 turn 冒頭に
+additionalContext として自動注入されます。特殊な復元操作は不要。
+#+end_example
+
+* Dependencies
+
+既に存在する:
+
+- =anvil-session= (Doc 17 SHIPPED): 5 lifecycle hook + =install-settings=
+  + event log を再利用
+- =anvil-state= (Doc 08 SHIPPED): snapshot / flag 永続化
+- =anvil-memory-engine= (Doc 29 SHIPPED, Phase 2 で利用): semantic
+  summary を snapshot に含める際の LLM call
+- =anvil-orchestrator= (Doc 10 SHIPPED, Phase 2): single-shot provider
+  呼び出し
+
+新規は =anvil-compact.el= 一本。
+
+* Risks & open questions
+
+1. *Claude の遵守率*: nudge を見て =/compact= を打たないケース。
+   CLAUDE.md の書き方 + =[MUST]= 等のキーワードで挙動は変わるが
+   100% 保証はない。最悪 83.5% の harness auto-compact で救済される
+2. *segment boundary 誤判定*: in_progress=0 でも実際には
+   Claude が途中で止まっているだけ (次 turn で思考再開予定) のケースあり。
+   初期の cooldown 25% はこれを緩和するが、Phase 2 で
+   =anvil-session= event log との照合により精度を上げる
+3. *Stop hook の発火頻度*: autonomous loop 内で sub-turn 毎に Stop が
+   鳴る場合、snapshot を毎回作ると重い。=compact-should-trigger= 側で
+   early-return する (percent < threshold なら snapshot skip)
+4. *35% は本当に最適か*: 低すぎると snapshot overhead の割合が増え、
+   逆に効率が下がる。Phase 3 の stats で実測、
+   =anvil-compact-trigger-percent= は defcustom なので運用で調整可能
+5. *transcript_path の読み取りコスト*: 大きい transcript (>10MB) を
+   毎 Stop で読むのは遅い。byte-size だけで percent を近似するか、
+   incremental parse を Phase 2 で検討
+6. *ERT での hook 結合テスト*: Claude Code 本体は mock できない。
+   hook stdin/stdout のみテスト対象とし、実セッションは手動 smoke test
+7. *compact after error*: tool call で失敗中に compact が走ると復旧
+   コンテキストが失われる。=in_progress= 判定に加えて「最後の tool call が
+   error 終了でない」を Phase 2 で条件に追加検討
+
+* Shipping plan
+
+- Phase 1 → feat/doc-36-auto-compact-phase1 → develop merge
+- Phase 2 → feat/doc-36-auto-compact-phase2 → develop merge
+- Phase 3 → feat/doc-36-auto-compact-phase3 → develop merge
+- 全 Phase SHIPPED 後 STATUS を =~Phase 1+2+3 SHIPPED~= に更新
+- v0.5 release note に feature として掲載
+
+工数見積 (Phase 1): 1-2 日
+- 設計詳細化: 2 h
+- 実装 (elisp + hook CLI): 4-6 h
+- ERT: 3-4 h
+- release-audit + make test-all: 1 h
+- commit + self-merge: 0.5 h
+
+* 関連 doc / memory
+
+- [[file:17-session.org][Doc 17 anvil-session]] — lifecycle hook + install-settings を再利用
+- [[file:08-state.org][Doc 08 anvil-state]] — snapshot 永続化層
+- [[file:29-memory-engine.org][Doc 29 anvil-memory-engine]] — Phase 2 で semantic summary に利用
+- [[file:10-orchestrator.org][Doc 10 anvil-orchestrator]] — Phase 2 で LLM call
+- [[https://code.claude.com/docs/en/hooks.md][Claude Code hooks doc]] — hook event / input / output schema の上流仕様
+- [[https://code.claude.com/docs/en/how-claude-code-works.md][Claude Code how-it-works]] — 83.5% auto-compact 言及箇所
