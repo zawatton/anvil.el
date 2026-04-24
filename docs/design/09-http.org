@@ -1,7 +1,7 @@
 #+title: HTTP Client — url-retrieve Wrapper with ETag/TTL Cache
 #+date: 2026-04-18
 #+author: zawatton
-#+property: status PHASE-1A-1B-1C-1E-SHIPPED
+#+property: status PHASE-1-SHIPPED
 #+property: scope GENERIC
 
 * STATUS
@@ -47,8 +47,25 @@ longest-match / pattern wildcard & anchor / integration disallow /
 fail-open)。tests 33 pass / 1 live skipped、byte-compile +
 release-audit clean。feat branch =feat/doc-09-http-phase1e=。
 
-Phase 1d (batch fetch) は次スロット。Review Questions Q1-Q10
-resolved のままキープ。
+~Phase 1d SHIPPED~ (2026-04-24) — batch fetch。
+=anvil-http-get-batch URLS &key concurrency timeout selector
+json-path body-mode header-filter no-cache= で並列取得、
+返り値は入力順に response plist の list。失敗 URL は
+=(:url :error)= で個別返却 (batch 丸ごとは壊れない)。TTL-fresh
+cache hit は async fan-out 自体をスキップ。=url-queue-retrieve=
+ベースで concurrency は =anvil-http-batch-concurrency= (既定 4)、
+URL 上限 =anvil-http-batch-max= (既定 16)。=anvil-http--request-
+async= を primitive として切り出し、tests は stub で同期 callback。
+=http-fetch-batch= MCP tool 追加、shared options (selector /
+json_path / body_mode / header_filter / no_cache) を全 URL に適用。
+ERT +4 (cache-only / order preservation / partial error / max
+exceed)、tests 37 pass / 1 live skipped、byte-compile +
+release-audit clean。feat branch =feat/doc-09-http-phase1d=。
+
+**Phase 1 完遂** — Doc 09 の 5 sub-phase (1a 基盤 / 1b extract /
+1c overflow + header-filter / 1e robots.txt / 1d batch) 全
+SHIPPED。Phase 1.5+ (POST + auth / offload 経由 / LRU eviction)
+は次期 roadmap へ。Review Questions Q1-Q10 resolved のままキープ。
 
 * Goal
 
@@ -664,7 +681,7 @@ Phase 1b〜1d は *独立に並ぶ* (依存なし)。1a 完了後、体力とユ
 4. cache に overflow path を保存、cache hit 時の lazy rehydrate
 5. ERT +4 (overflow / head-only / meta-only / filter variants)
 
-** Phase 1d — Batch fetch (所要 1-2 日)
+** Phase 1d — Batch fetch (所要 1-2 日、SHIPPED 2026-04-24)
 
 1. =anvil-http-get-batch= + url-queue 並列制御
 2. per-URL cache / ETag 独立

@@ -76,7 +76,26 @@
 ;;     request proceed, matching RFC 9309 guidance for missing or
 ;;     unreadable robots files.
 ;;
-;; Phase 1d+ (not yet in this file): batch fetch.
+;; Phase 1d (batch fetch) is live as of the release containing this
+;; comment:
+;;   * `anvil-http-get-batch URLS &key concurrency timeout ...'
+;;     fetches multiple URLs concurrently and returns the response
+;;     plists in input order.  Per-URL failures surface as
+;;     `(:url :error)' so one bad entry does not sink the batch.
+;;     TTL-fresh cache hits short-circuit the async fan-out
+;;     entirely — a mostly-cached batch costs one envelope and zero
+;;     network.
+;;   * `http-fetch-batch' MCP tool wraps the Elisp API.  The `urls'
+;;     parameter accepts a JSON array; shared `selector',
+;;     `json_path', `body_mode', `header_filter', `no_cache',
+;;     `concurrency' and `timeout_sec' apply to every URL in the
+;;     batch (per-URL overrides are out of scope for this phase).
+;;   * Under the hood uses `url-queue-retrieve'; concurrency is
+;;     bounded to `anvil-http-batch-concurrency' (default 4); URL
+;;     count is capped by `anvil-http-batch-max' (default 16).
+;;   * `anvil-http--request-async' is the replaceable primitive —
+;;     tests stub it to invoke the callback synchronously with
+;;     fixture responses.
 
 ;;; Code:
 
@@ -85,6 +104,7 @@
 (require 'url)
 (require 'url-http)
 (require 'url-parse)
+(require 'url-queue)
 (require 'url-util)
 (require 'dom)
 (require 'anvil-server)
@@ -221,6 +241,23 @@ is not meaningful."
 RFC 9309 recommends caching for no longer than 24h (86400 seconds)
 unless a Cache-Control header says otherwise.  anvil-http uses the
 plain TTL and ignores Cache-Control for simplicity."
+  :type 'integer
+  :group 'anvil-http)
+
+(defcustom anvil-http-batch-concurrency 4
+  "Maximum number of simultaneous url-queue requests per batch.
+Binds `url-queue-parallel-processes' for the scope of one
+`anvil-http-get-batch' call.  4 is a polite default — one handful
+of parallel connections per host is roughly what a browser uses
+for HTTP/1.1."
+  :type 'integer
+  :group 'anvil-http)
+
+(defcustom anvil-http-batch-max 16
+  "Maximum number of URLs accepted by one `anvil-http-get-batch' call.
+Guard against pathological LLM output that would otherwise fan out
+hundreds of requests.  Larger batches should be split by the
+caller."
   :type 'integer
   :group 'anvil-http)
 
@@ -416,6 +453,43 @@ RESPONSE is the last response plist; honours `Retry-After' for 429."
               (setq attempt (1+ attempt)))
           (throw 'done result))))
     result))
+
+(defun anvil-http--request-async (url extra-headers timeout callback)
+  "Issue an async GET for URL and invoke CALLBACK with the response plist.
+CALLBACK receives either (:status :headers :body :final-url) on
+success or (:error STRING) on transport / parse failure.  Uses
+`url-queue-retrieve' so concurrency is bounded by
+`url-queue-parallel-processes' (batch callers let-bind this
+from `anvil-http-batch-concurrency').
+
+Unlike `anvil-http--request' this primitive does not retry on 5xx
+— batch callers treat a per-URL failure as partial (one bad URL
+does not sink the whole batch).  Tests stub this function to
+invoke CALLBACK synchronously with fixture responses."
+  (let ((url-request-method "GET")
+        (url-request-extra-headers
+         (append
+          (unless (assoc "User-Agent" extra-headers)
+            `(("User-Agent" . ,anvil-http-user-agent)))
+          (unless (assoc "Accept-Encoding" extra-headers)
+            '(("Accept-Encoding" . "gzip")))
+          extra-headers))
+        (url-max-redirections anvil-http-max-redirections)
+        (url-queue-timeout (or timeout anvil-http-timeout-sec)))
+    (url-queue-retrieve
+     url
+     (lambda (status &rest _cbargs)
+       (funcall
+        callback
+        (cond
+         ((plist-get status :error)
+          (list :error (format "%S" (plist-get status :error))))
+         (t
+          (condition-case err
+              (anvil-http--parse-response url)
+            (error (list :error (error-message-string err))))))))
+     nil
+     t)))
 
 ;;;; --- conditional-request header assembly --------------------------------
 
@@ -1209,6 +1283,140 @@ HEAD responses never touch the cache."
           :final-url (plist-get resp :final-url)
           :elapsed-ms elapsed-ms)))
 
+;;;; --- batch fetch (Phase 1d) ---------------------------------------------
+
+(defun anvil-http--post-process (resp selector json-path body-mode header-filter)
+  "Apply extract → body-mode → header-filter to RESP in order."
+  (anvil-http--apply-header-filter
+   (anvil-http--apply-body-mode
+    (anvil-http--apply-extract resp selector json-path)
+    body-mode)
+   header-filter))
+
+(defun anvil-http--batch-handle-network (resp url now norm cached no-cache
+                                              selector json-path
+                                              body-mode header-filter)
+  "Decide what to return for URL given async RESP.
+RESP is either `(:status :headers :body :final-url)' from
+`anvil-http--request-async' or `(:error STR)' on failure.  CACHED
+is the existing cache entry (for 304 revalidation)."
+  (cond
+   ((plist-get resp :error)
+    (list :url url :error (plist-get resp :error)))
+   (t
+    (let ((status (plist-get resp :status)))
+      (cond
+       ((eq status 304)
+        (if cached
+            (let* ((merged (anvil-http--merge-headers
+                            (plist-get cached :headers)
+                            (plist-get resp :headers)))
+                   (refreshed (anvil-http--cache-entry
+                               (plist-get cached :status)
+                               merged
+                               (plist-get cached :body)
+                               now
+                               (or (plist-get resp :final-url)
+                                   (plist-get cached :final-url)))))
+              (unless no-cache (anvil-http--cache-put norm refreshed))
+              (anvil-http--post-process
+               (anvil-http--response-plist refreshed t 0)
+               selector json-path body-mode header-filter))
+          (list :url url :error "304 without cache")))
+       ((and (integerp status) (>= status 200) (< status 300))
+        (let ((entry (anvil-http--cache-entry
+                      status
+                      (plist-get resp :headers)
+                      (plist-get resp :body)
+                      now
+                      (plist-get resp :final-url))))
+          (unless no-cache (anvil-http--cache-put norm entry))
+          (anvil-http--post-process
+           (anvil-http--response-plist entry nil 0)
+           selector json-path body-mode header-filter)))
+       (t
+        (list :url url
+              :error (format "HTTP %s" status))))))))
+
+;;;###autoload
+(cl-defun anvil-http-get-batch (urls &key concurrency timeout
+                                     selector json-path
+                                     body-mode header-filter
+                                     no-cache cache-ttl-sec
+                                     skip-robots-check)
+  "Fetch URLS concurrently, return a list of response plists in input order.
+Concurrency is bounded by CONCURRENCY (defaulting to
+`anvil-http-batch-concurrency').  Each URL is cache-checked first;
+TTL-fresh hits short-circuit the async fan-out entirely.  Per-URL
+failures surface as (:url URL :error STR) plists so one bad entry
+does not sink the whole batch — the caller loops the return value.
+
+Shared keyword args SELECTOR / JSON-PATH / BODY-MODE / HEADER-FILTER
+are applied post-process to every successful response; per-URL
+overrides are out of scope for Phase 1d.
+
+SKIP-ROBOTS-CHECK bypasses the robots.txt pre-check (same semantics
+as `anvil-http-get'); otherwise each URL is robots-evaluated before
+any network round-trip."
+  (anvil-state-enable)
+  (let* ((urls (append urls nil))
+         (n (length urls))
+         (concurrency (or concurrency anvil-http-batch-concurrency))
+         (timeout* (or timeout anvil-http-timeout-sec))
+         (ttl (or cache-ttl-sec anvil-http-cache-ttl-sec))
+         (now (float-time))
+         (results (make-vector n nil))
+         (pending 0))
+    (when (> n anvil-http-batch-max)
+      (user-error
+       "anvil-http: batch URL count %d exceeds `anvil-http-batch-max' %d"
+       n anvil-http-batch-max))
+    (let ((url-queue-parallel-processes concurrency)
+          (url-queue-timeout timeout*))
+      (cl-loop
+       for url in urls
+       for i from 0
+       do
+       (condition-case err
+           (progn
+             (anvil-http--check-url url)
+             (when (and anvil-http-respect-robots-txt
+                        (not skip-robots-check)
+                        (not (anvil-http--is-robots-url-p url)))
+               (anvil-http--robots-check-signal url))
+             (let* ((norm (anvil-http--normalize-url url))
+                    (cached (unless no-cache
+                              (anvil-http--cache-get norm))))
+               (cond
+                ((and cached (numberp ttl) (> ttl 0)
+                      (numberp (plist-get cached :fetched-at))
+                      (< (- now (plist-get cached :fetched-at)) ttl))
+                 (aset results i
+                       (anvil-http--post-process
+                        (anvil-http--response-plist cached t 0)
+                        selector json-path body-mode header-filter)))
+                (t
+                 (cl-incf pending)
+                 (let* ((idx i)
+                        (cb-norm norm)
+                        (cb-cached cached)
+                        (extra (anvil-http--build-request-headers
+                                nil nil cached nil)))
+                   (anvil-http--request-async
+                    url extra timeout*
+                    (lambda (resp)
+                      (aset results idx
+                            (anvil-http--batch-handle-network
+                             resp url now cb-norm cb-cached no-cache
+                             selector json-path body-mode header-filter))
+                      (setq pending (1- pending)))))))))
+         (error
+          (aset results i
+                (list :url url :error (error-message-string err))))))
+      (while (> pending 0)
+        (accept-process-output nil 0.1)))
+    (append results nil)))
+
 ;;;###autoload
 (defun anvil-http-cache-clear (&optional url)
   "Remove cache entries.  With URL, drop just that key; nil flushes http ns."
@@ -1374,6 +1582,66 @@ probes (Content-Type, Content-Length, reachability checks)."
                         (t nil))))
      (anvil-http-head url :timeout-sec timeout))))
 
+(defun anvil-http--tool-fetch-batch (urls &optional concurrency timeout_sec
+                                           selector json_path
+                                           body_mode header_filter
+                                           no_cache)
+  "Batch-fetch URLS (array of http/https URLs) in parallel.
+
+MCP Parameters:
+  urls          - Array of absolute http/https URLs to fetch.
+                  Capped by `anvil-http-batch-max' (default 16).
+  concurrency   - Optional parallel limit (default
+                  `anvil-http-batch-concurrency', 4).
+  timeout_sec   - Optional per-request timeout override (integer).
+  selector      - Same as `http-fetch'; applied to every HTML result.
+  json_path     - Same as `http-fetch'; applied to every JSON result.
+  body_mode     - Same as `http-fetch'; shared body-size strategy.
+  header_filter - Same as `http-fetch'; shared header filter.
+  no_cache      - Non-nil skips cache on read and write for every URL.
+
+Returns an array of response plists in INPUT ORDER.  Successes use
+the same shape as `http-fetch'; per-URL failures surface as
+(:url URL :error STR) so one bad entry does not sink the batch.
+
+Uses `url-queue-retrieve' under the hood — concurrency is bounded
+to CONCURRENCY simultaneous requests and TTL-fresh cache hits
+short-circuit the network entirely."
+  (anvil-server-with-error-handling
+   (let ((url-list (cond
+                    ((vectorp urls) (append urls nil))
+                    ((listp urls) urls)
+                    (t (user-error
+                        "anvil-http: urls must be an array, got %S"
+                        (type-of urls)))))
+         (conc (cond ((null concurrency) nil)
+                     ((integerp concurrency) concurrency)
+                     ((and (stringp concurrency)
+                           (string-match-p "\\`[0-9]+\\'" concurrency))
+                      (string-to-number concurrency))
+                     (t nil)))
+         (timeout (cond ((null timeout_sec) nil)
+                        ((integerp timeout_sec) timeout_sec)
+                        ((and (stringp timeout_sec)
+                              (string-match-p "\\`[0-9]+\\'" timeout_sec))
+                         (string-to-number timeout_sec))
+                        (t nil)))
+         (sel (and (stringp selector) (not (string-empty-p selector))
+                   selector))
+         (jp (and (stringp json_path) (not (string-empty-p json_path))
+                  json_path))
+         (bm (anvil-http--coerce-symbol-arg body_mode))
+         (hf (anvil-http--coerce-symbol-arg header_filter))
+         (no-c (and no_cache (not (equal no_cache "")))))
+     (anvil-http-get-batch url-list
+                           :concurrency conc
+                           :timeout timeout
+                           :selector sel
+                           :json-path jp
+                           :body-mode bm
+                           :header-filter hf
+                           :no-cache no-c))))
+
 (defun anvil-http--robots-tool-payload (url ua)
   "Return the `http-robots-check' response plist for URL and UA.
 Factored out of the tool body so the tool handler ends on a
@@ -1506,6 +1774,23 @@ Cheap liveness / metadata probe; responses are never cached."
 removes just that entry; without, flushes every cached response.")
 
   (anvil-server-register-tool
+   #'anvil-http--tool-fetch-batch
+   :id "http-fetch-batch"
+   :intent '(http)
+   :layer 'io
+   :server-id anvil-http--server-id
+   :description
+   "Fetch an array of http/https URLs concurrently; return the
+responses in input order.  Each element of the returned array is
+either a normal http-fetch response plist or (:url :error) when
+that URL failed.  Concurrency defaults to 4 (tunable), capped at
+`anvil-http-batch-max' (16) URLs per call.  TTL-fresh cache hits
+short-circuit the async fan-out so a mostly-cached batch costs
+one envelope + zero network.  Shared selector / json_path /
+body_mode / header_filter apply to every response."
+   :read-only t)
+
+  (anvil-server-register-tool
    #'anvil-http--tool-robots-check
    :id "http-robots-check"
    :intent '(http diagnostics)
@@ -1522,7 +1807,7 @@ Fail-open on missing or unreadable robots.txt."
 (defun anvil-http--unregister-tools ()
   "Remove every http-* MCP tool from the shared server."
   (dolist (id '("http-fetch" "http-head" "http-cache-clear"
-                "http-robots-check"))
+                "http-fetch-batch" "http-robots-check"))
     (anvil-server-unregister-tool id anvil-http--server-id)))
 
 ;;;###autoload

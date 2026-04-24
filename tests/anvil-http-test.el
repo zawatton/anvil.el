@@ -519,6 +519,99 @@ tempfile; response carries head slice + overflow metadata."
         (should (= 200 (plist-get r :status)))
         (should (equal "payload" (plist-get r :body)))))))
 
+;;;; --- Phase 1d: batch fetch ----------------------------------------------
+
+(defmacro anvil-http-test--with-async-stub (response-alist &rest body)
+  "Stub `anvil-http--request-async' to invoke the callback synchronously.
+RESPONSE-ALIST maps URL to either a full response plist
+(:status :headers :body :final-url) or an error plist (:error STR).
+Binds a fresh `anvil-state' DB and disables robots.txt."
+  (declare (indent 1))
+  `(let ((anvil-http-test--async-map ,response-alist)
+         (anvil-state-db-path (make-temp-file "anvil-http-batch-" nil ".db"))
+         (anvil-state--db nil)
+         (anvil-http-respect-robots-txt nil)
+         (anvil-http--metrics
+          (list :requests 0 :cache-fresh 0 :cache-revalidated 0
+                :network-200 0 :errors 0 :log nil)))
+     (unwind-protect
+         (progn
+           (anvil-state-enable)
+           (cl-letf (((symbol-function 'anvil-http--request-async)
+                      (lambda (url _hdrs _timeout cb)
+                        (let ((resp (cdr (assoc url anvil-http-test--async-map))))
+                          (funcall cb (or resp (list :error "no stub")))))))
+             ,@body))
+       (anvil-state-disable)
+       (ignore-errors (delete-file anvil-state-db-path)))))
+
+(ert-deftest anvil-http-test-phase1d-batch-all-cache-hits ()
+  "Fully-cached batch short-circuits async and returns in input order."
+  (anvil-http-test--with-async-stub nil
+    (let ((urls '("https://a.test/one" "https://b.test/two"))
+          (now (float-time)))
+      (dolist (u urls)
+        (anvil-state-set
+         (anvil-http--normalize-url u)
+         (list :status 200
+               :headers (list :content-type "text/plain")
+               :body (format "cached-%s" u)
+               :fetched-at now
+               :final-url u
+               :etag nil :last-modified nil)
+         :ns "http"))
+      (let ((r (anvil-http-get-batch urls :cache-ttl-sec 600)))
+        (should (= 2 (length r)))
+        (should (eq t (plist-get (nth 0 r) :from-cache)))
+        (should (eq t (plist-get (nth 1 r) :from-cache)))
+        (should (string-match-p "a.test/one" (plist-get (nth 0 r) :body)))
+        (should (string-match-p "b.test/two" (plist-get (nth 1 r) :body)))))))
+
+(ert-deftest anvil-http-test-phase1d-batch-preserves-input-order ()
+  "Async stub returns per-URL responses; batch output matches input order."
+  (anvil-http-test--with-async-stub
+      '(("https://x.test/a" . (:status 200
+                               :headers (:content-type "text/plain")
+                               :body "A"
+                               :final-url "https://x.test/a"))
+        ("https://x.test/b" . (:status 200
+                               :headers (:content-type "text/plain")
+                               :body "B"
+                               :final-url "https://x.test/b"))
+        ("https://x.test/c" . (:status 200
+                               :headers (:content-type "text/plain")
+                               :body "C"
+                               :final-url "https://x.test/c")))
+    (let ((r (anvil-http-get-batch
+              '("https://x.test/a" "https://x.test/b" "https://x.test/c")
+              :cache-ttl-sec 0)))
+      (should (equal "A" (plist-get (nth 0 r) :body)))
+      (should (equal "B" (plist-get (nth 1 r) :body)))
+      (should (equal "C" (plist-get (nth 2 r) :body))))))
+
+(ert-deftest anvil-http-test-phase1d-batch-per-url-error ()
+  "Per-URL failure surfaces as (:url :error); other URLs still succeed."
+  (anvil-http-test--with-async-stub
+      '(("https://ok.test/" . (:status 200
+                               :headers (:content-type "text/plain")
+                               :body "ok"
+                               :final-url "https://ok.test/"))
+        ("https://bad.test/" . (:error "connection refused")))
+    (let ((r (anvil-http-get-batch
+              '("https://ok.test/" "https://bad.test/")
+              :cache-ttl-sec 0)))
+      (should (equal "ok" (plist-get (nth 0 r) :body)))
+      (should (equal "connection refused" (plist-get (nth 1 r) :error)))
+      (should (equal "https://bad.test/" (plist-get (nth 1 r) :url))))))
+
+(ert-deftest anvil-http-test-phase1d-batch-exceeds-max-errors ()
+  "Batch larger than `anvil-http-batch-max' raises a user-error upfront."
+  (let ((anvil-http-batch-max 2))
+    (should-error
+     (anvil-http-get-batch
+      '("https://a.test/" "https://b.test/" "https://c.test/"))
+     :type 'user-error)))
+
 ;;;; --- live smoke test ----------------------------------------------------
 
 (ert-deftest anvil-http-test-live-example-com ()
