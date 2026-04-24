@@ -1,7 +1,7 @@
 #+title: HTTP Client — url-retrieve Wrapper with ETag/TTL Cache
 #+date: 2026-04-18
 #+author: zawatton
-#+property: status PHASE-1-AND-1.5-SHIPPED
+#+property: status PHASE-1-1.5-AND-2-SHIPPED
 #+property: scope GENERIC
 
 * STATUS
@@ -80,8 +80,19 @@ raw / bearer / basic / jitter bounds)、tests 43 pass / 1 live
 skipped、byte-compile + release-audit clean。feat branch
 =feat/doc-09-http-phase1-5=。
 
-Phase 2+ (=:offload t= / LRU eviction / metrics) は次期 roadmap
-へ。Review Questions Q1-Q10 resolved のままキープ。
+~Phase 2 SHIPPED~ (2026-04-25) — =:offload t=。
+=anvil-http-get= / =anvil-http-post= に =:offload= +
+=:offload-timeout= kwarg、MCP も =offload= / =offload_timeout_sec=
+追加。anvil-offload 経由で worker subprocess に fetch を出して
+main daemon を free に保つ。worker side は cache / robots を
+skip (parent が責任を持つ)。worker-side error / await timeout は
+=anvil-server-tool-error= で surfacing。ERT +3 (success / error /
+timeout、anvil-offload を stub)、tests 46 pass / 1 live skip、
+byte-compile + release-audit clean。feat branch
+=feat/doc-09-http-phase2=。
+
+Phase 3 (LRU eviction / size cap / metrics) は次スロット。Review
+Questions Q1-Q10 resolved のままキープ。
 
 * Goal
 
