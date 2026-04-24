@@ -93,6 +93,24 @@
 ;;     many clients retry the same upstream simultaneously.  Set the
 ;;     ratio to 0 to restore deterministic backoff.
 ;;
+;; Phase 2 (offload) is live as of the release containing this
+;; comment:
+;;   * `:offload t' kwarg on `anvil-http-get' / `anvil-http-post'
+;;     (and `offload' MCP parameter on `http-fetch' / `http-post')
+;;     dispatches the actual fetch to an `anvil-offload' worker
+;;     subprocess and blocks on the future.  The main daemon stays
+;;     responsive while the network round-trip runs out of process
+;;     — useful for slow APIs, large downloads, or fetches that
+;;     would otherwise pin the event loop.
+;;   * `:offload-timeout' kwarg / `offload_timeout_sec' MCP param
+;;     bounds the await; defaults to
+;;     `anvil-http-offload-timeout-sec' (120s).  Worker-side errors
+;;     and await timeouts surface as `anvil-server-tool-error' so
+;;     existing error handling keeps working.
+;;   * Cache reads / writes are skipped on the worker side (the
+;;     parent daemon owns the SQLite file); robots.txt is evaluated
+;;     in the parent before dispatch, so the worker bypasses it.
+;;
 ;; Phase 1d (batch fetch) is live as of the release containing this
 ;; comment:
 ;;   * `anvil-http-get-batch URLS &key concurrency timeout ...'
@@ -130,6 +148,15 @@
 ;; `anvil-version' is defined in anvil.el; we only read it in the
 ;; User-Agent default so soft-require it to avoid a load-order dep.
 (defvar anvil-version)
+
+;; `anvil-offload' is loaded lazily — only when `:offload t' is used.
+;; Declare its surface to keep the byte-compiler happy without a hard
+;; dependency at load time.
+(declare-function anvil-offload "anvil-offload" (form &rest keys))
+(declare-function anvil-future-await "anvil-offload" (future &optional timeout))
+(declare-function anvil-future-value "anvil-offload" (future))
+(declare-function anvil-future-error "anvil-offload" (future))
+(declare-function anvil-future-done-p "anvil-offload" (future))
 
 ;;;; --- configuration ------------------------------------------------------
 
@@ -283,6 +310,13 @@ for HTTP/1.1."
 Guard against pathological LLM output that would otherwise fan out
 hundreds of requests.  Larger batches should be split by the
 caller."
+  :type 'integer
+  :group 'anvil-http)
+
+(defcustom anvil-http-offload-timeout-sec 120
+  "Default timeout (seconds) when waiting for an offloaded fetch.
+Long-running downloads or slow APIs should pass a per-call
+`:offload-timeout' override; this defcustom is the fallback."
   :type 'integer
   :group 'anvil-http)
 
@@ -1182,6 +1216,73 @@ fetch-failure."
        "anvil-http: %s is Disallowed for %s by robots.txt at %s"
        url anvil-http-user-agent (plist-get r :origin)))))
 
+;;;; --- offload (Phase 2) --------------------------------------------------
+
+(defun anvil-http--offload-form (method url opts)
+  "Build the elisp form sent to an offload worker for METHOD URL.
+OPTS carries pass-through keywords from the caller; the worker
+forces `:no-cache t' (cache concurrency is the main daemon's
+responsibility) and `:skip-robots-check t' (robots are evaluated
+in the parent before offloading)."
+  (cond
+   ((string= method "GET")
+    `(progn
+       (require 'anvil-state)
+       (require 'anvil-http)
+       (anvil-state-enable)
+       (anvil-http-get ,url
+                       :headers ',(plist-get opts :headers)
+                       :accept ,(plist-get opts :accept)
+                       :timeout-sec ,(plist-get opts :timeout-sec)
+                       :selector ,(plist-get opts :selector)
+                       :json-path ,(plist-get opts :json-path)
+                       :body-mode ',(plist-get opts :body-mode)
+                       :header-filter ',(plist-get opts :header-filter)
+                       :no-cache t
+                       :skip-robots-check t)))
+   ((string= method "POST")
+    `(progn
+       (require 'anvil-state)
+       (require 'anvil-http)
+       (anvil-state-enable)
+       (anvil-http-post ,url
+                        :body ,(plist-get opts :body)
+                        :content-type ,(plist-get opts :content-type)
+                        :headers ',(plist-get opts :headers)
+                        :accept ,(plist-get opts :accept)
+                        :timeout-sec ,(plist-get opts :timeout-sec)
+                        :auth ',(plist-get opts :auth)
+                        :body-mode ',(plist-get opts :body-mode)
+                        :header-filter ',(plist-get opts :header-filter)
+                        :skip-robots-check t)))
+   (t (error "anvil-http: offload supports GET and POST only, got %S"
+             method))))
+
+(defun anvil-http--offload-fetch (method url opts)
+  "Run a METHOD request to URL via anvil-offload and block on the result.
+The main daemon stays responsive while the actual network round-trip
+runs in a worker subprocess; the await timeout defaults to
+`anvil-http-offload-timeout-sec' but can be overridden via
+`(plist-get OPTS :offload-timeout)'.  Errors on the worker side
+surface as `anvil-server-tool-error' so the caller's existing error
+handling still works."
+  (require 'anvil-offload)
+  (let* ((timeout (or (plist-get opts :offload-timeout)
+                      anvil-http-offload-timeout-sec))
+         (form (anvil-http--offload-form method url opts))
+         (future (anvil-offload form :require '(anvil-http))))
+    (anvil-future-await future timeout)
+    (cond
+     ((anvil-future-error future)
+      (signal 'anvil-server-tool-error
+              (list (format "anvil-http: offload error for %s: %s"
+                            url (anvil-future-error future)))))
+     ((not (anvil-future-done-p future))
+      (signal 'anvil-server-tool-error
+              (list (format "anvil-http: offload await timed out (%ds) for %s"
+                            timeout url))))
+     (t (anvil-future-value future)))))
+
 ;;;; --- POST / auth helpers (Phase 1.5) ------------------------------------
 
 (defun anvil-http--url-encode-form (alist)
@@ -1289,7 +1390,8 @@ Existing Authorization in HEADERS is overwritten by Bearer/Basic."
                               no-cache cache-ttl-sec if-newer-than
                               selector json-path
                               body-mode header-filter
-                              skip-robots-check)
+                              skip-robots-check
+                              offload offload-timeout)
   "GET URL and return a response plist.
 
 Keyword args:
@@ -1337,6 +1439,15 @@ Disallow hit raises `user-error' before any network round-trip."
              (not skip-robots-check)
              (not (anvil-http--is-robots-url-p url)))
     (anvil-http--robots-check-signal url))
+  (when offload
+    (cl-return-from anvil-http-get
+      (anvil-http--offload-fetch
+       "GET" url
+       (list :headers headers :accept accept
+             :timeout-sec timeout-sec
+             :selector selector :json-path json-path
+             :body-mode body-mode :header-filter header-filter
+             :offload-timeout offload-timeout))))
   (anvil-http--metrics-bump :requests)
   (anvil-http--apply-header-filter
    (anvil-http--apply-body-mode
@@ -1433,7 +1544,8 @@ HEAD responses never touch the cache."
 (cl-defun anvil-http-post (url &key body content-type headers
                                accept timeout-sec auth
                                body-mode header-filter
-                               skip-robots-check)
+                               skip-robots-check
+                               offload offload-timeout)
   "POST URL with BODY and return a response plist.
 
 Keyword args:
@@ -1468,6 +1580,15 @@ enforcement applies — a Disallow on the target URL raises
              (not skip-robots-check)
              (not (anvil-http--is-robots-url-p url)))
     (anvil-http--robots-check-signal url))
+  (when offload
+    (cl-return-from anvil-http-post
+      (anvil-http--offload-fetch
+       "POST" url
+       (list :body body :content-type content-type
+             :headers headers :accept accept
+             :timeout-sec timeout-sec :auth auth
+             :body-mode body-mode :header-filter header-filter
+             :offload-timeout offload-timeout))))
   (anvil-http--metrics-bump :requests)
   (let* ((encoded (anvil-http--encode-body body))
          (data (car encoded))
@@ -1709,7 +1830,8 @@ live entry."
 (defun anvil-http--tool-fetch (url &optional if_newer_than accept
                                    timeout_sec no_cache
                                    selector json_path
-                                   body_mode header_filter)
+                                   body_mode header_filter
+                                   offload offload_timeout_sec)
   "GET URL through `anvil-http-get' and return the response plist.
 
 MCP Parameters:
@@ -1741,6 +1863,14 @@ MCP Parameters:
                   Content-Length, ETag, Last-Modified, Content-Encoding,
                   Location, Retry-After;
                   `all' returns every response header.
+  offload      - Non-nil offloads the actual fetch to an
+                  `anvil-offload' worker subprocess so the main
+                  daemon stays responsive.  Robots.txt is still
+                  evaluated in the parent before dispatch.  Cache
+                  reads / writes are skipped on the worker side.
+  offload_timeout_sec - Optional integer await timeout for the
+                  offloaded fetch (default
+                  `anvil-http-offload-timeout-sec', 120).
 
 Returns (:status :headers :body :from-cache :cached-at :final-url
 :elapsed-ms).  Same-URL calls within `anvil-http-cache-ttl-sec'
@@ -1779,7 +1909,15 @@ with offset/limit to pull only the slice it actually needs."
          (jp (and (stringp json_path) (not (string-empty-p json_path))
                   json_path))
          (bm (anvil-http--coerce-symbol-arg body_mode))
-         (hf (anvil-http--coerce-symbol-arg header_filter)))
+         (hf (anvil-http--coerce-symbol-arg header_filter))
+         (off (and offload (not (equal offload ""))))
+         (off-timeout
+          (cond ((null offload_timeout_sec) nil)
+                ((integerp offload_timeout_sec) offload_timeout_sec)
+                ((and (stringp offload_timeout_sec)
+                      (string-match-p "\\`[0-9]+\\'" offload_timeout_sec))
+                 (string-to-number offload_timeout_sec))
+                (t nil))))
      (anvil-http-get url
                      :accept accept*
                      :timeout-sec timeout
@@ -1788,7 +1926,9 @@ with offset/limit to pull only the slice it actually needs."
                      :selector sel
                      :json-path jp
                      :body-mode bm
-                     :header-filter hf))))
+                     :header-filter hf
+                     :offload off
+                     :offload-timeout off-timeout))))
 
 (defun anvil-http--tool-head (url &optional timeout_sec)
   "HEAD URL and return (:status :headers :final-url :elapsed-ms).
@@ -1811,7 +1951,8 @@ probes (Content-Type, Content-Length, reachability checks)."
 (defun anvil-http--tool-post (url &optional body content_type
                                    bearer_token headers_json
                                    accept timeout_sec
-                                   body_mode header_filter)
+                                   body_mode header_filter
+                                   offload offload_timeout_sec)
   "POST to URL through `anvil-http-post' and return the response.
 
 MCP Parameters:
@@ -1829,6 +1970,10 @@ MCP Parameters:
   timeout_sec   - Optional request timeout override.
   body_mode     - Same as `http-fetch' (auto / full / head-only / meta-only).
   header_filter - Same as `http-fetch' (minimal / all).
+  offload       - Non-nil offloads the actual POST to an
+                  `anvil-offload' worker subprocess; main daemon stays
+                  responsive.  Robots.txt evaluated in the parent.
+  offload_timeout_sec - Optional integer await timeout (default 120).
 
 Returns (:status :headers :body :from-cache :cached-at :final-url
 :elapsed-ms).  POSTs are never cached.  Retries 5xx / 408 / 429
@@ -1861,7 +2006,15 @@ Robots.txt is enforced for the target URL."
                        parsed))))
           (auth (and (stringp bearer_token)
                      (not (string-empty-p bearer_token))
-                     (list :bearer bearer_token))))
+                     (list :bearer bearer_token)))
+          (off (and offload (not (equal offload ""))))
+          (off-timeout
+           (cond ((null offload_timeout_sec) nil)
+                 ((integerp offload_timeout_sec) offload_timeout_sec)
+                 ((and (stringp offload_timeout_sec)
+                       (string-match-p "\\`[0-9]+\\'" offload_timeout_sec))
+                  (string-to-number offload_timeout_sec))
+                 (t nil))))
      (anvil-http-post url
                       :body body*
                       :content-type ct
@@ -1870,7 +2023,9 @@ Robots.txt is enforced for the target URL."
                       :timeout-sec timeout
                       :auth auth
                       :body-mode bm
-                      :header-filter hf))))
+                      :header-filter hf
+                      :offload off
+                      :offload-timeout off-timeout))))
 
 (defun anvil-http--tool-fetch-batch (urls &optional concurrency timeout_sec
                                            selector json_path

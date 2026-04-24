@@ -12,6 +12,7 @@
 (require 'cl-lib)
 (require 'anvil-http)
 (require 'anvil-state)
+(require 'anvil-offload)
 
 ;;;; --- fixtures -----------------------------------------------------------
 
@@ -692,6 +693,64 @@ Binds a fresh `anvil-state' DB and disables robots.txt."
                (should (and (>= j 750) (<= j 1250))))))
   (let ((anvil-http-retry-jitter-ratio 0))
     (should (= 1000 (anvil-http--apply-jitter 1000)))))
+
+;;;; --- Phase 2: offload ---------------------------------------------------
+
+(defmacro anvil-http-test--with-offload-stub (success-or-error
+                                              &rest body)
+  "Run BODY with anvil-offload stubbed.
+SUCCESS-OR-ERROR is `(:value PLIST)' / `(:error STR)' / `:timeout'.
+Robots check is disabled and a fresh state DB provisioned."
+  (declare (indent 1))
+  `(let* ((s ,success-or-error)
+          (anvil-state-db-path (make-temp-file "anvil-http-off-" nil ".db"))
+          (anvil-state--db nil)
+          (anvil-http-respect-robots-txt nil))
+     (unwind-protect
+         (cl-letf* (((symbol-function 'anvil-offload)
+                     (lambda (_form &rest _keys) :fake-future))
+                    ((symbol-function 'anvil-future-await)
+                     (lambda (_future &optional _timeout) nil))
+                    ((symbol-function 'anvil-future-done-p)
+                     (lambda (_future) (not (eq s :timeout))))
+                    ((symbol-function 'anvil-future-error)
+                     (lambda (_future)
+                       (and (eq (car-safe s) :error) (cadr s))))
+                    ((symbol-function 'anvil-future-value)
+                     (lambda (_future)
+                       (and (eq (car-safe s) :value) (cadr s)))))
+           (anvil-state-enable)
+           ,@body)
+       (anvil-state-disable)
+       (ignore-errors (delete-file anvil-state-db-path)))))
+
+(ert-deftest anvil-http-test-phase2-offload-success ()
+  "`:offload t' returns the value the offload future resolved to."
+  (anvil-http-test--with-offload-stub
+      (list :value (list :status 200
+                         :headers (list :content-type "text/plain")
+                         :body "from-offload"
+                         :from-cache nil
+                         :final-url "https://example.com/big"))
+    (let ((r (anvil-http-get "https://example.com/big" :offload t)))
+      (should (= 200 (plist-get r :status)))
+      (should (equal "from-offload" (plist-get r :body))))))
+
+(ert-deftest anvil-http-test-phase2-offload-error-surfaces ()
+  "Worker-side error surfaces as `anvil-server-tool-error'."
+  (anvil-http-test--with-offload-stub
+      (list :error "subprocess crashed: SIGSEGV")
+    (should-error
+     (anvil-http-get "https://example.com/x" :offload t)
+     :type 'anvil-server-tool-error)))
+
+(ert-deftest anvil-http-test-phase2-offload-timeout-surfaces ()
+  "Future never reaching `done' becomes a tool-error."
+  (anvil-http-test--with-offload-stub :timeout
+    (should-error
+     (anvil-http-get "https://example.com/slow"
+                     :offload t :offload-timeout 1)
+     :type 'anvil-server-tool-error)))
 
 ;;;; --- live smoke test ----------------------------------------------------
 
