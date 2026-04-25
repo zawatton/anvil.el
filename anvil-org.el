@@ -282,12 +282,18 @@ variables."
   `(progn
      (anvil-org--fail-if-modified ,file-path ,operation)
      (with-temp-buffer
-       (set-visited-file-name ,file-path t)
-       (insert-file-contents ,file-path)
-       (org-mode)
-       (goto-char (point-min))
-       ,@body
-       (anvil-org--complete-and-save ,file-path ,response-alist))))
+       (unwind-protect
+           (progn
+             (insert-file-contents ,file-path)
+             (set-visited-file-name ,file-path t)
+             (set-buffer-modified-p nil)
+             (org-mode)
+             (goto-char (point-min))
+             ,@body
+             (anvil-org--complete-and-save ,file-path ,response-alist))
+         ;; Do not let failed tool calls prompt about killing the
+         ;; temporary file-visiting buffer.
+         (set-buffer-modified-p nil)))))
 
 (defun anvil-org--find-allowed-file-with-id (id)
   "Find an allowed file containing the Org ID.
