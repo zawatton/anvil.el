@@ -1044,4 +1044,354 @@ Used in cl-letf binding to avoid recursing into the real
     (should (string-match-p "aws" text))
     (should (string-match-p "fp9" text))))
 
+;;;; --- T92 fixture realism scanner ---------------------------------------
+;;
+;; T70 cross-cutting #3 follow-up.  These tests exercise the
+;; production-shape-vs-test-shape mismatch detector that catches the
+;; class of false PASS where a `let' binds a hash-table-shaped global
+;; (e.g. `anvil-orchestrator--providers') to a quoted alist literal.
+
+(ert-deftest anvil-dev-test-realism-classify-init-shapes ()
+  "`anvil-dev--audit-realism-classify-init' recognises tracked init forms."
+  (should (eq :hash-table
+              (anvil-dev--audit-realism-classify-init
+               '(make-hash-table :test 'eq))))
+  (should (eq :vector
+              (anvil-dev--audit-realism-classify-init
+               '(make-vector 8 nil))))
+  (should (eq :vector
+              (anvil-dev--audit-realism-classify-init
+               '(vector 1 2 3))))
+  (should (eq :vector
+              (anvil-dev--audit-realism-classify-init [1 2 3])))
+  (should (null (anvil-dev--audit-realism-classify-init '(list 1 2 3))))
+  (should (null (anvil-dev--audit-realism-classify-init nil)))
+  (should (null (anvil-dev--audit-realism-classify-init "string"))))
+
+(ert-deftest anvil-dev-test-realism-classify-value-shapes ()
+  "`anvil-dev--audit-realism-classify-value' classifies the high-precision set."
+  (should (eq :alist
+              (anvil-dev--audit-realism-classify-value
+               '(quote ((a . 1) (b . 2))))))
+  (should (eq :alist
+              ;; `(let ((x '((a) (b)))))' — alist of cons-headed lists.
+              (anvil-dev--audit-realism-classify-value
+               '(quote ((a) (b))))))
+  (should (eq :hash-table
+              (anvil-dev--audit-realism-classify-value
+               '(make-hash-table :test 'eq))))
+  (should (eq :vector
+              (anvil-dev--audit-realism-classify-value
+               '(make-vector 4 nil))))
+  (should (eq :vector
+              (anvil-dev--audit-realism-classify-value [1 2 3])))
+  (should (eq :alist-runtime
+              (anvil-dev--audit-realism-classify-value
+               '(list (cons 'a 1) (cons 'b 2)))))
+  (should (eq :nil (anvil-dev--audit-realism-classify-value nil)))
+  (should (eq :nil (anvil-dev--audit-realism-classify-value '(quote nil))))
+  ;; Function-call delegate (the post-T70-fix pattern) — UNKNOWN, no flag.
+  (should (eq :unknown
+              (anvil-dev--audit-realism-classify-value
+               '(anvil-orchestrator-routing-test--make-providers
+                 '(claude codex)))))
+  ;; A flat quoted list of symbols is NOT an alist — must be :unknown.
+  (should (eq :unknown
+              (anvil-dev--audit-realism-classify-value
+               '(quote (a b c))))))
+
+(ert-deftest anvil-dev-test-realism-shapes-conflict-matrix ()
+  "Conflict matrix: hash-table↔alist & vector↔alist flag, same shapes do not."
+  (should (anvil-dev--audit-realism-shapes-conflict-p
+           :hash-table :alist))
+  (should (anvil-dev--audit-realism-shapes-conflict-p
+           :hash-table :alist-runtime))
+  (should (anvil-dev--audit-realism-shapes-conflict-p
+           :hash-table :vector))
+  (should (anvil-dev--audit-realism-shapes-conflict-p
+           :vector :alist))
+  (should (anvil-dev--audit-realism-shapes-conflict-p
+           :vector :hash-table))
+  ;; Same shape — no conflict.
+  (should-not (anvil-dev--audit-realism-shapes-conflict-p
+               :hash-table :hash-table))
+  (should-not (anvil-dev--audit-realism-shapes-conflict-p
+               :vector :vector))
+  ;; Unknown / nil — never flag (precision over recall).
+  (should-not (anvil-dev--audit-realism-shapes-conflict-p
+               :hash-table :unknown))
+  (should-not (anvil-dev--audit-realism-shapes-conflict-p
+               :hash-table :nil))
+  (should-not (anvil-dev--audit-realism-shapes-conflict-p
+               :vector :unknown)))
+
+(ert-deftest anvil-dev-test-realism-detects-alist-vs-hash ()
+  "T70 reproducer: production = (make-hash-table), test = quoted alist."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          ;; Production module declares a hash-table-shaped registry.
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-orchestrator.el" d)
+           (concat
+            "(defvar anvil-orchestrator--providers"
+            " (make-hash-table :test 'eq)"
+            "  \"Provider registry.\")\n"))
+          (make-directory (expand-file-name "tests" d) t)
+          ;; Test let-binds the same var to a quoted alist — the bug.
+          (anvil-dev-test--audit-write
+           (expand-file-name "tests/anvil-orchestrator-test.el" d)
+           (concat
+            "(ert-deftest x ()\n"
+            "  (let ((anvil-orchestrator--providers"
+            "         '((claude) (codex) (ollama))))\n"
+            "    (should t)))\n"))
+          (let* ((r (anvil-dev-release-audit d))
+                 (hits (plist-get r :fixture-realism)))
+            (should (= 1 (length hits)))
+            (should (equal "anvil-orchestrator-test.el"
+                           (plist-get (car hits) :file)))
+            (should (eq 'anvil-orchestrator--providers
+                        (plist-get (car hits) :var)))
+            (should (eq :hash-table (plist-get (car hits) :declared)))
+            (should (eq :alist      (plist-get (car hits) :bound)))
+            (should-not (plist-get r :clean-p))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-realism-skips-real-hash-fixture ()
+  "Test that builds the fixture via a helper-call (post-T70 pattern) is clean."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-orchestrator.el" d)
+           (concat
+            "(defvar anvil-orchestrator--providers"
+            " (make-hash-table :test 'eq)"
+            "  \"Registry.\")\n"))
+          (make-directory (expand-file-name "tests" d) t)
+          (anvil-dev-test--audit-write
+           (expand-file-name "tests/anvil-orchestrator-test.el" d)
+           (concat
+            "(ert-deftest x ()\n"
+            "  (let ((anvil-orchestrator--providers"
+            "         (anvil-orchestrator-test--make-providers"
+            "          '(claude codex))))\n"
+            "    (should t)))\n"))
+          (let ((r (anvil-dev-release-audit d)))
+            (should (null (plist-get r :fixture-realism)))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-realism-skips-matching-hash-fixture ()
+  "Same shape on both sides — `(make-hash-table)' bind is clean."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-x.el" d)
+           "(defvar anvil-x--reg (make-hash-table :test 'equal) \"reg\")\n")
+          (make-directory (expand-file-name "tests" d) t)
+          (anvil-dev-test--audit-write
+           (expand-file-name "tests/anvil-x-test.el" d)
+           (concat
+            "(ert-deftest y ()\n"
+            "  (let ((anvil-x--reg (make-hash-table :test 'equal)))\n"
+            "    (should t)))\n"))
+          (let ((r (anvil-dev-release-audit d)))
+            (should (null (plist-get r :fixture-realism)))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-realism-detects-alist-vs-vector ()
+  "Production = `(make-vector ...)', test = quoted alist — flagged."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-vec.el" d)
+           "(defvar anvil-vec--slots (make-vector 8 nil) \"slots\")\n")
+          (make-directory (expand-file-name "tests" d) t)
+          (anvil-dev-test--audit-write
+           (expand-file-name "tests/anvil-vec-test.el" d)
+           (concat
+            "(ert-deftest z ()\n"
+            "  (let ((anvil-vec--slots '((a . 1) (b . 2))))\n"
+            "    (should t)))\n"))
+          (let* ((r (anvil-dev-release-audit d))
+                 (hits (plist-get r :fixture-realism)))
+            (should (= 1 (length hits)))
+            (should (eq :vector (plist-get (car hits) :declared)))
+            (should (eq :alist  (plist-get (car hits) :bound)))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-realism-handles-cl-letf ()
+  "`cl-letf' / `cl-letf*' bindings of a tracked var are inspected too."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-orchestrator.el" d)
+           "(defvar anvil-orchestrator--providers (make-hash-table :test 'eq))\n")
+          (make-directory (expand-file-name "tests" d) t)
+          (anvil-dev-test--audit-write
+           (expand-file-name "tests/anvil-orchestrator-test.el" d)
+           (concat
+            "(ert-deftest q ()\n"
+            "  (cl-letf* ((anvil-orchestrator--providers"
+            "              '((claude) (codex))))\n"
+            "    (should t)))\n"))
+          (let* ((r (anvil-dev-release-audit d))
+                 (hits (plist-get r :fixture-realism)))
+            (should (= 1 (length hits)))
+            (should (eq 'anvil-orchestrator--providers
+                        (plist-get (car hits) :var)))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-realism-ignores-unknown-vars ()
+  "A let-bind of a symbol that is NOT in the production shape map is ignored."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          ;; No production defvar — shape map stays empty.
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-x.el" d)
+           "(defun anvil-x-fn () nil)\n")
+          (make-directory (expand-file-name "tests" d) t)
+          (anvil-dev-test--audit-write
+           (expand-file-name "tests/anvil-x-test.el" d)
+           (concat
+            "(ert-deftest q ()\n"
+            "  (let ((some-random-var '((a . 1))))\n"
+            "    (should t)))\n"))
+          (let ((r (anvil-dev-release-audit d)))
+            (should (null (plist-get r :fixture-realism)))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-realism-detects-runtime-alist-list-cons ()
+  "`(list (cons ...) ...)' against a hash-table production is flagged."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-y.el" d)
+           "(defvar anvil-y--reg (make-hash-table :test 'eq))\n")
+          (make-directory (expand-file-name "tests" d) t)
+          (anvil-dev-test--audit-write
+           (expand-file-name "tests/anvil-y-test.el" d)
+           (concat
+            "(ert-deftest q ()\n"
+            "  (let ((anvil-y--reg"
+            "         (list (cons 'a 1) (cons 'b 2))))\n"
+            "    (should t)))\n"))
+          (let* ((r (anvil-dev-release-audit d))
+                 (hits (plist-get r :fixture-realism)))
+            (should (= 1 (length hits)))
+            (should (eq :alist-runtime (plist-get (car hits) :bound)))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-realism-defconst-also-tracked ()
+  "`defconst' init forms contribute to the production shape map too."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-z.el" d)
+           "(defconst anvil-z--lookup (make-hash-table :test 'eq))\n")
+          (make-directory (expand-file-name "tests" d) t)
+          (anvil-dev-test--audit-write
+           (expand-file-name "tests/anvil-z-test.el" d)
+           (concat
+            "(ert-deftest q ()\n"
+            "  (let ((anvil-z--lookup '((x . 1))))\n"
+            "    (should t)))\n"))
+          (let* ((r (anvil-dev-release-audit d))
+                 (hits (plist-get r :fixture-realism)))
+            (should (= 1 (length hits)))
+            (should (eq :hash-table (plist-get (car hits) :declared)))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-realism-empty-tests-dir-clean ()
+  "Repo with no tests/ directory: scanner returns nil cleanly."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-x.el" d)
+           "(defvar anvil-x--reg (make-hash-table))\n")
+          ;; Note: no tests/ subdir.
+          (let ((r (anvil-dev-release-audit d)))
+            (should (null (plist-get r :fixture-realism)))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-realism-report-renders-finding ()
+  "`anvil-dev--audit-format-report' emits a FAIL block for fixture-realism."
+  (let* ((result
+          (list :arglist-strip nil
+                :missing-params nil
+                :plist-return nil
+                :issue-fix-no-test nil
+                :non-shipped-docs nil
+                :secrets nil
+                :fixture-realism
+                (list (list :file "anvil-orchestrator-test.el"
+                            :var 'anvil-orchestrator--providers
+                            :declared :hash-table
+                            :bound :alist))
+                :unused-tools nil
+                :clean-p nil
+                :root "/tmp/x/"
+                :scope nil :unused-since nil
+                :audited-at "2026-01-01 00:00:00"))
+         (text (anvil-dev--audit-format-report result)))
+    (should (string-match-p "FAIL fixture realism" text))
+    (should (string-match-p "anvil-orchestrator-test\\.el" text))
+    (should (string-match-p "anvil-orchestrator--providers" text))
+    (should (string-match-p "declared=:hash-table" text))
+    (should (string-match-p "bound=:alist" text))))
+
+(ert-deftest anvil-dev-test-realism-respects-file-exempt-marker ()
+  "A test file carrying the `fixture-realism-exempt' marker is skipped."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-orchestrator.el" d)
+           "(defvar anvil-orchestrator--providers (make-hash-table :test 'eq))\n")
+          (make-directory (expand-file-name "tests" d) t)
+          ;; Same shape mismatch as the canonical T70 reproducer, but
+          ;; this file declares the exemption marker in its header.
+          (anvil-dev-test--audit-write
+           (expand-file-name "tests/anvil-orchestrator-test.el" d)
+           (concat
+            ";;; anvil-orchestrator-test.el --- compat -*- lexical-binding: t; -*-\n"
+            ";;; anvil-audit: fixture-realism-exempt\n"
+            "(ert-deftest x ()\n"
+            "  (let ((anvil-orchestrator--providers"
+            "         '((claude) (codex))))\n"
+            "    (should t)))\n"))
+          (let ((r (anvil-dev-release-audit d)))
+            (should (null (plist-get r :fixture-realism)))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-realism-clean-p-gates-on-realism ()
+  "`:clean-p' becomes nil when only the realism scanner has a hit."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-x.el" d)
+           "(defvar anvil-x--reg (make-hash-table :test 'eq))\n")
+          (make-directory (expand-file-name "tests" d) t)
+          (anvil-dev-test--audit-write
+           (expand-file-name "tests/anvil-x-test.el" d)
+           (concat
+            "(ert-deftest q ()\n"
+            "  (let ((anvil-x--reg '((a) (b))))\n"
+            "    (should t)))\n"))
+          ;; No design docs, no source defun hits, no commits; only
+          ;; realism finding should drive `:clean-p' to nil.
+          (let ((r (anvil-dev-release-audit d)))
+            (should (plist-get r :fixture-realism))
+            (should-not (plist-get r :clean-p))))
+      (delete-directory d t))))
+
 ;;; anvil-dev-test.el ends here

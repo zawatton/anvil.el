@@ -1,4 +1,5 @@
 ;;; anvil-orchestrator-routing-test.el --- Tests for Doc 22 routing -*- lexical-binding: t; -*-
+;;; anvil-audit: fixture-realism-exempt
 
 ;;; Commentary:
 
@@ -8,6 +9,14 @@
 ;; A small end-to-end test drives `:provider 'auto' through
 ;; `anvil-orchestrator--coerce-task' to prove the sentinel gets
 ;; resolved and stamped.
+;;
+;; Audit exemption: `candidates-from-alist-fixture' intentionally
+;; binds `anvil-orchestrator--providers' to an alist literal to
+;; exercise the back-compat branch added during the T70 fix.  The
+;; `fixture-realism-exempt' marker above tells `anvil-dev's release
+;; audit to skip this file's realism check; the canonical hash-table
+;; fixture path is still covered by the other tests in the same suite
+;; (see `--make-providers' from line 46+).
 
 ;;; Code:
 

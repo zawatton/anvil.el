@@ -1017,10 +1017,305 @@ broken gitleaks install cannot block the rest of the audit."
               (error nil)))
         (ignore-errors (delete-file report-file))))))
 
+;;;; --- fixture realism scanner --------------------------------------------
+;;
+;; T70 (anvil-orchestrator-routing) shipped with a "test fixture realism"
+;; bug: production stored its provider registry in
+;; `(make-hash-table :test 'eq)' but the test let-bound the same variable
+;; to a quoted alist `'((claude) (codex) (ollama))'.  ERT passed because
+;; the routing code-path under test happened to also use `mapcar #'car'
+;; — the real production caller signalled `wrong-type-argument'.  This
+;; was a false PASS caused by a fixture whose *shape* did not mirror the
+;; production data structure.
+;;
+;; This scanner is the structured guard against that class of bug.  It
+;; reads each anvil-*.el source file, classifies the *declared shape* of
+;; each `defvar' / `defconst' (only when the init form is one of a small
+;; high-confidence set: `make-hash-table' / `make-vector' / vector
+;; literal), then walks every tests/anvil-*-test.el looking for `let' /
+;; `let*' / `cl-letf' / `cl-letf*' bindings of those same symbols whose
+;; bound value form classifies to a different shape.  Function-call
+;; values (the post-T70-fix pattern of binding via a helper that builds
+;; the right shape) classify as `:unknown' and are intentionally NOT
+;; flagged — the scanner aims for high precision so it can be a CI gate.
+
+(defconst anvil-dev--audit-realism-tracked-init-cars
+  '(make-hash-table make-vector vector)
+  "`car' symbols whose `defvar' / `defconst' init forms we classify.
+Any other init form leaves the symbol unrecorded — the scanner only
+fires on symbols whose production shape we are confident about.")
+
+(defconst anvil-dev--audit-realism-exempt-marker
+  ";;; anvil-audit: fixture-realism-exempt"
+  "File-header comment that exempts a whole test file from the realism scan.
+Tests that intentionally exercise a back-compat branch by binding a
+production var to a non-canonical shape (e.g. T70's
+`candidates-from-alist-fixture' which proves the alist fallback in
+`anvil-orchestrator-routing--candidates') must include this line in
+the first 2 KB of the file.  Coarse by design — opt-out is per-file
+rather than per-binding because per-binding requires preserving
+comments through `read', which `read' does not do.")
+
+(defun anvil-dev--audit-realism-file-exempt-p (file)
+  "Return non-nil when FILE carries the realism-exemption marker.
+The marker must appear within the first 2 KB of the file on a line
+starting with `anvil-dev--audit-realism-exempt-marker'."
+  (with-temp-buffer
+    (insert-file-contents file nil 0 2000)
+    (goto-char (point-min))
+    (re-search-forward
+     (concat "^" (regexp-quote anvil-dev--audit-realism-exempt-marker))
+     nil t)))
+
+(defun anvil-dev--audit-realism-classify-init (form)
+  "Classify a `defvar' / `defconst' INIT FORM into a shape symbol.
+Returns one of `:hash-table', `:vector', or nil (unknown / not a
+shape we track).  See `anvil-dev--audit-realism-tracked-init-cars'."
+  (cond
+   ((and (consp form) (eq (car form) 'make-hash-table)) :hash-table)
+   ((and (consp form) (eq (car form) 'make-vector))     :vector)
+   ((and (consp form) (eq (car form) 'vector))          :vector)
+   ((vectorp form)                                       :vector)
+   (t nil)))
+
+(defun anvil-dev--audit-realism-classify-value (form)
+  "Classify a let-binding VALUE FORM into a runtime shape symbol.
+Returns one of:
+  :alist          - quoted list whose first element is a cons-pair
+                    `(SYM . X)' or a cons-headed list (the alist
+                    literal pattern that broke T70).
+  :alist-runtime  - `(list (cons ...) ...)' — the constructor form
+                    of an alist.
+  :hash-table     - `(make-hash-table ...)'.
+  :vector         - vector literal `[...]' or `(make-vector ...)'
+                    or `(vector ...)'.
+  :nil            - the literal nil (or `(quote nil)') — empty bind.
+  :unknown        - everything else (function calls, symbols, numbers,
+                    strings, ...).  NOT flagged.
+
+Quoted-form recognition handles both the `'(...)' reader macro and
+the explicit `(quote ...)' form, since `read' normalises them.
+
+The classifier is deliberately conservative: anything not in the
+high-confidence set returns `:unknown' so that fixture builders
+that legitimately delegate to a helper (like the post-T70 fix's
+`anvil-orchestrator-routing-test--make-providers') do not produce
+false positives."
+  (cond
+   ((null form) :nil)
+   ((and (consp form) (eq (car form) 'quote))
+    (let ((q (cadr form)))
+      (cond
+       ((null q) :nil)
+       ((vectorp q) :vector)
+       ((and (consp q)
+             ;; A list whose every element is a cons (or a cons-headed
+             ;; list, since `(SYM VAL)` reads as `(SYM . (VAL))') is
+             ;; an alist literal.  Single-element non-cons lists
+             ;; (like `'(x y z)') are `:unknown' to keep precision.
+             (cl-every (lambda (e) (consp e)) q))
+        :alist)
+       (t :unknown))))
+   ((vectorp form) :vector)
+   ((and (consp form) (eq (car form) 'make-hash-table)) :hash-table)
+   ((and (consp form) (eq (car form) 'make-vector))     :vector)
+   ((and (consp form) (eq (car form) 'vector))          :vector)
+   ((and (consp form) (eq (car form) 'list)
+         (cl-every (lambda (e)
+                     (and (consp e) (eq (car e) 'cons)))
+                   (cdr form)))
+    :alist-runtime)
+   (t :unknown)))
+
+(defun anvil-dev--audit-realism-shapes-conflict-p (declared bound)
+  "Non-nil when DECLARED production shape conflicts with BOUND test shape.
+DECLARED is one of `:hash-table' / `:vector'.  BOUND is one of
+the keywords returned by `anvil-dev--audit-realism-classify-value'.
+
+Conflicts (== flagged):
+  hash-table ↔ alist        (the T70 case)
+  hash-table ↔ alist-runtime
+  hash-table ↔ vector
+  vector ↔ alist
+  vector ↔ alist-runtime
+  vector ↔ hash-table
+
+Non-conflicts (== clean):
+  same shape on both sides
+  bound is :unknown (function-call delegate)
+  bound is :nil (empty bind, harmless)"
+  (cond
+   ((memq bound '(:unknown :nil)) nil)
+   ((eq declared bound) nil)
+   ((and (eq declared :hash-table)
+         (memq bound '(:alist :alist-runtime :vector))) t)
+   ((and (eq declared :vector)
+         (memq bound '(:alist :alist-runtime :hash-table))) t)
+   (t nil)))
+
+(defun anvil-dev--audit-realism-read-forms (file)
+  "Read every top-level form in FILE and return a list of them.
+Forms that fail to `read' (e.g. unbalanced sexps in a partial file)
+are dropped silently — the scanner is read-only and must never
+abort the audit on a syntactically broken sibling test file."
+  (let (forms)
+    (with-temp-buffer
+      (insert-file-contents file)
+      (goto-char (point-min))
+      (condition-case nil
+          (while t (push (read (current-buffer)) forms))
+        (end-of-file nil)
+        (error nil)))
+    (nreverse forms)))
+
+(defun anvil-dev--audit-realism-collect-shape-map-from-forms (forms shape-map)
+  "Walk top-level FORMS, recording defvar/defconst shapes into SHAPE-MAP.
+SHAPE-MAP is a hash-table keyed by symbol, value = shape keyword.
+Only `defvar' / `defconst' forms with a tracked init form get an
+entry — see `anvil-dev--audit-realism-classify-init'.  When the
+same symbol appears more than once with different shapes the first
+entry wins (matches Emacs's own `defvar' precedence: a later
+re-defvar in the same file is unusual, and we want the canonical
+init expression to set policy)."
+  (dolist (form forms)
+    (when (and (consp form)
+               (memq (car form) '(defvar defconst))
+               (>= (length form) 3))
+      (let* ((sym   (nth 1 form))
+             (init  (nth 2 form))
+             (shape (anvil-dev--audit-realism-classify-init init)))
+        (when (and shape (symbolp sym) (not (gethash sym shape-map)))
+          (puthash sym shape shape-map))))))
+
+(defun anvil-dev--audit-realism-build-shape-map (source-files)
+  "Return a hash-table mapping SOURCE-FILES' production var → declared shape.
+SOURCE-FILES is the production module list (i.e. the same list
+`anvil-dev--audit-module-files' returns).  Test files are not
+scanned here — only real anvil-*.el source files contribute to the
+shape map."
+  (let ((shape-map (make-hash-table :test 'eq)))
+    (dolist (file source-files)
+      (let ((forms (anvil-dev--audit-realism-read-forms file)))
+        (anvil-dev--audit-realism-collect-shape-map-from-forms
+         forms shape-map)))
+    shape-map))
+
+(defconst anvil-dev--audit-realism-let-heads
+  '(let let* cl-letf cl-letf*)
+  "Forms whose first list-of-bindings argument we inspect for shape mismatch.
+`cl-letf' / `cl-letf*' are included because anvil tests routinely
+use them to monkey-patch globals; the binding shape rules are the
+same as plain `let'.")
+
+(defun anvil-dev--audit-realism-binding-pair (binding)
+  "Return (SYM . VALUE-FORM) for BINDING in a let-style binding list.
+BINDING may be a symbol (no value form — bound to nil), or a
+two-element list `(SYM VALUE)'.  cl-letf binding shapes that wrap
+the head in a `(symbol-function ...)' or `((function ...))' form
+do not match a tracked production variable (which is always a plain
+symbol) and therefore harmlessly classify as `nil' — they never
+generate findings."
+  (cond
+   ((symbolp binding) (cons binding nil))
+   ((and (consp binding) (symbolp (car binding)))
+    (cons (car binding) (cadr binding)))
+   (t (cons nil nil))))
+
+(defun anvil-dev--audit-realism-walk-form (form shape-map findings-cell file)
+  "Recursively walk FORM looking for shape-mismatched let-bindings.
+SHAPE-MAP is the production var → declared shape hash-table built
+by `anvil-dev--audit-realism-build-shape-map'.  FINDINGS-CELL is a
+mutable cons whose `car' accumulates findings.  FILE is the
+basename used to label findings.
+
+Findings are pushed as plists `(:file FILE :var SYM :declared SHAPE
+:bound SHAPE)'.  Line numbers are NOT recorded — the scanner reads
+forms via `read' which discards source positions, and the
+trade-off (precision over location) is acceptable since the
+mismatch is uniquely identified by `(file, var, shapes)' triple.
+
+Recursion is safe for improper / dotted lists (e.g. cons-pair
+literals `(a . 1)' read via `read'): the walker descends only
+through the `car' / `cdr' chain manually instead of using
+`dolist', which would signal `wrong-type-argument' on a non-list
+tail.  The walker also stops at `quote' forms — the contents of
+a quoted literal are data, not code, and cannot contain a runtime
+let-binding."
+  (when (consp form)
+    (let ((head (car form)))
+      (cond
+       ;; Quoted data — never contains a runtime let.  Skip the body
+       ;; entirely so we do not waste cycles or trip on dotted pairs.
+       ((eq head 'quote) nil)
+       (t
+        (when (memq head anvil-dev--audit-realism-let-heads)
+          (let ((bindings (cadr form)))
+            (when (listp bindings)
+              (dolist (b bindings)
+                (let* ((pair  (anvil-dev--audit-realism-binding-pair b))
+                       (sym   (car pair))
+                       (value (cdr pair))
+                       (declared (and sym (gethash sym shape-map))))
+                  (when declared
+                    (let ((bound (anvil-dev--audit-realism-classify-value
+                                  value)))
+                      (when (anvil-dev--audit-realism-shapes-conflict-p
+                             declared bound)
+                        (push (list :file file
+                                    :var sym
+                                    :declared declared
+                                    :bound bound)
+                              (car findings-cell))))))))))
+        ;; Manually walk the cons spine so improper / dotted lists do
+        ;; not blow up `dolist'.
+        (let ((cell form))
+          (while (consp cell)
+            (anvil-dev--audit-realism-walk-form
+             (car cell) shape-map findings-cell file)
+            (setq cell (cdr cell)))
+          ;; Handle a final non-nil non-cons cdr (the dotted tail).
+          (when (and cell (not (consp cell)))
+            (anvil-dev--audit-realism-walk-form
+             cell shape-map findings-cell file))))))))
+
+(defun anvil-dev--audit-realism-test-files (root)
+  "Return the tests/anvil-*-test.el files under ROOT.
+Returns nil when ROOT/tests does not exist."
+  (let ((dir (expand-file-name "tests" root)))
+    (when (file-directory-p dir)
+      (directory-files dir t "\\`anvil-.*-test\\.el\\'" t))))
+
+(defun anvil-dev--audit-scan-fixture-realism (root)
+  "Scan ROOT for test fixtures whose let-bind shape conflicts with production.
+Returns a list of plists `(:file NAME :var SYM :declared SHAPE
+:bound SHAPE)'.  The `:declared' shape comes from a `defvar' /
+`defconst' init form in some `anvil-*.el' under ROOT; the
+`:bound' shape is the classification of the test-side value
+form.  The classifier is conservative: helper-call values
+(`:unknown') are never flagged.
+
+Test files tagged with `anvil-dev--audit-realism-exempt-marker' in
+their first 2 KB are skipped wholesale — the supported way for a
+back-compat-fixture file to opt out (see the marker docstring for
+the rationale)."
+  (let* ((source-files (anvil-dev--audit-module-files root))
+         (test-files   (anvil-dev--audit-realism-test-files root))
+         (shape-map    (anvil-dev--audit-realism-build-shape-map
+                        source-files))
+         (findings-cell (cons nil nil)))
+    (dolist (file test-files)
+      (unless (anvil-dev--audit-realism-file-exempt-p file)
+        (let ((forms (anvil-dev--audit-realism-read-forms file))
+              (base  (file-name-nondirectory file)))
+          (dolist (form forms)
+            (anvil-dev--audit-realism-walk-form
+             form shape-map findings-cell base)))))
+    (nreverse (car findings-cell))))
+
 (cl-defun anvil-dev-release-audit (&optional project-dir &key scope unused-since)
   "Audit the anvil tree at PROJECT-DIR for pre-release hazards.
 
-Runs six cheap scanners (see the `release audit' section for
+Runs seven cheap scanners (see the `release audit' section for
 details) and returns a plist:
 
   :arglist-strip    — list of wrapper plists hit by the Emacs 30
@@ -1042,6 +1337,10 @@ details) and returns a plist:
                       plists for secrets detected by `gitleaks'.
                       Skipped when gitleaks is not installed or
                       `anvil-dev-audit-secrets-enabled' is nil.
+  :fixture-realism  — list of `(:file :var :declared :bound)'
+                      plists for tests that let-bind a production
+                      variable to a value of the wrong shape (T70
+                      hash-table-vs-alist false-PASS pattern).
   :unused-tools     — Doc 34 Phase C.  Populated only when
                       UNUSED-SINCE is a positive integer; list of
                       plists `(:id :reason :last-called :days-ago
@@ -1049,7 +1348,7 @@ details) and returns a plist:
                       (>UNUSED-SINCE days) or absent.  Requires
                       `anvil-state' + `anvil-discovery' loaded.
                       Advisory — does not affect `:clean-p'.
-  :clean-p          — t iff the six release-blocker scans returned
+  :clean-p          — t iff the seven release-blocker scans returned
                       empty (unused-tools excluded by design)
   :root             — absolute directory that was audited
   :scope            — SCOPE value when supplied, else nil
@@ -1060,8 +1359,8 @@ details) and returns a plist:
 plist-return) to a single file or directory path.  When SCOPE names
 a regular file, only that file is audited; when it names a
 directory, files under it are audited.  The design-docs, issue-fix,
-and unused-tools scanners always run against the whole project /
-registry state.
+fixture-realism, and unused-tools scanners always run against the
+whole project / registry state.
 
 :UNUSED-SINCE N (integer days) activates the Phase C unused-tools
 scanner.  Typical values: 14 (biweekly review) or 30 (monthly
@@ -1085,6 +1384,7 @@ deprecation candidate list).  Omit or pass nil to skip."
          (issue-fix-no-test (anvil-dev--audit-scan-issue-fix-without-test root))
          (non-shipped    (anvil-dev--audit-scan-design-docs root))
          (secrets        (anvil-dev--audit-scan-secrets root))
+         (fixture-realism (anvil-dev--audit-scan-fixture-realism root))
          (unused-tools   (when (and (integerp unused-since) (> unused-since 0))
                            (anvil-dev--audit-scan-unused-tools unused-since)))
          (clean-p        (and (null arglist-strip)
@@ -1092,7 +1392,8 @@ deprecation candidate list).  Omit or pass nil to skip."
                               (null plist-return)
                               (null issue-fix-no-test)
                               (null non-shipped)
-                              (null secrets)))
+                              (null secrets)
+                              (null fixture-realism)))
          (result
           (list :arglist-strip arglist-strip
                 :missing-params missing-params
@@ -1100,6 +1401,7 @@ deprecation candidate list).  Omit or pass nil to skip."
                 :issue-fix-no-test issue-fix-no-test
                 :non-shipped-docs non-shipped
                 :secrets secrets
+                :fixture-realism fixture-realism
                 :unused-tools unused-tools
                 :clean-p clean-p
                 :root (file-name-as-directory (expand-file-name root))
@@ -1130,6 +1432,7 @@ return a one-line string."
         (issue-fix (plist-get result :issue-fix-no-test))
         (docs    (plist-get result :non-shipped-docs))
         (secrets (plist-get result :secrets))
+        (realism (plist-get result :fixture-realism))
         (clean-p (plist-get result :clean-p)))
     (concat
      (format "anvil release audit — %s\n" (plist-get result :audited-at))
@@ -1181,6 +1484,15 @@ return a one-line string."
                    (plist-get f :rule)
                    (plist-get f :fingerprint))))
         (anvil-dev--audit-format-findings
+         "FAIL fixture realism: test let-binds production var to wrong shape\n     (T70 false-PASS pattern — production = hash-table, test = alist)"
+         realism
+         (lambda (f)
+           (format "%s  %s  declared=%s  bound=%s"
+                   (plist-get f :file)
+                   (plist-get f :var)
+                   (plist-get f :declared)
+                   (plist-get f :bound))))
+        (anvil-dev--audit-format-findings
          "WARN design docs not yet SHIPPED (master-gate informational)"
          docs
          (lambda (f)
@@ -1193,9 +1505,10 @@ return a one-line string."
 
 MCP Parameters:
   scope - Optional file-or-directory path.  When supplied, the
-          source scanners (arglist-strip / missing-params) are
-          restricted to that path; the design-docs scan still
-          covers the whole tree.  Empty string = full audit."
+          source scanners (arglist-strip / missing-params /
+          plist-return) are restricted to that path; the
+          design-docs, issue-fix, and fixture-realism scans still
+          cover the whole tree.  Empty string = full audit."
   (anvil-server-with-error-handling
     (let ((sc (and scope (stringp scope) (not (string-empty-p scope))
                    scope)))
@@ -1250,7 +1563,7 @@ any real code lives in it."
    :layer 'dev
    :server-id anvil-dev--server-id
    :description
-   "Scan the anvil tree for six pre-release hazard classes:
+   "Scan the anvil tree for seven pre-release hazard classes:
 Emacs 30 `_arg' arglist-strip regressions in MCP tool wrappers,
 wrappers with real args but no `MCP Parameters:' docstring
 section, wrappers whose body ends with a `(list :K ...)' plist
@@ -1258,10 +1571,12 @@ literal (MCP string-or-nil contract violation, unless the file
 opts out via `;;; anvil-audit: tools-wrapped-at-registration'),
 issue-closing commits whose diff does not touch `tests/' (the
 37fcc52 pattern — ship a fix with no regression guard),
-docs/design/*.org files whose STATUS text lacks `SHIPPED', and
+docs/design/*.org files whose STATUS text lacks `SHIPPED',
 secrets detected by `gitleaks' in tracked content (skipped when
-the binary is unavailable).  Returns a formatted report; `clean'
-when empty."
+the binary is unavailable), and test fixtures that let-bind a
+production variable to a wrong-shape value (the T70 false-PASS
+hash-table-vs-alist pattern).  Returns a formatted report;
+`clean' when empty."
    :read-only t))
 
 (defun anvil-dev-disable ()
