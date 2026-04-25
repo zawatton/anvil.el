@@ -99,9 +99,25 @@ Routing reads the live stats table over this sliding window."
   "Server id under which routing MCP tools register.")
 
 (defun anvil-orchestrator-routing--candidates ()
-  "Return the full list of registered provider symbols."
+  "Return the full list of registered provider symbols.
+
+`anvil-orchestrator--providers' is the orchestrator's live provider
+registry (a hash-table keyed by provider symbol; see
+`anvil-orchestrator-register-provider').  We use `hash-table-keys'
+to enumerate it.  For test ergonomics we additionally accept an
+alist (e.g. `((claude) (codex))') so fixtures that let-bind the
+variable to a quoted list still work — but production code must
+populate the registry through the normal `register-provider' API,
+which always yields a hash-table."
   (when (boundp 'anvil-orchestrator--providers)
-    (mapcar #'car anvil-orchestrator--providers)))
+    (let ((reg anvil-orchestrator--providers))
+      (cond
+       ((hash-table-p reg) (hash-table-keys reg))
+       ;; Test-fixture path: alist of `(SYM . _)' or `(SYM)'.
+       ((listp reg) (mapcar (lambda (cell)
+                              (if (consp cell) (car cell) cell))
+                            reg))
+       (t nil)))))
 
 (defun anvil-orchestrator-routing--collect-samples (candidates since min-samples stats-fn)
   "Call STATS-FN per CANDIDATE with SINCE filter; keep those with >= MIN-SAMPLES.
