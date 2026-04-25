@@ -46,6 +46,13 @@
 
 (require 'cl-lib)
 (require 'subr-x)
+(require 'json)
+
+;; AI compression dispatches through anvil-orchestrator when
+;; available.  The module is loaded lazily; rule-based fallback
+;; works without it.
+(declare-function anvil-orchestrator-submit-and-collect
+                  "anvil-orchestrator")
 
 
 ;;;; --- group + defcustoms -------------------------------------------------
@@ -128,8 +135,83 @@ Set to nil to keep every row regardless of importance."
                  integer)
   :group 'anvil-memory-obs)
 
+
+;;;; --- Phase 2: compression knobs ---------------------------------------
+
+(defcustom anvil-memory-obs-compress-min-observations 5
+  "Skip session summarisation when fewer than this many obs rows exist.
+Tiny sessions are not worth a summary row."
+  :type 'integer
+  :group 'anvil-memory-obs)
+
+(defcustom anvil-memory-obs-compress-rule-excerpt-chars 200
+  "Characters retained from the head and tail when rule-based summary runs.
+Total fallback length is roughly twice this value."
+  :type 'integer
+  :group 'anvil-memory-obs)
+
+(defcustom anvil-memory-obs-compress-fallback 'rule-based
+  "Behaviour when AI compression is unavailable or skipped.
+  `rule-based' — concat first/last excerpts of each observation.
+  `none'       — skip; no summary row is created."
+  :type '(choice (const :tag "Rule-based excerpt" rule-based)
+                 (const :tag "No summary"         none))
+  :group 'anvil-memory-obs)
+
+(defcustom anvil-memory-obs-use-ai-compression nil
+  "When non-nil, `anvil-memory-obs-summarize-session' tries AI first.
+The AI path requires `anvil-orchestrator-submit-and-collect' to be
+loaded.  Failures fall back to the configured
+`anvil-memory-obs-compress-fallback' silently."
+  :type 'boolean
+  :group 'anvil-memory-obs)
+
+(defcustom anvil-memory-obs-compress-provider "claude"
+  "Default provider id passed to `anvil-orchestrator-submit-and-collect'."
+  :type 'string
+  :group 'anvil-memory-obs)
+
+(defcustom anvil-memory-obs-compress-model nil
+  "Default model slug for AI compression (nil = provider default)."
+  :type '(choice (const :tag "Provider default" nil) string)
+  :group 'anvil-memory-obs)
+
+(defcustom anvil-memory-obs-compress-timeout-sec 60
+  "Wall-clock cap for the AI compression call (`:collect-timeout-sec')."
+  :type 'integer
+  :group 'anvil-memory-obs)
+
+(defcustom anvil-memory-obs-compress-on-session-end nil
+  "When non-nil, `anvil-memory-obs-record-session-end' auto-summarises.
+Gated on `anvil-memory-obs-enabled' (which already gates the record
+function itself); off by default so opting into observation capture
+does not implicitly opt into LLM spend."
+  :type 'boolean
+  :group 'anvil-memory-obs)
+
+(defcustom anvil-memory-obs-compress-monthly-budget 100
+  "Maximum number of AI summary calls allowed per calendar month.
+When the count of `is_ai = 1' rows in `obs_summaries' for the
+current month reaches this value, AI compression is skipped and
+the rule-based fallback is used.  Set to nil to disable the guard."
+  :type '(choice (const :tag "No budget guard" nil)
+                 integer)
+  :group 'anvil-memory-obs)
+
+(defcustom anvil-memory-obs-compress-prompt-template
+  "You are summarising a software development session for later recall.
+Read the observation log below and respond with **strict JSON only**:
+{\"topic\": \"<= 8 words\", \"summary\": \"1-3 sentences\"}
+
+Observations:
+%s"
+  "Prompt template; %s is replaced by the rendered observation list."
+  :type 'string
+  :group 'anvil-memory-obs)
+
 (defconst anvil-memory-obs-supported
-  '(schema record importance redact integration purge)
+  '(schema record importance redact integration purge
+           compress-rule-based compress-ai compress-auto budget)
   "Capability tags this module currently provides.
 Tests `skip-unless' their tag is in this list so a half-shipped
 feature never breaks CI.  Phase milestones append tags here.")
@@ -239,11 +321,25 @@ feature never breaks CI.  Phase milestones append tags here.")
                        obs_end_id    INTEGER,
                        topic         TEXT,
                        summary       TEXT NOT NULL,
-                       ts            INTEGER NOT NULL
+                       ts            INTEGER NOT NULL,
+                       is_ai         INTEGER NOT NULL DEFAULT 0
                      )")
     (sqlite-execute db
                     "CREATE INDEX IF NOT EXISTS obs_summaries_session_idx
                        ON obs_summaries(session_id)")
+    (sqlite-execute db
+                    "CREATE INDEX IF NOT EXISTS obs_summaries_ts_idx
+                       ON obs_summaries(ts)")
+    ;; Forward-compat: a Phase 2 commit 1 DB lacks `is_ai'.  Add it
+    ;; in place so the budget guard can run without requiring a
+    ;; full rebuild.
+    (unless (cl-some
+             (lambda (col) (equal (nth 1 col) "is_ai"))
+             (sqlite-select db "PRAGMA table_info('obs_summaries')"))
+      (sqlite-execute
+       db
+       "ALTER TABLE obs_summaries
+          ADD COLUMN is_ai INTEGER NOT NULL DEFAULT 0"))
     ;; Standalone FTS5 (no content= mode) so inserts are explicit and
     ;; trigger-free; rowid is aligned with the obs_observations.id by
     ;; the caller.  Mirrors the memory_body_fts approach in
@@ -397,7 +493,11 @@ SUMMARY is the (truncated) tool result/argument summary."
      :payload (list :transcript-path transcript-path))))
 
 (defun anvil-memory-obs-record-session-end (session-id)
-  "Record a session-end observation and stamp ended_at on the session row."
+  "Record a session-end observation and stamp ended_at on the session row.
+When `anvil-memory-obs-compress-on-session-end' is non-nil, also
+trigger `anvil-memory-obs-summarize-session' after the row is
+written; summarisation errors are swallowed so a flaky orchestrator
+never breaks the session-end pipeline."
   (when (and anvil-memory-obs-enabled (stringp session-id))
     (let ((db (anvil-memory-obs--db))
           (now (anvil-memory-obs--now)))
@@ -406,11 +506,15 @@ SUMMARY is the (truncated) tool result/argument summary."
        db
        "UPDATE obs_sessions SET ended_at = ? WHERE id = ?"
        (list now session-id))
-      (anvil-memory-obs--insert-observation
-       :session-id session-id
-       :hook "session-end"
-       :body (format "session %s ended" session-id)
-       :ts now))))
+      (let ((rowid (anvil-memory-obs--insert-observation
+                    :session-id session-id
+                    :hook "session-end"
+                    :body (format "session %s ended" session-id)
+                    :ts now)))
+        (when anvil-memory-obs-compress-on-session-end
+          (ignore-errors
+            (anvil-memory-obs-summarize-session session-id)))
+        rowid))))
 
 
 ;;;; --- purge --------------------------------------------------------------
@@ -451,6 +555,185 @@ Returns the number of observation rows removed."
                      placeholders)
              ids)))
         (length ids)))))
+
+
+;;;; --- Phase 2: compression --------------------------------------------
+
+(defun anvil-memory-obs--gather-observations (session-id)
+  "Return rows (id ts hook tool body importance) for SESSION-ID, oldest first."
+  (sqlite-select
+   (anvil-memory-obs--db)
+   "SELECT id, ts, hook, tool_name, body, importance
+      FROM obs_observations
+      WHERE session_id = ?
+      ORDER BY id ASC"
+   (list session-id)))
+
+(defun anvil-memory-obs--rule-based-summary (obs-rows)
+  "Build a deterministic summary from OBS-ROWS without an LLM.
+Concatenates each row's hook + body excerpt; the result is one
+short paragraph suitable as a temporary stand-in until Phase 2
+ships the AI path."
+  (let* ((cap anvil-memory-obs-compress-rule-excerpt-chars)
+         (lines
+          (cl-loop for row in obs-rows
+                   for hook = (nth 2 row)
+                   for body = (or (nth 4 row) "")
+                   for excerpt = (if (<= (length body) cap)
+                                     body
+                                   (concat (substring body 0 cap)
+                                           " […] "
+                                           (substring body (- (length body)
+                                                              cap))))
+                   collect (format "[%s] %s" hook excerpt))))
+    (string-join lines "\n")))
+
+(defun anvil-memory-obs--rule-based-topic (obs-rows)
+  "Pick a coarse topic for OBS-ROWS by majority hook + tool name."
+  (let* ((tools (cl-loop for row in obs-rows
+                         for tool = (nth 3 row)
+                         when (and tool (not (string-empty-p tool)))
+                         collect tool))
+         (most-tool (when tools
+                      (caar (sort
+                             (mapcar (lambda (s) (cons s 1)) tools)
+                             (lambda (a _) (stringp (car a)))))))
+         (count (length obs-rows)))
+    (if most-tool
+        (format "%d obs (%s)" count most-tool)
+      (format "%d obs" count))))
+
+(defun anvil-memory-obs--insert-summary (session-id topic summary
+                                                    obs-start-id obs-end-id
+                                                    &optional is-ai)
+  "Persist a summary row and its FTS5 mirror.  Returns the row id.
+IS-AI is the integer flag (1 when AI produced the summary, 0 otherwise);
+nil treats it as 0."
+  (let* ((db (anvil-memory-obs--db))
+         (ts (anvil-memory-obs--now)))
+    (sqlite-execute
+     db
+     "INSERT INTO obs_summaries
+        (session_id, obs_start_id, obs_end_id, topic, summary, ts, is_ai)
+        VALUES (?, ?, ?, ?, ?, ?, ?)"
+     (list session-id obs-start-id obs-end-id
+           (or topic "") summary ts (if is-ai 1 0)))
+    (let ((rowid (caar (sqlite-select db "SELECT last_insert_rowid()"))))
+      (sqlite-execute
+       db
+       "INSERT INTO obs_summaries_fts (rowid, topic, summary)
+          VALUES (?, ?, ?)"
+       (list rowid (or topic "") summary))
+      rowid)))
+
+(defun anvil-memory-obs--current-month-start (&optional now)
+  "Return the unix epoch of the first day of the month containing NOW.
+NOW defaults to the current time (`anvil-memory-obs--now')."
+  (let* ((t* (or now (anvil-memory-obs--now)))
+         (dec (decode-time t*))
+         (year (nth 5 dec))
+         (month (nth 4 dec)))
+    (truncate (time-to-seconds (encode-time 0 0 0 1 month year)))))
+
+(defun anvil-memory-obs--ai-budget-exhausted-p ()
+  "Non-nil when this calendar month's AI summary count >= budget."
+  (when anvil-memory-obs-compress-monthly-budget
+    (let* ((db (anvil-memory-obs--db))
+           (since (anvil-memory-obs--current-month-start))
+           (count (caar (sqlite-select
+                         db
+                         "SELECT COUNT(*) FROM obs_summaries
+                            WHERE is_ai = 1 AND ts >= ?"
+                         (list since)))))
+      (>= count anvil-memory-obs-compress-monthly-budget))))
+
+(defun anvil-memory-obs--render-obs-for-prompt (obs-rows)
+  "Render OBS-ROWS as `[hook] body' lines for the AI prompt."
+  (mapconcat
+   (lambda (row)
+     (format "[%s] %s" (nth 2 row) (or (nth 4 row) "")))
+   obs-rows
+   "\n"))
+
+(defun anvil-memory-obs--strip-code-fences (text)
+  "Drop a leading / trailing ```json fence around TEXT, if any."
+  (let ((s text))
+    (setq s (replace-regexp-in-string
+             "\\`[[:space:]]*```[a-zA-Z]*\n?" "" s))
+    (setq s (replace-regexp-in-string
+             "\n?[[:space:]]*```[[:space:]]*\\'" "" s))
+    s))
+
+(defun anvil-memory-obs--parse-ai-response (text)
+  "Extract (TOPIC . SUMMARY) from TEXT.
+Tries strict JSON first; returns nil on any error so callers can
+fall back to the rule-based path."
+  (when (and (stringp text) (not (string-empty-p text)))
+    (condition-case _err
+        (let* ((cleaned (anvil-memory-obs--strip-code-fences text))
+               (json-object-type 'plist)
+               (json-key-type 'keyword)
+               (json-array-type 'list)
+               (parsed (json-read-from-string cleaned))
+               (topic (plist-get parsed :topic))
+               (summary (plist-get parsed :summary)))
+          (when (and (stringp topic) (stringp summary)
+                     (not (string-empty-p summary)))
+            (cons topic summary)))
+      (error nil))))
+
+(defun anvil-memory-obs--ai-summary (obs-rows)
+  "Submit OBS-ROWS to anvil-orchestrator and parse the JSON response.
+Returns (TOPIC . SUMMARY) on success or nil on any failure path
+(orchestrator unavailable, provider error, malformed JSON, timeout)."
+  (when (and obs-rows
+             (fboundp 'anvil-orchestrator-submit-and-collect))
+    (condition-case _err
+        (let* ((rendered (anvil-memory-obs--render-obs-for-prompt obs-rows))
+               (prompt (format anvil-memory-obs-compress-prompt-template
+                               rendered))
+               (result (funcall (intern "anvil-orchestrator-submit-and-collect")
+                                :provider anvil-memory-obs-compress-provider
+                                :model anvil-memory-obs-compress-model
+                                :prompt prompt
+                                :collect-timeout-sec
+                                anvil-memory-obs-compress-timeout-sec))
+               (status (and (listp result) (plist-get result :status)))
+               (text (when (eq status 'done)
+                       (or (plist-get result :summary)
+                           (plist-get result :text)))))
+          (anvil-memory-obs--parse-ai-response text))
+      (error nil))))
+
+(defun anvil-memory-obs-summarize-session (session-id &optional force-fallback)
+  "Compress SESSION-ID's observations into a single summary row.
+Tries AI summarisation when
+`anvil-memory-obs-use-ai-compression' is non-nil,
+`anvil-orchestrator-submit-and-collect' is loaded, and the monthly
+AI budget is not exhausted; otherwise (or when FORCE-FALLBACK is
+non-nil) emits the rule-based summary.
+Returns the new summary row id, or nil when the session is below
+the size gate or summaries are disabled."
+  (let* ((rows (anvil-memory-obs--gather-observations session-id))
+         (n (length rows)))
+    (cond
+     ((< n anvil-memory-obs-compress-min-observations) nil)
+     ((eq anvil-memory-obs-compress-fallback 'none)    nil)
+     (t
+      (let* ((ai-allowed (and (not force-fallback)
+                              anvil-memory-obs-use-ai-compression
+                              (not (anvil-memory-obs--ai-budget-exhausted-p))))
+             (ai (when ai-allowed
+                   (anvil-memory-obs--ai-summary rows)))
+             (topic (or (car-safe ai)
+                        (anvil-memory-obs--rule-based-topic rows)))
+             (summary (or (cdr-safe ai)
+                          (anvil-memory-obs--rule-based-summary rows)))
+             (start-id (nth 0 (car rows)))
+             (end-id   (nth 0 (car (last rows)))))
+        (anvil-memory-obs--insert-summary
+         session-id topic summary start-id end-id
+         (when ai 1)))))))
 
 
 ;;;; --- enable / disable stubs --------------------------------------------

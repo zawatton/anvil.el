@@ -299,6 +299,313 @@
         (should (>= (length rows) 1))))))
 
 
+;;;; --- Phase 2: rule-based compression tests -----------------------------
+
+(defun anvil-memory-obs-test--seed-session (session-id n)
+  "Insert N observations for SESSION-ID and return the row ids list."
+  (anvil-memory-obs--upsert-session session-id)
+  (cl-loop for i from 1 to n
+           collect (anvil-memory-obs--insert-observation
+                    :session-id session-id
+                    :hook (if (= i 1) "session-start" "post-tool-use")
+                    :tool-name (if (cl-evenp i) "Read" "Bash")
+                    :body (format "obs-body-%d details on this step" i))))
+
+(ert-deftest anvil-memory-obs-summarize-skips-tiny-sessions ()
+  "summarize-session returns nil when below the min-observations gate."
+  (skip-unless (anvil-memory-obs-test--supported-p 'compress-rule-based))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-compress-min-observations 5))
+      (anvil-memory-obs-test--seed-session "tiny" 3)
+      (should (null (anvil-memory-obs-summarize-session "tiny")))
+      (should (zerop (length
+                      (sqlite-select (anvil-memory-obs--db)
+                                     "SELECT id FROM obs_summaries")))))))
+
+(ert-deftest anvil-memory-obs-summarize-inserts-rule-based-summary ()
+  "summarize-session writes a summary row with correct id range."
+  (skip-unless (anvil-memory-obs-test--supported-p 'compress-rule-based))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-compress-min-observations 3))
+      (let* ((ids (anvil-memory-obs-test--seed-session "comp1" 5))
+             (sid (anvil-memory-obs-summarize-session "comp1")))
+        (should (integerp sid))
+        (let ((row (car (sqlite-select
+                         (anvil-memory-obs--db)
+                         "SELECT obs_start_id, obs_end_id, summary
+                            FROM obs_summaries WHERE id = ?"
+                         (list sid)))))
+          (should (= (nth 0 row) (car ids)))
+          (should (= (nth 1 row) (car (last ids))))
+          (should (string-match-p "obs-body-1" (nth 2 row)))
+          (should (string-match-p "obs-body-5" (nth 2 row))))))))
+
+(ert-deftest anvil-memory-obs-summarize-mirrors-into-fts ()
+  "Summary body is searchable through the FTS5 mirror."
+  (skip-unless (anvil-memory-obs-test--supported-p 'compress-rule-based))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-compress-min-observations 3))
+      (anvil-memory-obs-test--seed-session "comp2" 4)
+      (anvil-memory-obs-summarize-session "comp2")
+      ;; Use a hyphen-free token so unicode61 / trigram tokenisers
+      ;; behave the same way; the body fixture contains "details on
+      ;; this step" verbatim.
+      (let ((rows (sqlite-select
+                   (anvil-memory-obs--db)
+                   "SELECT rowid FROM obs_summaries_fts
+                     WHERE obs_summaries_fts MATCH 'details'")))
+        (should (>= (length rows) 1))))))
+
+(ert-deftest anvil-memory-obs-summarize-respects-none-fallback ()
+  "fallback = none => no summary row even with enough observations."
+  (skip-unless (anvil-memory-obs-test--supported-p 'compress-rule-based))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-compress-min-observations 3)
+          (anvil-memory-obs-compress-fallback 'none))
+      (anvil-memory-obs-test--seed-session "comp3" 5)
+      (should (null (anvil-memory-obs-summarize-session "comp3")))
+      (should (zerop (length
+                      (sqlite-select (anvil-memory-obs--db)
+                                     "SELECT id FROM obs_summaries")))))))
+
+(ert-deftest anvil-memory-obs-summarize-truncates-long-bodies ()
+  "Bodies longer than rule-excerpt-chars * 2 are summarised with `[…]'."
+  (skip-unless (anvil-memory-obs-test--supported-p 'compress-rule-based))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-compress-min-observations 3)
+          (anvil-memory-obs-compress-rule-excerpt-chars 10))
+      (anvil-memory-obs--upsert-session "comp4")
+      (dotimes (_ 4)
+        (anvil-memory-obs--insert-observation
+         :session-id "comp4" :hook "post-tool-use"
+         :body (concat "HEAD"
+                       (make-string 200 ?x)
+                       "TAIL")))
+      (anvil-memory-obs-summarize-session "comp4")
+      (let ((summary (caar (sqlite-select
+                            (anvil-memory-obs--db)
+                            "SELECT summary FROM obs_summaries"))))
+        (should (string-match-p "HEAD" summary))
+        (should (string-match-p "TAIL" summary))
+        (should (string-match-p "\\[…\\]" summary))))))
+
+
+;;;; --- Phase 2: AI compression tests -------------------------------------
+
+(ert-deftest anvil-memory-obs-parse-ai-response-strict-json ()
+  "parse-ai-response extracts (topic . summary) from clean JSON."
+  (skip-unless (anvil-memory-obs-test--supported-p 'compress-ai))
+  (let ((parsed (anvil-memory-obs--parse-ai-response
+                 "{\"topic\":\"refactor parser\",\"summary\":\"Cleaned up parsing.\"}")))
+    (should (equal (car parsed) "refactor parser"))
+    (should (equal (cdr parsed) "Cleaned up parsing."))))
+
+(ert-deftest anvil-memory-obs-parse-ai-response-strips-fences ()
+  "Markdown ```json fences around the JSON are tolerated."
+  (skip-unless (anvil-memory-obs-test--supported-p 'compress-ai))
+  (let ((parsed (anvil-memory-obs--parse-ai-response
+                 "```json\n{\"topic\":\"X\",\"summary\":\"Y\"}\n```")))
+    (should (equal (car parsed) "X"))
+    (should (equal (cdr parsed) "Y"))))
+
+(ert-deftest anvil-memory-obs-parse-ai-response-rejects-garbage ()
+  "Non-JSON or missing-field bodies return nil."
+  (skip-unless (anvil-memory-obs-test--supported-p 'compress-ai))
+  (should (null (anvil-memory-obs--parse-ai-response "not json at all")))
+  (should (null (anvil-memory-obs--parse-ai-response
+                 "{\"topic\":\"X\"}")))                ; no summary
+  (should (null (anvil-memory-obs--parse-ai-response ""))))
+
+(ert-deftest anvil-memory-obs-summarize-uses-ai-when-enabled ()
+  "use-ai-compression=t routes through the orchestrator stub."
+  (skip-unless (anvil-memory-obs-test--supported-p 'compress-ai))
+  (anvil-memory-obs-test--with-env
+    (cl-letf (((symbol-function 'anvil-orchestrator-submit-and-collect)
+               (lambda (&rest _args)
+                 (list :status 'done
+                       :summary
+                       "{\"topic\":\"AI topic\",\"summary\":\"AI body.\"}"))))
+      (let ((anvil-memory-obs-enabled t)
+            (anvil-memory-obs-use-ai-compression t)
+            (anvil-memory-obs-compress-min-observations 3))
+        (anvil-memory-obs-test--seed-session "ai1" 4)
+        (anvil-memory-obs-summarize-session "ai1")
+        (let ((row (car (sqlite-select
+                         (anvil-memory-obs--db)
+                         "SELECT topic, summary FROM obs_summaries"))))
+          (should (equal (nth 0 row) "AI topic"))
+          (should (equal (nth 1 row) "AI body.")))))))
+
+(ert-deftest anvil-memory-obs-summarize-falls-back-on-orchestrator-error ()
+  "AI failure falls back to rule-based without raising."
+  (skip-unless (anvil-memory-obs-test--supported-p 'compress-ai))
+  (anvil-memory-obs-test--with-env
+    (cl-letf (((symbol-function 'anvil-orchestrator-submit-and-collect)
+               (lambda (&rest _args)
+                 (error "boom"))))
+      (let ((anvil-memory-obs-enabled t)
+            (anvil-memory-obs-use-ai-compression t)
+            (anvil-memory-obs-compress-min-observations 3))
+        (anvil-memory-obs-test--seed-session "ai2" 4)
+        (anvil-memory-obs-summarize-session "ai2")
+        (let ((summary (caar (sqlite-select
+                              (anvil-memory-obs--db)
+                              "SELECT summary FROM obs_summaries"))))
+          (should (string-match-p "obs-body-1" summary))
+          (should (string-match-p "obs-body-4" summary)))))))
+
+(ert-deftest anvil-memory-obs-summarize-falls-back-on-malformed-json ()
+  "Garbage AI body yields a rule-based summary instead."
+  (skip-unless (anvil-memory-obs-test--supported-p 'compress-ai))
+  (anvil-memory-obs-test--with-env
+    (cl-letf (((symbol-function 'anvil-orchestrator-submit-and-collect)
+               (lambda (&rest _args)
+                 (list :status 'done :summary "definitely not json"))))
+      (let ((anvil-memory-obs-enabled t)
+            (anvil-memory-obs-use-ai-compression t)
+            (anvil-memory-obs-compress-min-observations 3))
+        (anvil-memory-obs-test--seed-session "ai3" 4)
+        (anvil-memory-obs-summarize-session "ai3")
+        (let ((summary (caar (sqlite-select
+                              (anvil-memory-obs--db)
+                              "SELECT summary FROM obs_summaries"))))
+          (should (string-match-p "obs-body" summary)))))))
+
+(ert-deftest anvil-memory-obs-summarize-skips-ai-when-flag-off ()
+  "use-ai-compression=nil never calls the orchestrator."
+  (skip-unless (anvil-memory-obs-test--supported-p 'compress-ai))
+  (anvil-memory-obs-test--with-env
+    (let ((called nil))
+      (cl-letf (((symbol-function 'anvil-orchestrator-submit-and-collect)
+                 (lambda (&rest _args)
+                   (setq called t)
+                   (list :status 'done :summary
+                         "{\"topic\":\"X\",\"summary\":\"Y\"}"))))
+        (let ((anvil-memory-obs-enabled t)
+              (anvil-memory-obs-use-ai-compression nil)
+              (anvil-memory-obs-compress-min-observations 3))
+          (anvil-memory-obs-test--seed-session "ai4" 4)
+          (anvil-memory-obs-summarize-session "ai4")
+          (should (null called)))))))
+
+(ert-deftest anvil-memory-obs-summarize-force-fallback-bypasses-ai ()
+  "FORCE-FALLBACK=t skips AI even when use-ai-compression=t."
+  (skip-unless (anvil-memory-obs-test--supported-p 'compress-ai))
+  (anvil-memory-obs-test--with-env
+    (let ((called nil))
+      (cl-letf (((symbol-function 'anvil-orchestrator-submit-and-collect)
+                 (lambda (&rest _args)
+                   (setq called t)
+                   (list :status 'done :summary
+                         "{\"topic\":\"X\",\"summary\":\"Y\"}"))))
+        (let ((anvil-memory-obs-enabled t)
+              (anvil-memory-obs-use-ai-compression t)
+              (anvil-memory-obs-compress-min-observations 3))
+          (anvil-memory-obs-test--seed-session "ai5" 4)
+          (anvil-memory-obs-summarize-session "ai5" t)
+          (should (null called)))))))
+
+
+;;;; --- Phase 2: AI budget guard tests ------------------------------------
+
+(ert-deftest anvil-memory-obs-summary-flag-records-is-ai ()
+  "Successful AI summarisation stores `is_ai=1'."
+  (skip-unless (anvil-memory-obs-test--supported-p 'budget))
+  (anvil-memory-obs-test--with-env
+    (cl-letf (((symbol-function 'anvil-orchestrator-submit-and-collect)
+               (lambda (&rest _args)
+                 (list :status 'done :summary
+                       "{\"topic\":\"X\",\"summary\":\"Y.\"}"))))
+      (let ((anvil-memory-obs-enabled t)
+            (anvil-memory-obs-use-ai-compression t)
+            (anvil-memory-obs-compress-monthly-budget nil)
+            (anvil-memory-obs-compress-min-observations 3))
+        (anvil-memory-obs-test--seed-session "bud1" 4)
+        (anvil-memory-obs-summarize-session "bud1")
+        (let ((flag (caar (sqlite-select
+                           (anvil-memory-obs--db)
+                           "SELECT is_ai FROM obs_summaries"))))
+          (should (= flag 1)))))))
+
+(ert-deftest anvil-memory-obs-summary-flag-rule-based-is-zero ()
+  "Rule-based summarisation stores `is_ai=0'."
+  (skip-unless (anvil-memory-obs-test--supported-p 'budget))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-use-ai-compression nil)
+          (anvil-memory-obs-compress-min-observations 3))
+      (anvil-memory-obs-test--seed-session "bud2" 4)
+      (anvil-memory-obs-summarize-session "bud2")
+      (let ((flag (caar (sqlite-select
+                         (anvil-memory-obs--db)
+                         "SELECT is_ai FROM obs_summaries"))))
+        (should (= flag 0))))))
+
+(ert-deftest anvil-memory-obs-budget-exhaustion-skips-ai ()
+  "When monthly budget is reached, AI is skipped (rule-based runs)."
+  (skip-unless (anvil-memory-obs-test--supported-p 'budget))
+  (anvil-memory-obs-test--with-env
+    (let ((called nil))
+      (cl-letf (((symbol-function 'anvil-orchestrator-submit-and-collect)
+                 (lambda (&rest _args)
+                   (setq called t)
+                   (list :status 'done :summary
+                         "{\"topic\":\"X\",\"summary\":\"Y.\"}"))))
+        (let ((anvil-memory-obs-enabled t)
+              (anvil-memory-obs-use-ai-compression t)
+              (anvil-memory-obs-compress-monthly-budget 1)
+              (anvil-memory-obs-compress-min-observations 3))
+          ;; Pre-populate the budget by inserting a fake AI summary row.
+          (anvil-memory-obs--upsert-session "seed")
+          (anvil-memory-obs--insert-summary
+           "seed" "T" "S" 1 1 1)
+          (anvil-memory-obs-test--seed-session "bud3" 4)
+          (anvil-memory-obs-summarize-session "bud3")
+          (should (null called))
+          (let ((flag (caar (sqlite-select
+                             (anvil-memory-obs--db)
+                             "SELECT is_ai FROM obs_summaries
+                               WHERE session_id = 'bud3'"))))
+            (should (= flag 0))))))))
+
+(ert-deftest anvil-memory-obs-budget-nil-disables-guard ()
+  "Setting the budget to nil never blocks AI."
+  (skip-unless (anvil-memory-obs-test--supported-p 'budget))
+  (anvil-memory-obs-test--with-env
+    (let ((called nil))
+      (cl-letf (((symbol-function 'anvil-orchestrator-submit-and-collect)
+                 (lambda (&rest _args)
+                   (setq called t)
+                   (list :status 'done :summary
+                         "{\"topic\":\"X\",\"summary\":\"Y.\"}"))))
+        (let ((anvil-memory-obs-enabled t)
+              (anvil-memory-obs-use-ai-compression t)
+              (anvil-memory-obs-compress-monthly-budget nil)
+              (anvil-memory-obs-compress-min-observations 3))
+          ;; Even with many existing AI summaries, no gate.
+          (anvil-memory-obs--upsert-session "seed")
+          (dotimes (_ 50)
+            (anvil-memory-obs--insert-summary "seed" "T" "S" 1 1 1))
+          (anvil-memory-obs-test--seed-session "bud4" 4)
+          (anvil-memory-obs-summarize-session "bud4")
+          (should called))))))
+
+(ert-deftest anvil-memory-obs-month-start-is-deterministic ()
+  "current-month-start matches the local-time first-of-month."
+  (skip-unless (anvil-memory-obs-test--supported-p 'budget))
+  (let* ((ts (time-to-seconds (encode-time 30 14 10 15 6 2026)))
+         (start (anvil-memory-obs--current-month-start (truncate ts)))
+         (start-time (decode-time start)))
+    (should (= (nth 3 start-time) 1))   ; day
+    (should (= (nth 4 start-time) 6))   ; month
+    (should (= (nth 5 start-time) 2026)))) ; year
+
+
 ;;;; --- purge tests --------------------------------------------------------
 
 (ert-deftest anvil-memory-obs-purge-removes-old-low-importance ()
@@ -380,6 +687,71 @@
                   (sqlite-select (anvil-memory-obs--db)
                                  "SELECT id FROM obs_observations"))
                  1)))))
+
+
+;;;; --- Phase 2: auto-compression-on-session-end tests --------------------
+
+(ert-deftest anvil-memory-obs-auto-compress-off-by-default ()
+  "Default flag off: session-end alone never creates a summary row."
+  (skip-unless (anvil-memory-obs-test--supported-p 'compress-auto))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-compress-on-session-end nil)
+          (anvil-memory-obs-compress-min-observations 3))
+      (anvil-memory-obs-test--seed-session "auto-off" 5)
+      (anvil-memory-obs-record-session-end "auto-off")
+      (should (zerop (length
+                      (sqlite-select (anvil-memory-obs--db)
+                                     "SELECT id FROM obs_summaries")))))))
+
+(ert-deftest anvil-memory-obs-auto-compress-creates-summary ()
+  "Flag on: session-end populates obs_summaries with a rule-based row."
+  (skip-unless (anvil-memory-obs-test--supported-p 'compress-auto))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-compress-on-session-end t)
+          (anvil-memory-obs-use-ai-compression nil)
+          (anvil-memory-obs-compress-min-observations 3))
+      (anvil-memory-obs-test--seed-session "auto-on" 5)
+      (anvil-memory-obs-record-session-end "auto-on")
+      (let ((rows (sqlite-select
+                   (anvil-memory-obs--db)
+                   "SELECT session_id FROM obs_summaries")))
+        (should (= (length rows) 1))
+        (should (equal (caar rows) "auto-on"))))))
+
+(ert-deftest anvil-memory-obs-auto-compress-respects-min-observations ()
+  "Even with the flag on, sessions below min-observations skip summary."
+  (skip-unless (anvil-memory-obs-test--supported-p 'compress-auto))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-compress-on-session-end t)
+          (anvil-memory-obs-compress-min-observations 5))
+      (anvil-memory-obs-test--seed-session "auto-tiny" 3)
+      (anvil-memory-obs-record-session-end "auto-tiny")
+      (should (zerop (length
+                      (sqlite-select (anvil-memory-obs--db)
+                                     "SELECT id FROM obs_summaries")))))))
+
+(ert-deftest anvil-memory-obs-auto-compress-swallows-errors ()
+  "A flaky AI path does not break the session-end pipeline."
+  (skip-unless (anvil-memory-obs-test--supported-p 'compress-auto))
+  (anvil-memory-obs-test--with-env
+    (cl-letf (((symbol-function 'anvil-orchestrator-submit-and-collect)
+               (lambda (&rest _args)
+                 (error "boom"))))
+      (let ((anvil-memory-obs-enabled t)
+            (anvil-memory-obs-compress-on-session-end t)
+            (anvil-memory-obs-use-ai-compression t)
+            (anvil-memory-obs-compress-min-observations 3))
+        (anvil-memory-obs-test--seed-session "auto-flaky" 5)
+        ;; should-not error => the call must complete
+        (anvil-memory-obs-record-session-end "auto-flaky")
+        ;; rule-based fallback wrote a summary anyway
+        (should (= (length
+                    (sqlite-select (anvil-memory-obs--db)
+                                   "SELECT id FROM obs_summaries"))
+                   1))))))
 
 
 ;;;; --- anvil-session integration tests ------------------------------------
