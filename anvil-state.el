@@ -50,6 +50,7 @@
 
 (require 'cl-lib)
 (require 'subr-x)
+(require 'nelisp-state nil 'noerror)
 
 ;;; Customization
 
@@ -80,10 +81,14 @@ Bump on incompatible changes; add a migration branch in
 ;;; Backend plumbing
 
 (defun anvil-state--require-sqlite ()
-  "Signal `user-error' unless built-in sqlite (Emacs 29+) is available."
-  (unless (and (fboundp 'sqlite-available-p) (sqlite-available-p))
-    (user-error
-     "anvil-state: built-in sqlite not available (Emacs 29+ required)")))
+  "Signal `user-error' unless built-in sqlite (Emacs 29+) is available.
+
+Delegates to `nelisp-state--require-sqlite' when available."
+  (if (fboundp 'nelisp-state--require-sqlite)
+      (nelisp-state--require-sqlite)
+    (unless (and (fboundp 'sqlite-available-p) (sqlite-available-p))
+      (user-error
+       "anvil-state: built-in sqlite not available (Emacs 29+ required)"))))
 
 (defun anvil-state--open ()
   "Open the database at `anvil-state-db-path' and cache the handle."
@@ -164,32 +169,44 @@ Phase 1 only knows schema v1."
 
 (defun anvil-state--serialize (val)
   "Return a printed, re-readable representation of VAL.
-Signals `user-error' when VAL contains non-readable objects."
-  (let ((printed (let ((print-length nil)
-                       (print-level nil)
-                       (print-circle t))
-                   (prin1-to-string val))))
-    (condition-case err
-        (let ((round (car (read-from-string printed))))
-          (ignore round)
-          printed)
-      (error
-       (user-error
-        "anvil-state: value is not readable (%s): %S"
-        (error-message-string err) val)))))
+Signals `user-error' when VAL contains non-readable objects.
+
+Delegates to `nelisp-state--serialize' when available."
+  (if (fboundp 'nelisp-state--serialize)
+      (nelisp-state--serialize val)
+    (let ((printed (let ((print-length nil)
+                         (print-level nil)
+                         (print-circle t))
+                     (prin1-to-string val))))
+      (condition-case err
+          (let ((round (car (read-from-string printed))))
+            (ignore round)
+            printed)
+        (error
+         (user-error
+          "anvil-state: value is not readable (%s): %S"
+          (error-message-string err) val))))))
 
 (defun anvil-state--deserialize (text)
-  "Restore the Lisp value stored as TEXT."
-  (car (read-from-string text)))
+  "Restore the Lisp value stored as TEXT.
+
+Delegates to `nelisp-state--deserialize' when available."
+  (if (fboundp 'nelisp-state--deserialize)
+      (nelisp-state--deserialize text)
+    (car (read-from-string text))))
 
 ;;; Key helpers
 
 (defun anvil-state--check-string (name val)
   "Signal `user-error' unless VAL is a non-empty string.
-NAME is the argument name used in the error message."
-  (unless (and (stringp val) (not (string-empty-p val)))
-    (user-error "anvil-state: %s must be a non-empty string, got %S"
-                name val)))
+NAME is the argument name used in the error message.
+
+Delegates to `nelisp-state--check-string' when available."
+  (if (fboundp 'nelisp-state--check-string)
+      (nelisp-state--check-string name val)
+    (unless (and (stringp val) (not (string-empty-p val)))
+      (user-error "anvil-state: %s must be a non-empty string, got %S"
+                  name val))))
 
 (defun anvil-state--ns (opts)
   "Pick the namespace out of OPTS, defaulting to `anvil-state-default-namespace'."
@@ -198,18 +215,22 @@ NAME is the argument name used in the error message."
     ns))
 
 (defun anvil-state--expires-at (opts)
-  "Return an absolute unix-timestamp for `:ttl' in OPTS, or nil."
-  (let ((ttl (plist-get opts :ttl)))
-    (cond
-     ((null ttl) nil)
-     ((and (integerp ttl) (> ttl 0))
-      (+ (truncate (float-time)) ttl))
-     ((and (numberp ttl) (> ttl 0))
-      (+ (truncate (float-time)) (truncate ttl)))
-     (t
-      (user-error
-       "anvil-state: :ttl must be a positive number of seconds, got %S"
-       ttl)))))
+  "Return an absolute unix-timestamp for `:ttl' in OPTS, or nil.
+
+Delegates to `nelisp-state--expires-at' when available."
+  (if (fboundp 'nelisp-state--expires-at)
+      (nelisp-state--expires-at opts)
+    (let ((ttl (plist-get opts :ttl)))
+      (cond
+       ((null ttl) nil)
+       ((and (integerp ttl) (> ttl 0))
+        (+ (truncate (float-time)) ttl))
+       ((and (numberp ttl) (> ttl 0))
+        (+ (truncate (float-time)) (truncate ttl)))
+       (t
+        (user-error
+         "anvil-state: :ttl must be a positive number of seconds, got %S"
+         ttl))))))
 
 ;;; Public API
 
