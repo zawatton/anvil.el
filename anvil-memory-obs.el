@@ -129,7 +129,7 @@ Set to nil to keep every row regardless of importance."
   :group 'anvil-memory-obs)
 
 (defconst anvil-memory-obs-supported
-  '(schema record importance redact)
+  '(schema record importance redact integration)
   "Capability tags this module currently provides.
 Tests `skip-unless' their tag is in this list so a half-shipped
 feature never breaks CI.  Phase milestones append tags here.")

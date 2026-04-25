@@ -299,5 +299,97 @@
         (should (>= (length rows) 1))))))
 
 
+;;;; --- anvil-session integration tests ------------------------------------
+
+(require 'anvil-session nil t)
+
+(ert-deftest anvil-memory-obs-integration-session-start ()
+  "Dispatching session-start through anvil-session creates an obs row."
+  (skip-unless (anvil-memory-obs-test--supported-p 'integration))
+  (skip-unless (fboundp 'anvil-session-hook-dispatch))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t))
+      (anvil-session-hook-dispatch 'session-start "int-1")
+      (let ((rows (sqlite-select
+                   (anvil-memory-obs--db)
+                   "SELECT hook FROM obs_observations
+                     WHERE session_id = 'int-1'")))
+        (should (member "session-start" (mapcar #'car rows)))))))
+
+(ert-deftest anvil-memory-obs-integration-user-prompt ()
+  "Dispatching user-prompt records the prompt body."
+  (skip-unless (anvil-memory-obs-test--supported-p 'integration))
+  (skip-unless (fboundp 'anvil-session-hook-dispatch))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t))
+      (anvil-session-hook-dispatch 'user-prompt "int-2" "investigate slow build")
+      (let ((rows (sqlite-select
+                   (anvil-memory-obs--db)
+                   "SELECT body FROM obs_observations
+                     WHERE session_id = 'int-2' AND hook = 'user-prompt'")))
+        (should (= (length rows) 1))
+        (should (string-match-p "slow build" (caar rows)))))))
+
+(ert-deftest anvil-memory-obs-integration-post-tool-use ()
+  "Dispatching post-tool-use stores the tool name."
+  (skip-unless (anvil-memory-obs-test--supported-p 'integration))
+  (skip-unless (fboundp 'anvil-session-hook-dispatch))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t))
+      (anvil-session-hook-dispatch 'post-tool-use "int-3" "Bash" "ls /tmp")
+      (let ((rows (sqlite-select
+                   (anvil-memory-obs--db)
+                   "SELECT tool_name FROM obs_observations
+                     WHERE session_id = 'int-3' AND hook = 'post-tool-use'")))
+        (should (equal (mapcar #'car rows) '("Bash")))))))
+
+(ert-deftest anvil-memory-obs-integration-session-end ()
+  "Dispatching session-end records the obs row and stamps ended_at."
+  (skip-unless (anvil-memory-obs-test--supported-p 'integration))
+  (skip-unless (fboundp 'anvil-session-hook-dispatch))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t))
+      (anvil-session-hook-dispatch 'session-start "int-4")
+      (anvil-session-hook-dispatch 'session-end "int-4")
+      (let* ((db (anvil-memory-obs--db))
+             (sess (sqlite-select
+                    db
+                    "SELECT ended_at FROM obs_sessions WHERE id = 'int-4'"))
+             (obs (sqlite-select
+                   db
+                   "SELECT hook FROM obs_observations
+                     WHERE session_id = 'int-4' ORDER BY id")))
+        (should (integerp (caar sess)))
+        (should (member "session-end" (mapcar #'car obs)))))))
+
+(ert-deftest anvil-memory-obs-integration-stop ()
+  "Dispatching stop records the transcript path as obs body."
+  (skip-unless (anvil-memory-obs-test--supported-p 'integration))
+  (skip-unless (fboundp 'anvil-session-hook-dispatch))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t))
+      (anvil-session-hook-dispatch 'stop "int-5" "/tmp/transcript-int-5.json")
+      (let ((rows (sqlite-select
+                   (anvil-memory-obs--db)
+                   "SELECT body FROM obs_observations
+                     WHERE session_id = 'int-5' AND hook = 'stop'")))
+        (should (= (length rows) 1))
+        (should (string-match-p "transcript-int-5" (caar rows)))))))
+
+(ert-deftest anvil-memory-obs-integration-disabled-is-noop ()
+  "When the module is loaded but disabled, dispatch creates no obs rows."
+  (skip-unless (anvil-memory-obs-test--supported-p 'integration))
+  (skip-unless (fboundp 'anvil-session-hook-dispatch))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled nil))
+      (anvil-session-hook-dispatch 'session-start "int-6")
+      (anvil-session-hook-dispatch 'user-prompt "int-6" "hello")
+      (let ((db (anvil-memory-obs--db)))
+        (should
+         (zerop
+          (caar (sqlite-select
+                 db "SELECT COUNT(*) FROM obs_observations"))))))))
+
+
 (provide 'anvil-memory-obs-test)
 ;;; anvil-memory-obs-test.el ends here

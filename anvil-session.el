@@ -437,6 +437,9 @@ the shell wrapper does not crash the Claude hook pipeline."
       ('stop
        (let* ((session-id (or (nth 0 args) "unknown"))
               (transcript-path (nth 1 args)))
+         (when (fboundp 'anvil-memory-obs-record-stop)
+           (funcall (intern "anvil-memory-obs-record-stop")
+                    session-id transcript-path))
          (if (fboundp 'anvil-compact-on-stop)
              (funcall (intern "anvil-compact-on-stop")
                       session-id
@@ -452,6 +455,9 @@ the shell wrapper does not crash the Claude hook pipeline."
                (when (fboundp 'anvil-compact-on-session-start)
                  (funcall (intern "anvil-compact-on-session-start")
                           session-id))))
+         (when (fboundp 'anvil-memory-obs-record-session-start)
+           (funcall (intern "anvil-memory-obs-record-session-start")
+                    session-id default-directory))
          (if (and (stringp compact-preamble)
                   (not (string-empty-p compact-preamble)))
              compact-preamble
@@ -460,11 +466,17 @@ the shell wrapper does not crash the Claude hook pipeline."
        (let* ((session-id (or (nth 0 args) "unknown"))
               (tool (nth 1 args))
               (summary (nth 2 args)))
+         (when (fboundp 'anvil-memory-obs-record-post-tool-use)
+           (funcall (intern "anvil-memory-obs-record-post-tool-use")
+                    session-id tool summary))
          (anvil-session-log-event session-id 'tool-use
                                   :tool tool :summary summary)))
       ('user-prompt
        (let* ((session-id (or (nth 0 args) "unknown"))
               (prompt (nth 1 args)))
+         (when (fboundp 'anvil-memory-obs-record-user-prompt)
+           (funcall (intern "anvil-memory-obs-record-user-prompt")
+                    session-id prompt))
          (anvil-session-log-event session-id 'user-prompt
                                   :summary prompt)
          (let ((nudge (when (fboundp 'anvil-compact-on-user-prompt)
@@ -475,6 +487,9 @@ the shell wrapper does not crash the Claude hook pipeline."
              ""))))
       ('session-end
        (let ((session-id (or (nth 0 args) "unknown")))
+         (when (fboundp 'anvil-memory-obs-record-session-end)
+           (funcall (intern "anvil-memory-obs-record-session-end")
+                    session-id))
          (anvil-session-log-event session-id 'session-end
                                   :summary "session ended")))
       (_ (list :error
