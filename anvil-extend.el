@@ -1,4 +1,4 @@
-;;; anvil-extend.el --- Claude self-extension SDK scaffold + hot-reload (Phase A+B) -*- lexical-binding: t; -*-
+;;; anvil-extend.el --- Claude self-extension SDK scaffold + hot-reload + sandbox v0 (Phase A+B+C) -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026 zawatton
 
@@ -10,9 +10,10 @@
 
 ;;; Commentary:
 
-;; anvil-extend implements Phases A and B of the Claude self-extension
-;; SDK sketched in `docs/design/38-claude-self-extension-sdk.org'
-;; (LOCKED v2; renumbered from former Doc 35 per option B path).
+;; anvil-extend implements Phases A, B, and C (sandbox v0) of the
+;; Claude self-extension SDK sketched in
+;; `docs/design/38-claude-self-extension-sdk.org' (LOCKED v2;
+;; renumbered from former Doc 35 per option B path).
 ;;
 ;; Phase A ships a scaffold generator that lets a Claude Code session
 ;; emit a new ad-hoc tool module — elisp body + ERT skeleton + MCP
@@ -25,6 +26,20 @@
 ;; load fails.  A `filenotify' watcher lets a session auto-reload after
 ;; every edit so the inner loop is `scaffold → edit → save → ERT' with
 ;; no manual reload step.
+;;
+;; Phase C (sandbox v0) layers an isolated-subprocess + static AST
+;; policy-scan baseline on top.  Per Doc 38 §3.C the v0 surface is
+;; deliberately the best-effort layer that can be built on shipped
+;; code: forms are evaluated through `anvil-offload' (a separate REPL
+;; subprocess) so a runaway eval cannot directly damage the host
+;; daemon, and a recursive AST walker rejects forms that statically
+;; reference high-privilege callables (shell-command, delete-file,
+;; make-process, network primitives, ...) before any subprocess hop
+;; is made.  This is *not* a syscall-level sandbox — file I/O and
+;; network sockets opened from inside the subprocess still hit the
+;; OS — and Doc 38 §3.C.v1 / §6.1 will eventually layer real
+;; seccomp / RLIMIT / chroot enforcement on top.  Phase v0's scope is
+;; strictly: process isolation + AST scan + per-session policy plist.
 ;;
 ;; Public API (all `anvil-extend-*' prefixed for safe namespace
 ;; reservation per Doc 38 §3.A/§3.B spec; the Phase A names are
@@ -73,15 +88,39 @@
 ;;   (anvil-extend-watch-all)                                 -- Phase B
 ;;     Watch every scaffolded extension currently on disk.
 ;;
+;;   (anvil-extend-eval-sandboxed FORM &key timeout memory-limit)  -- Phase C
+;;     Statically AST-scan FORM for blacklisted callables; on clean
+;;     scan, ship FORM to an `anvil-offload' subprocess and await the
+;;     reply.  Returns a plist `(:status :success :result V)' /
+;;     `(:status :violation :forms ...)' / `(:status :timeout ...)' /
+;;     `(:status :error :reason ...)' — failures are reported as data
+;;     so MCP callers do not have to wrap a `condition-case'.
+;;
+;;   (anvil-extend-scan-dangerous-forms FORM)                 -- Phase C
+;;     Pure recursive AST walker; returns the list of
+;;     `(:form FORM :reason REASON)' hits, or nil if FORM only uses
+;;     callables outside the blacklist.  Honors any allowances
+;;     toggled by `anvil-extend-sandbox-policy'.
+;;
+;;   (anvil-extend-sandbox-policy &key allow-shell allow-network
+;;                                     allow-fileio)           -- Phase C
+;;     Update the per-session policy plist that
+;;     `anvil-extend-scan-dangerous-forms' consults.  Defaults deny
+;;     all three classes; pass `:allow-shell t' (etc.) to permit a
+;;     class.  Returns the resulting plist.
+;;
 ;; MCP tools registered against `emacs-eval':
 ;;
-;;   `anvil-extend-scaffold' (Phase A) — emit scaffold files
-;;   `anvil-extend-reload'   (Phase B) — transactional hot-reload
-;;   `anvil-extend-watch'    (Phase B) — install auto-reload watch
+;;   `anvil-extend-scaffold'              (Phase A) — emit scaffold files
+;;   `anvil-extend-reload'                (Phase B) — transactional hot-reload
+;;   `anvil-extend-watch'                 (Phase B) — install auto-reload watch
+;;   `anvil-extend-eval-sandboxed'        (Phase C) — sandbox v0 eval
+;;   `anvil-extend-scan-dangerous-forms'  (Phase C) — AST policy scan
 ;;
-;; Phases C-F (sandbox eval / rationale auto-record / NeLisp execute
-;; path / ephemeral-permanent promotion gates) remain out of scope
-;; per Doc 38 §3.C-§3.F.
+;; Phases D-F (rationale auto-record / NeLisp execute path / ephemeral-
+;; permanent promotion gates) remain out of scope per Doc 38 §3.D-§3.F.
+;; Phase C v1 (real syscall sandbox = seccomp / RLIMIT / chroot /
+;; namespace) is the future Phase 9d.A6 task per Doc 38 §3.C.v1 / §6.
 
 ;;; Code:
 
@@ -90,6 +129,12 @@
 (require 'ert)
 (require 'filenotify)
 (require 'bytecomp)
+
+;; Phase C uses anvil-offload's REPL pool + future API for the
+;; isolated-subprocess baseline.  We require eagerly because
+;; `anvil-extend-eval-sandboxed' is part of the public surface and
+;; load failure should surface at module load time, not first call.
+(require 'anvil-offload)
 
 ;;;; --- customization ------------------------------------------------------
 
@@ -792,6 +837,290 @@ Returns a list of (NAME . HANDLE) pairs."
        (cons name (anvil-extend-watch name))))
    (anvil-extend-list)))
 
+;;;; --- Phase C: sandbox v0 (isolated subprocess + AST scan) --------------
+
+;; Per Doc 38 §3.C.v0 the Phase C scope is *process isolation +
+;; static AST policy scan*, NOT a syscall-level sandbox.  See the
+;; commentary above and the §3.C.v0 / §6.1 sections of the design
+;; doc for the full enumeration of what is and is not enforced.
+
+(defcustom anvil-extend-sandbox-default-timeout 5.0
+  "Default seconds awaited for a sandboxed eval before timing out.
+
+The timeout is enforced via `anvil-future-await' on the
+`anvil-offload' future.  On expiry the future is left running
+in the subprocess (use `anvil-future-kill' from the result
+plist's `:future' field if you need to hard-stop it); a
+`(:status :timeout ...)' plist is returned to the caller."
+  :type 'number
+  :group 'anvil-extend)
+
+(defcustom anvil-extend-sandbox-memory-limit nil
+  "Soft memory limit hint (bytes) recorded into the result plist.
+
+Phase v0 does not enforce this — `RLIMIT_AS' is a Phase v1
+concern (Doc 38 §3.C.v1 / §6).  The value is merely echoed back
+in the result plist so a caller can record what it asked for."
+  :type '(choice (const :tag "Unbounded" nil) integer)
+  :group 'anvil-extend)
+
+(defconst anvil-extend--dangerous-shell-functions
+  '(shell-command
+    shell-command-to-string
+    call-process
+    call-process-region
+    call-process-shell-command
+    process-file
+    process-file-shell-command
+    start-process
+    start-process-shell-command
+    start-file-process
+    start-file-process-shell-command
+    make-process
+    make-pipe-process)
+  "Callables classified as `:shell' for AST policy purposes.
+
+Hits in this list are rejected unless the active policy plist
+has `:allow-shell t'.  The list intentionally covers both the
+synchronous `*-process' family and the asynchronous
+`make-process' / `start-process' family because both can shell
+out under the right `:command' value.")
+
+(defconst anvil-extend--dangerous-fileio-functions
+  '(delete-file
+    delete-directory
+    rename-file
+    copy-file
+    write-region
+    set-file-modes
+    set-file-times
+    set-file-acl
+    set-file-extended-attributes
+    add-name-to-file
+    make-symbolic-link
+    chmod
+    chown)
+  "Callables classified as `:fileio' for AST policy purposes.
+
+Hits in this list are rejected unless the active policy plist
+has `:allow-fileio t'.  Read-only file access (e.g.
+`insert-file-contents') is intentionally NOT in this list — the
+v0 policy is mutation-oriented because read-only access cannot
+damage the host filesystem.")
+
+(defconst anvil-extend--dangerous-network-functions
+  '(make-network-process
+    open-network-stream
+    url-retrieve
+    url-retrieve-synchronously
+    url-copy-file
+    url-http
+    network-stream-open
+    open-tls-stream)
+  "Callables classified as `:network' for AST policy purposes.
+
+Hits in this list are rejected unless the active policy plist
+has `:allow-network t'.")
+
+(defun anvil-extend--default-policy ()
+  "Return a freshly allocated deny-all policy plist.
+
+Built with `list' (not a quoted literal) so successive
+`plist-put' calls — which mutate cells in place when a key
+already exists — cannot share structure with the module-level
+default and silently flip subsequent callers' policy.  This
+mirrors `feedback_elisp_quoted_literal_nreverse_share.md'."
+  (list :allow-shell nil :allow-network nil :allow-fileio nil))
+
+(defvar anvil-extend--sandbox-policy
+  (anvil-extend--default-policy)
+  "Per-session policy plist consulted by the AST scanner.
+
+Default denies all three classes (`:allow-shell',
+`:allow-network', `:allow-fileio').  Mutated through
+`anvil-extend-sandbox-policy'; per Doc 38 §3.C.v0 the policy
+layer is best-effort — flipping `:allow-shell t' lets a form
+through the AST gate but does not weaken any other defence
+because there is no other defence at v0.")
+
+(defun anvil-extend--policy-class-allowed-p (class &optional policy)
+  "Return non-nil if CLASS is currently permitted by POLICY.
+
+CLASS is one of `:shell', `:fileio', `:network'.  POLICY
+defaults to the active `anvil-extend--sandbox-policy'."
+  (let* ((p (or policy anvil-extend--sandbox-policy))
+         (key (pcase class
+                (:shell   :allow-shell)
+                (:fileio  :allow-fileio)
+                (:network :allow-network)
+                (_        nil))))
+    (and key (plist-get p key))))
+
+(defun anvil-extend--classify-function (sym)
+  "Return the policy class for SYM, or nil if not blacklisted.
+
+Returns one of `:shell', `:fileio', `:network', or nil."
+  (cond
+   ((memq sym anvil-extend--dangerous-shell-functions)   :shell)
+   ((memq sym anvil-extend--dangerous-fileio-functions)  :fileio)
+   ((memq sym anvil-extend--dangerous-network-functions) :network)
+   (t                                                    nil)))
+
+(defun anvil-extend-scan-dangerous-forms (form &optional policy)
+  "Recursively scan FORM for blacklisted callables.
+
+POLICY is an optional policy plist (same shape as
+`anvil-extend--sandbox-policy'); defaults to the live module
+value.  Returns a list of `(:form SUBFORM :reason CLASS)'
+plists, or nil if FORM only references callables that are
+either outside the blacklist or explicitly permitted by POLICY.
+
+The walker descends into every `cdr' of every cons cell so
+nested forms (e.g. `(let (...) (shell-command ...))') are
+detected.  Vectors are walked elementwise.  Atoms (numbers,
+strings, symbols other than the call head, ...) are pure
+data and never produce a hit.  No macroexpansion is performed
+so a macro that internally expands to `shell-command' will
+*not* trip the gate — Doc 38 §3.C.v0 documents this as an
+explicit best-effort limitation."
+  (let ((hits nil)
+        (active-policy (or policy anvil-extend--sandbox-policy)))
+    (cl-labels
+        ((walk (node)
+           (cond
+            ((vectorp node)
+             (dotimes (i (length node))
+               (walk (aref node i))))
+            ((consp node)
+             (let ((head (car node)))
+               (when (symbolp head)
+                 (let ((class (anvil-extend--classify-function head)))
+                   (when (and class
+                              (not (anvil-extend--policy-class-allowed-p
+                                    class active-policy)))
+                     (push (list :form node :reason class) hits)))))
+             ;; Walk every element so that head-position calls inside
+             ;; nested forms (e.g. (let (...) (shell-command ...))) are
+             ;; also caught.  `dolist' over a list whose tail is nil
+             ;; handles both proper and dotted lists adequately for
+             ;; macro-shaped source.
+             (let ((cur node))
+               (while (consp cur)
+                 (walk (car cur))
+                 (setq cur (cdr cur)))
+               ;; A trailing non-nil atom is just data; ignore.
+               )))))
+      (walk form))
+    (nreverse hits)))
+
+(defun anvil-extend-sandbox-policy (&rest args)
+  "Update the per-session sandbox policy plist and return it.
+
+ARGS is a list of keyword/value pairs.  Recognised keys:
+
+  :allow-shell    BOOL  -- permit AST hits in
+                           `anvil-extend--dangerous-shell-functions'
+  :allow-network  BOOL  -- permit AST hits in
+                           `anvil-extend--dangerous-network-functions'
+  :allow-fileio   BOOL  -- permit AST hits in
+                           `anvil-extend--dangerous-fileio-functions'
+
+Unknown keys are stored verbatim so future Phase v1 additions
+(e.g. `:max-memory') compose without code changes here.  Returns
+the resulting policy plist."
+  (cl-loop for (k v) on args by #'cddr
+           do (setq anvil-extend--sandbox-policy
+                    (plist-put anvil-extend--sandbox-policy k v)))
+  anvil-extend--sandbox-policy)
+
+(defun anvil-extend-sandbox-policy-reset ()
+  "Reset the sandbox policy to the deny-all default.
+
+Provided so tests (and humans) can recover deterministically
+from a session that flipped a class on with
+`anvil-extend-sandbox-policy'.  Returns the reset plist.  Uses
+`anvil-extend--default-policy' so successive resets do not
+share structure (see commentary on that helper)."
+  (setq anvil-extend--sandbox-policy (anvil-extend--default-policy)))
+
+(define-error 'anvil-extend-sandbox-violation
+  "anvil-extend sandbox AST policy violation")
+
+;;;###autoload
+(cl-defun anvil-extend-eval-sandboxed (form &key timeout memory-limit policy)
+  "Evaluate FORM in an isolated subprocess after a static AST policy scan.
+
+Steps (Doc 38 §3.C.v0):
+
+  1. Walk FORM with `anvil-extend-scan-dangerous-forms' under
+     POLICY (default = live `anvil-extend--sandbox-policy').
+     If any blacklisted callable shows up that the policy does
+     not permit, return immediately with `:status :violation'.
+  2. Ship the still-quoted FORM to an `anvil-offload' subprocess
+     so a runaway eval cannot crash or wedge the host daemon.
+  3. `anvil-future-await' the reply with TIMEOUT seconds (defaults
+     to `anvil-extend-sandbox-default-timeout').  On timeout the
+     future is returned in the result plist so a caller can
+     `anvil-future-kill' it; the subprocess is *not* auto-killed
+     because Phase v0 is opt-in on hard-kill.
+
+Failure modes are reported as data, not as signals, so MCP
+callers can introspect without a `condition-case' wrapper.
+Returns one of:
+
+  (:status :success   :result VALUE)
+  (:status :violation :forms LIST :reason \"static AST scan rejected\")
+  (:status :timeout   :timeout SEC :future FUTURE)
+  (:status :error     :reason MSG)
+
+MEMORY-LIMIT is currently a hint only; per Doc 38 §3.C.v0 there
+is no `RLIMIT_AS' enforcement at v0 — it is echoed back in the
+`:memory-limit' field of the result plist so callers can record
+what they asked for."
+  (let* ((scan-policy (or policy anvil-extend--sandbox-policy))
+         (hits (anvil-extend-scan-dangerous-forms form scan-policy)))
+    (cond
+     (hits
+      (list :status :violation
+            :forms hits
+            :reason "static AST scan rejected"
+            :memory-limit (or memory-limit
+                              anvil-extend-sandbox-memory-limit)))
+     (t
+      (let ((wait (or timeout anvil-extend-sandbox-default-timeout)))
+        (condition-case err
+            (let* ((future (anvil-offload `(eval ',form lexical-binding)))
+                   (settled (anvil-future-await future wait)))
+              (cond
+               ((not settled)
+                (list :status :timeout
+                      :timeout wait
+                      :future future
+                      :memory-limit (or memory-limit
+                                        anvil-extend-sandbox-memory-limit)))
+               ((eq (anvil-future-status future) 'done)
+                (list :status :success
+                      :result (anvil-future-value future)
+                      :memory-limit (or memory-limit
+                                        anvil-extend-sandbox-memory-limit)))
+               ((eq (anvil-future-status future) 'error)
+                (list :status :error
+                      :reason (or (anvil-future-error future)
+                                  "subprocess returned error")
+                      :memory-limit (or memory-limit
+                                        anvil-extend-sandbox-memory-limit)))
+               (t
+                (list :status :error
+                      :reason (format "unexpected future status: %S"
+                                      (anvil-future-status future))
+                      :memory-limit (or memory-limit
+                                        anvil-extend-sandbox-memory-limit)))))
+          (error
+           (list :status :error
+                 :reason (error-message-string err)
+                 :memory-limit (or memory-limit
+                                   anvil-extend-sandbox-memory-limit)))))))))
+
 ;;;; --- MCP wrappers -------------------------------------------------------
 
 ;; Forward declarations to silence the byte-compiler when anvil-server
@@ -862,6 +1191,61 @@ with the NAME to tear the watch down."
      (anvil-extend-watch sym)
      (format "%S" (list :status :watching :name sym)))))
 
+(defun anvil-extend--coerce-form (form)
+  "Coerce FORM (string or list) into an evaluable S-expression.
+
+When FORM is a string it is `read'-parsed; when it is already a
+cons / atom it is returned as-is.  Used by the MCP wrappers so
+JSON callers can pass either a printed S-expr or a structured
+list."
+  (cond
+   ((stringp form)
+    (condition-case err
+        (car (read-from-string form))
+      (error
+       (user-error
+        "anvil-extend: cannot read FORM string: %s"
+        (error-message-string err)))))
+   (t form)))
+
+(defun anvil-extend--tool-eval-sandboxed (form &optional timeout memory-limit)
+  "MCP wrapper for `anvil-extend-eval-sandboxed'.
+
+MCP Parameters:
+  form - S-expression to evaluate (printed string or structured list)
+  timeout - optional seconds to await before reporting :timeout
+  memory-limit - optional byte hint (echoed back; not enforced at v0)
+
+Returns the printed result plist (`:status :success' / `:violation'
+/ `:timeout' / `:error').  The opaque `:future' handle from a
+`:timeout' result is stripped before printing because futures are
+not safely serialisable across the MCP boundary."
+  (anvil-server-with-error-handling
+   (let* ((parsed (anvil-extend--coerce-form form))
+          (result (anvil-extend-eval-sandboxed
+                   parsed
+                   :timeout      timeout
+                   :memory-limit memory-limit))
+          ;; Strip the (unprintable / non-serialisable) future
+          ;; before crossing the MCP boundary.
+          (clean (cl-loop for (k v) on result by #'cddr
+                          unless (eq k :future)
+                          append (list k v))))
+     (format "%S" clean))))
+
+(defun anvil-extend--tool-scan-dangerous-forms (form)
+  "MCP wrapper for `anvil-extend-scan-dangerous-forms'.
+
+MCP Parameters:
+  form - S-expression to scan (printed string or structured list)
+
+Returns a printed list of `(:form ... :reason ...)' hits, or the
+string \"nil\" when FORM passes the active policy."
+  (anvil-server-with-error-handling
+   (let* ((parsed (anvil-extend--coerce-form form))
+          (hits (anvil-extend-scan-dangerous-forms parsed)))
+     (format "%S" hits))))
+
 ;;;; --- module lifecycle ---------------------------------------------------
 
 ;;;###autoload
@@ -916,7 +1300,35 @@ remains in memory.  Phase B of Doc 38 §3.B (LOCKED v2).")
 Reloads are debounced (default 0.3s) so a single editor save
 coalesces into one transactional reload (Phase B of Doc 38 §3.B
 LOCKED v2).  Use `anvil-extend-unwatch' with the same NAME to
-remove the watch."))
+remove the watch.")
+  (anvil-server-register-tool
+   #'anvil-extend--tool-eval-sandboxed
+   :id "anvil-extend-eval-sandboxed"
+   :intent '(extend sandbox eval isolated)
+   :layer 'experimental
+   :stability 'experimental
+   :server-id anvil-extend-server-id
+   :description
+   "Evaluate an S-expression in an isolated `anvil-offload' subprocess
+after a static AST policy scan rejects high-privilege callables
+(shell-command / delete-file / make-process / network primitives).
+Returns a plist `(:status :success | :violation | :timeout | :error
+...)'.  Phase C v0 of Doc 38 §3.C — process isolation + AST scan
+only, NOT a syscall-level sandbox; real seccomp / RLIMIT / chroot
+enforcement is the future Phase v1 (Doc 38 §3.C.v1 / §6).")
+  (anvil-server-register-tool
+   #'anvil-extend--tool-scan-dangerous-forms
+   :id "anvil-extend-scan-dangerous-forms"
+   :intent '(extend sandbox scan ast)
+   :layer 'experimental
+   :stability 'experimental
+   :server-id anvil-extend-server-id
+   :description
+   "Statically AST-scan an S-expression for blacklisted callables.
+Returns a list of `(:form ... :reason CLASS)' hits (CLASS is one
+of `:shell', `:fileio', `:network'), or nil if FORM only uses
+callables that the active policy allows.  Pure read-only — no
+subprocess hop, no host-side eval.  Phase C v0 of Doc 38 §3.C."))
 
 (defun anvil-extend-disable ()
   "Unregister anvil-extend's MCP tools."
@@ -924,7 +1336,9 @@ remove the watch."))
   (when (featurep 'anvil-server)
     (dolist (id '("anvil-extend-scaffold"
                   "anvil-extend-reload"
-                  "anvil-extend-watch"))
+                  "anvil-extend-watch"
+                  "anvil-extend-eval-sandboxed"
+                  "anvil-extend-scan-dangerous-forms"))
       (ignore-errors
         (anvil-server-unregister-tool id anvil-extend-server-id)))))
 
