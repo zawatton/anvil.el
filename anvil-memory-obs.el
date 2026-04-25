@@ -211,7 +211,8 @@ Observations:
 
 (defconst anvil-memory-obs-supported
   '(schema record importance redact integration purge
-           compress-rule-based compress-ai compress-auto budget)
+           compress-rule-based compress-ai compress-auto budget
+           search timeline get summary-search)
   "Capability tags this module currently provides.
 Tests `skip-unless' their tag is in this list so a half-shipped
 feature never breaks CI.  Phase milestones append tags here.")
@@ -734,6 +735,160 @@ the size gate or summaries are disabled."
         (anvil-memory-obs--insert-summary
          session-id topic summary start-id end-id
          (when ai 1)))))))
+
+
+;;;; --- Phase 3: 3-layer search APIs --------------------------------------
+
+(defcustom anvil-memory-obs-search-preview-chars 80
+  "Characters retained in the `:preview' field of Layer 1 search results.
+Tuned so each row stays under ~100 tokens for cheap index scans."
+  :type 'integer
+  :group 'anvil-memory-obs)
+
+(defcustom anvil-memory-obs-get-max-ids 20
+  "Maximum number of ids `anvil-memory-obs-get' accepts per call."
+  :type 'integer
+  :group 'anvil-memory-obs)
+
+(cl-defun anvil-memory-obs-search (query &key limit hook session-id)
+  "Layer 1 — FTS5 index search across observation bodies.
+QUERY is required.  :LIMIT defaults to 10.  :HOOK restricts to a
+specific event (e.g. `post-tool-use').  :SESSION-ID scopes to one
+session.  Returns plist list ordered by FTS rank (best first):
+  (:id :ts :session-id :hook :tool-name :preview :rank)
+Empty / whitespace-only QUERY returns nil."
+  (when (and query (stringp query)
+             (not (string-empty-p (string-trim query))))
+    (let* ((db (anvil-memory-obs--db))
+           (limit (or limit 10))
+           (clauses (list "obs_observations_fts MATCH ?"))
+           (params (list query)))
+      (when hook
+        (push "o.hook = ?" clauses)
+        (push hook params))
+      (when session-id
+        (push "o.session_id = ?" clauses)
+        (push session-id params))
+      (let* ((sql (format
+                   "SELECT o.id, o.ts, o.session_id, o.hook, o.tool_name,
+                          substr(o.body, 1, %d) AS preview,
+                          obs_observations_fts.rank AS r
+                     FROM obs_observations_fts
+                     JOIN obs_observations o
+                       ON o.id = obs_observations_fts.rowid
+                    WHERE %s
+                 ORDER BY r
+                    LIMIT ?"
+                   anvil-memory-obs-search-preview-chars
+                   (string-join (nreverse clauses) " AND ")))
+             (rows (ignore-errors
+                     (sqlite-select
+                      db sql
+                      (append (nreverse params) (list limit))))))
+        (mapcar (lambda (r)
+                  (list :id         (nth 0 r)
+                        :ts         (nth 1 r)
+                        :session-id (nth 2 r)
+                        :hook       (nth 3 r)
+                        :tool-name  (nth 4 r)
+                        :preview    (nth 5 r)
+                        :rank       (nth 6 r)))
+                rows)))))
+
+(cl-defun anvil-memory-obs-timeline (anchor-id &key window)
+  "Layer 2 — return ±WINDOW observations around ANCHOR-ID, same session.
+WINDOW defaults to 5.  Returns plist list ordered by id ASC; the
+anchor is included in the result.  Returns nil when ANCHOR-ID does
+not exist."
+  (let* ((db (anvil-memory-obs--db))
+         (window (or window 5))
+         (anchor (sqlite-select
+                  db
+                  "SELECT session_id FROM obs_observations WHERE id = ?"
+                  (list anchor-id))))
+    (when anchor
+      (let* ((session-id (caar anchor))
+             (rows (sqlite-select
+                    db
+                    "SELECT id, ts, hook, tool_name, body, importance
+                       FROM obs_observations
+                       WHERE session_id = ?
+                         AND id >= ?
+                         AND id <= ?
+                       ORDER BY id ASC"
+                    (list session-id
+                          (- anchor-id window)
+                          (+ anchor-id window)))))
+        (mapcar (lambda (r)
+                  (list :id         (nth 0 r)
+                        :ts         (nth 1 r)
+                        :hook       (nth 2 r)
+                        :tool-name  (nth 3 r)
+                        :body       (nth 4 r)
+                        :importance (nth 5 r)))
+                rows)))))
+
+(defun anvil-memory-obs-get (ids)
+  "Layer 3 — fetch full observation rows for IDS list.
+IDS is a list of integers; max `anvil-memory-obs-get-max-ids' per
+call (default 20).  Returns plist list ordered by id ASC:
+  (:id :session-id :ts :hook :tool-name :body :payload-json :importance)"
+  (when ids
+    (when (> (length ids) anvil-memory-obs-get-max-ids)
+      (user-error
+       "anvil-memory-obs-get: max %d ids per call (got %d)"
+       anvil-memory-obs-get-max-ids (length ids)))
+    (let* ((db (anvil-memory-obs--db))
+           (placeholders (mapconcat (lambda (_) "?") ids ","))
+           (sql (format
+                 "SELECT id, session_id, ts, hook, tool_name,
+                        body, payload_json, importance
+                   FROM obs_observations
+                   WHERE id IN (%s)
+                   ORDER BY id ASC"
+                 placeholders))
+           (rows (sqlite-select db sql ids)))
+      (mapcar (lambda (r)
+                (list :id           (nth 0 r)
+                      :session-id   (nth 1 r)
+                      :ts           (nth 2 r)
+                      :hook         (nth 3 r)
+                      :tool-name    (nth 4 r)
+                      :body         (nth 5 r)
+                      :payload-json (nth 6 r)
+                      :importance   (nth 7 r)))
+              rows))))
+
+(cl-defun anvil-memory-obs-summary-search (query &key limit)
+  "Topic-level search over `obs_summaries' via FTS5.
+QUERY is required.  :LIMIT defaults to 10.  Returns plist list:
+  (:id :session-id :topic :summary :ts :is-ai :rank)
+Empty / whitespace-only QUERY returns nil."
+  (when (and query (stringp query)
+             (not (string-empty-p (string-trim query))))
+    (let* ((db (anvil-memory-obs--db))
+           (limit (or limit 10))
+           (rows (ignore-errors
+                   (sqlite-select
+                    db
+                    "SELECT s.id, s.session_id, s.topic, s.summary,
+                            s.ts, s.is_ai, obs_summaries_fts.rank
+                       FROM obs_summaries_fts
+                       JOIN obs_summaries s
+                         ON s.id = obs_summaries_fts.rowid
+                      WHERE obs_summaries_fts MATCH ?
+                   ORDER BY obs_summaries_fts.rank
+                      LIMIT ?"
+                    (list query limit)))))
+      (mapcar (lambda (r)
+                (list :id         (nth 0 r)
+                      :session-id (nth 1 r)
+                      :topic      (nth 2 r)
+                      :summary    (nth 3 r)
+                      :ts         (nth 4 r)
+                      :is-ai      (and (nth 5 r) (= (nth 5 r) 1))
+                      :rank       (nth 6 r)))
+              rows))))
 
 
 ;;;; --- enable / disable stubs --------------------------------------------

@@ -606,6 +606,189 @@
     (should (= (nth 5 start-time) 2026)))) ; year
 
 
+;;;; --- Phase 3: search API tests -----------------------------------------
+
+(ert-deftest anvil-memory-obs-search-returns-fts-hits ()
+  "search returns plist rows ordered by FTS rank."
+  (skip-unless (anvil-memory-obs-test--supported-p 'search))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t))
+      (anvil-memory-obs-test--seed-session "s1" 5)
+      (let ((rows (anvil-memory-obs-search "details")))
+        (should (>= (length rows) 1))
+        (should (plist-get (car rows) :id))
+        (should (plist-get (car rows) :preview))
+        (should (string-match-p "details" (plist-get (car rows) :preview)))))))
+
+(ert-deftest anvil-memory-obs-search-honors-limit ()
+  "search :limit caps the returned row count."
+  (skip-unless (anvil-memory-obs-test--supported-p 'search))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t))
+      (anvil-memory-obs-test--seed-session "s2" 8)
+      (let ((rows (anvil-memory-obs-search "details" :limit 3)))
+        (should (<= (length rows) 3))))))
+
+(ert-deftest anvil-memory-obs-search-filters-by-hook ()
+  "search :hook scopes the result to a single hook event."
+  (skip-unless (anvil-memory-obs-test--supported-p 'search))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t))
+      (anvil-memory-obs-test--seed-session "s3" 6)
+      (let ((rows (anvil-memory-obs-search "details" :hook "post-tool-use")))
+        (should (cl-every (lambda (r)
+                            (equal (plist-get r :hook) "post-tool-use"))
+                          rows))))))
+
+(ert-deftest anvil-memory-obs-search-filters-by-session-id ()
+  "search :session-id scopes the result."
+  (skip-unless (anvil-memory-obs-test--supported-p 'search))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t))
+      (anvil-memory-obs-test--seed-session "s4a" 4)
+      (anvil-memory-obs-test--seed-session "s4b" 4)
+      (let ((rows (anvil-memory-obs-search "details" :session-id "s4a")))
+        (should (cl-every (lambda (r)
+                            (equal (plist-get r :session-id) "s4a"))
+                          rows))))))
+
+(ert-deftest anvil-memory-obs-search-empty-query-returns-nil ()
+  "Whitespace / empty / nil queries short-circuit to nil."
+  (skip-unless (anvil-memory-obs-test--supported-p 'search))
+  (anvil-memory-obs-test--with-env
+    (anvil-memory-obs--db)
+    (should (null (anvil-memory-obs-search "")))
+    (should (null (anvil-memory-obs-search "   ")))
+    (should (null (anvil-memory-obs-search nil)))))
+
+(ert-deftest anvil-memory-obs-search-preview-respects-cap ()
+  "preview is truncated to `anvil-memory-obs-search-preview-chars'."
+  (skip-unless (anvil-memory-obs-test--supported-p 'search))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-search-preview-chars 20))
+      (anvil-memory-obs--upsert-session "s5")
+      (anvil-memory-obs--insert-observation
+       :session-id "s5" :hook "post-tool-use"
+       :body (concat "details "
+                     (make-string 200 ?x)))
+      (let* ((rows (anvil-memory-obs-search "details"))
+             (preview (plist-get (car rows) :preview)))
+        (should (<= (length preview) 20))))))
+
+
+;;;; --- Phase 3: timeline tests --------------------------------------------
+
+(ert-deftest anvil-memory-obs-timeline-includes-anchor ()
+  "timeline always includes the anchor id in its result."
+  (skip-unless (anvil-memory-obs-test--supported-p 'timeline))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t))
+      (let* ((ids (anvil-memory-obs-test--seed-session "tl1" 5))
+             (anchor (nth 2 ids))
+             (rows (anvil-memory-obs-timeline anchor :window 1)))
+        (should (member anchor (mapcar (lambda (r) (plist-get r :id)) rows)))))))
+
+(ert-deftest anvil-memory-obs-timeline-respects-window ()
+  "timeline returns at most 2*WINDOW + 1 rows."
+  (skip-unless (anvil-memory-obs-test--supported-p 'timeline))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t))
+      (let* ((ids (anvil-memory-obs-test--seed-session "tl2" 7))
+             (anchor (nth 3 ids))
+             (rows (anvil-memory-obs-timeline anchor :window 1)))
+        (should (<= (length rows) 3))))))
+
+(ert-deftest anvil-memory-obs-timeline-stays-within-session ()
+  "timeline never crosses session boundaries even with id-adjacent rows."
+  (skip-unless (anvil-memory-obs-test--supported-p 'timeline))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t))
+      (let* ((a-ids (anvil-memory-obs-test--seed-session "tl3a" 3))
+             (_b-ids (anvil-memory-obs-test--seed-session "tl3b" 3))
+             (anchor (nth 1 a-ids))
+             (rows (anvil-memory-obs-timeline anchor :window 10)))
+        (should (cl-every (lambda (r)
+                            (member (plist-get r :id) a-ids))
+                          rows))))))
+
+(ert-deftest anvil-memory-obs-timeline-unknown-anchor-is-nil ()
+  "An anchor id that does not exist returns nil."
+  (skip-unless (anvil-memory-obs-test--supported-p 'timeline))
+  (anvil-memory-obs-test--with-env
+    (anvil-memory-obs--db)
+    (should (null (anvil-memory-obs-timeline 9999)))))
+
+
+;;;; --- Phase 3: get tests -------------------------------------------------
+
+(ert-deftest anvil-memory-obs-get-returns-full-rows ()
+  "get returns plist rows with body / payload / importance."
+  (skip-unless (anvil-memory-obs-test--supported-p 'get))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t))
+      (let* ((ids (anvil-memory-obs-test--seed-session "g1" 3))
+             (rows (anvil-memory-obs-get ids)))
+        (should (= (length rows) 3))
+        (should (plist-get (car rows) :body))
+        (should (plist-get (car rows) :payload-json))))))
+
+(ert-deftest anvil-memory-obs-get-rejects-too-many-ids ()
+  "get errors when given more than `anvil-memory-obs-get-max-ids' ids."
+  (skip-unless (anvil-memory-obs-test--supported-p 'get))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-get-max-ids 2))
+      (anvil-memory-obs-test--seed-session "g2" 4)
+      (should-error
+       (anvil-memory-obs-get '(1 2 3))
+       :type 'user-error))))
+
+(ert-deftest anvil-memory-obs-get-empty-ids-returns-nil ()
+  "An empty ids list returns nil without touching the DB."
+  (skip-unless (anvil-memory-obs-test--supported-p 'get))
+  (anvil-memory-obs-test--with-env
+    (anvil-memory-obs--db)
+    (should (null (anvil-memory-obs-get nil)))))
+
+
+;;;; --- Phase 3: summary-search tests --------------------------------------
+
+(ert-deftest anvil-memory-obs-summary-search-finds-summary-text ()
+  "summary-search hits text in the summary column."
+  (skip-unless (anvil-memory-obs-test--supported-p 'summary-search))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-compress-min-observations 3))
+      (anvil-memory-obs-test--seed-session "ss1" 4)
+      (anvil-memory-obs-summarize-session "ss1")
+      (let ((rows (anvil-memory-obs-summary-search "details")))
+        (should (>= (length rows) 1))
+        (should (string-match-p "details" (plist-get (car rows) :summary)))))))
+
+(ert-deftest anvil-memory-obs-summary-search-preserves-is-ai-flag ()
+  "summary-search exposes :is-ai correctly for both paths."
+  (skip-unless (anvil-memory-obs-test--supported-p 'summary-search))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t))
+      (anvil-memory-obs--upsert-session "ss2")
+      ;; IS-AI follows the 6th-arg contract: nil → 0, truthy → 1.
+      ;; (Elisp 0 is truthy, so "rule-based" must pass nil here.)
+      (anvil-memory-obs--insert-summary "ss2" "tA" "uniqueAtopic" 1 1 1)
+      (anvil-memory-obs--insert-summary "ss2" "tB" "uniqueBtopic" 1 1 nil)
+      (let ((rows (anvil-memory-obs-summary-search "uniqueAtopic")))
+        (should (eq (plist-get (car rows) :is-ai) t)))
+      (let ((rows (anvil-memory-obs-summary-search "uniqueBtopic")))
+        (should (eq (plist-get (car rows) :is-ai) nil))))))
+
+(ert-deftest anvil-memory-obs-summary-search-empty-query-returns-nil ()
+  "Empty query returns nil."
+  (skip-unless (anvil-memory-obs-test--supported-p 'summary-search))
+  (anvil-memory-obs-test--with-env
+    (anvil-memory-obs--db)
+    (should (null (anvil-memory-obs-summary-search "")))))
+
+
 ;;;; --- purge tests --------------------------------------------------------
 
 (ert-deftest anvil-memory-obs-purge-removes-old-low-importance ()
