@@ -295,30 +295,34 @@ variables."
          ;; temporary file-visiting buffer.
          (set-buffer-modified-p nil)))))
 
-(defun anvil-org--find-allowed-file-with-id (id)
+(defun anvil-org--find-allowed-file-with-id
+    (id &optional not-found-fn file-access-fn)
   "Find an allowed file containing the Org ID.
 First looks up in the org-id database, then validates the file is in
 the allowed list.
 Returns the expanded file path if found and allowed.
-Throws a tool error if ID exists but file is not allowed, or if ID
-is not found."
-  (if-let* ((id-file (org-id-find-id-file id)))
-    ;; ID found in database, check if file is allowed
-    (if-let* ((allowed-file (anvil-org--find-allowed-file id-file)))
-      allowed-file
-      (anvil-org--tool-file-access-error id))
-    ;; ID not in database - might not exist or DB is stale
-    ;; Fall back to searching allowed files manually (only when restriction is on)
-    (if (not anvil-org-allowed-files-enabled)
-        (anvil-org--id-not-found-error id)
-      (let ((found-file nil))
-        (dolist (allowed-file anvil-org-allowed-files)
-          (unless found-file
-            (when (file-exists-p allowed-file)
-              (anvil-org--with-org-file allowed-file
-                (when (org-find-property "ID" id)
-                  (setq found-file (expand-file-name allowed-file)))))))
-        (or found-file (anvil-org--id-not-found-error id))))))
+NOT-FOUND-FN and FILE-ACCESS-FN customize the error shape for tool
+versus resource callers."
+  (let ((not-found-fn (or not-found-fn #'anvil-org--id-not-found-error))
+        (file-access-fn
+         (or file-access-fn #'anvil-org--tool-file-access-error)))
+    (if-let* ((id-file (org-id-find-id-file id)))
+      ;; ID found in database, check if file is allowed
+      (if-let* ((allowed-file (anvil-org--find-allowed-file id-file)))
+        allowed-file
+        (funcall file-access-fn id))
+      ;; ID not in database - might not exist or DB is stale
+      ;; Fall back to searching allowed files manually (only when restriction is on)
+      (if (not anvil-org-allowed-files-enabled)
+          (funcall not-found-fn id)
+        (let ((found-file nil))
+          (dolist (allowed-file anvil-org-allowed-files)
+            (unless found-file
+              (when (file-exists-p allowed-file)
+                (anvil-org--with-org-file allowed-file
+                  (when (org-find-property "ID" id)
+                    (setq found-file (expand-file-name allowed-file)))))))
+          (or found-file (funcall not-found-fn id)))))))
 
 (defmacro anvil-org--with-uri-prefix-dispatch
     (uri headline-body id-body)
@@ -1100,13 +1104,13 @@ The filename parameter includes both file and headline path."
   "Handler for org-id://{uuid} template.
 PARAMS is an alist containing the uuid parameter."
   (let* ((id (alist-get "uuid" params nil nil #'string=))
-         (file-path (org-id-find-id-file id)))
-    (unless file-path
-      (anvil-org--resource-not-found-error "ID" id))
-    (let ((allowed-file (anvil-org--find-allowed-file file-path)))
-      (unless allowed-file
-        (anvil-org--resource-file-access-error id))
-      (anvil-org--get-content-by-id allowed-file id))))
+         (allowed-file
+          (anvil-org--find-allowed-file-with-id
+           id
+           (lambda (missing-id)
+             (anvil-org--resource-not-found-error "ID" missing-id))
+           #'anvil-org--resource-file-access-error)))
+    (anvil-org--get-content-by-id allowed-file id)))
 
 ;; PHASE-C-IDE-SPLIT-CANDIDATE: writes via org-edit-headline in real buffer
 (defun anvil-org--tool-rename-headline (uri current_title new_title)
@@ -1185,83 +1189,89 @@ MCP Parameters:
          headline-path
          (string-prefix-p anvil-org--uri-id-prefix resource_uri))
 
-        (anvil-org--validate-body-no-headlines
-         new_body (org-current-level))
+        (let ((target-marker (point-marker)))
+          (unwind-protect
+              (progn
+                (anvil-org--validate-body-no-headlines
+                 new_body (org-current-level))
 
-        ;; Skip past headline and properties
-        (org-end-of-meta-data t)
+                ;; Skip past headline and properties
+                (org-end-of-meta-data t)
 
-        ;; Get body boundaries
-        (let ((body-begin (point))
-              (body-end nil)
-              (body-content nil)
-              (occurrence-count 0))
+                ;; Get body boundaries
+                (let ((body-begin (point))
+                      (body-end nil)
+                      (body-content nil)
+                      (occurrence-count 0))
 
-          ;; Find end of body (before next headline or end of subtree)
-          (save-excursion
-            (if (org-goto-first-child)
-                ;; Has children - body ends before first child
-                (setq body-end (point))
-              ;; No children - body extends to end of subtree
-              (org-end-of-subtree t)
-              (setq body-end (point))))
+                  ;; Find end of body (before next headline or end of subtree)
+                  (save-excursion
+                    (if (org-goto-first-child)
+                        ;; Has children - body ends before first child
+                        (setq body-end (point))
+                      ;; No children - body extends to end of subtree
+                      (org-end-of-subtree t)
+                      (setq body-end (point))))
 
-          ;; Extract body content
-          (setq body-content
-                (buffer-substring-no-properties body-begin body-end))
+                  ;; Extract body content
+                  (setq body-content
+                        (buffer-substring-no-properties body-begin body-end))
 
-          ;; Trim leading newline if present
-          ;; (`org-end-of-meta-data' includes it)
-          (when (and (> (length body-content) 0)
-                     (= (aref body-content 0) ?\n))
-            (setq body-content (substring body-content 1))
-            (setq body-begin (1+ body-begin)))
+                  ;; Trim leading newline if present
+                  ;; (`org-end-of-meta-data' includes it)
+                  (when (and (> (length body-content) 0)
+                             (= (aref body-content 0) ?\n))
+                    (setq body-content (substring body-content 1))
+                    (setq body-begin (1+ body-begin)))
 
-          ;; Check if body is empty
-          (when (string-match-p "\\`[[:space:]]*\\'" body-content)
-            ;; Empty oldBody + empty body -> add content
-            (if (string= old_body "")
-                ;; Treat as single replacement
-                (setq occurrence-count 1)
-              (anvil-org--tool-validation-error
-               "Node has no body content")))
+                  ;; Check if body is empty
+                  (when (string-match-p "\\`[[:space:]]*\\'" body-content)
+                    ;; Empty oldBody + empty body -> add content
+                    (if (string= old_body "")
+                        ;; Treat as single replacement
+                        (setq occurrence-count 1)
+                      (anvil-org--tool-validation-error
+                       "Node has no body content")))
 
-          ;; Count occurrences (unless already handled above)
-          (unless (= occurrence-count 1)
-            ;; Empty oldBody with non-empty body is an error
-            (if (and (string= old_body "")
-                     (not
-                      (string-match-p
-                       "\\`[[:space:]]*\\'" body-content)))
-                (anvil-org--tool-validation-error
-                 "Cannot use empty old_body with non-empty body")
-              ;; Normal occurrence counting
-              (let ((case-fold-search nil)
-                    (search-pos 0))
-                (while (string-match
-                        (regexp-quote old_body) body-content
-                        search-pos)
-                  (setq occurrence-count (1+ occurrence-count))
-                  (setq search-pos (match-end 0))))))
+                  ;; Count occurrences (unless already handled above)
+                  (unless (= occurrence-count 1)
+                    ;; Empty oldBody with non-empty body is an error
+                    (if (and (string= old_body "")
+                             (not
+                              (string-match-p
+                               "\\`[[:space:]]*\\'" body-content)))
+                        (anvil-org--tool-validation-error
+                         "Cannot use empty old_body with non-empty body")
+                      ;; Normal occurrence counting
+                      (let ((case-fold-search nil)
+                            (search-pos 0))
+                        (while (string-match
+                                (regexp-quote old_body) body-content
+                                search-pos)
+                          (setq occurrence-count (1+ occurrence-count))
+                          (setq search-pos (match-end 0))))))
 
-          ;; Validate occurrences
-          (cond
-           ((= occurrence-count 0)
-            (anvil-org--tool-validation-error "Body text not found: %s"
-                                            old_body))
-           ((and (> occurrence-count 1) (not replace_all))
-            (anvil-org--tool-validation-error
-             (concat "Text appears %d times (use replace_all)")
-             occurrence-count)))
+                  ;; Validate occurrences
+                  (cond
+                   ((= occurrence-count 0)
+                    (anvil-org--tool-validation-error
+                     "Body text not found: %s"
+                     old_body))
+                   ((and (> occurrence-count 1) (not replace_all))
+                    (anvil-org--tool-validation-error
+                     (concat "Text appears %d times (use replace_all)")
+                     occurrence-count)))
 
-          ;; Perform replacement
-          (anvil-org--replace-body-content
-           old_body
-           new_body
-           body-content
-           replace_all
-           body-begin
-           body-end))))))
+                  ;; Perform replacement
+                  (anvil-org--replace-body-content
+                   old_body
+                   new_body
+                   body-content
+                   replace_all
+                   body-begin
+                   body-end))
+                (goto-char target-marker))
+            (set-marker target-marker nil)))))))
 
 ;; Tools duplicating resource templates
 
