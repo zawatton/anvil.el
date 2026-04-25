@@ -1,0 +1,266 @@
+#+TITLE: Doc 37 — anvil-memory observation layer (claude-mem inspired)
+#+AUTHOR: zawatton
+#+DATE: 2026-04-25
+#+OPTIONS: toc:2
+
+* Status
+:PROPERTIES:
+:STATE: DRAFT (revised)
+:CREATED: 2026-04-25
+:OWNER: zawatton
+:END:
+
+DRAFT — design only. /Revised 2026-04-25/: claude-mem を install せず、公開仕様
+([[https://github.com/thedotmack/claude-mem][thedotmack/claude-mem]] / [[https://docs.claude-mem.ai/][docs]]) のロジックを参考に **anvil-memory 内に独自実装**
+する方針へ転換。AGPL 依存ゼロ、GPL-3.0 only。
+
+* Goal
+
+claude-mem が示した 5 つの設計パターンを anvil-memory に取り込み、
+
+1. 5 hook 自動キャプチャによる observation 蓄積
+2. AI 圧縮による long-term context 化
+3. 3-layer progressive disclosure search (~10x token saving)
+4. session 横断の context 自動 inject
+5. 重複・矛盾検出を含む memory health 機能
+
+を anvil-memory のみで完結させる。
+
+** Non-goals
+- claude-mem 本体の install / 利用 (AGPL 汚染を完全回避)
+- claude-mem コードの直接コピー (アイデア参照のみ、実装は独自)
+- HTTP server (port 37777 相当) 提供 (Emacs in-process で完結)
+- Chroma vector DB のような Python 依存追加
+
+* License posture
+
+| Component       | License   | Notes                                            |
+|-----------------+-----------+--------------------------------------------------|
+| anvil.el        | GPL-3.0   | 本機能はここに同梱                               |
+| claude-mem docs | (公開)    | アイデア / spec のみ参照、コード非引用             |
+| auto-memory MD  | (作成物) | user 資産、無依存                                  |
+
+参考にするのは **公開ドキュメント・公開 README に書かれた API 仕様とアーキテクチャ図**
+のみ。**ソースコードは読まない・写さない**。アイデア・概念・アーキテクチャ図は著作権の保護対象外
+([[https://www.copyright.gov/circs/circ31.pdf]] section 102(b)) なので、独自実装に法的問題なし。
+
+* 既存資産との関係
+
+** 既に揃っている部品
+- *anvil-hook* (7 hook 全部 ~/.claude/settings.json 登録済): PreCompact / PostCompact /
+  Stop / SessionStart / PostToolUse / UserPromptSubmit / SessionEnd
+  → **5 hook 自動キャプチャの土台が既に存在**、追加 install 不要
+- *anvil-memory.el* (Doc 29 SHIPPED): SQLite + FTS5 (trigram tokenizer)、16 MCP tool
+- *anvil-orchestrator.el* (Doc 10): provider routing で AI 圧縮実装に流用可能
+- *anvil-disclosure.el* (Doc 28 LOCKED): progressive disclosure 機構と統合
+- *anvil-data.el*: SQLite 一般操作
+
+** 不足部品 (本 Doc 37 で追加)
+- observation テーブル (raw + summary 二段)
+- hook → observation 書き込みパス
+- AI 圧縮 worker (anvil-orchestrator 呼び出し)
+- 3-layer search MCP tool 群
+- session メタ管理 (session-id ↔ observations)
+
+* 概念モデル (claude-mem 風)
+
+#+begin_src
+session ─┬─ observation 1 (raw)──┐
+         ├─ observation 2 (raw)  ├─ AI 圧縮 ─→ summary (semantic)
+         └─ observation N (raw)──┘
+                                              │
+              search (index)  ←──────────────┤
+              timeline (window)              ├─ inject to next session
+              get_observations (full)        │
+                                              │
+              promote                        │
+                  ↓                          │
+              auto-memory MEMORY.md          │
+              + individual *.md (人手 curated) │
+#+end_src
+
+* SQLite schema
+
+#+begin_src sql
+CREATE TABLE sessions (
+  id            TEXT PRIMARY KEY,            -- claude session id
+  started_at    INTEGER NOT NULL,            -- unix epoch
+  ended_at      INTEGER,
+  project_dir   TEXT,
+  meta_json     TEXT
+);
+
+CREATE TABLE observations (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id    TEXT NOT NULL REFERENCES sessions(id),
+  ts            INTEGER NOT NULL,
+  hook          TEXT NOT NULL,               -- session-start / user-prompt / post-tool-use / stop / session-end
+  tool_name     TEXT,                         -- post-tool-use 限定
+  payload_json  TEXT,                         -- raw event data
+  body          TEXT,                         -- 検索対象 (tool 名 + args + result の textual form)
+  importance    INTEGER DEFAULT 0,            -- 0..100, AI 圧縮時に更新
+  is_compressed INTEGER DEFAULT 0
+);
+
+CREATE TABLE summaries (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id    TEXT NOT NULL REFERENCES sessions(id),
+  obs_start_id  INTEGER,                      -- 圧縮した observation 範囲
+  obs_end_id    INTEGER,
+  topic         TEXT,                         -- AI 抽出トピック
+  summary       TEXT NOT NULL,                -- 1-3 sentence semantic summary
+  ts            INTEGER NOT NULL
+);
+
+CREATE VIRTUAL TABLE observations_fts USING fts5(
+  body, content='observations', content_rowid='id',
+  tokenize='trigram'                          -- CJK 対応
+);
+
+CREATE VIRTUAL TABLE summaries_fts USING fts5(
+  topic, summary, content='summaries', content_rowid='id',
+  tokenize='trigram'
+);
+#+end_src
+
+* Phase plan
+
+** Phase 1 — Observation capture (1-2 weeks)
+*** 1.1 hook handler 拡張
+- =anvil-hook.el= の =anvil-hook-dispatch= で各 event 後に
+  =(anvil-memory-observation-record HOOK SESSION-ID PAYLOAD)= を呼ぶ
+- raw payload は =payload_json= に prin1、検索用 =body= は textual extraction
+*** 1.2 schema migration
+- =anvil-memory--ensure-schema= に observations / summaries / sessions 追加
+- 既存の memory_index テーブルとは独立 (auto-memory MD は従来通り)
+*** 1.3 importance 推定 (rule-based)
+- error / fix / commit 系 keyword: +30
+- 大きい diff (>100 lines): +20
+- repeated tool call (同 tool 連続): -10
+- 後続で AI 圧縮時に再評価
+
+** Phase 2 — AI compression worker (1 week)
+*** 2.1 SessionEnd 時に圧縮
+- =anvil-orchestrator-submit= で claude provider に
+  「直近 N 件 observation を 1-3 sentence で要約 + topic 抽出」
+- result を summaries テーブル insert
+*** 2.2 token cost guard
+- =defcustom anvil-memory-compress-monthly-budget-tokens= (default 100k)
+- 月予算超過時は圧縮 skip + log warning
+*** 2.3 失敗時 fallback
+- claude API 不通 → rule-based 要約 (最初の200char + last200char で代替)
+
+** Phase 3 — 3-layer search MCP tools (1-2 weeks)
+*** 3.1 =memory-obs-search= (Layer 1: index)
+- input: =query=, =limit= (default 10), =filter= (session/date/hook)
+- output: =[(:id N :ts T :hook H :preview "..." :score S)]=  (~50-100 tokens/件)
+- FTS5 BM25 ranking
+*** 3.2 =memory-obs-timeline= (Layer 2: context)
+- input: =anchor-id=, =window= (default ±5)
+- output: anchor の前後 observation を時系列で
+*** 3.3 =memory-obs-get= (Layer 3: full body)
+- input: =ids= (array), max 20
+- output: =[(:id N :body "..." :payload {...})]=
+*** 3.4 =memory-summary-search= (高速トピック検索)
+- summaries_fts 直接、~30 tokens/件
+- 「過去にこの問題どう解いたか」用
+
+** Phase 4 — Auto-inject on SessionStart (1 week)
+*** 4.1 関連 summary の prepend
+- =SessionStart= hook 発火時、=current project-dir= を key に
+  直近 7 日の summaries を関連度 top-5 抽出
+- =CLAUDE_INJECT_CONTEXT= 環境変数 or hook output で context 注入
+*** 4.2 token budget
+- 注入は max 1000 tokens、優先度 = recency × importance × project_match
+*** 4.3 opt-out
+- =defcustom anvil-memory-auto-inject= (default nil 安全側)
+
+** Phase 5 — UI (Tabulated list, 1 week)
+*** 5.1 =M-x anvil-memory-observations=
+- session ごとに observation を table 表示
+- column: ts / hook / tool / preview / importance
+- =RET= で full body 表示、=p= で promote、=d= で delete
+*** 5.2 =M-x anvil-memory-summaries=
+- topic ごとに集約、関連 observations へ drill-down
+
+** Phase 6 — Promote to auto-memory (semi-automatic, 1 week)
+*** 6.1 候補抽出 (cron / 手動)
+- 週 1 回 =M-x anvil-memory-promote-candidates=
+- 高 importance + 同 topic 反復 + auto-memory 既存と非重複の summary を提示
+*** 6.2 1-click promote
+- =memory-save-check= 既存 tool に対象 summary を渡す → frontmatter 整形 →
+  MEMORY.md 追記
+*** 6.3 双方向は意図的に **NG**
+- auto-memory → observation 書き戻しはしない (人手 curated 層を尊重)
+
+** Phase 7 — Vector embedding (optional, deferred)
+- =anvil-http= (Doc 09) 経由で OpenAI / local embedding API 呼ぶ
+- summaries に vector column 追加、cosine sim search
+- 必要性は Phase 1-6 運用後に判断 (FTS5 trigram で十分なケースが多い見込み)
+
+* Tooling matrix (新規 / 拡張)
+
+| Tool                          | Type     | Phase |
+|-------------------------------+----------+-------|
+| anvil-memory-observation-record | internal | 1     |
+| memory-obs-search              | MCP      | 3     |
+| memory-obs-timeline            | MCP      | 3     |
+| memory-obs-get                 | MCP      | 3     |
+| memory-summary-search          | MCP      | 3     |
+| memory-promote-candidates      | MCP      | 6     |
+| anvil-memory-observations      | UI       | 5     |
+| anvil-memory-summaries         | UI       | 5     |
+
+* Risks / Open Questions
+
+| #  | Risk                                                  | 対策                                                       |
+|----+-------------------------------------------------------+------------------------------------------------------------|
+| R1 | observation 量が爆発し SQLite 巨大化                  | 90日超 + importance<10 を auto purge (defcustom)           |
+| R2 | hook payload に secret/credential が紛れる            | =anvil-memory-redact-patterns= で正規表現マスク            |
+| R3 | AI 圧縮の API コストが嵩む                            | Phase 2.2 月予算ガード + rule-based fallback               |
+| R4 | claude-mem コードを誤って参照するリスク              | 開発時 GitHub claude-mem repo は閲覧禁止、docs のみ参照    |
+| R5 | auto-memory との粒度不一致で UX 混乱                 | search レスポンスに =:source= 明示、UI で別タブ            |
+
+* Decision log
+
+** 2026-04-25 (DRAFT 起こし → revised)
+- 当初: claude-mem を install して bridge → AGPL 境界が user 環境に紛れる
+- 変更: claude-mem **install しない**、ロジックのみ参考に anvil-memory 自前実装
+- 利点:
+  - GPL-3.0 only、ライセンス境界が単純
+  - 既存 anvil-hook 7 hook を再利用、新たな install 作業不要
+  - Web UI / HTTP server を Emacs Tabulated-list に置換、依存最小
+- 制約:
+  - vector search は Phase 7 deferred (FTS5 trigram で当面回す)
+  - claude-mem の最新改善 (Endless Mode 等) は手動で追従要
+
+* Distribution
+
+** License
+- GPL-3.0-or-later (consistent with anvil.el)
+- claude-mem は AGPL-3.0。本実装は独立 reimpl で AGPL code を embed しないため、
+  GPL-only 配布で license 整合する
+
+** Channels
+| Channel             | Format             |
+|---------------------+--------------------|
+| GitHub Release      | tarball / .zip     |
+| MELPA               | el package         |
+| Skill marketplace   | manifest + .md     |
+
+** Phase ↔ channel
+| Phase                          | Channel                      |
+|--------------------------------+------------------------------|
+| Phase 1-3 (capture/AI/search)  | private dev branch           |
+| Phase 4 (auto-inject)          | GitHub release v0.1.0        |
+| Phase 5 (UI)                   | MELPA pre-release            |
+| Phase 6 (promote)              | MELPA stable + Skill marketplace |
+| Phase 7 (vector)               | (deferred)                   |
+
+* Open for review
+- [ ] importance 推定の rule-based セット (Phase 1.3)
+- [ ] AI 圧縮プロンプト template (Phase 2.1)
+- [ ] auto-inject 既定値 (nil / t どちらが UX 良いか)
+- [ ] purge policy: 90日 / importance<10 が妥当か
+- [ ] Phase 順序: 1→3→2→4 でも回せる (圧縮なしで search 先に試す)
+- [ ] リリース repo 構成: anvil mono-repo か独立 anvil-memory repo か
