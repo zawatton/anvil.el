@@ -189,6 +189,15 @@ does not implicitly opt into LLM spend."
   :type 'boolean
   :group 'anvil-memory-obs)
 
+(defcustom anvil-memory-obs-compress-monthly-budget 100
+  "Maximum number of AI summary calls allowed per calendar month.
+When the count of `is_ai = 1' rows in `obs_summaries' for the
+current month reaches this value, AI compression is skipped and
+the rule-based fallback is used.  Set to nil to disable the guard."
+  :type '(choice (const :tag "No budget guard" nil)
+                 integer)
+  :group 'anvil-memory-obs)
+
 (defcustom anvil-memory-obs-compress-prompt-template
   "You are summarising a software development session for later recall.
 Read the observation log below and respond with **strict JSON only**:
@@ -202,7 +211,7 @@ Observations:
 
 (defconst anvil-memory-obs-supported
   '(schema record importance redact integration purge
-           compress-rule-based compress-ai compress-auto)
+           compress-rule-based compress-ai compress-auto budget)
   "Capability tags this module currently provides.
 Tests `skip-unless' their tag is in this list so a half-shipped
 feature never breaks CI.  Phase milestones append tags here.")
@@ -312,11 +321,25 @@ feature never breaks CI.  Phase milestones append tags here.")
                        obs_end_id    INTEGER,
                        topic         TEXT,
                        summary       TEXT NOT NULL,
-                       ts            INTEGER NOT NULL
+                       ts            INTEGER NOT NULL,
+                       is_ai         INTEGER NOT NULL DEFAULT 0
                      )")
     (sqlite-execute db
                     "CREATE INDEX IF NOT EXISTS obs_summaries_session_idx
                        ON obs_summaries(session_id)")
+    (sqlite-execute db
+                    "CREATE INDEX IF NOT EXISTS obs_summaries_ts_idx
+                       ON obs_summaries(ts)")
+    ;; Forward-compat: a Phase 2 commit 1 DB lacks `is_ai'.  Add it
+    ;; in place so the budget guard can run without requiring a
+    ;; full rebuild.
+    (unless (cl-some
+             (lambda (col) (equal (nth 1 col) "is_ai"))
+             (sqlite-select db "PRAGMA table_info('obs_summaries')"))
+      (sqlite-execute
+       db
+       "ALTER TABLE obs_summaries
+          ADD COLUMN is_ai INTEGER NOT NULL DEFAULT 0"))
     ;; Standalone FTS5 (no content= mode) so inserts are explicit and
     ;; trigger-free; rowid is aligned with the obs_observations.id by
     ;; the caller.  Mirrors the memory_body_fts approach in
@@ -581,17 +604,20 @@ ships the AI path."
       (format "%d obs" count))))
 
 (defun anvil-memory-obs--insert-summary (session-id topic summary
-                                                    obs-start-id obs-end-id)
-  "Persist a summary row and its FTS5 mirror.  Returns the row id."
+                                                    obs-start-id obs-end-id
+                                                    &optional is-ai)
+  "Persist a summary row and its FTS5 mirror.  Returns the row id.
+IS-AI is the integer flag (1 when AI produced the summary, 0 otherwise);
+nil treats it as 0."
   (let* ((db (anvil-memory-obs--db))
          (ts (anvil-memory-obs--now)))
     (sqlite-execute
      db
      "INSERT INTO obs_summaries
-        (session_id, obs_start_id, obs_end_id, topic, summary, ts)
-        VALUES (?, ?, ?, ?, ?, ?)"
+        (session_id, obs_start_id, obs_end_id, topic, summary, ts, is_ai)
+        VALUES (?, ?, ?, ?, ?, ?, ?)"
      (list session-id obs-start-id obs-end-id
-           (or topic "") summary ts))
+           (or topic "") summary ts (if is-ai 1 0)))
     (let ((rowid (caar (sqlite-select db "SELECT last_insert_rowid()"))))
       (sqlite-execute
        db
@@ -599,6 +625,27 @@ ships the AI path."
           VALUES (?, ?, ?)"
        (list rowid (or topic "") summary))
       rowid)))
+
+(defun anvil-memory-obs--current-month-start (&optional now)
+  "Return the unix epoch of the first day of the month containing NOW.
+NOW defaults to the current time (`anvil-memory-obs--now')."
+  (let* ((t* (or now (anvil-memory-obs--now)))
+         (dec (decode-time t*))
+         (year (nth 5 dec))
+         (month (nth 4 dec)))
+    (truncate (time-to-seconds (encode-time 0 0 0 1 month year)))))
+
+(defun anvil-memory-obs--ai-budget-exhausted-p ()
+  "Non-nil when this calendar month's AI summary count >= budget."
+  (when anvil-memory-obs-compress-monthly-budget
+    (let* ((db (anvil-memory-obs--db))
+           (since (anvil-memory-obs--current-month-start))
+           (count (caar (sqlite-select
+                         db
+                         "SELECT COUNT(*) FROM obs_summaries
+                            WHERE is_ai = 1 AND ts >= ?"
+                         (list since)))))
+      (>= count anvil-memory-obs-compress-monthly-budget))))
 
 (defun anvil-memory-obs--render-obs-for-prompt (obs-rows)
   "Render OBS-ROWS as `[hook] body' lines for the AI prompt."
@@ -661,9 +708,10 @@ Returns (TOPIC . SUMMARY) on success or nil on any failure path
 (defun anvil-memory-obs-summarize-session (session-id &optional force-fallback)
   "Compress SESSION-ID's observations into a single summary row.
 Tries AI summarisation when
-`anvil-memory-obs-use-ai-compression' is non-nil and
-`anvil-orchestrator-submit-and-collect' is loaded; otherwise (or
-when FORCE-FALLBACK is non-nil) emits the rule-based summary.
+`anvil-memory-obs-use-ai-compression' is non-nil,
+`anvil-orchestrator-submit-and-collect' is loaded, and the monthly
+AI budget is not exhausted; otherwise (or when FORCE-FALLBACK is
+non-nil) emits the rule-based summary.
 Returns the new summary row id, or nil when the session is below
 the size gate or summaries are disabled."
   (let* ((rows (anvil-memory-obs--gather-observations session-id))
@@ -672,8 +720,10 @@ the size gate or summaries are disabled."
      ((< n anvil-memory-obs-compress-min-observations) nil)
      ((eq anvil-memory-obs-compress-fallback 'none)    nil)
      (t
-      (let* ((ai (when (and (not force-fallback)
-                            anvil-memory-obs-use-ai-compression)
+      (let* ((ai-allowed (and (not force-fallback)
+                              anvil-memory-obs-use-ai-compression
+                              (not (anvil-memory-obs--ai-budget-exhausted-p))))
+             (ai (when ai-allowed
                    (anvil-memory-obs--ai-summary rows)))
              (topic (or (car-safe ai)
                         (anvil-memory-obs--rule-based-topic rows)))
@@ -682,7 +732,8 @@ the size gate or summaries are disabled."
              (start-id (nth 0 (car rows)))
              (end-id   (nth 0 (car (last rows)))))
         (anvil-memory-obs--insert-summary
-         session-id topic summary start-id end-id))))))
+         session-id topic summary start-id end-id
+         (when ai 1)))))))
 
 
 ;;;; --- enable / disable stubs --------------------------------------------

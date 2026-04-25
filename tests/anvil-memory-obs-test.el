@@ -511,6 +511,101 @@
           (should (null called)))))))
 
 
+;;;; --- Phase 2: AI budget guard tests ------------------------------------
+
+(ert-deftest anvil-memory-obs-summary-flag-records-is-ai ()
+  "Successful AI summarisation stores `is_ai=1'."
+  (skip-unless (anvil-memory-obs-test--supported-p 'budget))
+  (anvil-memory-obs-test--with-env
+    (cl-letf (((symbol-function 'anvil-orchestrator-submit-and-collect)
+               (lambda (&rest _args)
+                 (list :status 'done :summary
+                       "{\"topic\":\"X\",\"summary\":\"Y.\"}"))))
+      (let ((anvil-memory-obs-enabled t)
+            (anvil-memory-obs-use-ai-compression t)
+            (anvil-memory-obs-compress-monthly-budget nil)
+            (anvil-memory-obs-compress-min-observations 3))
+        (anvil-memory-obs-test--seed-session "bud1" 4)
+        (anvil-memory-obs-summarize-session "bud1")
+        (let ((flag (caar (sqlite-select
+                           (anvil-memory-obs--db)
+                           "SELECT is_ai FROM obs_summaries"))))
+          (should (= flag 1)))))))
+
+(ert-deftest anvil-memory-obs-summary-flag-rule-based-is-zero ()
+  "Rule-based summarisation stores `is_ai=0'."
+  (skip-unless (anvil-memory-obs-test--supported-p 'budget))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-use-ai-compression nil)
+          (anvil-memory-obs-compress-min-observations 3))
+      (anvil-memory-obs-test--seed-session "bud2" 4)
+      (anvil-memory-obs-summarize-session "bud2")
+      (let ((flag (caar (sqlite-select
+                         (anvil-memory-obs--db)
+                         "SELECT is_ai FROM obs_summaries"))))
+        (should (= flag 0))))))
+
+(ert-deftest anvil-memory-obs-budget-exhaustion-skips-ai ()
+  "When monthly budget is reached, AI is skipped (rule-based runs)."
+  (skip-unless (anvil-memory-obs-test--supported-p 'budget))
+  (anvil-memory-obs-test--with-env
+    (let ((called nil))
+      (cl-letf (((symbol-function 'anvil-orchestrator-submit-and-collect)
+                 (lambda (&rest _args)
+                   (setq called t)
+                   (list :status 'done :summary
+                         "{\"topic\":\"X\",\"summary\":\"Y.\"}"))))
+        (let ((anvil-memory-obs-enabled t)
+              (anvil-memory-obs-use-ai-compression t)
+              (anvil-memory-obs-compress-monthly-budget 1)
+              (anvil-memory-obs-compress-min-observations 3))
+          ;; Pre-populate the budget by inserting a fake AI summary row.
+          (anvil-memory-obs--upsert-session "seed")
+          (anvil-memory-obs--insert-summary
+           "seed" "T" "S" 1 1 1)
+          (anvil-memory-obs-test--seed-session "bud3" 4)
+          (anvil-memory-obs-summarize-session "bud3")
+          (should (null called))
+          (let ((flag (caar (sqlite-select
+                             (anvil-memory-obs--db)
+                             "SELECT is_ai FROM obs_summaries
+                               WHERE session_id = 'bud3'"))))
+            (should (= flag 0))))))))
+
+(ert-deftest anvil-memory-obs-budget-nil-disables-guard ()
+  "Setting the budget to nil never blocks AI."
+  (skip-unless (anvil-memory-obs-test--supported-p 'budget))
+  (anvil-memory-obs-test--with-env
+    (let ((called nil))
+      (cl-letf (((symbol-function 'anvil-orchestrator-submit-and-collect)
+                 (lambda (&rest _args)
+                   (setq called t)
+                   (list :status 'done :summary
+                         "{\"topic\":\"X\",\"summary\":\"Y.\"}"))))
+        (let ((anvil-memory-obs-enabled t)
+              (anvil-memory-obs-use-ai-compression t)
+              (anvil-memory-obs-compress-monthly-budget nil)
+              (anvil-memory-obs-compress-min-observations 3))
+          ;; Even with many existing AI summaries, no gate.
+          (anvil-memory-obs--upsert-session "seed")
+          (dotimes (_ 50)
+            (anvil-memory-obs--insert-summary "seed" "T" "S" 1 1 1))
+          (anvil-memory-obs-test--seed-session "bud4" 4)
+          (anvil-memory-obs-summarize-session "bud4")
+          (should called))))))
+
+(ert-deftest anvil-memory-obs-month-start-is-deterministic ()
+  "current-month-start matches the local-time first-of-month."
+  (skip-unless (anvil-memory-obs-test--supported-p 'budget))
+  (let* ((ts (time-to-seconds (encode-time 30 14 10 15 6 2026)))
+         (start (anvil-memory-obs--current-month-start (truncate ts)))
+         (start-time (decode-time start)))
+    (should (= (nth 3 start-time) 1))   ; day
+    (should (= (nth 4 start-time) 6))   ; month
+    (should (= (nth 5 start-time) 2026)))) ; year
+
+
 ;;;; --- purge tests --------------------------------------------------------
 
 (ert-deftest anvil-memory-obs-purge-removes-old-low-importance ()
