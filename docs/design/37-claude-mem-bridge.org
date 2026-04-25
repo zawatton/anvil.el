@@ -5,14 +5,24 @@
 
 * Status
 :PROPERTIES:
-:STATE: DRAFT (revised)
+:STATE: SHIPPED (Phase 1-6, Phase 7 deferred)
 :CREATED: 2026-04-25
+:SHIPPED: 2026-04-25
 :OWNER: zawatton
 :END:
 
-DRAFT — design only. /Revised 2026-04-25/: claude-mem を install せず、公開仕様
-([[https://github.com/thedotmack/claude-mem][thedotmack/claude-mem]] / [[https://docs.claude-mem.ai/][docs]]) のロジックを参考に **anvil-memory 内に独自実装**
-する方針へ転換。AGPL 依存ゼロ、GPL-3.0 only。
+SHIPPED on develop (2026-04-25): Phase 1 (capture), 2 (compression),
+3 (search MCP), 4 (auto-inject), 5 (UI), 6 (promote loop) all merged
+via the feat/doc37-phaseN-* branches; Phase 7 (vector embedding) is
+intentionally deferred.
+
+Module: =anvil-memory-obs.el= (~1700 LOC at ship), tests:
+=tests/anvil-memory-obs-test.el= (108 ERT, all green).  Full suite at
+ship: 1435/1441 pass, 0 failed.
+
+claude-mem は install せず、公開仕様 ([[https://github.com/thedotmack/claude-mem][thedotmack/claude-mem]] /
+[[https://docs.claude-mem.ai/][docs]]) のロジックを参考に **anvil-memory 内に独自実装**。AGPL 依存ゼロ、
+GPL-3.0 only.
 
 * Goal
 
@@ -125,7 +135,7 @@ CREATE VIRTUAL TABLE summaries_fts USING fts5(
 
 * Phase plan
 
-** Phase 1 — Observation capture (1-2 weeks)
+** Phase 1 — Observation capture (SHIPPED 2026-04-25, merge 37fab6b)
 *** 1.1 hook handler 拡張
 - =anvil-hook.el= の =anvil-hook-dispatch= で各 event 後に
   =(anvil-memory-observation-record HOOK SESSION-ID PAYLOAD)= を呼ぶ
@@ -139,7 +149,7 @@ CREATE VIRTUAL TABLE summaries_fts USING fts5(
 - repeated tool call (同 tool 連続): -10
 - 後続で AI 圧縮時に再評価
 
-** Phase 2 — AI compression worker (1 week)
+** Phase 2 — AI compression worker (SHIPPED 2026-04-25, merge 6071b92)
 *** 2.1 SessionEnd 時に圧縮
 - =anvil-orchestrator-submit= で claude provider に
   「直近 N 件 observation を 1-3 sentence で要約 + topic 抽出」
@@ -150,7 +160,7 @@ CREATE VIRTUAL TABLE summaries_fts USING fts5(
 *** 2.3 失敗時 fallback
 - claude API 不通 → rule-based 要約 (最初の200char + last200char で代替)
 
-** Phase 3 — 3-layer search MCP tools (1-2 weeks)
+** Phase 3 — 3-layer search MCP tools (SHIPPED 2026-04-25, merge 244eda1)
 *** 3.1 =memory-obs-search= (Layer 1: index)
 - input: =query=, =limit= (default 10), =filter= (session/date/hook)
 - output: =[(:id N :ts T :hook H :preview "..." :score S)]=  (~50-100 tokens/件)
@@ -165,7 +175,7 @@ CREATE VIRTUAL TABLE summaries_fts USING fts5(
 - summaries_fts 直接、~30 tokens/件
 - 「過去にこの問題どう解いたか」用
 
-** Phase 4 — Auto-inject on SessionStart (1 week)
+** Phase 4 — Auto-inject on SessionStart (SHIPPED 2026-04-25, merge 089b32c)
 *** 4.1 関連 summary の prepend
 - =SessionStart= hook 発火時、=current project-dir= を key に
   直近 7 日の summaries を関連度 top-5 抽出
@@ -175,7 +185,7 @@ CREATE VIRTUAL TABLE summaries_fts USING fts5(
 *** 4.3 opt-out
 - =defcustom anvil-memory-auto-inject= (default nil 安全側)
 
-** Phase 5 — UI (Tabulated list, 1 week)
+** Phase 5 — UI (Tabulated list, SHIPPED 2026-04-25, merge 3f43492)
 *** 5.1 =M-x anvil-memory-observations=
 - session ごとに observation を table 表示
 - column: ts / hook / tool / preview / importance
@@ -183,7 +193,7 @@ CREATE VIRTUAL TABLE summaries_fts USING fts5(
 *** 5.2 =M-x anvil-memory-summaries=
 - topic ごとに集約、関連 observations へ drill-down
 
-** Phase 6 — Promote to auto-memory (semi-automatic, 1 week)
+** Phase 6 — Promote to auto-memory (SHIPPED 2026-04-25, merge 4f5814a)
 *** 6.1 候補抽出 (cron / 手動)
 - 週 1 回 =M-x anvil-memory-promote-candidates=
 - 高 importance + 同 topic 反復 + auto-memory 既存と非重複の summary を提示
@@ -223,7 +233,7 @@ CREATE VIRTUAL TABLE summaries_fts USING fts5(
 
 * Decision log
 
-** 2026-04-25 (DRAFT 起こし → revised)
+** 2026-04-25 (DRAFT 起こし → revised → SHIPPED)
 - 当初: claude-mem を install して bridge → AGPL 境界が user 環境に紛れる
 - 変更: claude-mem **install しない**、ロジックのみ参考に anvil-memory 自前実装
 - 利点:
@@ -233,6 +243,14 @@ CREATE VIRTUAL TABLE summaries_fts USING fts5(
 - 制約:
   - vector search は Phase 7 deferred (FTS5 trigram で当面回す)
   - claude-mem の最新改善 (Endless Mode 等) は手動で追従要
+
+** 2026-04-25 (Phase 1-6 SHIPPED on develop)
+- Phase 1-6 全部、設計通り (Doc 37 § Phase plan) 着地。Phase 5 の UI は
+  純 inspection だが p キーで Phase 6 の promote にショートカットを張った
+- 当初想定 (Phase 当たり 1-2 週) を 1 セッション内に圧縮、ERT 108 / 全 1435
+  パスで 0 failed
+- 全 commit Co-Authored-By 付与、master gate は他 DRAFT 設計書の audit 後に
+  解除予定
 
 * Distribution
 
@@ -258,9 +276,10 @@ CREATE VIRTUAL TABLE summaries_fts USING fts5(
 | Phase 7 (vector)               | (deferred)                   |
 
 * Open for review
-- [ ] importance 推定の rule-based セット (Phase 1.3)
-- [ ] AI 圧縮プロンプト template (Phase 2.1)
-- [ ] auto-inject 既定値 (nil / t どちらが UX 良いか)
-- [ ] purge policy: 90日 / importance<10 が妥当か
-- [ ] Phase 順序: 1→3→2→4 でも回せる (圧縮なしで search 先に試す)
-- [ ] リリース repo 構成: anvil mono-repo か独立 anvil-memory repo か
+Phase 1-6 SHIPPED の段階で残る論点 — 実運用データ蓄積後に再検討:
+- [ ] importance 推定の rule-based セット (Phase 1.3 採用済、要 tuning)
+- [ ] AI 圧縮プロンプト template (Phase 2.1 採用、出力品質を soak で評価)
+- [ ] auto-inject 既定値 (nil 採用、opt-in 運用で問題なければ確定)
+- [ ] purge policy: 90 日 / importance<10 が妥当か (実 DB サイズ観察後)
+- [x] Phase 順序: 1→2→3→4→6→5 で実装、設計順序 (1→3→2→4) は未採用
+- [ ] リリース repo 構成: anvil mono-repo に同梱 (現状)、独立 repo 化は保留
