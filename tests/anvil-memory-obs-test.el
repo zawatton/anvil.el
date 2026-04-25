@@ -789,6 +789,96 @@
     (should (null (anvil-memory-obs-summary-search "")))))
 
 
+;;;; --- Phase 3: MCP tool wrapper tests -----------------------------------
+
+(ert-deftest anvil-memory-obs-tool-search-returns-rows-plist ()
+  "`--tool-search' returns (:rows ROWS) with FTS hits."
+  (skip-unless (anvil-memory-obs-test--supported-p 'mcp-tools))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t))
+      (anvil-memory-obs-test--seed-session "tw1" 5)
+      (let ((result (anvil-memory-obs--tool-search "details" "3")))
+        (should (plist-get result :rows))
+        (should (<= (length (plist-get result :rows)) 3))))))
+
+(ert-deftest anvil-memory-obs-tool-timeline-coerces-digit-strings ()
+  "`--tool-timeline' accepts digit-string anchor / window args."
+  (skip-unless (anvil-memory-obs-test--supported-p 'mcp-tools))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t))
+      (let* ((ids (anvil-memory-obs-test--seed-session "tw2" 6))
+             (anchor (nth 2 ids))
+             (result (anvil-memory-obs--tool-timeline
+                      (number-to-string anchor) "1")))
+        (should (plist-get result :rows))
+        (should (member anchor
+                        (mapcar (lambda (r) (plist-get r :id))
+                                (plist-get result :rows))))))))
+
+(ert-deftest anvil-memory-obs-tool-get-accepts-comma-string ()
+  "`--tool-get' accepts a comma-separated id string."
+  (skip-unless (anvil-memory-obs-test--supported-p 'mcp-tools))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t))
+      (let* ((ids (anvil-memory-obs-test--seed-session "tw3" 4))
+             (id-str (string-join (mapcar #'number-to-string
+                                          (cl-subseq ids 0 3))
+                                  ", "))
+             (result (anvil-memory-obs--tool-get id-str)))
+        (should (= (length (plist-get result :rows)) 3))))))
+
+(ert-deftest anvil-memory-obs-tool-get-accepts-list ()
+  "`--tool-get' accepts a plain list of integers."
+  (skip-unless (anvil-memory-obs-test--supported-p 'mcp-tools))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t))
+      (let* ((ids (anvil-memory-obs-test--seed-session "tw4" 3))
+             (result (anvil-memory-obs--tool-get ids)))
+        (should (= (length (plist-get result :rows)) 3))))))
+
+(ert-deftest anvil-memory-obs-tool-summary-search-basic ()
+  "`--tool-summary-search' returns (:rows ...) for matched summaries."
+  (skip-unless (anvil-memory-obs-test--supported-p 'mcp-tools))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-compress-min-observations 3))
+      (anvil-memory-obs-test--seed-session "tw5" 4)
+      (anvil-memory-obs-summarize-session "tw5")
+      (let ((result (anvil-memory-obs--tool-summary-search "details")))
+        (should (>= (length (plist-get result :rows)) 1))))))
+
+(ert-deftest anvil-memory-obs-coerce-int-handles-edges ()
+  "Integer / digit-string / garbage all coerce predictably."
+  (skip-unless (anvil-memory-obs-test--supported-p 'mcp-tools))
+  (should (= (anvil-memory-obs--coerce-int 5 0) 5))
+  (should (= (anvil-memory-obs--coerce-int "42" 0) 42))
+  (should (= (anvil-memory-obs--coerce-int "not-a-number" 7) 7))
+  (should (= (anvil-memory-obs--coerce-int nil 9) 9)))
+
+(ert-deftest anvil-memory-obs-coerce-id-list-accepts-various-shapes ()
+  "List, JSON-array string, and comma string all parse to int lists."
+  (skip-unless (anvil-memory-obs-test--supported-p 'mcp-tools))
+  (should (equal (anvil-memory-obs--coerce-id-list '(1 2 3))
+                 '(1 2 3)))
+  (should (equal (anvil-memory-obs--coerce-id-list "[1,2,3]")
+                 '(1 2 3)))
+  (should (equal (anvil-memory-obs--coerce-id-list "1, 2, 3")
+                 '(1 2 3)))
+  (should (null (anvil-memory-obs--coerce-id-list nil))))
+
+(ert-deftest anvil-memory-obs-enable-disable-roundtrip ()
+  "enable / disable register and unregister cleanly without errors."
+  (skip-unless (anvil-memory-obs-test--supported-p 'mcp-tools))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t))
+      (anvil-memory-obs-enable)
+      (anvil-memory-obs-disable)
+      ;; Re-running both is idempotent.
+      (anvil-memory-obs-enable)
+      (anvil-memory-obs-disable)
+      (should t))))
+
+
 ;;;; --- purge tests --------------------------------------------------------
 
 (ert-deftest anvil-memory-obs-purge-removes-old-low-importance ()

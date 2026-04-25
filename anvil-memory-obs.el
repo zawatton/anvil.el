@@ -47,6 +47,7 @@
 (require 'cl-lib)
 (require 'subr-x)
 (require 'json)
+(require 'anvil-server)
 
 ;; AI compression dispatches through anvil-orchestrator when
 ;; available.  The module is loaded lazily; rule-based fallback
@@ -212,7 +213,7 @@ Observations:
 (defconst anvil-memory-obs-supported
   '(schema record importance redact integration purge
            compress-rule-based compress-ai compress-auto budget
-           search timeline get summary-search)
+           search timeline get summary-search mcp-tools)
   "Capability tags this module currently provides.
 Tests `skip-unless' their tag is in this list so a half-shipped
 feature never breaks CI.  Phase milestones append tags here.")
@@ -891,22 +892,166 @@ Empty / whitespace-only QUERY returns nil."
               rows))))
 
 
-;;;; --- enable / disable stubs --------------------------------------------
+;;;; --- Phase 3: MCP tool wrappers ----------------------------------------
 
+(defun anvil-memory-obs--coerce-int (v default)
+  "Coerce V to integer; falls back to DEFAULT on a non-numeric value."
+  (cond
+   ((integerp v) v)
+   ((and (stringp v) (string-match-p "\\`-?[0-9]+\\'" v))
+    (string-to-number v))
+   (t default)))
+
+(defun anvil-memory-obs--coerce-string (v)
+  "Return V when it is a non-empty string, otherwise nil."
+  (when (and (stringp v) (not (string-empty-p v)))
+    v))
+
+(defun anvil-memory-obs--coerce-id-list (v)
+  "Coerce V to a list of integers.
+V may be a list, a JSON-style array string, or a comma / space
+separated string of digits.  Non-numeric tokens are dropped."
+  (cond
+   ((null v) nil)
+   ((listp v)
+    (delq nil (mapcar (lambda (e) (anvil-memory-obs--coerce-int e nil)) v)))
+   ((stringp v)
+    (let* ((trimmed (string-trim
+                     (replace-regexp-in-string "[][]" "" v)))
+           (tokens (split-string trimmed "[, ]+" t)))
+      (delq nil
+            (mapcar (lambda (s) (anvil-memory-obs--coerce-int s nil))
+                    tokens))))
+   (t nil)))
+
+(defun anvil-memory-obs--tool-search (query &optional limit hook session-id)
+  "Layer-1 FTS5 index search across observation bodies.
+
+MCP Parameters:
+  query      - FTS5 query string.  Empty / whitespace returns (:rows nil).
+  limit      - Optional max row count (default 10, digit-string accepted).
+  hook       - Optional hook filter (e.g. \"post-tool-use\").
+  session-id - Optional session id filter.
+
+Returns (:rows ROWS) ordered by FTS rank (best first)."
+  (anvil-server-with-error-handling
+   (list :rows
+         (anvil-memory-obs-search
+          query
+          :limit (anvil-memory-obs--coerce-int limit 10)
+          :hook (anvil-memory-obs--coerce-string hook)
+          :session-id (anvil-memory-obs--coerce-string session-id)))))
+
+(defun anvil-memory-obs--tool-timeline (anchor-id &optional window)
+  "Layer-2 timeline window around an anchor observation.
+
+MCP Parameters:
+  anchor-id - Anchor observation id (integer or digit-string).
+  window    - Optional ± window size (default 5, digit-string accepted).
+
+Returns (:rows ROWS) ordered by id ASC.  Empty when ANCHOR-ID is unknown."
+  (anvil-server-with-error-handling
+   (list :rows
+         (anvil-memory-obs-timeline
+          (anvil-memory-obs--coerce-int anchor-id 0)
+          :window (anvil-memory-obs--coerce-int window 5)))))
+
+(defun anvil-memory-obs--tool-get (ids)
+  "Layer-3 full-row fetch by id list.
+
+MCP Parameters:
+  ids - Observation ids.  Accepts a list of integers, a JSON-style
+        \"[1,2,3]\" string, or a comma / space separated digit
+        string.  Capped at `anvil-memory-obs-get-max-ids' (default 20).
+
+Returns (:rows ROWS) ordered by id ASC."
+  (anvil-server-with-error-handling
+   (list :rows
+         (anvil-memory-obs-get
+          (anvil-memory-obs--coerce-id-list ids)))))
+
+(defun anvil-memory-obs--tool-summary-search (query &optional limit)
+  "Topic-level FTS5 search over compressed session summaries.
+
+MCP Parameters:
+  query - FTS5 query string.  Empty / whitespace returns (:rows nil).
+  limit - Optional max row count (default 10, digit-string accepted).
+
+Returns (:rows ROWS) ordered by FTS rank.  Each row carries an
+`:is-ai' boolean so callers can prefer AI-derived summaries."
+  (anvil-server-with-error-handling
+   (list :rows
+         (anvil-memory-obs-summary-search
+          query
+          :limit (anvil-memory-obs--coerce-int limit 10)))))
+
+
+(defconst anvil-memory-obs--tool-specs
+  `((,(anvil-server-encode-handler #'anvil-memory-obs--tool-search)
+     :id "memory-obs-search"
+     :intent '(memory observation search)
+     :layer 'index
+     :description
+     "Layer 1 — FTS5 index search across observation bodies.  Returns
+capped previews (~80 chars per row) so the result fits comfortably in a
+single tool response.  Use `memory-obs-timeline' for surrounding context
+and `memory-obs-get' for full bodies."
+     :read-only t)
+
+    (,(anvil-server-encode-handler #'anvil-memory-obs--tool-timeline)
+     :id "memory-obs-timeline"
+     :intent '(memory observation context)
+     :layer 'context
+     :description
+     "Layer 2 — return ±WINDOW observations around an anchor id within the
+same session, ordered by id ASC.  Use this after `memory-obs-search' to
+recover context around a hit."
+     :read-only t)
+
+    (,(anvil-server-encode-handler #'anvil-memory-obs--tool-get)
+     :id "memory-obs-get"
+     :intent '(memory observation read)
+     :layer 'detail
+     :description
+     "Layer 3 — fetch full observation rows (body, payload, importance,
+hook, tool name) for an explicit id list.  Capped at 20 ids per call."
+     :read-only t)
+
+    (,(anvil-server-encode-handler #'anvil-memory-obs--tool-summary-search)
+     :id "memory-obs-summary-search"
+     :intent '(memory observation search)
+     :layer 'workflow
+     :description
+     "FTS5 search over compressed session summaries (topic + summary).
+Each row carries an `:is-ai' boolean so callers can prefer AI-derived
+summaries when available."
+     :read-only t))
+  "Spec list consumed by `anvil-server-register-tools'.")
+
+(defun anvil-memory-obs--register-tools ()
+  (anvil-server-register-tools anvil-memory-obs--server-id
+                               anvil-memory-obs--tool-specs))
+
+(defun anvil-memory-obs--unregister-tools ()
+  (anvil-server-unregister-tools anvil-memory-obs--server-id
+                                 anvil-memory-obs--tool-specs))
+
+
+;;;; --- enable / disable --------------------------------------------------
+
+;;;###autoload
 (defun anvil-memory-obs-enable ()
-  "Enable the observation capture module.
-Phase 1 has no MCP tools to register; this stub exists so
-`anvil--load-module' can call it uniformly with other modules.
-Phase 3+ will register the search MCP tools here."
+  "Open the obs DB (when enabled) and register memory-obs-* MCP tools."
   (interactive)
-  ;; Touch the DB so a misconfigured `anvil-memory-obs-db-path'
-  ;; surfaces immediately rather than at the first record call.
   (when anvil-memory-obs-enabled
-    (ignore (anvil-memory-obs--db))))
+    (ignore (anvil-memory-obs--db)))
+  (anvil-memory-obs--register-tools))
 
+;;;###autoload
 (defun anvil-memory-obs-disable ()
-  "Disable the observation capture module: close the DB if open."
+  "Unregister memory-obs-* MCP tools and close the obs DB."
   (interactive)
+  (anvil-memory-obs--unregister-tools)
   (anvil-memory-obs--close))
 
 
