@@ -4,7 +4,7 @@
 
 ;; Author: Anvil contributors
 ;; Keywords: http, twitter, reddit, tools
-;; Package-Requires: ((emacs "28.1") (anvil-http "0.1") (anvil-server "0.1"))
+;; Package-Requires: ((emacs "28.1"))
 ;; Version: 0.1.0
 
 ;;; Commentary:
