@@ -257,7 +257,22 @@ These are not loaded by default.  Available modules:
                 29+ and `session'.  Phase 2 (AI compression),
                 Phase 3 (3-layer search MCP tools), Phase 4
                 (auto-inject), Phase 5 (UI), Phase 6 (promote) and
-                Phase 7 (vector) stay DRAFT."
+                Phase 7 (vector) stay DRAFT.
+- `extend'    — Claude self-extension SDK scaffold (Doc 35 Phase
+                A, DRAFT v0).  Adds the
+                `anvil-extend-scaffold' MCP tool: a Claude Code
+                session can emit `<NAME>.el' (function body) +
+                `<NAME>-test.el' (ERT skeleton) +
+                `<NAME>-register.el' (MCP register stub) into
+                `anvil-extend-storage-dir' (default
+                ~/.anvil-extend/) in a single call, then run
+                `anvil-extend-load' / `-test' / `-list' / `-remove'
+                from the same session to iterate.  Phase A is
+                scaffold-only: hot-reload (Phase B), sandbox
+                eval (Phase C), rationale auto-record (Phase D),
+                NeLisp execute path (Phase E), and ephemeral /
+                permanent promotion (Phase F) stay DRAFT until
+                Doc 35 reaches LOCKED."
   :type '(repeat symbol)
   :group 'anvil)
 
