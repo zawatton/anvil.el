@@ -384,14 +384,18 @@ Maintained incrementally by `--cache-put' / `--cache-delete' /
 
 (defun anvil-http--normalize-url (url)
   "Return a canonical form of URL suitable as a cache key.
-Lowercases scheme and host, strips fragment, keeps path+query."
-  (let ((parsed (url-generic-parse-url url)))
-    (when (url-type parsed)
-      (setf (url-type parsed) (downcase (url-type parsed))))
-    (when (url-host parsed)
-      (setf (url-host parsed) (downcase (url-host parsed))))
-    (setf (url-target parsed) nil)
-    (url-recreate-url parsed)))
+Lowercases scheme and host, strips fragment, keeps path+query.
+
+Delegates to `nelisp-http--normalize-url' when available."
+  (if (fboundp 'nelisp-http--normalize-url)
+      (nelisp-http--normalize-url url)
+    (let ((parsed (url-generic-parse-url url)))
+      (when (url-type parsed)
+        (setf (url-type parsed) (downcase (url-type parsed))))
+      (when (url-host parsed)
+        (setf (url-host parsed) (downcase (url-host parsed))))
+      (setf (url-target parsed) nil)
+      (url-recreate-url parsed))))
 
 ;;;; --- cache I/O (anvil-state ns="http") ----------------------------------
 
@@ -1181,27 +1185,39 @@ user input without a pre-check."
 ;;;; --- robots.txt (Phase 1e) ----------------------------------------------
 
 (defun anvil-http--url-origin (url)
-  "Return scheme://host[:port] for URL, omitting the default port."
-  (let* ((u (url-generic-parse-url url))
-         (scheme (url-type u))
-         (host (url-host u))
-         (port (url-port u))
-         (default (pcase scheme ("http" 80) ("https" 443) (_ nil))))
-    (if (and (numberp port) default (= port default))
-        (format "%s://%s" scheme host)
-      (format "%s://%s:%s" scheme host port))))
+  "Return scheme://host[:port] for URL, omitting the default port.
+
+Delegates to `nelisp-http--url-origin' when available."
+  (if (fboundp 'nelisp-http--url-origin)
+      (nelisp-http--url-origin url)
+    (let* ((u (url-generic-parse-url url))
+           (scheme (url-type u))
+           (host (url-host u))
+           (port (url-port u))
+           (default (pcase scheme ("http" 80) ("https" 443) (_ nil))))
+      (if (and (numberp port) default (= port default))
+          (format "%s://%s" scheme host)
+        (format "%s://%s:%s" scheme host port)))))
 
 (defun anvil-http--url-path (url)
-  "Return path+query of URL, defaulting to `/' when absent."
-  (let* ((u (url-generic-parse-url url))
-         (filename (url-filename u)))
-    (if (or (null filename) (string-empty-p filename))
-        "/"
-      filename)))
+  "Return path+query of URL, defaulting to `/' when absent.
+
+Delegates to `nelisp-http--url-path' when available."
+  (if (fboundp 'nelisp-http--url-path)
+      (nelisp-http--url-path url)
+    (let* ((u (url-generic-parse-url url))
+           (filename (url-filename u)))
+      (if (or (null filename) (string-empty-p filename))
+          "/"
+        filename))))
 
 (defun anvil-http--is-robots-url-p (url)
-  "Return non-nil when URL itself points at /robots.txt."
-  (string-equal "/robots.txt" (anvil-http--url-path url)))
+  "Return non-nil when URL itself points at /robots.txt.
+
+Delegates to `nelisp-http--is-robots-url-p' when available."
+  (if (fboundp 'nelisp-http--is-robots-url-p)
+      (nelisp-http--is-robots-url-p url)
+    (string-equal "/robots.txt" (anvil-http--url-path url))))
 
 (defun anvil-http--robots-parse (text)
   "Parse robots.txt TEXT into a list of (UA-LIST . RULES).
