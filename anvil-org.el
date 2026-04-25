@@ -689,6 +689,7 @@ Throws an MCP tool error if unbalanced blocks are found."
   "Normalize TAGS parameter to a list format.
 TAGS can be:
 - nil or empty list -> returns nil
+- empty / whitespace-only string -> returns nil (no tags)
 - vector (JSON array) -> converts to list
 - string -> wraps in list
 - list -> returns as-is
@@ -701,7 +702,11 @@ Throws error for invalid types."
    ((listp tags)
     tags) ; Already a list
    ((stringp tags)
-    (list tags)) ; Single tag string
+    (if (string-empty-p (string-trim tags))
+        nil ; "" / whitespace -> no tags (MCP schema declares tags
+            ; as a single required string, so callers need a way to
+            ; express "no tags" without inventing a sentinel value)
+      (list tags))) ; Single tag string
    (t
     (anvil-org--tool-validation-error "Invalid tags format: %s" tags))))
 
@@ -939,10 +944,18 @@ MCP Parameters:
       (anvil-org--goto-headline-from-uri
        headline-path (string-prefix-p anvil-org--uri-id-prefix uri))
 
-      ;; Check current state matches
+      ;; Check current state matches.  `org-get-todo-state' returns
+      ;; nil for headlines without a TODO keyword; treat nil and ""
+      ;; (the documented "no state" sentinel on the MCP wire) as the
+      ;; same value so callers can transition from no-state to a real
+      ;; state without inventing a magic string.
       (beginning-of-line)
-      (let ((actual-state (org-get-todo-state)))
-        (unless (string= actual-state current_state)
+      (let* ((actual-state (org-get-todo-state))
+             (expected (if (or (null current_state)
+                               (string-empty-p current_state))
+                           nil
+                         current_state)))
+        (unless (equal actual-state expected)
           (anvil-org--state-mismatch-error
            (or current_state "(no state)")
            (or actual-state "(no state)") "State")))

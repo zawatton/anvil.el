@@ -123,4 +123,38 @@
       "org://550e8400-e29b-41d4-a716-446655440000"
       (cadr err)))))
 
+(ert-deftest anvil-org-test-update-todo-state-no-state-transition ()
+  "Empty `current_state' must match a headline that has no TODO keyword."
+  (anvil-org-test--with-temp-org
+   "* Plain :test:\nBody.\n"
+   (lambda (path)
+     (let* ((anvil-org-allowed-files (list path))
+            (anvil-org-allowed-files-enabled t)
+            (uri (concat "org-headline://" path "#Plain"))
+            (response
+             (json-parse-string
+              (anvil-org--tool-update-todo-state uri "" "TODO")
+              :object-type 'alist))
+            (content (anvil-org-test--read path)))
+       (should (eq t (alist-get 'success response)))
+       (should (string-match-p "^\\* TODO Plain" content))))))
+
+(ert-deftest anvil-org-test-add-todo-empty-tags-string ()
+  "Empty `tags' string must mean no tags, not a single empty tag."
+  (anvil-org-test--with-temp-org
+   "* Parent\nBody.\n"
+   (lambda (path)
+     (let* ((anvil-org-allowed-files (list path))
+            (anvil-org-allowed-files-enabled t)
+            (parent-uri (concat "org-headline://" path "#Parent"))
+            (response
+             (json-parse-string
+              (anvil-org--tool-add-todo
+               "Child" "TODO" "" "Child body." parent-uri)
+              :object-type 'alist))
+            (content (anvil-org-test--read path)))
+       (should (eq t (alist-get 'success response)))
+       (should (string-match-p "^\\*\\* TODO Child$" content))
+       (should-not (string-match-p "^\\*\\* TODO Child[ \t]+:" content))))))
+
 ;;; anvil-org-test.el ends here
