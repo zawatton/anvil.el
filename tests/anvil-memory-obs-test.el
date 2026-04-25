@@ -125,5 +125,179 @@
         (should (equal (nth 2 (car rows)) "read foo.el line 1-50"))))))
 
 
+;;;; --- redaction tests ----------------------------------------------------
+
+(ert-deftest anvil-memory-obs-redact-replaces-secrets ()
+  "Common secret patterns are replaced by [REDACTED]."
+  (skip-unless (anvil-memory-obs-test--supported-p 'redact))
+  (should (string-match-p
+           "\\[REDACTED\\]"
+           (anvil-memory-obs--redact "api_key=abc123def")))
+  (should (string-match-p
+           "\\[REDACTED\\]"
+           (anvil-memory-obs--redact "password=hunter2")))
+  (should (string-match-p
+           "\\[REDACTED\\]"
+           (anvil-memory-obs--redact "Authorization: Bearer eyJ.abc.def")))
+  (should (string-match-p
+           "\\[REDACTED\\]"
+           (anvil-memory-obs--redact "ghp_abcdefghijklmnopqrstuvwxyz0123456789")))
+  (should (string-match-p
+           "\\[REDACTED\\]"
+           (anvil-memory-obs--redact "sk-abcdefghijklmnopqrst"))))
+
+(ert-deftest anvil-memory-obs-redact-passes-through-clean-text ()
+  "Plain text without secrets is returned unchanged."
+  (skip-unless (anvil-memory-obs-test--supported-p 'redact))
+  (let ((clean "read foo.el line 42 and it returned a list"))
+    (should (equal (anvil-memory-obs--redact clean) clean))))
+
+(ert-deftest anvil-memory-obs-redact-handles-nil-and-empty ()
+  "nil and empty bodies pass through without error."
+  (skip-unless (anvil-memory-obs-test--supported-p 'redact))
+  (should (null (anvil-memory-obs--redact nil)))
+  (should (equal (anvil-memory-obs--redact "") "")))
+
+
+;;;; --- importance tests ---------------------------------------------------
+
+(ert-deftest anvil-memory-obs-importance-applies-rules ()
+  "Each matching rule contributes its :delta to the score."
+  (skip-unless (anvil-memory-obs-test--supported-p 'importance))
+  ;; Default rules: "error" +30, "fix" +20.
+  (should (= (anvil-memory-obs--compute-importance "got an error here") 30))
+  (should (= (anvil-memory-obs--compute-importance "applied a fix") 20))
+  (should (= (anvil-memory-obs--compute-importance "error fixed") 50)))
+
+(ert-deftest anvil-memory-obs-importance-clamps-to-100 ()
+  "Importance is clamped to the [0, 100] range."
+  (skip-unless (anvil-memory-obs-test--supported-p 'importance))
+  (let ((anvil-memory-obs-importance-rules
+         '((:keyword "x" :delta 200))))
+    (should (= (anvil-memory-obs--compute-importance "x") 100))))
+
+(ert-deftest anvil-memory-obs-importance-handles-empty-body ()
+  "Empty / nil body yields 0."
+  (skip-unless (anvil-memory-obs-test--supported-p 'importance))
+  (should (= (anvil-memory-obs--compute-importance "") 0))
+  (should (= (anvil-memory-obs--compute-importance nil) 0)))
+
+
+;;;; --- record API tests ---------------------------------------------------
+
+(ert-deftest anvil-memory-obs-record-is-noop-when-disabled ()
+  "Record functions are no-ops when `anvil-memory-obs-enabled' is nil."
+  (skip-unless (anvil-memory-obs-test--supported-p 'record))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled nil))
+      (should (null (anvil-memory-obs-record-session-start "sess-x")))
+      (should (null (anvil-memory-obs-record-user-prompt "sess-x" "hi"))))))
+
+(ert-deftest anvil-memory-obs-record-session-start-inserts-row ()
+  "record-session-start creates a session and an observation."
+  (skip-unless (anvil-memory-obs-test--supported-p 'record))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t))
+      (anvil-memory-obs-record-session-start "sess-1" "/tmp/proj")
+      (let* ((db (anvil-memory-obs--db))
+             (sess (sqlite-select
+                    db "SELECT id, project_dir FROM obs_sessions"))
+             (obs (sqlite-select
+                   db "SELECT session_id, hook FROM obs_observations")))
+        (should (= (length sess) 1))
+        (should (equal (nth 0 (car sess)) "sess-1"))
+        (should (equal (nth 1 (car sess)) "/tmp/proj"))
+        (should (= (length obs) 1))
+        (should (equal (nth 1 (car obs)) "session-start"))))))
+
+(ert-deftest anvil-memory-obs-record-session-start-is-idempotent-on-id ()
+  "Calling record-session-start twice for the same id keeps started_at."
+  (skip-unless (anvil-memory-obs-test--supported-p 'record))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t))
+      (anvil-memory-obs-record-session-start "sess-2")
+      (let* ((db (anvil-memory-obs--db))
+             (started1 (caar (sqlite-select
+                              db "SELECT started_at FROM obs_sessions
+                                   WHERE id = 'sess-2'"))))
+        ;; Wait 1+ second so a buggy re-insert would change started_at.
+        (sleep-for 1)
+        (anvil-memory-obs-record-session-start "sess-2")
+        (let ((started2 (caar (sqlite-select
+                               db "SELECT started_at FROM obs_sessions
+                                    WHERE id = 'sess-2'"))))
+          (should (= started1 started2)))))))
+
+(ert-deftest anvil-memory-obs-record-user-prompt-stores-importance ()
+  "user-prompt body containing a keyword bumps importance."
+  (skip-unless (anvil-memory-obs-test--supported-p 'record))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t))
+      (anvil-memory-obs-record-user-prompt "sess-3" "got an error in the build")
+      (let* ((db (anvil-memory-obs--db))
+             (rows (sqlite-select
+                    db
+                    "SELECT body, importance FROM obs_observations")))
+        (should (= (length rows) 1))
+        (should (string-match-p "error" (nth 0 (car rows))))
+        (should (>= (nth 1 (car rows)) 30))))))
+
+(ert-deftest anvil-memory-obs-record-post-tool-use-sets-tool-name ()
+  "post-tool-use stores the tool name."
+  (skip-unless (anvil-memory-obs-test--supported-p 'record))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t))
+      (anvil-memory-obs-record-post-tool-use "sess-4" "Read" "foo.el line 1-50")
+      (let ((rows (sqlite-select
+                   (anvil-memory-obs--db)
+                   "SELECT tool_name, hook FROM obs_observations")))
+        (should (= (length rows) 1))
+        (should (equal (nth 0 (car rows)) "Read"))
+        (should (equal (nth 1 (car rows)) "post-tool-use"))))))
+
+(ert-deftest anvil-memory-obs-record-session-end-stamps-ended-at ()
+  "session-end updates ended_at on the session row and logs an obs row."
+  (skip-unless (anvil-memory-obs-test--supported-p 'record))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t))
+      (anvil-memory-obs-record-session-start "sess-5")
+      (anvil-memory-obs-record-session-end "sess-5")
+      (let* ((db (anvil-memory-obs--db))
+             (sess (sqlite-select
+                    db "SELECT ended_at FROM obs_sessions WHERE id = 'sess-5'"))
+             (obs (sqlite-select
+                   db "SELECT hook FROM obs_observations
+                        WHERE session_id = 'sess-5' ORDER BY id")))
+        (should (integerp (caar sess)))
+        (should (equal (mapcar #'car obs)
+                       '("session-start" "session-end")))))))
+
+(ert-deftest anvil-memory-obs-record-redacts-secret-in-prompt ()
+  "Secrets in user-prompt body are redacted before storage."
+  (skip-unless (anvil-memory-obs-test--supported-p 'record))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t))
+      (anvil-memory-obs-record-user-prompt "sess-6" "set api_key=abcdef123456")
+      (let ((body (caar (sqlite-select
+                         (anvil-memory-obs--db)
+                         "SELECT body FROM obs_observations"))))
+        (should (string-match-p "\\[REDACTED\\]" body))
+        (should-not (string-match-p "abcdef123456" body))))))
+
+(ert-deftest anvil-memory-obs-record-fts-roundtrip ()
+  "Observation body is searchable via FTS5 after insert."
+  (skip-unless (anvil-memory-obs-test--supported-p 'record))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t))
+      (anvil-memory-obs-record-user-prompt
+       "sess-7" "implementing claude-mem inspired observation layer")
+      (let* ((db (anvil-memory-obs--db))
+             (rows (sqlite-select
+                    db
+                    "SELECT rowid FROM obs_observations_fts
+                      WHERE obs_observations_fts MATCH 'observation'")))
+        (should (>= (length rows) 1))))))
+
+
 (provide 'anvil-memory-obs-test)
 ;;; anvil-memory-obs-test.el ends here

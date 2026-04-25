@@ -129,7 +129,7 @@ Set to nil to keep every row regardless of importance."
   :group 'anvil-memory-obs)
 
 (defconst anvil-memory-obs-supported
-  '(schema)
+  '(schema record importance redact)
   "Capability tags this module currently provides.
 Tests `skip-unless' their tag is in this list so a half-shipped
 feature never breaks CI.  Phase milestones append tags here.")
@@ -244,18 +244,173 @@ feature never breaks CI.  Phase milestones append tags here.")
     (sqlite-execute db
                     "CREATE INDEX IF NOT EXISTS obs_summaries_session_idx
                        ON obs_summaries(session_id)")
+    ;; Standalone FTS5 (no content= mode) so inserts are explicit and
+    ;; trigger-free; rowid is aligned with the obs_observations.id by
+    ;; the caller.  Mirrors the memory_body_fts approach in
+    ;; anvil-memory.el for consistency.
     (sqlite-execute
      db
      (format "CREATE VIRTUAL TABLE IF NOT EXISTS obs_observations_fts
-                USING fts5(body, content='obs_observations',
-                           content_rowid='id'%s)"
+                USING fts5(body%s)"
              tok-sql))
     (sqlite-execute
      db
      (format "CREATE VIRTUAL TABLE IF NOT EXISTS obs_summaries_fts
-                USING fts5(topic, summary, content='obs_summaries',
-                           content_rowid='id'%s)"
+                USING fts5(topic, summary%s)"
              tok-sql))))
+
+
+;;;; --- redaction + importance --------------------------------------------
+
+(defun anvil-memory-obs--redact (text)
+  "Return TEXT with `anvil-memory-obs-redact-patterns' replaced by [REDACTED].
+Returns TEXT unchanged when nil or empty."
+  (if (or (null text) (string-empty-p text))
+      text
+    (let ((case-fold-search t)
+          (out text))
+      (dolist (pat anvil-memory-obs-redact-patterns)
+        (setq out (replace-regexp-in-string pat "[REDACTED]" out)))
+      out)))
+
+(defun anvil-memory-obs--compute-importance (body)
+  "Sum :delta from every `anvil-memory-obs-importance-rules' matching BODY.
+Result is clamped to [0, 100]."
+  (if (or (null body) (string-empty-p body))
+      0
+    (let ((case-fold-search t)
+          (score 0))
+      (dolist (rule anvil-memory-obs-importance-rules)
+        (let ((kw (plist-get rule :keyword))
+              (delta (plist-get rule :delta)))
+          (when (and (stringp kw) (integerp delta)
+                     (string-match-p kw body))
+            (setq score (+ score delta)))))
+      (max 0 (min 100 score)))))
+
+
+;;;; --- encoder + insert helpers ------------------------------------------
+
+(defun anvil-memory-obs--encode-payload (payload)
+  "Encode PAYLOAD (plist or alist) to a string for the payload_json column.
+Phase 1 stores `prin1-to-string'; Phase 2+ may switch to real JSON."
+  (when payload
+    (let ((print-length nil)
+          (print-level nil))
+      (prin1-to-string payload))))
+
+(defun anvil-memory-obs--now ()
+  "Return current unix epoch as integer."
+  (truncate (time-to-seconds)))
+
+(defun anvil-memory-obs--upsert-session (session-id &optional project-dir)
+  "INSERT a session row if SESSION-ID is new; otherwise leave it untouched.
+Returns the session id."
+  (let ((db (anvil-memory-obs--db)))
+    (sqlite-execute
+     db
+     "INSERT OR IGNORE INTO obs_sessions (id, started_at, project_dir)
+        VALUES (?, ?, ?)"
+     (list session-id (anvil-memory-obs--now) (or project-dir "")))
+    session-id))
+
+(defun anvil-memory-obs--insert-observation (&rest args)
+  "Insert an observation row.  Plist ARGS:
+  :session-id  required string
+  :hook        required string (e.g. \"session-start\")
+  :tool-name   optional string
+  :body        optional string (redacted before storage)
+  :payload     optional plist/alist (prin1'd into payload_json)
+  :ts          optional integer epoch (default `anvil-memory-obs--now')
+Returns the new row id (integer)."
+  (let* ((db (anvil-memory-obs--db))
+         (session-id (plist-get args :session-id))
+         (hook (plist-get args :hook))
+         (tool-name (plist-get args :tool-name))
+         (raw-body (plist-get args :body))
+         (body (anvil-memory-obs--redact raw-body))
+         (payload (plist-get args :payload))
+         (payload-json (or (anvil-memory-obs--encode-payload payload) ""))
+         (importance (anvil-memory-obs--compute-importance body))
+         (ts (or (plist-get args :ts) (anvil-memory-obs--now))))
+    (unless (and (stringp session-id) (stringp hook))
+      (user-error "anvil-memory-obs: :session-id and :hook are required"))
+    (sqlite-execute
+     db
+     "INSERT INTO obs_observations
+        (session_id, ts, hook, tool_name, payload_json, body, importance)
+        VALUES (?, ?, ?, ?, ?, ?, ?)"
+     (list session-id ts hook (or tool-name "")
+           payload-json (or body "") importance))
+    (let ((rowid (caar (sqlite-select db "SELECT last_insert_rowid()"))))
+      (sqlite-execute
+       db
+       "INSERT INTO obs_observations_fts (rowid, body) VALUES (?, ?)"
+       (list rowid (or body "")))
+      rowid)))
+
+
+;;;; --- public record API --------------------------------------------------
+
+(defun anvil-memory-obs-record-session-start (session-id &optional project-dir)
+  "Record a session-start observation.  No-op when disabled.
+Returns the new observation row id, or nil when disabled."
+  (when (and anvil-memory-obs-enabled (stringp session-id))
+    (anvil-memory-obs--upsert-session session-id project-dir)
+    (anvil-memory-obs--insert-observation
+     :session-id session-id
+     :hook "session-start"
+     :body (format "session %s started" session-id)
+     :payload (list :session-id session-id
+                    :project-dir project-dir))))
+
+(defun anvil-memory-obs-record-user-prompt (session-id prompt)
+  "Record a user-prompt observation.  PROMPT is the (excerpt) text."
+  (when (and anvil-memory-obs-enabled (stringp session-id))
+    (anvil-memory-obs--upsert-session session-id)
+    (anvil-memory-obs--insert-observation
+     :session-id session-id
+     :hook "user-prompt"
+     :body (or prompt "")
+     :payload (list :prompt prompt))))
+
+(defun anvil-memory-obs-record-post-tool-use (session-id tool-name &optional summary)
+  "Record a post-tool-use observation.
+SUMMARY is the (truncated) tool result/argument summary."
+  (when (and anvil-memory-obs-enabled (stringp session-id))
+    (anvil-memory-obs--upsert-session session-id)
+    (anvil-memory-obs--insert-observation
+     :session-id session-id
+     :hook "post-tool-use"
+     :tool-name (or tool-name "")
+     :body (or summary "")
+     :payload (list :tool tool-name :summary summary))))
+
+(defun anvil-memory-obs-record-stop (session-id &optional transcript-path)
+  "Record a stop observation (Claude Code Stop hook)."
+  (when (and anvil-memory-obs-enabled (stringp session-id))
+    (anvil-memory-obs--upsert-session session-id)
+    (anvil-memory-obs--insert-observation
+     :session-id session-id
+     :hook "stop"
+     :body (or transcript-path "")
+     :payload (list :transcript-path transcript-path))))
+
+(defun anvil-memory-obs-record-session-end (session-id)
+  "Record a session-end observation and stamp ended_at on the session row."
+  (when (and anvil-memory-obs-enabled (stringp session-id))
+    (let ((db (anvil-memory-obs--db))
+          (now (anvil-memory-obs--now)))
+      (anvil-memory-obs--upsert-session session-id)
+      (sqlite-execute
+       db
+       "UPDATE obs_sessions SET ended_at = ? WHERE id = ?"
+       (list now session-id))
+      (anvil-memory-obs--insert-observation
+       :session-id session-id
+       :hook "session-end"
+       :body (format "session %s ended" session-id)
+       :ts now))))
 
 
 (provide 'anvil-memory-obs)
