@@ -72,6 +72,67 @@ See also: `anvil-server-start'"
     (message "%s" (anvil-server-metrics-summary)))
   t)
 
+;;;###autoload
+(defun anvil-server-run-batch-stdio (&optional server-id)
+  "Read line-delimited JSON-RPC requests from STDIN, emit responses to STDOUT.
+
+Loops until state is cleared or EOF is seen.  Intended for batch
+subprocess invocation (Stage D `anvil mcp serve' launcher), not for
+daemon emacsclient transport.
+
+SERVER-ID defaults to \"default\".  Use the alias `emacs-eval-headless'
+to enable the Stage D headless tool profile via `anvil-manifest'.
+
+Example:
+  emacs --batch -Q -L /path/to/anvil.el \\
+    -l anvil -l anvil-server-commands -l anvil-manifest \\
+    --eval \"(anvil-manifest-enable)\" \\
+    --eval \"(anvil-server-run-batch-stdio \\\"emacs-eval-headless\\\")\""
+  (let ((server-id (or server-id "default"))
+        (line nil))
+    (anvil-server-start)
+    (while (and anvil-server--running
+                (setq line (ignore-errors (read-from-minibuffer ""))))
+      (when (and (stringp line) (not (string-empty-p line)))
+        (let ((resp (anvil-server-process-jsonrpc line server-id)))
+          (when (and resp (not (string-empty-p resp)))
+            (princ resp)
+            (terpri)))))
+    (when anvil-server--running
+      (anvil-server-stop))))
+
+;;;###autoload
+(defun anvil-server-stage-d-headless-run ()
+  "Stage D launcher entry: load anvil + headless profile, run batch stdio.
+
+Convenience wrapper that:
+  1. Loads `anvil' (which calls `anvil-enable' to register all modules)
+  2. Activates `anvil-manifest' headless profile filter
+  3. Runs the batch stdio loop with server-id `emacs-eval-headless'
+
+Used by `bin/anvil mcp serve' when anvil.el is bundled in the
+Stage D distribution.  Equivalent shell invocation:
+
+  emacs --batch -Q -L /path/to/anvil.el \\
+    --eval \"(require \\='anvil)\" \\
+    --eval \"(anvil-enable)\" \\
+    --eval \"(require \\='anvil-manifest)\" \\
+    --eval \"(anvil-manifest-enable)\" \\
+    --eval \"(anvil-server-run-batch-stdio \\\"emacs-eval-headless\\\")\""
+  (require 'anvil)
+  ;; Stage D needs http + state to expose the architecture α delegate
+  ;; chain (anvil-http → nelisp-http etc).  Honour any prior user
+  ;; customisation but ensure the two are present.
+  (when (boundp 'anvil-optional-modules)
+    (dolist (m '(http state))
+      (cl-pushnew m anvil-optional-modules)))
+  (when (fboundp 'anvil-enable)
+    (anvil-enable))
+  (require 'anvil-manifest)
+  (when (fboundp 'anvil-manifest-enable)
+    (anvil-manifest-enable))
+  (anvil-server-run-batch-stdio "emacs-eval-headless"))
+
 ;;; Script Installation
 
 (defun anvil-server--package-script-path ()
