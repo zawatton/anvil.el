@@ -72,9 +72,68 @@ See also: `anvil-server-start'"
     (message "%s" (anvil-server-metrics-summary)))
   t)
 
+(defun anvil-server--batch-emit-response (resp framing-p)
+  "Emit RESP to stdout, framed if FRAMING-P is non-nil.
+
+Framed responses use MCP Content-Length framing:
+
+    Content-Length: <N>\\r\\n\\r\\n<body>
+
+Legacy responses are emitted as a single line terminated by `terpri'."
+  (when (and resp (stringp resp) (not (string-empty-p resp)))
+    (cond
+     (framing-p
+      ;; Encode via the canonical framing helper so byte length matches
+      ;; the UTF-8 wire representation.
+      (let ((frame (anvil-server-mcp-frame-encode resp)))
+        ;; `princ' on a unibyte string writes the bytes verbatim in
+        ;; --batch mode.  Avoid any decoding round-trips.
+        (let ((coding-system-for-write 'utf-8))
+          (princ frame))))
+     (t
+      (princ resp)
+      (terpri)))))
+
+(defun anvil-server--batch-skip-blank-lines ()
+  "Drain consecutive blank lines from STDIN and return next non-blank.
+
+Returns the next non-empty string read from `read-from-minibuffer',
+or nil on EOF.  Each `\\r' byte read in batch mode shows up as an
+extra empty line under `read-from-minibuffer'; this helper skips
+all of them transparently so a CRLF-separated MCP framed message
+parses cleanly under `--batch'."
+  (let ((line ""))
+    (while (and (stringp line) (string-empty-p line))
+      (setq line (ignore-errors (read-from-minibuffer ""))))
+    line))
+
+(defun anvil-server--batch-read-framed-message ()
+  "Read one MCP Content-Length framed message from STDIN.
+
+Returns the JSON body string, or nil on EOF / malformed framing.
+Header lines are read with `read-from-minibuffer' (line-based,
+EOF-tolerant); the body is read by accumulating subsequent lines
+until the announced byte length is satisfied.  CRLF separators are
+handled by treating empty reads as blanks.  This is best-effort
+under `--batch': Emacs' line reader is the only practical primitive
+for stdin in batch mode, so a JSON body that contains literal
+newlines is reassembled by re-inserting `\\n' between read chunks
+and trusting Content-Length to delimit the message.  In practice
+MCP clients emit single-line JSON bodies."
+  (let* ((first-header (anvil-server--batch-skip-blank-lines)))
+    (when first-header
+      (anvil-server--batch-read-framed-with-prefix first-header))))
+
 ;;;###autoload
 (defun anvil-server-run-batch-stdio (&optional server-id)
-  "Read line-delimited JSON-RPC requests from STDIN, emit responses to STDOUT.
+  "Read JSON-RPC requests from STDIN, emit responses to STDOUT.
+
+The loop auto-detects MCP Content-Length framing on the very first
+line: if the first non-empty line starts with `Content-Length:'
+(case-insensitive), all subsequent traffic — input and output — is
+treated as framed; otherwise the legacy line-delimited JSON path is
+used.  See `anvil-server-mcp-frame-encode' /
+`anvil-server-mcp-frame-parse-string' for the framing helpers.
 
 Loops until state is cleared or EOF is seen.  Intended for batch
 subprocess invocation (Stage D `anvil mcp serve' launcher), not for
@@ -89,17 +148,127 @@ Example:
     --eval \"(anvil-manifest-enable)\" \\
     --eval \"(anvil-server-run-batch-stdio \\\"emacs-eval-headless\\\")\""
   (let ((server-id (or server-id "default"))
-        (line nil))
+        (framing-p nil)
+        (sniffed-line nil)
+        (first-iter t))
     (anvil-server-start)
-    (while (and anvil-server--running
-                (setq line (ignore-errors (read-from-minibuffer ""))))
-      (when (and (stringp line) (not (string-empty-p line)))
-        (let ((resp (anvil-server-process-jsonrpc line server-id)))
-          (when (and resp (not (string-empty-p resp)))
-            (princ resp)
-            (terpri)))))
+    (while anvil-server--running
+      (let* ((req
+              (cond
+               ;; First iteration: sniff one line to decide framing.
+               (first-iter
+                (setq first-iter nil)
+                (let ((peek (ignore-errors
+                              (read-from-minibuffer ""))))
+                  (cond
+                   ((null peek) nil) ; EOF before any input
+                   ((anvil-server-mcp-detect-framing-p peek)
+                    (setq framing-p t)
+                    ;; The peek line is the first header — read remaining
+                    ;; headers + body using the framed path, prepending
+                    ;; the already-consumed header line.
+                    (anvil-server--batch-read-framed-with-prefix peek))
+                   (t
+                    ;; Legacy mode: peek line is the JSON body itself.
+                    peek))))
+               ;; Subsequent iterations: dispatch by mode.
+               (framing-p
+                (anvil-server--batch-read-framed-message))
+               (t
+                (ignore-errors (read-from-minibuffer ""))))))
+        (cond
+         ((null req)
+          ;; EOF — exit loop.
+          (setq anvil-server--running nil))
+         ((and (stringp req) (not (string-empty-p req)))
+          (let ((resp (anvil-server-process-jsonrpc req server-id)))
+            (anvil-server--batch-emit-response resp framing-p)))
+         (t
+          ;; Empty request: silently ignore (legacy line mode).
+          nil))))
     (when anvil-server--running
-      (anvil-server-stop))))
+      (anvil-server-stop))
+    (ignore sniffed-line)))
+
+(defun anvil-server--batch-read-framed-with-prefix (first-header-line)
+  "Continue reading a framed MCP message after FIRST-HEADER-LINE.
+
+Used on the very first iteration of `anvil-server-run-batch-stdio'
+when sniffing detects framing — the sniffed line is the first
+header rather than a JSON body, so we keep reading subsequent
+headers + body.  Uses `anvil-server--batch-skip-blank-lines' to
+tolerate CRLF expansion under `--batch' line-based stdin reads."
+  (let ((header-lines (list (replace-regexp-in-string
+                             "\r\\'" "" first-header-line))))
+    ;; Read remaining header lines.  A blank line marks the end of
+    ;; the header section, BUT a single CRLF in the input shows up
+    ;; as an empty `read-from-minibuffer' result, then \r as another
+    ;; empty, etc.  We stop at the first empty read and let
+    ;; `anvil-server--batch-skip-blank-lines' below absorb any
+    ;; extra CRs before the body.
+    (let ((seen-blank nil))
+      (catch 'done
+        (while (not seen-blank)
+          (let ((line (ignore-errors (read-from-minibuffer ""))))
+            (cond
+             ((null line) (throw 'done nil))
+             ((string-empty-p
+               (replace-regexp-in-string "\r\\'" "" line))
+              (setq seen-blank t))
+             (t (push (replace-regexp-in-string "\r\\'" "" line)
+                      header-lines)))))))
+    (let* ((header-block (mapconcat #'identity
+                                    (nreverse header-lines) "\r\n"))
+           (n (anvil-server-mcp-parse-content-length-header
+               header-block)))
+      (when (and n (>= n 0))
+        ;; Body: skip any extra blank reads that the CRLF separator
+        ;; produced under batch line-input.  Then accumulate until
+        ;; N UTF-8 bytes are collected.
+        (let* ((first-body-line
+                (anvil-server--batch-skip-blank-lines))
+               (acc "")
+               (need n)
+               (first t))
+          (when first-body-line
+            (let* ((piece-bytes
+                    (encode-coding-string first-body-line 'utf-8 t))
+                   (piece-len (length piece-bytes)))
+              (cond
+               ((<= piece-len need)
+                (setq acc (concat acc first-body-line))
+                (setq need (- need piece-len)))
+               (t
+                (let ((trimmed-bytes (substring piece-bytes 0 need)))
+                  (setq acc
+                        (concat acc
+                                (decode-coding-string
+                                 trimmed-bytes 'utf-8 t)))
+                  (setq need 0))))
+              (setq first nil)))
+          (while (> need 0)
+            (let ((chunk (ignore-errors (read-from-minibuffer ""))))
+              (unless chunk
+                (setq need 0))
+              (when chunk
+                (let* ((piece (if first chunk (concat "\n" chunk)))
+                       (piece-bytes
+                        (encode-coding-string piece 'utf-8 t))
+                       (piece-len (length piece-bytes)))
+                  (setq first nil)
+                  (cond
+                   ((<= piece-len need)
+                    (setq acc (concat acc piece))
+                    (setq need (- need piece-len)))
+                   (t
+                    (let ((trimmed-bytes
+                           (substring piece-bytes 0 need)))
+                      (setq acc
+                            (concat acc
+                                    (decode-coding-string
+                                     trimmed-bytes 'utf-8 t)))
+                      (setq need 0))))))))
+          (and (not (string-empty-p acc)) acc))))))
 
 ;;;###autoload
 (defun anvil-server-stage-d-headless-run ()
