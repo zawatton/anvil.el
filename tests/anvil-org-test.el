@@ -8,6 +8,7 @@
 
 (require 'ert)
 (require 'cl-lib)
+(require 'json)
 (require 'anvil-org)
 
 (defun anvil-org-test--with-temp-org (content fn)
@@ -20,6 +21,13 @@
           (funcall fn path))
       (when (file-exists-p path)
         (delete-file path)))))
+
+(defun anvil-org-test--read (path)
+  "Return PATH's contents as a UTF-8 string."
+  (with-temp-buffer
+    (let ((coding-system-for-read 'utf-8))
+      (insert-file-contents path))
+    (buffer-string)))
 
 (ert-deftest anvil-org-test-modify-errors-do-not-prompt-on-kill ()
   "Failed modify tools must not ask to kill their temp file buffer."
@@ -59,6 +67,41 @@
                   (string= (file-truename buffer-file-name)
                            (file-truename path)))))
          (buffer-list)))))))
+
+(ert-deftest anvil-org-test-read-by-id-scans-allowed-files ()
+  "Read an ID property from allowed files when org-id has no DB entry."
+  (let ((id (concat "mcp-test-root-id-"
+                    (substring (md5 (number-to-string (float-time))) 0 8))))
+    (anvil-org-test--with-temp-org
+     (format "* TODO Root\n:PROPERTIES:\n:ID: %s\n:END:\nBody line.\n" id)
+     (lambda (path)
+       (let ((anvil-org-allowed-files (list path))
+             (anvil-org-allowed-files-enabled t)
+             (anvil-org-use-index nil))
+         (should-not (org-id-find-id-file id))
+         (let ((content (anvil-org--tool-read-by-id id)))
+           (should (string-match-p "\\* TODO Root" content))
+           (should (string-match-p "Body line." content))))))))
+
+(ert-deftest anvil-org-test-edit-body-returns-target-headline-id ()
+  "Editing parent body must return the parent URI, not a child URI."
+  (anvil-org-test--with-temp-org
+   "* TODO Root :test:\n:PROPERTIES:\n:ID: root-id-for-edit-body-test\n:END:\nBody line.\n** Child\nChild body.\n"
+   (lambda (path)
+     (let* ((anvil-org-allowed-files (list path))
+            (anvil-org-allowed-files-enabled t)
+            (root-uri (concat "org-headline://" path "#Root"))
+            (response
+             (json-parse-string
+              (anvil-org--tool-edit-body
+               root-uri "Body line." "Body line edited." nil)
+              :object-type 'alist))
+            (content (anvil-org-test--read path)))
+       (should
+        (equal "org-id://root-id-for-edit-body-test"
+               (alist-get 'uri response)))
+       (should (string-match-p "Body line edited." content))
+       (should-not (string-match-p "^\\*\\* Child\n:PROPERTIES:" content))))))
 
 (ert-deftest anvil-org-test-tool-read-by-id-rejects-org-id-resource-uri ()
   "The Layer-3 tool accepts org:// citations, not org-id:// resources."
