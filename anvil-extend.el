@@ -11,16 +11,16 @@
 ;;; Commentary:
 
 ;; anvil-extend implements Phase A of the Claude self-extension SDK
-;; sketched in `docs/design/35-claude-self-extension-sdk.org' (DRAFT
-;; v0).  Phase A is intentionally tiny: it only ships a scaffold
-;; generator that lets a Claude Code session emit a new ad-hoc tool
-;; module — elisp body + ERT skeleton + MCP register stub — into a
-;; storage directory that is completely isolated from the host anvil
-;; package.
+;; sketched in `docs/design/38-claude-self-extension-sdk.org' (LOCKED
+;; v2; renumbered from former Doc 35 per option B path).  Phase A is
+;; intentionally tiny: it only ships a scaffold generator that lets a
+;; Claude Code session emit a new ad-hoc tool module — elisp body +
+;; ERT skeleton + MCP register stub — into a storage directory that is
+;; completely isolated from the host anvil package.
 ;;
 ;; Public API (all `anvil-extend-*' prefixed for safe namespace
-;; reservation while Doc 35 is still DRAFT v0; codex review may rename
-;; the eventual stable surface):
+;; reservation per Doc 38 §3.A spec; subsequent phases may extend the
+;; stable surface but the Phase A names are LOCKED):
 ;;
 ;;   (anvil-extend-scaffold NAME &key params body docstring)
 ;;     Emit `<NAME>.el', `<NAME>-test.el', `<NAME>-register.el' under
@@ -51,7 +51,7 @@
 ;; Phase A explicitly excludes hot-reload after edit (Phase B), sandbox
 ;; eval (Phase C), rationale auto-record (Phase D), the NeLisp execute
 ;; path (Phase E), and ephemeral/permanent promotion gates (Phase F).
-;; Those land in subsequent design rounds once Doc 35 reaches LOCKED.
+;; Those land in subsequent design rounds per Doc 38 §3.B.
 
 ;;; Code:
 
@@ -62,7 +62,7 @@
 ;;;; --- customization ------------------------------------------------------
 
 (defgroup anvil-extend nil
-  "Claude self-extension SDK scaffold generator (Doc 35 Phase A)."
+  "Claude self-extension SDK scaffold generator (Doc 38 Phase A)."
   :group 'anvil
   :prefix "anvil-extend-")
 
@@ -535,7 +535,7 @@ while iterating on the generated source."
 `anvil-extend-storage-dir' (default ~/.anvil-extend/).  The new
 tool is NOT auto-loaded; call `anvil-extend-load' to byte-compile
 + load it, then `anvil-extend-test' to run its ERT.  Phase A of
-Doc 35 (DRAFT v0) — API surface may rename in subsequent phases."))
+Doc 38 (LOCKED v2) — Phase A surface is stable; later phases extend."))
 
 (defun anvil-extend-disable ()
   "Unregister anvil-extend's MCP tools."
