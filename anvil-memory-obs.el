@@ -55,6 +55,16 @@
 (declare-function anvil-orchestrator-submit-and-collect
                   "anvil-orchestrator")
 
+;; Phase 6 promote-candidates uses anvil-memory-save-check to dedup
+;; against the user's existing auto-memory store.  Soft dependency —
+;; the dedup path is opt-in (`:check-against-memory t').
+(declare-function anvil-memory-save-check "anvil-memory")
+
+;; Phase 6 promote uses anvil-memory--effective-roots to pick a
+;; default writable memory directory; soft-dep so an explicit
+;; `:target-dir' continues to work without anvil-memory loaded.
+(declare-function anvil-memory--effective-roots "anvil-memory")
+
 
 ;;;; --- group + defcustoms -------------------------------------------------
 
@@ -214,7 +224,8 @@ Observations:
   '(schema record importance redact integration purge
            compress-rule-based compress-ai compress-auto budget
            search timeline get summary-search mcp-tools
-           auto-inject auto-inject-integration)
+           auto-inject auto-inject-integration
+           promote-candidates promote)
   "Capability tags this module currently provides.
 Tests `skip-unless' their tag is in this list so a half-shipped
 feature never breaks CI.  Phase milestones append tags here.")
@@ -1029,6 +1040,257 @@ qualify.  PROJECT-DIR defaults to `default-directory'."
       (anvil-memory-obs--render-preamble capped))))
 
 
+;;;; --- Phase 6: promote candidates ---------------------------------------
+
+(defcustom anvil-memory-obs-promote-min-importance 30
+  "Minimum aggregate observation importance for a promote candidate.
+Sums `obs_observations.importance' across the underlying rows;
+high-impact sessions clear this gate without manual triage."
+  :type 'integer
+  :group 'anvil-memory-obs)
+
+(defcustom anvil-memory-obs-promote-window-days 30
+  "Look back this many days when ranking promote candidates."
+  :type 'integer
+  :group 'anvil-memory-obs)
+
+(defcustom anvil-memory-obs-promote-similar-threshold 0.5
+  "Drop a candidate when a MEMORY.md row has Jaccard similarity >= this.
+Only consulted when `:check-against-memory' is non-nil."
+  :type 'number
+  :group 'anvil-memory-obs)
+
+(cl-defun anvil-memory-obs-promote-candidates
+    (&key limit min-importance check-against-memory window-days)
+  "Return ranked promote candidates from recent compressed summaries.
+Each candidate plist:
+  (:summary-id :session-id :topic :summary :is-ai
+   :total-importance :similar)
+:LIMIT defaults to 5.
+:MIN-IMPORTANCE defaults to
+  `anvil-memory-obs-promote-min-importance'.
+:WINDOW-DAYS defaults to
+  `anvil-memory-obs-promote-window-days'.
+:CHECK-AGAINST-MEMORY (default nil) — when non-nil and
+  `anvil-memory-save-check' is loaded, each candidate is scored
+  against the auto-memory store and rows whose top match is at or
+  above `anvil-memory-obs-promote-similar-threshold' are filtered
+  out; the remaining rows carry the match list under `:similar'."
+  (let* ((db (anvil-memory-obs--db))
+         (limit (or limit 5))
+         (min-imp (or min-importance
+                      anvil-memory-obs-promote-min-importance))
+         (window (or window-days
+                     anvil-memory-obs-promote-window-days))
+         (since (- (anvil-memory-obs--now) (* window 24 60 60)))
+         (rows (sqlite-select
+                db
+                "SELECT s.id, s.session_id, s.topic, s.summary, s.is_ai,
+                        COALESCE(SUM(o.importance), 0) AS imp
+                   FROM obs_summaries s
+                   LEFT JOIN obs_observations o
+                     ON o.session_id = s.session_id
+                    AND o.id >= s.obs_start_id
+                    AND o.id <= s.obs_end_id
+                  WHERE s.ts >= ?
+               GROUP BY s.id
+                 HAVING imp >= ?
+               ORDER BY imp DESC, s.ts DESC
+                  LIMIT ?"
+                (list since min-imp limit)))
+         (rendered (mapcar
+                    (lambda (r)
+                      (list :summary-id (nth 0 r)
+                            :session-id (nth 1 r)
+                            :topic (nth 2 r)
+                            :summary (nth 3 r)
+                            :is-ai (and (nth 4 r) (= (nth 4 r) 1))
+                            :total-importance (nth 5 r)))
+                    rows)))
+    (if (and check-against-memory
+             (fboundp 'anvil-memory-save-check))
+        (delq nil
+              (mapcar
+               (lambda (cand)
+                 (let* ((subject (or (plist-get cand :topic) ""))
+                        (body (or (plist-get cand :summary) ""))
+                        (raw (ignore-errors
+                               (funcall (intern "anvil-memory-save-check")
+                                        subject body)))
+                        ;; raw may be (:candidates list) or a list directly.
+                        (matches (cond
+                                  ((null raw) nil)
+                                  ((and (listp raw) (plist-get raw :candidates))
+                                   (plist-get raw :candidates))
+                                  ((listp raw) raw)
+                                  (t nil)))
+                        (top (when matches
+                               (apply #'max
+                                      (mapcar
+                                       (lambda (m)
+                                         (or (plist-get m :similarity)
+                                             0.0))
+                                       matches)))))
+                   (cond
+                    ((and top
+                          (>= top
+                              anvil-memory-obs-promote-similar-threshold))
+                     nil)
+                    (t
+                     (append cand (list :similar matches))))))
+               rendered))
+      rendered)))
+
+
+;;;; --- Phase 6: promote action -------------------------------------------
+
+(defcustom anvil-memory-obs-promote-target-dir nil
+  "Override directory for newly promoted memory files.
+When nil, uses the first writable directory from
+`anvil-memory--effective-roots' (when anvil-memory is loaded)."
+  :type '(choice (const :tag "Auto (anvil-memory roots)" nil)
+                 directory)
+  :group 'anvil-memory-obs)
+
+(defcustom anvil-memory-obs-promote-default-type 'feedback
+  "Default memory type assigned when `--promote' is called without one."
+  :type '(choice (const feedback) (const project) (const reference)
+                 (const user) (const memo))
+  :group 'anvil-memory-obs)
+
+(defun anvil-memory-obs--slug (text)
+  "Build a kebab-case slug from TEXT, capped at 30 characters.
+Falls back to `untitled' for empty / all-punctuation inputs."
+  (let* ((lower (downcase (or text "")))
+         (cleaned (replace-regexp-in-string "[^a-z0-9]+" "-" lower))
+         (trimmed (string-trim cleaned "-+" "-+"))
+         (capped (if (> (length trimmed) 30)
+                     (substring trimmed 0 30)
+                   trimmed)))
+    (if (string-empty-p capped) "untitled" capped)))
+
+(defun anvil-memory-obs--resolve-target-dir (override)
+  "Pick the directory new memory files are written into.
+OVERRIDE wins when non-nil; falls back to
+`anvil-memory-obs-promote-target-dir', then the first writable
+entry from `anvil-memory--effective-roots'."
+  (cond
+   ((and override (stringp override) (not (string-empty-p override)))
+    (expand-file-name override))
+   ((and (stringp anvil-memory-obs-promote-target-dir)
+         (not (string-empty-p anvil-memory-obs-promote-target-dir)))
+    (expand-file-name anvil-memory-obs-promote-target-dir))
+   ((fboundp 'anvil-memory--effective-roots)
+    (let* ((roots (funcall (intern "anvil-memory--effective-roots")))
+           (writable (cl-remove-if-not
+                      (lambda (d)
+                        (and (stringp d)
+                             (file-directory-p d)
+                             (file-writable-p d)))
+                      roots)))
+      (or (car writable)
+          (user-error
+           "anvil-memory-obs-promote: no writable memory dir found"))))
+   (t
+    (user-error
+     "anvil-memory-obs-promote: :target-dir required (anvil-memory not loaded)"))))
+
+(defun anvil-memory-obs--render-frontmatter (name description type body)
+  "Return a Markdown string with frontmatter + BODY for promote output."
+  (format "---\nname: %s\ndescription: %s\ntype: %s\n---\n\n%s\n"
+          (or name "untitled")
+          (or description "")
+          (symbol-name type)
+          (or body "")))
+
+(defun anvil-memory-obs--memory-index-path (target-dir)
+  (expand-file-name "MEMORY.md" target-dir))
+
+(defun anvil-memory-obs--update-memory-index
+    (target-dir filename name description)
+  "Append a one-line entry to MEMORY.md, creating it when absent.
+Returns t when an entry was added, nil when FILENAME was already
+referenced (idempotent)."
+  (let* ((index (anvil-memory-obs--memory-index-path target-dir))
+         (line (format "- [%s](%s) — %s\n"
+                       (or name "untitled")
+                       filename
+                       (or description ""))))
+    (cond
+     ((and (file-exists-p index)
+           (with-temp-buffer
+             (let ((coding-system-for-read 'utf-8))
+               (insert-file-contents index))
+             (search-forward (format "(%s)" filename) nil t)))
+      nil)
+     (t
+      (let ((coding-system-for-write 'utf-8))
+        (with-temp-buffer
+          (when (file-exists-p index)
+            (let ((coding-system-for-read 'utf-8))
+              (insert-file-contents index)))
+          (goto-char (point-max))
+          (unless (or (= (point-max) 1)
+                      (eq (char-before) ?\n))
+            (insert "\n"))
+          (insert line)
+          (write-region (point-min) (point-max) index nil 'silent)))
+      t))))
+
+(cl-defun anvil-memory-obs-promote
+    (summary-id &key target-type target-dir name description)
+  "Write a new auto-memory `.md' file from `obs_summaries.id = SUMMARY-ID'.
+
+Keys:
+  :TARGET-TYPE  symbol (`feedback' / `project' / `reference' / `user'
+                / `memo'), default `anvil-memory-obs-promote-default-type'.
+  :TARGET-DIR   override target directory.
+  :NAME         override the memory `name'; defaults to the summary topic.
+  :DESCRIPTION  one-liner for the MEMORY.md index; defaults to the
+                summary first line capped at ~100 chars.
+
+Returns plist (:file PATH :status `created' :index-updated BOOL).
+Errors when SUMMARY-ID does not exist or the target file collides."
+  (let* ((db (anvil-memory-obs--db))
+         (row (car (sqlite-select
+                    db
+                    "SELECT topic, summary FROM obs_summaries WHERE id = ?"
+                    (list summary-id)))))
+    (unless row
+      (user-error "anvil-memory-obs-promote: summary id %s not found"
+                  summary-id))
+    (let* ((topic (or name (nth 0 row) "untitled"))
+           (body (or (nth 1 row) ""))
+           (default-desc
+            (let* ((firstline (car (split-string body "\n" t)))
+                   (cap 100))
+              (if (and firstline (> (length firstline) cap))
+                  (concat (substring firstline 0 cap) "…")
+                (or firstline ""))))
+           (desc (or description default-desc))
+           (type (or target-type
+                     anvil-memory-obs-promote-default-type))
+           (dir (anvil-memory-obs--resolve-target-dir target-dir))
+           (filename (format "%s_%s.md"
+                             (symbol-name type)
+                             (anvil-memory-obs--slug topic)))
+           (filepath (expand-file-name filename dir))
+           (content (anvil-memory-obs--render-frontmatter
+                     topic desc type body)))
+      (when (file-exists-p filepath)
+        (user-error "anvil-memory-obs-promote: %s already exists" filepath))
+      (let ((coding-system-for-write 'utf-8))
+        (with-temp-buffer
+          (insert content)
+          (write-region (point-min) (point-max) filepath nil 'silent)))
+      (let ((index-updated
+             (anvil-memory-obs--update-memory-index
+              dir filename topic desc)))
+        (list :file filepath
+              :status 'created
+              :index-updated index-updated)))))
+
+
 ;;;; --- Phase 3: MCP tool wrappers ----------------------------------------
 
 (defun anvil-memory-obs--coerce-int (v default)
@@ -1107,6 +1369,68 @@ Returns (:rows ROWS) ordered by id ASC."
          (anvil-memory-obs-get
           (anvil-memory-obs--coerce-id-list ids)))))
 
+(defun anvil-memory-obs--coerce-bool (v)
+  "Coerce V (nil / bool / string) to `t' / nil."
+  (cond
+   ((null v) nil)
+   ((eq v t) t)
+   ((stringp v)
+    (not (member (downcase v) '("" "false" "nil" "0" "no" "off"))))
+   (t t)))
+
+(defun anvil-memory-obs--tool-promote-candidates
+    (&optional limit min_importance check_against_memory window_days)
+  "List promote candidates ranked by aggregate observation importance.
+
+MCP Parameters:
+  limit                - Optional max candidate count (default 5).
+  min_importance       - Optional importance floor (default 30).
+  check_against_memory - Optional truthy flag.  When set, each
+                         candidate is scored against MEMORY.md via
+                         `anvil-memory-save-check'; rows with a top
+                         match at or above
+                         `anvil-memory-obs-promote-similar-threshold'
+                         are filtered out and the remaining rows
+                         carry the match list as `:similar'.
+  window_days          - Optional look-back days (default 30).
+
+Returns (:rows ROWS)."
+  (anvil-server-with-error-handling
+   (list :rows
+         (anvil-memory-obs-promote-candidates
+          :limit (anvil-memory-obs--coerce-int limit 5)
+          :min-importance
+          (anvil-memory-obs--coerce-int min_importance nil)
+          :check-against-memory
+          (anvil-memory-obs--coerce-bool check_against_memory)
+          :window-days
+          (anvil-memory-obs--coerce-int window_days nil)))))
+
+(defun anvil-memory-obs--tool-promote
+    (summary_id &optional target_type target_dir name description)
+  "Promote a compressed summary into a permanent auto-memory file.
+
+MCP Parameters:
+  summary_id  - obs_summaries.id (integer or digit-string).
+  target_type - One of feedback / project / reference / user / memo
+                (default `feedback').
+  target_dir  - Optional override directory (default: first writable
+                anvil-memory root).
+  name        - Optional name override (default: summary topic).
+  description - Optional one-line index description.
+
+Returns (:file PATH :status STATUS :index-updated BOOL)."
+  (anvil-server-with-error-handling
+   (let* ((id (anvil-memory-obs--coerce-int summary_id 0))
+          (typ (let ((s (anvil-memory-obs--coerce-string target_type)))
+                 (when s (intern s)))))
+     (anvil-memory-obs-promote
+      id
+      :target-type typ
+      :target-dir (anvil-memory-obs--coerce-string target_dir)
+      :name (anvil-memory-obs--coerce-string name)
+      :description (anvil-memory-obs--coerce-string description)))))
+
 (defun anvil-memory-obs--tool-summary-search (query &optional limit)
   "Topic-level FTS5 search over compressed session summaries.
 
@@ -1162,7 +1486,28 @@ hook, tool name) for an explicit id list.  Capped at 20 ids per call."
      "FTS5 search over compressed session summaries (topic + summary).
 Each row carries an `:is-ai' boolean so callers can prefer AI-derived
 summaries when available."
-     :read-only t))
+     :read-only t)
+
+    (,(anvil-server-encode-handler #'anvil-memory-obs--tool-promote-candidates)
+     :id "memory-obs-promote-candidates"
+     :intent '(memory observation promote)
+     :layer 'workflow
+     :description
+     "List recent session summaries ranked by aggregate observation
+importance.  Optional `check_against_memory' adds a Jaccard dedup
+pass against MEMORY.md so already-known patterns drop out, leaving
+only candidates worth turning into permanent auto-memory entries."
+     :read-only t)
+
+    (,(anvil-server-encode-handler #'anvil-memory-obs--tool-promote)
+     :id "memory-obs-promote"
+     :intent '(memory observation promote write)
+     :layer 'workflow
+     :description
+     "Write a new auto-memory `.md' file from a compressed summary id and
+append a one-line entry to MEMORY.md.  This is the write-side of the
+Phase 6 loop — call after `memory-obs-promote-candidates' to surface
+the candidate id and confirm the user wants to keep it permanently."))
   "Spec list consumed by `anvil-server-register-tools'.")
 
 (defun anvil-memory-obs--register-tools ()
