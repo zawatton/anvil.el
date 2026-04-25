@@ -205,8 +205,97 @@ else
 	mcp_debug_log "INFO" "Skipping init function call (none provided)"
 fi
 
+# --- T71: MCP Content-Length framing read helpers --------------------
+# The standard MCP stdio transport frames messages as:
+#
+#     Content-Length: <N>\r\n
+#     \r\n
+#     <N bytes JSON body>
+#
+# Older callers may still emit line-delimited JSON.  We sniff the first
+# byte of each request: if it is `{', treat as legacy line mode; if it
+# is `C' (start of "Content-Length:"), treat as framed.  Mode is
+# decided per-request to keep the legacy fallback transparent for
+# dev/test invocations.
+#
+# Output: when input was framed, emit a framed response; otherwise emit
+# legacy single-line JSON.
+
+# anvil_mcp_read_framed_message
+#
+# Reads one MCP framed message from STDIN.  Headers are read line by
+# line until an empty line; then exactly N bytes of body are read.
+# Prints the JSON body on STDOUT (no trailing newline).  Returns 1 on
+# EOF or malformed framing, 2 if no Content-Length header found.
+anvil_mcp_read_framed_message() {
+	local first_line="$1"
+	local header_line content_length=""
+
+	# Process the already-consumed first line.
+	# Strip trailing CR (DOS line endings).
+	first_line="${first_line%$'\r'}"
+	if [[ "$first_line" =~ ^[Cc]ontent-[Ll]ength:[[:space:]]*([0-9]+)[[:space:]]*$ ]]; then
+		content_length="${BASH_REMATCH[1]}"
+	fi
+
+	# Read remaining header lines until blank line.
+	while IFS= read -r header_line; do
+		header_line="${header_line%$'\r'}"
+		if [ -z "$header_line" ]; then
+			break
+		fi
+		if [[ "$header_line" =~ ^[Cc]ontent-[Ll]ength:[[:space:]]*([0-9]+)[[:space:]]*$ ]]; then
+			content_length="${BASH_REMATCH[1]}"
+		fi
+	done
+
+	if [ -z "$content_length" ]; then
+		return 2
+	fi
+
+	# Read exactly content_length bytes of body.
+	# `head -c N` is portable across GNU/BSD coreutils for byte count.
+	local body
+	body=$(head -c "$content_length")
+	if [ -z "$body" ]; then
+		return 1
+	fi
+	printf '%s' "$body"
+	return 0
+}
+
+# anvil_mcp_emit_framed_response BODY
+#
+# Emits BODY framed with Content-Length.  N is computed in bytes
+# (not characters) because the MCP spec mandates byte length.
+anvil_mcp_emit_framed_response() {
+	local body="$1"
+	local n
+	# `wc -c' counts bytes (LANG=C ensures no locale weirdness).
+	n=$(LC_ALL=C printf '%s' "$body" | wc -c)
+	# Strip leading whitespace from wc output (BSD pads).
+	n="${n##* }"
+	printf 'Content-Length: %s\r\n\r\n%s' "$n" "$body"
+}
+
 # Process input and print response
-while read -r line; do
+while IFS= read -r line; do
+	# T71: detect framing.  An MCP framed request begins with
+	# `Content-Length:' (case-insensitive); legacy line-delimited
+	# requests begin with `{'.
+	# Strip CR for cross-platform safety.
+	_anvil_first_line="${line%$'\r'}"
+	_anvil_framed=0
+	if [[ "$_anvil_first_line" =~ ^[Cc]ontent-[Ll]ength: ]]; then
+		_anvil_framed=1
+		mcp_debug_log "FRAMING" "Content-Length detected"
+		# Re-read full framed message; reuse the already-consumed line.
+		line=$(anvil_mcp_read_framed_message "$_anvil_first_line") || {
+			mcp_debug_log "FRAMING-ERROR" "rc=$? first=$_anvil_first_line"
+			continue
+		}
+	fi
+
 	# Log the incoming request
 	mcp_debug_log "REQUEST" "$line"
 
@@ -298,8 +387,13 @@ while read -r line; do
 
 	# Only output non-empty responses
 	if [ -n "$formatted_response" ]; then
-		# Output the response
-		echo "$formatted_response"
+		if [ "$_anvil_framed" = "1" ]; then
+			# T71: framed output for MCP-compliant clients.
+			anvil_mcp_emit_framed_response "$formatted_response"
+		else
+			# Legacy line-delimited output (dev / test mode).
+			echo "$formatted_response"
+		fi
 	fi
 done
 
