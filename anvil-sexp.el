@@ -1060,9 +1060,17 @@ leak in."
       (when (buffer-live-p log-buf) (kill-buffer log-buf)))))
 
 (defun anvil-sexp--run-checkdoc (file)
-  "Run `checkdoc-file' on FILE, return list of diagnostic plists."
+  "Run `checkdoc-file' on FILE, return list of diagnostic plists.
+`checkdoc-file' visits FILE via `find-file-noselect' and never
+kills the resulting buffer.  Subsequent apply-path writes go
+through `with-temp-buffer' + `write-region' (anvil-file's
+no-buffer-side-effects pattern) and would leave that visiting
+buffer stale, triggering `ask-user-about-supersession-threat'
+the next time the user touches it.  Track whether a visiting
+buffer existed before the call and kill the one we created."
   (require 'checkdoc)
-  (let ((warn-buf (get-buffer-create "*anvil-sexp-cd*"))
+  (let ((pre-buf (find-buffer-visiting file))
+        (warn-buf (get-buffer-create "*anvil-sexp-cd*"))
         (diags '()))
     (unwind-protect
         (progn
@@ -1091,7 +1099,13 @@ leak in."
                               :source 'checkdoc
                               :line line :message msg)
                         diags))))))
-      (when (buffer-live-p warn-buf) (kill-buffer warn-buf)))
+      (when (buffer-live-p warn-buf) (kill-buffer warn-buf))
+      (unless pre-buf
+        (let ((post-buf (find-buffer-visiting file)))
+          (when (buffer-live-p post-buf)
+            (with-current-buffer post-buf
+              (set-buffer-modified-p nil))
+            (kill-buffer post-buf)))))
     (nreverse diags)))
 
 (defun anvil-sexp--tool-verify (file &optional byte_compile checkdoc)

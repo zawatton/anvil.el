@@ -340,6 +340,30 @@
       (let ((elc (concat tmp "c")))
         (when (file-exists-p elc) (delete-file elc))))))
 
+(ert-deftest anvil-sexp-test-verify-leaves-no-visiting-buffer ()
+  "verify must not leave a `checkdoc-file' visiting buffer behind.
+`checkdoc-file' uses `find-file-noselect' internally; the previous
+implementation never killed that buffer, which clashed with the
+apply path's `with-temp-buffer' + `write-region' writes and caused
+`ask-user-about-supersession-threat' on the next interactive edit."
+  (anvil-sexp-test--with-sample
+   (lambda (path)
+     (should-not (find-buffer-visiting path))
+     (anvil-sexp--tool-verify path "nil" t)
+     (should-not (find-buffer-visiting path)))))
+
+(ert-deftest anvil-sexp-test-verify-preserves-pre-existing-buffer ()
+  "verify must not kill a buffer the caller had already visited."
+  (anvil-sexp-test--with-sample
+   (lambda (path)
+     (let ((pre (find-file-noselect path)))
+       (unwind-protect
+           (progn
+             (anvil-sexp--tool-verify path "nil" t)
+             (should (buffer-live-p pre))
+             (should (eq pre (find-buffer-visiting path))))
+         (when (buffer-live-p pre) (kill-buffer pre)))))))
+
 
 ;;;; --- ship criterion: stub + verify + restore round-trip ----------------
 
