@@ -4,7 +4,7 @@
 
 ;; Author: zawatton
 ;; Keywords: tools, convenience
-;; Package-Requires: ((emacs "29.1") (anvil-server "0.1") (anvil-state "0.1"))
+;; Package-Requires: ((emacs "29.1"))
 
 ;; This file is NOT part of GNU Emacs.
 
