@@ -1062,19 +1062,42 @@ virtual server-ids share the same handler pool."
                     (if (plist-get tool :encode-result)
                         (anvil-server-encode-for-mcp raw-result)
                       raw-result))
-                   ;; Ensure result is string or nil, error on other types
+                   ;; Coerce result to string for MCP transport.
+                   ;;
+                   ;; Contract widen (T118 / T97-FOLLOWUP-1):
+                   ;;   string / nil  → pass through (legacy)
+                   ;;   plist / list / cons / hash-table / vector
+                   ;;                 → JSON-encode via
+                   ;;                   `anvil-server-encode-for-mcp'
+                   ;;   symbol / function / buffer / process / marker
+                   ;;                 → reject (cannot be wire-encoded)
+                   ;;
+                   ;; This removes the "string or nil" hard reject that
+                   ;; surfaced as `defs-index-status` etc returning a
+                   ;; plist (= boot-smoke WARN, T97 M1 / T110 M2).  The
+                   ;; existing `:encode-result' wrapper path stays the
+                   ;; preferred long-form (it round-trips through the
+                   ;; raw handler for ERT), but un-wrapped handlers no
+                   ;; longer need to hand-stringify.
                    (result-text
                     (cond
                      ((null result)
                       "")
                      ((stringp result)
                       result)
+                     ((or (consp result)        ; plist / alist / list / dotted
+                          (hash-table-p result)
+                          (vectorp result))
+                      (anvil-server-encode-for-mcp result))
                      (t
                       (signal
                        'anvil-server-invalid-params
                        (list
                         (format
-                         "Tool handler must return string or nil, got: %s"
+                         (concat
+                          "Tool handler must return a JSON-serialisable"
+                          " value (string / nil / plist / list /"
+                          " hash-table / vector), got: %s")
                          (type-of result)))))))
                    ;; Wrap the handler result in the MCP format
                    (formatted-result
