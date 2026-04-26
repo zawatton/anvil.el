@@ -115,8 +115,10 @@ Override per-project for non-Cowork users."
 Either a STRING with %TITLE%, %DATE%, %URL%, %TAGS%, %CONTENT%
 placeholders, or a FUNCTION of one plist argument (same keys as
 keywords: :title :date :url :tags :content) that returns the
-rendered string.  The dual-type pattern mirrors
-`org-capture-templates'."
+rendered string.  The dual-type (string OR function) pattern is a
+common Emacs idiom; on Emacs hosts it mirrors the org-capture
+template DSL when `org-capture-templates' is bound, but this module
+does not require org-mode to be loaded."
   :type '(choice string function)
   :group 'anvil-browser)
 
