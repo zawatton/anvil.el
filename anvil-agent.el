@@ -1,4 +1,5 @@
 ;;; anvil-agent.el --- Compact agent dispatch prompts -*- lexical-binding: t; -*-
+;;; anvil-audit: tools-wrapped-at-registration
 
 ;; Copyright (C) 2026 zawatton
 
