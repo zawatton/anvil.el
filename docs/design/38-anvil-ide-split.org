@@ -1,0 +1,230 @@
+#+TITLE: Doc 38 — anvil-ide split (= AI workbench / human IDE separation)
+#+AUTHOR: zawatton + Claude
+#+DATE: 2026-04-26
+#+OPTIONS: toc:2
+
+* Status
+:PROPERTIES:
+:STATE: DRAFT (= module audit + classification done; impl phases pending user signoff)
+:CREATED: 2026-04-26
+:OWNER: zawatton
+:END:
+
+DRAFT 2026-04-26: NeLisp-side capability audit (= Explore agent dispatch,
+this commit) + per-module classification table closed.  Impl Phase B (=
+adapter wave) + Phase C-D (= rename + split) await separate user signoff.
+
+* §0 要旨
+
+NeLisp standalone (= Doc 32 v2 Phase 7.5) 完成見込みと整合させて、
+=anvil.el= を「AI 用 workbench (= NeLisp 上で動く、Emacs 不要)」と
+「人間用 IDE 拡張 (= Emacs 必要)」の 2 layer に分離する。
+
+** §0.1 戦略 message
+
+- =anvil.el= 名は維持 (= brand)、AI 用 main 主力
+- =anvil-ide.el= を新規切り出し、Emacs 必須機能のみ収納
+- 依存方向: =anvil-ide.el= → =anvil.el= (= IDE は tools の上に乗る)
+- 配布: =anvil.el= は NeLisp standalone tarball 同梱、=anvil-ide.el= は
+  Emacs ユーザー向け MELPA-style 別 install
+
+** §0.2 期待効果
+
+| 項目 | 現状 | 切り出し後 |
+|------+------+------------|
+| AI 利用 checkout | anvil.el 60+ module (~150K LOC) | anvil.el ~57 module (~144K LOC、Emacs 不要) |
+| Emacs install 要否 | 必須 (= 隠蔽 wrapper でも) | 不要 (= NeLisp standalone で完結) |
+| 依存明示 | 60 module 全部相互依存 | tools / ide 2 layer + 単方向依存 |
+| repo 分離 | mono | =zawatton/anvil.el= + =zawatton/anvil-ide.el= |
+
+* §1 NeLisp counterpart audit (= 2026-04-26 dispatch 結果)
+
+Explore agent 1 dispatch で =/Notes/dev/nelisp/= 全 audit。
+
+** §1.1 API surface 確認結果
+
+| API surface | NeLisp side | status |
+|-------------+-------------+--------|
+| byte-compile | =nelisp-cc-runtime-compile-and-allocate= (form-based) | partial (= file-based なし、form-loop で代替) |
+| help-fns (=documentation= 等) | =nelisp-defs-index-signature= (arity/docstring) | partial (= adapter wrap 必要) |
+| info-look | none | absent → ide 行き |
+| buffer abstraction | =nelisp-buffer.el= + =nelisp-emacs-compat.el= | full (= drop-in compatible) |
+| org-element / org-edit | =nelisp-org-index= (FTS5/index のみ) | partial (= 大半 delegate 可、tree-walk なし) |
+| tree-sitter | none | absent → ide 行き |
+| find-file-noselect | =nelisp-ec-insert-file-contents= 2-step | partial (= 2-step adapter で代替可) |
+
+** §1.2 結論
+
+- **anvil-buffer**: 既に PURE (= adapter 不要、NeLisp で drop-in 動作)
+- **anvil-elisp**: 6/7 tool 移植可、=elisp-info-lookup-symbol= 1 件のみ ide
+- **anvil-org-index**: 直接 delegate で PURE 化可
+- **anvil-org**: 大半 PURE、=org-edit-body= 等 tree-walk 系のみ ide
+- **anvil-treesit / anvil-ide / anvil-worker-ui**: 真の ide
+
+* §2 全 module 分類 (= 60 module、grep + audit 根拠)
+
+** §2.1 PURE (= NeLisp で動く、anvil.el 残り = 53 module)
+
+stdio MCP / subprocess / state KV / JSON / file I/O 中心、Emacs UI 非依存:
+
+#+BEGIN_QUOTE
+anvil.el (entry point), anvil-server.el / anvil-server-commands.el /
+anvil-server-metrics.el / anvil-server-ert.el, anvil-eval.el,
+anvil-state.el, anvil-shell-filter.el, anvil-data.el, anvil-agent.el,
+anvil-http.el, anvil-defs.el, anvil-memory.el, anvil-memory-obs.el,
+anvil-disk.el, anvil-file.el, anvil-fs.el, anvil-host.el, anvil-uri.el,
+anvil-net.el, anvil-bench.el, anvil-bisect.el, anvil-orchestrator.el /
+anvil-orchestrator-presets.el / anvil-orchestrator-routing.el,
+anvil-worker.el, anvil-shell.el, anvil-sexp.el, anvil-sexp-cst.el,
+anvil-ts.el (= 文字列処理、Emacs ts と無関係), anvil-lint.el (= 部分),
+anvil-sqlite.el, anvil-cron.el, anvil-extend.el, anvil-discovery.el,
+anvil-disclosure.el, anvil-html.el, anvil-pty-broker.el, anvil-py.el,
+anvil-emacs.el (= 名前のみ、中身 149 LOC pure utility), anvil-git.el /
+anvil-git-msg.el, anvil-manifest.el, anvil-session.el, anvil-clipboard.el
+(= 134 LOC、xclip/pbcopy shell-out), anvil-pdf.el (= 171 LOC、
+pdftotext shell-out), anvil-xlsx.el (= 244 LOC、openpyxl shell-out),
+anvil-browser.el (= 786 LOC、headless browser subprocess + 1 ヶ所
+=org-capture-templates= ref → fboundp guard で対処), anvil-dev.el (=
+1594 LOC、ERT 中心、=with-current-buffer= 3 件は temp buffer)
+#+END_QUOTE
+
+** §2.2 ADAPTER 化 (= 既存 module を NeLisp 対応に小修正、anvil.el 残り)
+
+| module | 修正内容 | 工数 |
+|--------+----------+------|
+| anvil-elisp.el (6/7 tool) | =elisp-byte-compile-file= → form-loop with =nelisp-cc=、=elisp-describe-function= → =documentation= + =help-function-arglist= 再実装 (両 runtime で動く)、他 4 tool は既存ロジックで動く | ~100-150 LOC |
+| anvil-org-index.el | =nelisp-org-index= API 直接 delegate (= architecture α 第 N 弾 pattern) | ~50 LOC |
+| anvil-org.el (= 部分) | headline 列挙系は =nelisp-org-index= delegate、=org-element= / =org-edit-body= 等は ide 行き | ~150 LOC |
+
+** §2.3 IDE-only (= anvil-ide.el 行き = ~3-4 module + 部分)
+
+| 行き先 | source | 理由 |
+|--------+--------+------|
+| anvil-ide.el (= 全部) | anvil-ide.el (486 LOC)、anvil-treesit.el (311 LOC)、anvil-worker-ui.el (145 LOC) | treesit + find-file-noselect IDE 統合、Tabulated List dashboard、tree-sitter binding |
+| anvil-ide-elisp.el (新規) | anvil-elisp.el の =elisp-info-lookup-symbol= 1 tool | info system NeLisp 側なし |
+| anvil-ide-org.el (新規) | anvil-org.el の tree-walk 系 (=org-edit-body=, =org-back-to-heading= 等) | org-mode tree API NeLisp 側なし |
+
+合計 ~942 LOC + 部分 ~200 LOC = **anvil 全体の 0.8% 弱**
+
+* §3 移行 phase 計画
+
+** §3.1 Phase A — 分類 audit *DONE 2026-04-26*
+
+§1 + §2 完成。本 doc が成果物。
+
+** §3.2 Phase B — adapter 化 wave (= ~1-2 週、並列 dispatch)
+
+各 module で:
+- adapter 関数導入 (= =fboundp= guard + NeLisp delegate / Emacs fallback)
+- 既存 ERT は両 runtime で pass を確認
+- 必要なら NeLisp-side で =make test= 通す
+
+並列 wave 候補:
+
+1. anvil-buffer NeLisp 動作確認 (= adapter 不要、smoke test のみ)
+2. anvil-elisp 6 tool adapter 化
+3. anvil-org-index nelisp-org-index delegate
+4. anvil-org headline-only delegate (= tree-walk は §3.3 で ide へ)
+5. anvil-browser =org-capture-templates= fboundp guard
+
+** §3.3 Phase C — in-place rename (= ~3-5 日)
+
+- =anvil-treesit.el= → =anvil-ide-treesit.el=
+- =anvil-worker-ui.el= → =anvil-ide-worker-ui.el=
+- =anvil-ide.el= はそのまま (= 既に "ide" prefix)
+- =anvil-elisp.el= から =elisp-info-lookup-symbol= を抜き出して
+  新規 =anvil-ide-elisp.el= に
+- =anvil-org.el= の tree-walk 系を抜き出して新規 =anvil-ide-org.el= に
+- =anvil.el= entry point から =(require 'anvil-ide-*)= を解除
+
+** §3.4 Phase D — git subtree split (= 1 day, 1-shot)
+
+#+BEGIN_SRC bash
+cd /home/madblack-21/Notes/dev/anvil.el
+git subtree split --prefix=. --branch=ide-split -- anvil-ide*.el tests/anvil-ide-*-test.el
+git push <new-repo> ide-split:main
+#+END_SRC
+
+新 repo: =zawatton/anvil-ide.el=
+- =package.el= header に =(:depends-on (anvil "X.Y"))= 1 行
+- README に "Emacs IDE extensions for anvil.el" 説明
+
+** §3.5 Phase E — inter-repo wire (= ~1 day)
+
+- =anvil-ide.el= の =(require 'anvil-server)= 等は package dependency 経由
+- CI: anvil-ide repo は anvil.el を git clone → loadpath 指定で test
+- documentation: anvil.el README に "for IDE features see =anvil-ide.el="
+
+* §4 工数 + リスク
+
+| Phase | 工数 | リスク |
+|-------+------+--------|
+| A     | 完了 | — |
+| B     | 1-2 週 (= 並列 wave) | NeLisp counterpart の subtle 差異が adapter で吸収しきれない場合あり (= 個別対応) |
+| C     | 3-5 日 | rename で =require= 漏れ → ERT で検出 |
+| D     | 1 日 (1-shot) | =git subtree split= の commit history fragmentation (= acceptable per 2-repo pattern) |
+| E     | 1 日 | inter-repo CI setup (= junction / path resolution) |
+
+合計 ~3 週、NeLisp Phase 7.5 完成までに余裕で並走可能。
+
+* §5 ship gate
+
+** §5.1 Phase B SHIPPED 条件
+
+- pure 53 + adapter 4-5 module の =make test-all= green
+- 各 adapter module で NeLisp-runtime 経由 ERT pass (= 別 CI job)
+
+** §5.2 Phase C SHIPPED 条件
+
+- =anvil-ide-*.el= の存在 + =anvil.el= 主 entry が ide require 解除
+- =make test-all= green、anvil-ide 単体 ERT 全 pass
+
+** §5.3 Phase D SHIPPED 条件
+
+- =zawatton/anvil-ide.el= repo 作成、初回 push
+- anvil.el develop branch から ide module 物理削除
+- 両 repo の README + CI 整合
+
+** §5.4 Phase E SHIPPED 条件 (= 全 split 完了)
+
+- anvil-ide repo CI green
+- =anvil-ide= MELPA recipe 提出 (optional)
+- anvil.el README に "for IDE features see =anvil-ide.el=" 記載
+
+* §6 NeLisp Phase 7.5 との連携
+
+** §6.1 同梱 path
+
+NeLisp standalone tarball (= Stage D Phase 6.x 経由) に以下バンドル:
+
+#+BEGIN_QUOTE
+- =bin/anvil= (Stage D launcher)
+- =anvil-lib/anvil*.el= (= anvil.el repo 全 module、ide 抜き)
+- =nelisp-runtime= cdylib (Phase 7.5 で 4 核 C runtime 完成後)
+#+END_QUOTE
+
+⇒ ユーザー = 1 tarball 解凍 + Emacs install 不要で AI workbench 完備。
+
+** §6.2 Phase 7.5 SHIPPED gate との同期
+
+本 Doc 38 は NeLisp Phase 7.5 SHIPPED の **直前**完了を target。
+Phase 7.5 直前で anvil.el が ide 抜き状態 = NeLisp standalone 公開告知時に
+"AI が NeLisp + anvil.el で自己拡張可能" を示せる。
+
+* §7 Open questions
+
+- =anvil-org= の tree-walk 系を =nelisp-org-element= 等として NeLisp 側に
+  port するか? (= ide 行きを最小化、ただし NeLisp side 工数増)
+- =anvil-treesit= は将来 NeLisp に tree-sitter Rust binding 入れたら ide
+  から戻せるか? (= 6-12 ヶ月先の検討)
+- =zawatton/anvil-ide.el= の license / authorship policy (= GPL-3.0
+  only? anvil.el と同じ?)
+
+* §8 References
+
+- Doc 18 Stage D standalone (= bin/anvil launcher、tarball)
+- Doc 27 Phase 7.0-7.4 C runtime self-impl
+- Doc 32 v2 Phase 7.5 integration (= NeLisp standalone)
+- Doc 33 anvil-data path tools (= adapter pattern reference)
+- architecture α 8 連弾 (anvil-http / anvil-state / anvil-defs delegate
+  実装、main 326d503〜0bd3b63)
