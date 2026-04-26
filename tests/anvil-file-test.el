@@ -710,6 +710,42 @@ Uses a fixture whose target line is already on disk so no write fires."
                       (alist-get "price" (plist-get (nth 1 matches) :fields)
                                  nil nil #'equal)))))))
 
+(ert-deftest anvil-code-extract-test-brace-balance-header-before-brace ()
+  "brace-balance expects :block-start to match the header before `{'."
+  (anvil-file-test--with-tmp-ts
+   (concat "if (id == 1) {\n"
+           "  count = 5;\n"
+           "}\n")
+   (lambda (path)
+     (let* ((res (anvil-code-extract-pattern
+                  path
+                  '(:block-start "if (id == \\([0-9]+\\))"
+                    :block-end brace-balance
+                    :fields ((:name "count"
+                              :regexp "count = \\([0-9]+\\)")))))
+            (matches (plist-get res :matches)))
+       (should (= 1 (plist-get res :returned)))
+       (should (equal "1" (plist-get (car matches) :id)))
+       (should (equal "5"
+                      (alist-get "count" (plist-get (car matches) :fields)
+                                 nil nil #'equal)))))))
+
+(ert-deftest anvil-code-extract-test-brace-balance-start-must-not-consume-brace ()
+  "Document current contract: :block-start must not consume the opening `{'."
+  (anvil-file-test--with-tmp-ts
+   (concat "if (id == 1) {\n"
+           "  count = 5;\n"
+           "}\n")
+   (lambda (path)
+     (let ((res (anvil-code-extract-pattern
+                 path
+                 '(:block-start "if (id == \\([0-9]+\\)) {"
+                   :block-end brace-balance
+                   :fields ((:name "count"
+                             :regexp "count = \\([0-9]+\\)"))))))
+       (should (= 1 (plist-get res :total)))
+       (should (= 0 (plist-get res :returned)))))))
+
 (ert-deftest anvil-code-extract-test-brace-balance-skips-string-braces ()
   "brace-balance ignores `{' / `}' that appear inside double-quoted strings."
   (anvil-file-test--with-tmp-ts
