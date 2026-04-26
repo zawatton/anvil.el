@@ -34,12 +34,30 @@
 (require 'subr-x)
 (require 'anvil-server)
 
+;; Architecture (2026-04-25 user signoff): anvil-XXX delegates pure
+;; helpers to nelisp-XXX low-level libraries so the substrate
+;; investment (Doc 24 Phase 6.2) is reused.  nelisp src/ must be on
+;; `load-path' (anvil dev daemon adds it via Phase 5-E setup; Stage D
+;; launcher bundles nelisp src/ alongside anvil.el).  Soft load — defer
+;; to require so byte-compile works in both anvil-only and anvil+nelisp
+;; environments.  Doc 38 Phase B3.
+(require 'nelisp-org-index nil 'noerror)
+
 ;; Checkpoint is provided by anvil-offload but is a no-op in the main
 ;; daemon, so we do not hard-require the module — just declare it to
 ;; keep byte-compile quiet.  Inside the offload REPL the subprocess's
 ;; own definition takes over and actually emits the message.
 (declare-function anvil-preempt-checkpoint "anvil-offload"
                   (value &optional cursor))
+
+;; Forward declarations for nelisp-org-index helpers we soft-delegate
+;; to.  These suppress byte-compile warnings in anvil-only builds.
+(declare-function nelisp-org-index--excluded-p
+                  "nelisp-org-index" (path))
+(declare-function nelisp-org-index--parse-headline-title
+                  "nelisp-org-index" (raw level))
+(defvar nelisp-org-index-exclude-patterns)
+(defvar nelisp-org-index-todo-keywords)
 
 ;;; Customization
 
@@ -216,9 +234,17 @@ present on all targets)."
 ;;; File discovery
 
 (defun anvil-org-index--excluded-p (path)
-  "Return non-nil if PATH matches any `anvil-org-index-exclude-patterns'."
-  (cl-some (lambda (re) (string-match-p re path))
-           anvil-org-index-exclude-patterns))
+  "Return non-nil if PATH matches any `anvil-org-index-exclude-patterns'.
+
+Delegates to `nelisp-org-index--excluded-p' when available, with
+`nelisp-org-index-exclude-patterns' let-bound to the anvil
+defcustom so semantics are preserved across runtimes."
+  (if (fboundp 'nelisp-org-index--excluded-p)
+      (let ((nelisp-org-index-exclude-patterns
+             anvil-org-index-exclude-patterns))
+        (nelisp-org-index--excluded-p path))
+    (cl-some (lambda (re) (string-match-p re path))
+             anvil-org-index-exclude-patterns)))
 
 (defun anvil-org-index--collect-files (&optional paths)
   "Return absolute paths of all *.org files under PATHS.
@@ -239,27 +265,36 @@ PATHS defaults to `anvil-org-index-paths'."
 (defun anvil-org-index--parse-headline-title (raw level)
   "Parse RAW headline text (without leading stars) at LEVEL into a plist.
 Extracts TODO keyword, priority cookie [#A], trailing tags :t1:t2:,
-and the clean title."
-  (let ((s raw) todo prio tags)
-    (when (string-match "\\`\\([A-Z]+\\(?:-[A-Z]+\\)?\\)[ \t]+\\(.*\\)\\'" s)
-      (let ((kw (match-string 1 s)))
-        (when (member kw anvil-org-index-todo-keywords)
-          (setq todo kw
-                s (match-string 2 s)))))
-    (when (string-match "\\`\\[#\\([A-Z]\\)\\][ \t]+\\(.*\\)\\'" s)
-      (setq prio (match-string 1 s)
-            s (match-string 2 s)))
-    (when (string-match "[ \t]+\\(:[A-Za-z0-9_@#%:]+:\\)[ \t]*\\'" s)
-      ;; Capture match data before calling `split-string' which resets it.
-      (let ((beg    (match-beginning 0))
-            (tagstr (match-string 1 s)))
-        (setq tags (split-string tagstr ":" t))
-        (setq s    (substring s 0 beg))))
-    (list :level level
-          :todo todo
-          :priority prio
-          :tags tags
-          :title (string-trim s))))
+and the clean title.
+
+Delegates to `nelisp-org-index--parse-headline-title' when
+available, with `nelisp-org-index-todo-keywords' let-bound to the
+anvil defcustom so the recognised keyword set matches anvil
+semantics."
+  (if (fboundp 'nelisp-org-index--parse-headline-title)
+      (let ((nelisp-org-index-todo-keywords
+             anvil-org-index-todo-keywords))
+        (nelisp-org-index--parse-headline-title raw level))
+    (let ((s raw) todo prio tags)
+      (when (string-match "\\`\\([A-Z]+\\(?:-[A-Z]+\\)?\\)[ \t]+\\(.*\\)\\'" s)
+        (let ((kw (match-string 1 s)))
+          (when (member kw anvil-org-index-todo-keywords)
+            (setq todo kw
+                  s (match-string 2 s)))))
+      (when (string-match "\\`\\[#\\([A-Z]\\)\\][ \t]+\\(.*\\)\\'" s)
+        (setq prio (match-string 1 s)
+              s (match-string 2 s)))
+      (when (string-match "[ \t]+\\(:[A-Za-z0-9_@#%:]+:\\)[ \t]*\\'" s)
+        ;; Capture match data before calling `split-string' which resets it.
+        (let ((beg    (match-beginning 0))
+              (tagstr (match-string 1 s)))
+          (setq tags (split-string tagstr ":" t))
+          (setq s    (substring s 0 beg))))
+      (list :level level
+            :todo todo
+            :priority prio
+            :tags tags
+            :title (string-trim s)))))
 
 (defun anvil-org-index--scan-buffer ()
   "Scan the current buffer as org text.
