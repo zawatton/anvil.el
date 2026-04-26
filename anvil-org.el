@@ -690,10 +690,15 @@ Throws an MCP tool error if unbalanced blocks are found."
 TAGS can be:
 - nil or empty list -> returns nil
 - empty / whitespace-only string -> returns nil (no tags)
-- vector (JSON array) -> converts to list
-- string -> wraps in list
+- vector (JSON array, decoded form) -> converts to list
+- string starting with `[' -> parsed as a JSON array of tag strings
+  (multi-tag form for MCP callers, since `anvil-server-register-tool'
+  types every parameter as \"string\" and structured values must arrive
+  JSON-encoded — same convention as `file-batch.operations',
+  `json-object-add.pairs-json', etc.)
+- other string -> wraps in single-element list (single-tag convenience)
 - list -> returns as-is
-Throws error for invalid types."
+Throws error for invalid types or malformed JSON."
   (cond
    ((null tags)
     nil) ; No tags (nil or empty list)
@@ -702,11 +707,26 @@ Throws error for invalid types."
    ((listp tags)
     tags) ; Already a list
    ((stringp tags)
-    (if (string-empty-p (string-trim tags))
-        nil ; "" / whitespace -> no tags (MCP schema declares tags
-            ; as a single required string, so callers need a way to
-            ; express "no tags" without inventing a sentinel value)
-      (list tags))) ; Single tag string
+    (let ((trimmed (string-trim tags)))
+      (cond
+       ((string-empty-p trimmed)
+        nil) ; "" / whitespace -> no tags (kept for MCP callers wanting
+             ; to express "no tags" without inventing a sentinel)
+       ((eq (aref trimmed 0) ?\[)
+        (condition-case err
+            (let ((parsed (json-parse-string trimmed
+                                             :array-type 'list
+                                             :null-object nil
+                                             :false-object nil)))
+              (unless (listp parsed)
+                (anvil-org--tool-validation-error
+                 "Tags JSON must encode an array, got: %s" tags))
+              parsed)
+          (json-error
+           (anvil-org--tool-validation-error
+            "Invalid tags JSON: %s" (error-message-string err)))))
+       (t
+        (list tags))))) ; Single tag string
    (t
     (anvil-org--tool-validation-error "Invalid tags format: %s" tags))))
 
@@ -970,7 +990,9 @@ MCP Parameters:
 Creates an Org ID for the new headline and returns its ID-based URI.
 TITLE is the headline text.
 TODO_STATE is the TODO state from `org-todo-keywords'.
-TAGS is a single tag string or list of tag strings.
+TAGS is a single tag string, a list/vector of tag strings, or a JSON
+array literal string (e.g. \"[\\\"a\\\",\\\"b\\\"]\") for the MCP wire form;
+empty string means no tags.
 BODY is optional body text.
 PARENT_URI is the URI of the parent item.
 AFTER_URI is optional URI of sibling to insert after.
@@ -978,7 +1000,7 @@ AFTER_URI is optional URI of sibling to insert after.
 MCP Parameters:
   title - The headline text
   todo_state - TODO state from `org-todo-keywords'
-  tags - Tags to add (single string or array of strings)
+  tags - Tags to add (single string, JSON array string, or empty for none)
   body - Optional body text content
   parent_uri - Parent item URI
                Formats:
@@ -1574,9 +1596,10 @@ Parameters:
           Cannot be empty or whitespace-only
           Cannot contain newlines
   todo_state - TODO keyword from org-todo-keywords (string, required)
-  tags - Tags for the headline (string or array, required)
+  tags - Tags for the headline (string, required)
          Single tag: \"urgent\"
-         Multiple tags: [\"work\", \"urgent\"]
+         Multiple tags: JSON array literal, e.g. \"[\\\"work\\\",\\\"urgent\\\"]\"
+         No tags: empty string \"\"
          Validated against org-tag-alist if configured
          Must follow Org tag rules (alphanumeric, _, @)
          Respects mutually exclusive tag groups
