@@ -1,4 +1,4 @@
-;;; anvil-worker-ui.el --- tabulated-list view for anvil-worker metrics -*- lexical-binding: t; -*-
+;;; anvil-ide-worker-ui.el --- tabulated-list view for anvil-worker metrics (IDE layer) -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2025-2026 zawatton
 
@@ -141,5 +141,5 @@ classifier hits (to keep empty rows visible we still emit them)."
       (anvil-worker-ui--refresh-header))
     (pop-to-buffer buf)))
 
-(provide 'anvil-worker-ui)
-;;; anvil-worker-ui.el ends here
+(provide 'anvil-ide-worker-ui)
+;;; anvil-ide-worker-ui.el ends here

@@ -139,9 +139,11 @@ These are not loaded by default.  Available modules:
 - `bisect'    — Test-driven git bisect that pins a failing ERT
                 test to the introducing commit via worktree-
                 isolated emacs --batch steps (Doc 13 Phase 1)
-- `treesit'   — Tree-sitter shared core for per-language structural
+- `ide-treesit' — Tree-sitter shared core for per-language structural
                 editing modules (Doc 21).  Registers no tools
-                itself; language modules depend on it.
+                itself; language modules depend on it.  Renamed
+                from `treesit' in Doc 38 Phase C (= IDE layer
+                relocation).
 - `py'        — Python read-only structural locators: py-list-imports
                 / py-list-functions / py-list-classes / py-list-methods
                 / py-list-decorators / py-find-definition /

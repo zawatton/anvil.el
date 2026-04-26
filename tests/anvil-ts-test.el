@@ -13,7 +13,7 @@
 
 (require 'ert)
 (require 'cl-lib)
-(require 'anvil-treesit)
+(require 'anvil-ide-treesit)
 (require 'anvil-ts)
 
 (defconst anvil-ts-test--ts-fixture

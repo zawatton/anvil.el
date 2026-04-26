@@ -1,4 +1,4 @@
-;;; anvil-treesit.el --- Tree-sitter shared core for anvil  -*- lexical-binding: t; -*-
+;;; anvil-ide-treesit.el --- Tree-sitter shared core for anvil (IDE layer)  -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026 zawatton
 
@@ -307,5 +307,5 @@ No MCP tools are registered at the core level — per-language modules
   (anvil-treesit-clear-query-cache)
   t)
 
-(provide 'anvil-treesit)
-;;; anvil-treesit.el ends here
+(provide 'anvil-ide-treesit)
+;;; anvil-ide-treesit.el ends here

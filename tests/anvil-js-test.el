@@ -13,7 +13,7 @@
 
 (require 'ert)
 (require 'cl-lib)
-(require 'anvil-treesit)
+(require 'anvil-ide-treesit)
 (require 'anvil-ts)
 (require 'anvil-js)
 

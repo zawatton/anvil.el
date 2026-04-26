@@ -2,14 +2,15 @@
 
 ;;; Commentary:
 
-;; Phase B2 (Doc 38) — verify that anvil-elisp's 7 MCP tools work in
-;; both Emacs and NeLisp runtimes.  Six tools must be portable; the
-;; seventh (`elisp-info-lookup-symbol') must degrade gracefully when
-;; `info-lookup-symbol' is unavailable.
+;; Phase B2 (Doc 38) — verify that anvil-elisp's 6 portable MCP tools
+;; work in both Emacs and NeLisp runtimes.
 ;;
-;; The split-out fallback / portable-renderer / fboundp-guard paths
-;; are exercised via `cl-letf' so the tests do not require an actual
-;; NeLisp runtime.
+;; The 7th tool (`elisp-info-lookup-symbol') was moved to
+;; `anvil-ide-elisp.el' in Phase C and is exercised by
+;; `tests/anvil-ide-elisp-test.el'.
+;;
+;; The split-out fallback / portable-renderer paths are exercised via
+;; `cl-letf' so the tests do not require an actual NeLisp runtime.
 
 ;;; Code:
 
@@ -38,29 +39,7 @@ contains the docstring and a function signature, without calling
     "anvil-elisp-test--definitely-not-a-function")
    :type 'anvil-server-tool-error))
 
-;;;; --- elisp-info-lookup-symbol: fboundp guard ----------------------
-
-(ert-deftest anvil-elisp-test-info-lookup-unavailable-returns-error-json ()
-  "When `info-lookup-symbol' is not bound the tool returns a JSON
-object with `error: \"info-look-unavailable\"' instead of throwing."
-  (let ((real-fboundp (symbol-function 'fboundp)))
-    (cl-letf (((symbol-function 'fboundp)
-               (lambda (sym)
-                 (and (not (eq sym 'info-lookup-symbol))
-                      (funcall real-fboundp sym)))))
-      (let* ((out (anvil-elisp--info-lookup-symbol "car"))
-             (parsed (json-read-from-string out)))
-        (should (equal :json-false (alist-get 'found parsed)))
-        (should (equal "info-look-unavailable"
-                       (alist-get 'error parsed)))))))
-
-(ert-deftest anvil-elisp-test-info-lookup-validates-symbol-first ()
-  "Empty / non-string symbol arg must throw before reaching the
-fboundp guard."
-  (should-error (anvil-elisp--info-lookup-symbol "")
-                :type 'anvil-server-tool-error)
-  (should-error (anvil-elisp--info-lookup-symbol 42)
-                :type 'anvil-server-tool-error))
+;;;; --- elisp-info-lookup-symbol moved to anvil-ide-elisp-test.el (Doc 38 Phase C)
 
 ;;;; --- elisp-byte-compile-file: nelisp-cc delegate ------------------
 

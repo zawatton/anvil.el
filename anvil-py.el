@@ -29,7 +29,7 @@
 (require 'cl-lib)
 (require 'subr-x)
 (require 'anvil-server)
-(require 'anvil-treesit)
+(require 'anvil-ide-treesit)
 
 (defconst anvil-py--server-id "emacs-eval"
   "Server ID under which py-* MCP tools are registered.")

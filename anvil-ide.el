@@ -52,8 +52,8 @@
 (declare-function treesit-parser-list "treesit" (&optional buffer language))
 (declare-function treesit-parser-create "treesit" (language &optional buffer no-reuse tag))
 (declare-function treesit-parser-root-node "treesit" (parser))
-(autoload 'anvil-treesit-language-for-file "anvil-treesit" nil nil)
-(autoload 'anvil-treesit-ensure-grammar "anvil-treesit" nil nil)
+(autoload 'anvil-treesit-language-for-file "anvil-ide-treesit" nil nil)
+(autoload 'anvil-treesit-ensure-grammar "anvil-ide-treesit" nil nil)
 
 ;; Flycheck declarations
 (defvar flycheck-current-errors)

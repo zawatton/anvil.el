@@ -11,7 +11,7 @@
 (require 'ert)
 (require 'cl-lib)
 (require 'anvil-worker)
-(require 'anvil-worker-ui)
+(require 'anvil-ide-worker-ui)
 
 (defmacro anvil-worker-ui-test--with-metrics (classify latency &rest body)
   "Run BODY with metric plists bound to CLASSIFY / LATENCY."

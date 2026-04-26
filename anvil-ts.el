@@ -35,7 +35,7 @@
 (require 'cl-lib)
 (require 'subr-x)
 (require 'anvil-server)
-(require 'anvil-treesit)
+(require 'anvil-ide-treesit)
 
 (defconst anvil-ts--server-id "emacs-eval"
   "Server ID under which ts-* MCP tools are registered.")

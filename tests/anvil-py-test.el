@@ -15,7 +15,7 @@
 
 (require 'ert)
 (require 'cl-lib)
-(require 'anvil-treesit)
+(require 'anvil-ide-treesit)
 (require 'anvil-py)
 
 (defconst anvil-py-test--fixture

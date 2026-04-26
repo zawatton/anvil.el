@@ -27,7 +27,7 @@
 (require 'cl-lib)
 (require 'subr-x)
 (require 'anvil-server)
-(require 'anvil-treesit)
+(require 'anvil-ide-treesit)
 (require 'anvil-ts)
 
 (defconst anvil-js--server-id "emacs-eval"
