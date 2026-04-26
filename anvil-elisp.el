@@ -1,4 +1,5 @@
 ;;; anvil-elisp.el --- Elisp development tools for anvil -*- lexical-binding: t; -*-
+;;; anvil-audit: tools-wrapped-at-registration
 
 ;; Copyright (C) 2025-2026 anvil-elisp.el contributors
 
@@ -173,18 +174,56 @@ is a custom variable, is obsolete, or is an alias."
 
 ;;; Tool Implementations
 
+(defun anvil-elisp--describe-function-portable (sym)
+  "Render a portable description for SYM using `documentation' +
+`help-function-arglist'.  Returns a plain string compatible with
+both Emacs and NeLisp runtimes (no `describe-function-1' usage)."
+  (let* ((fn (symbol-function sym))
+         (is-alias (symbolp fn))
+         (aliased-to (and is-alias fn))
+         (is-subr (subrp (if is-alias aliased-to fn)))
+         (arglist (condition-case nil
+                      (help-function-arglist sym t)
+                    (error nil)))
+         (doc (or (documentation sym) ""))
+         (file (and (fboundp 'find-lisp-object-file-name)
+                    (find-lisp-object-file-name sym 'defun)))
+         (sig (cond
+               (arglist (format "(%s%s)" sym
+                                (if arglist
+                                    (concat " "
+                                            (mapconcat
+                                             (lambda (a) (format "%S" a))
+                                             arglist " "))
+                                  "")))
+               (t (format "(%s ...)" sym))))
+         (kind (cond
+                (is-alias (format "alias for `%s'" aliased-to))
+                (is-subr "built-in function")
+                (t "Lisp function"))))
+    (format "%s\n\n%s%s%s%s"
+            sig
+            (format "  %s.\n\n" kind)
+            (if file (format "Defined in `%s'.\n\n" file) "")
+            (if is-alias
+                (format "Aliased to `%s'.\n\n" aliased-to)
+              "")
+            doc)))
+
 (defun anvil-elisp--describe-function (function)
   "Get full documentation for Emacs Lisp FUNCTION.
+
+Uses `documentation' + `help-function-arglist' so the renderer is
+portable across Emacs and NeLisp runtimes.  `describe-function-1'
+(an Emacs-internal *Help* buffer formatter) is intentionally not
+used here.
 
 MCP Parameters:
   function - The name of the function to describe"
   (anvil-server-with-error-handling
    (let ((sym (anvil-elisp--validate-symbol function "function" t)))
      (if (fboundp sym)
-         (with-temp-buffer
-           (let ((standard-output (current-buffer)))
-             (describe-function-1 sym)
-             (buffer-string)))
+         (anvil-elisp--describe-function-portable sym)
        (anvil-server-tool-throw
         (format "Function %s is void" function))))))
 
@@ -643,19 +682,31 @@ Returns an alist with lookup results or nil if not found."
 (defun anvil-elisp--info-lookup-symbol (symbol)
   "Look up SYMBOL in Elisp Info documentation.
 
+This tool depends on the Emacs `info-look' subsystem, which is
+not part of the portable runtime contract.  When `info-lookup-symbol'
+is unavailable (for example under the standalone NeLisp runtime),
+the call returns a JSON object with `error: \"info-look-unavailable\"'
+instead of signalling, so MCP clients can degrade gracefully.
+
 MCP Parameters:
   symbol - The symbol to look up (string)"
   (anvil-server-with-error-handling
-   ;; Validate input
+   ;; Validate input first so callers always get a uniform validation error.
    (anvil-elisp--validate-symbol symbol "symbol")
-   ;; Perform lookup
-   (let ((result (anvil-elisp--perform-info-lookup symbol)))
-     (if result
-         (json-encode result)
-       (anvil-elisp--json-encode-not-found
-        symbol
-        (format "Symbol '%s' not found in Elisp Info documentation"
-                symbol))))))
+   (if (not (fboundp 'info-lookup-symbol))
+       (json-encode
+        `((found . :json-false)
+          (symbol . ,symbol)
+          (error . "info-look-unavailable")
+          (message . "info-lookup-symbol is not available in this runtime")))
+     ;; Perform lookup
+     (let ((result (anvil-elisp--perform-info-lookup symbol)))
+       (if result
+           (json-encode result)
+         (anvil-elisp--json-encode-not-found
+          symbol
+          (format "Symbol '%s' not found in Elisp Info documentation"
+                  symbol)))))))
 
 (defun anvil-elisp--library-name-p (name)
   "Return non-nil if NAME is a library name, not a file path.
@@ -938,8 +989,68 @@ isolation matters."
 
 ;;; Byte-compile — compact result
 
+(defun anvil-elisp--byte-compile-file--nelisp (path)
+  "Compile every top-level lambda in PATH via nelisp-cc.
+Reads top-level forms from PATH (must already exist on disk) and
+feeds each `(defun ...)' / `(defmacro ...)'  body as a lambda
+form into `nelisp-cc-runtime-compile-and-allocate'.  Returns a
+plist of (:ok BOOL :output PATH :warnings (...) :errors (...)).
+
+Top-level forms that are not function definitions are skipped
+(this matches `byte-compile-file' which compiles them as part of
+the load-time stream but does not produce per-form artefacts that
+nelisp-cc cares about).  Errors raised by the nelisp-cc pipeline
+are captured into the :errors list rather than bubbled up.
+
+This delegate path is only taken when
+`nelisp-cc-runtime-compile-and-allocate' is `fboundp'; otherwise
+the caller falls back to the Emacs `byte-compile-file' renderer."
+  (let ((errors nil)
+        (warnings nil)
+        (compiled 0)
+        (forms nil))
+    (condition-case err
+        (with-temp-buffer
+          (insert-file-contents path)
+          (goto-char (point-min))
+          (let ((sexp t))
+            (while sexp
+              (setq sexp (condition-case _
+                             (read (current-buffer))
+                           (end-of-file nil)
+                           (error nil)))
+              (when (and (consp sexp)
+                         (memq (car sexp) '(defun defmacro)))
+                (push sexp forms)))))
+      (error (push (error-message-string err) errors)))
+    (dolist (form (nreverse forms))
+      ;; (defun NAME ARGS [DOC] BODY...) -> (lambda ARGS [DOC] BODY...)
+      (let ((lambda-form `(lambda ,@(cddr form))))
+        (condition-case err
+            (progn
+              (funcall (intern "nelisp-cc-runtime-compile-and-allocate")
+                       lambda-form)
+              (cl-incf compiled))
+          (error
+           (push (format "%s: %s"
+                         (cadr form) (error-message-string err))
+                 warnings)))))
+    (format "%S" (list :ok (null errors)
+                       :output (concat (file-name-sans-extension path)
+                                       ".elc")
+                       :backend 'nelisp-cc
+                       :compiled-forms compiled
+                       :warnings (nreverse warnings)
+                       :errors (nreverse errors)))))
+
 (defun anvil-elisp--byte-compile-file (file)
   "Byte-compile FILE and return a compact result plist.
+
+When `nelisp-cc-runtime-compile-and-allocate' is bound (NeLisp
+runtime), each top-level `defun' / `defmacro' is fed through that
+form-based JIT; the response is annotated `:backend nelisp-cc'.
+Otherwise the Emacs `byte-compile-file' path runs as before and
+the `:backend' key is omitted.  Both paths return the same shape:
 
 MCP Parameters:
   file - Path to an .el file to byte-compile (string).
@@ -948,31 +1059,34 @@ Returns a printed plist:
   (:ok BOOL :output PATH :warnings (...) :errors (...))
 Warnings and errors are parsed out of the byte-compile log so the
 caller does not have to scan it."
-  (let* ((path (expand-file-name file))
-         (log-buf (get-buffer-create " *anvil-bc-log*"))
-         (byte-compile-log-buffer (buffer-name log-buf))
-         (warnings nil)
-         (errors nil)
-         (result nil))
-    (with-current-buffer log-buf
-      (let ((inhibit-read-only t)) (erase-buffer)))
-    (condition-case err
-        (setq result (byte-compile-file path))
-      (error (push (error-message-string err) errors)))
-    (with-current-buffer log-buf
-      (goto-char (point-min))
-      (while (re-search-forward
-              "^\\(?:.*?:\\)?\\(?:[0-9]+:[0-9]+: ?\\)?\\(Warning\\|Error\\): \\(.*\\)$"
-              nil t)
-        (let ((kind (match-string 1))
-              (msg  (match-string 2)))
-          (if (equal kind "Warning")
-              (push msg warnings)
-            (push msg errors)))))
-    (format "%S" (list :ok (and result (null errors))
-                       :output (concat (file-name-sans-extension path) ".elc")
-                       :warnings (nreverse warnings)
-                       :errors (nreverse errors)))))
+  (let ((path (expand-file-name file)))
+    (if (fboundp 'nelisp-cc-runtime-compile-and-allocate)
+        (anvil-elisp--byte-compile-file--nelisp path)
+      (let* ((log-buf (get-buffer-create " *anvil-bc-log*"))
+             (byte-compile-log-buffer (buffer-name log-buf))
+             (warnings nil)
+             (errors nil)
+             (result nil))
+        (with-current-buffer log-buf
+          (let ((inhibit-read-only t)) (erase-buffer)))
+        (condition-case err
+            (setq result (byte-compile-file path))
+          (error (push (error-message-string err) errors)))
+        (with-current-buffer log-buf
+          (goto-char (point-min))
+          (while (re-search-forward
+                  "^\\(?:.*?:\\)?\\(?:[0-9]+:[0-9]+: ?\\)?\\(Warning\\|Error\\): \\(.*\\)$"
+                  nil t)
+            (let ((kind (match-string 1))
+                  (msg  (match-string 2)))
+              (if (equal kind "Warning")
+                  (push msg warnings)
+                (push msg errors)))))
+        (format "%S" (list :ok (and result (null errors))
+                           :output (concat (file-name-sans-extension path)
+                                           ".elc")
+                           :warnings (nreverse warnings)
+                           :errors (nreverse errors)))))))
 
 ;;;###autoload
 (defun anvil-elisp-enable ()
