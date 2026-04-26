@@ -1595,8 +1595,11 @@ SPEC is a plist:
   :block-end      One of:
                     `next-block-start' (default) — block ends right before
                       the next `:block-start' match (or EOF).
-                    `brace-balance' — track `{}' depth from `:block-start';
-                      end at the matching closing `}'.  Strings are skipped.
+                    `brace-balance' — find the first `{` after the
+                      `:block-start' match, then track `{}' depth and end at
+                      the matching closing `}'.  Strings are skipped.
+                      `:block-start' should match the header before the
+                      opening brace and must not consume the brace itself.
                     REGEXP string — block ends at the start of the first
                       regexp match after `:block-start'.
   :fields         List of field plists.  Each plist:
@@ -2492,12 +2495,14 @@ descriptions and disclosure-help cover the full contract."
 For each match of `block-start' the tool finds the block's body via
 `block-end' (`next-block-start', `brace-balance', or a regexp), then
 runs each `fields' regexp inside the body and captures group 1 as the
-field's value.  Read-only — the file is never modified.  Returns plist
-with :matches (each :id :start-line :end-line :fields) :total :returned
-:skipped.  Targets legacy code migration / data extraction where reading
-the entire file would be wasteful.  Regexp values use Emacs regexp
-syntax, and `fields' must be a JSON array of {name, regexp, required?}
-objects.  Brace-balance skips strings."
+field's value.  In `brace-balance' mode, `block-start' should match the
+header before the opening `{` and must not consume the brace itself.
+Read-only — the file is never modified.  Returns plist with :matches
+(each :id :start-line :end-line :fields) :total :returned :skipped.
+Targets legacy code migration / data extraction where reading the entire
+file would be wasteful.  Regexp values use Emacs regexp syntax, and
+`fields' must be a JSON array of {name, regexp, required?} objects.
+Brace-balance skips strings."
    :read-only t
    :offload t
    :server-id anvil-file--server-id)
