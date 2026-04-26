@@ -522,7 +522,7 @@ budget goes to reasoning about your code, not re-reading it.
 | =data=       | JSON/CSV read/write with UTF-8 enforcement     | —                |
 | =xlsx=       | Excel read/write (optional)                    | Python, openpyxl |
 | =pdf=        | PDF text extraction (optional)                 | Python, pymupdf  |
-| =ide=        | xref, diagnostics, imenu, tree-sitter (opt.)   | project.el       |
+| =ide= (split) | Moved to [[https://github.com/zawatton/anvil-ide.el][zawatton/anvil-ide.el]] in 2026-04 (Doc 38).  =anvil.el= is now NeLisp-runnable; =anvil-ide.el= bundles the Emacs-only IDE layer (xref / diagnostics / imenu / tree-sitter / info-look / worker-ui dashboard).  Install both for the original feature set | anvil-ide.el repo |
 | =cron=       | Scheduled task runner with worker dispatch      | —                |
 | =elisp=      | Agentic Elisp development tools (optional)     | —                |
 | =browser=    | Web fetch / interact / capture / screenshot via agent-browser (opt.) | agent-browser CLI |

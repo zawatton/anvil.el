@@ -15,13 +15,20 @@
 
 (require 'ert)
 (require 'cl-lib)
-(require 'anvil-ide-treesit)
+;; Doc 38 Phase E — anvil-ide-treesit lives in zawatton/anvil-ide.el now.
+;; Soft-require keeps loading clean when the IDE layer is absent;
+;; grammar-dependent tests already auto-skip on missing grammars.
+(require 'anvil-ide-treesit nil 'noerror)
 (require 'anvil-py)
 
 (defconst anvil-py-test--fixture
   (expand-file-name "fixtures/py-sample/app.py"
                     (file-name-directory
                      (or load-file-name buffer-file-name))))
+
+(defun anvil-py-test--ide-ready ()
+  "Return non-nil when anvil-ide-treesit is loaded (= Doc 38 Phase E)."
+  (fboundp 'anvil-treesit-language-for-file))
 
 (defun anvil-py-test--grammar-ready ()
   "Return non-nil when the Python tree-sitter grammar is loadable.
@@ -33,28 +40,41 @@ run."
        (treesit-language-available-p 'python)))
 
 (defmacro anvil-py-test--requires-grammar (&rest body)
-  "Skip the test body unless the Python grammar is available."
+  "Skip the test body unless the Python grammar is available
+AND the anvil-ide-treesit layer is loaded (= Doc 38 Phase E gate)."
   (declare (indent 0))
-  `(if (anvil-py-test--grammar-ready)
+  `(cond
+    ((not (anvil-py-test--ide-ready))
+     (ert-skip "anvil-ide-treesit not loaded (= ide layer absent)"))
+    ((anvil-py-test--grammar-ready) (progn ,@body))
+    (t (ert-skip "tree-sitter-python grammar not installed on this runner"))))
+
+(defmacro anvil-py-test--requires-ide (&rest body)
+  "Skip BODY when anvil-ide-treesit isn't loaded.  For pure-dispatch
+unit tests that still depend on the IDE layer."
+  (declare (indent 0))
+  `(if (anvil-py-test--ide-ready)
        (progn ,@body)
-     (ert-skip "tree-sitter-python grammar not installed on this runner")))
+     (ert-skip "anvil-ide-treesit not loaded (= ide layer absent)")))
 
 ;;;; --- pure / grammar-independent -----------------------------------------
 
 (ert-deftest anvil-py-test-dispatch-py-extension ()
+ (anvil-py-test--requires-ide
   (should (eq 'python (anvil-treesit-language-for-file "/x/app.py")))
   (should (eq 'python (anvil-treesit-language-for-file "/x/app.pyi")))
-  (should (null (anvil-treesit-language-for-file "/x/unknown.xyz"))))
+  (should (null (anvil-treesit-language-for-file "/x/unknown.xyz")))))
 
 (ert-deftest anvil-py-test-grammar-missing-error-shape ()
   "The structured error carries the install hint and source URL."
+ (anvil-py-test--requires-ide
   (let ((e (anvil-treesit-grammar-missing-error 'python)))
     (should (eq 'grammar-missing (plist-get e :kind)))
     (should (eq 'python (plist-get e :lang)))
     (should (string-match-p "treesit-install-language-grammar"
                             (plist-get e :install-hint)))
     (should (string-match-p "tree-sitter-python"
-                            (plist-get e :source-url)))))
+                            (plist-get e :source-url))))))
 
 (ert-deftest anvil-py-test-query-cache-stable-handle ()
   "Identical (lang . op) calls return the same compiled query object."
@@ -256,11 +276,13 @@ parity with `py-list-functions'."
                   :type 'user-error)))
 
 (ert-deftest anvil-py-test-list-imports-errors-on-nil-file ()
-  (should-error (anvil-py-list-imports nil) :type 'user-error))
+ (anvil-py-test--requires-ide
+  (should-error (anvil-py-list-imports nil) :type 'user-error)))
 
 (ert-deftest anvil-py-test-grammar-missing-signals-structured-user-error ()
   "With the grammar stubbed as unavailable, callers see a
 user-error whose message is a `read'-able grammar-missing plist."
+ (anvil-py-test--requires-ide
   (cl-letf (((symbol-function 'treesit-language-available-p)
              (lambda (_lang) nil)))
     (condition-case err
@@ -270,7 +292,7 @@ user-error whose message is a `read'-able grammar-missing plist."
        (let* ((msg (error-message-string err))
               (plist (read msg)))
          (should (eq 'grammar-missing (plist-get plist :kind)))
-         (should (eq 'python (plist-get plist :lang))))))))
+         (should (eq 'python (plist-get plist :lang)))))))))
 
 ;;;; --- edit primitives (Phase 2a) ----------------------------------------
 

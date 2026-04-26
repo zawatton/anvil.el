@@ -35,7 +35,11 @@
 (require 'cl-lib)
 (require 'subr-x)
 (require 'anvil-server)
-(require 'anvil-ide-treesit)
+;; Doc 38 Phase E — anvil-ide-treesit lives in zawatton/anvil-ide.el now.
+;; We soft-require so anvil.el loads cleanly in NeLisp standalone tarball
+;; (= no IDE layer); the treesit-* tools below will then signal at call
+;; time, which is acceptable since they require Emacs anyway.
+(require 'anvil-ide-treesit nil 'noerror)
 
 (defconst anvil-ts--server-id "emacs-eval"
   "Server ID under which ts-* MCP tools are registered.")

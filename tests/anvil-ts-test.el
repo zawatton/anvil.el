@@ -13,7 +13,11 @@
 
 (require 'ert)
 (require 'cl-lib)
-(require 'anvil-ide-treesit)
+;; Doc 38 Phase E — anvil-ide-treesit lives in zawatton/anvil-ide.el now.
+;; Tests requiring tree-sitter grammars already auto-skip via
+;; `anvil-ts-test--requires'; soft-require keeps loading clean when the
+;; IDE layer is absent.
+(require 'anvil-ide-treesit nil 'noerror)
 (require 'anvil-ts)
 
 (defconst anvil-ts-test--ts-fixture
@@ -26,51 +30,73 @@
                     (file-name-directory
                      (or load-file-name buffer-file-name))))
 
+(defun anvil-ts-test--ide-ready ()
+  "Return non-nil when the anvil-ide-treesit layer is loaded.
+Doc 38 Phase E moved anvil-ide-treesit into zawatton/anvil-ide.el; in
+the standalone tarball (= no IDE layer) the treesit MCP tools are
+unbound and the entire suite must skip."
+  (fboundp 'anvil-treesit-language-for-file))
+
 (defun anvil-ts-test--grammar-ready (lang)
   "Return non-nil when the LANG grammar is loadable."
   (and (fboundp 'treesit-language-available-p)
        (treesit-language-available-p lang)))
 
 (defmacro anvil-ts-test--requires (lang &rest body)
-  "Skip the test body unless the tree-sitter LANG grammar is available."
+  "Skip the test body unless the tree-sitter LANG grammar is available
+AND the anvil-ide-treesit layer is loaded (= Doc 38 Phase E gate)."
   (declare (indent 1))
-  `(if (anvil-ts-test--grammar-ready ,lang)
-       (progn ,@body)
-     (ert-skip (format "tree-sitter-%s grammar not installed" ,lang))))
+  `(cond
+    ((not (anvil-ts-test--ide-ready))
+     (ert-skip "anvil-ide-treesit not loaded (= ide layer absent)"))
+    ((anvil-ts-test--grammar-ready ,lang)
+     (progn ,@body))
+    (t (ert-skip (format "tree-sitter-%s grammar not installed" ,lang)))))
 
 ;;;; --- pure / grammar-independent -----------------------------------------
 
+(defmacro anvil-ts-test--ide-required (&rest body)
+  "Skip BODY when anvil-ide-treesit isn't loaded (= Doc 38 Phase E)."
+  (declare (indent 0))
+  `(if (anvil-ts-test--ide-ready)
+       (progn ,@body)
+     (ert-skip "anvil-ide-treesit not loaded (= ide layer absent)")))
+
 (ert-deftest anvil-ts-test-dispatch-ts-extension ()
+ (anvil-ts-test--ide-required
   (should (eq 'typescript (anvil-treesit-language-for-file "/x/app.ts")))
   (should (eq 'tsx        (anvil-treesit-language-for-file "/x/app.tsx")))
   (should (eq 'javascript (anvil-treesit-language-for-file "/x/app.js")))
   (should (eq 'javascript (anvil-treesit-language-for-file "/x/app.jsx")))
   (should (eq 'javascript (anvil-treesit-language-for-file "/x/app.mjs")))
   (should (eq 'javascript (anvil-treesit-language-for-file "/x/app.cjs")))
-  (should (null (anvil-treesit-language-for-file "/x/unknown.xyz"))))
+  (should (null (anvil-treesit-language-for-file "/x/unknown.xyz")))))
 
 (ert-deftest anvil-ts-test-lang-for-file-rejects-non-ts ()
   "The TS dispatcher errors on .js / .jsx / unknown rather than silently
 defaulting; users who meant JS should have called anvil-js-*."
+ (anvil-ts-test--ide-required
   (should-error (anvil-ts--lang-for-file "/x/app.js") :type 'user-error)
   (should-error (anvil-ts--lang-for-file "/x/app.jsx") :type 'user-error)
   (should-error (anvil-ts--lang-for-file "/x/foo.py") :type 'user-error)
   (should (eq 'typescript (anvil-ts--lang-for-file "/x/app.ts")))
-  (should (eq 'tsx (anvil-ts--lang-for-file "/x/app.tsx"))))
+  (should (eq 'tsx (anvil-ts--lang-for-file "/x/app.tsx")))))
 
 (ert-deftest anvil-ts-test-grammar-missing-error-shape ()
   "The structured error carries the install hint and source URL."
+ (anvil-ts-test--ide-required
   (dolist (lang '(typescript tsx javascript))
     (let ((e (anvil-treesit-grammar-missing-error lang)))
       (should (eq 'grammar-missing (plist-get e :kind)))
       (should (eq lang (plist-get e :lang)))
       (should (string-match-p "treesit-install-language-grammar"
                               (plist-get e :install-hint)))
-      (should (string-match-p "tree-sitter" (plist-get e :source-url))))))
+      (should (string-match-p "tree-sitter" (plist-get e :source-url)))))))
 
 (ert-deftest anvil-ts-test-grammar-missing-signals-structured-user-error ()
   "With the grammar stubbed as unavailable, callers see a user-error
 whose message is a `read'-able grammar-missing plist."
+ (anvil-ts-test--ide-required
   (cl-letf (((symbol-function 'treesit-language-available-p)
              (lambda (_lang) nil)))
     (condition-case err
@@ -80,7 +106,7 @@ whose message is a `read'-able grammar-missing plist."
        (let* ((msg (error-message-string err))
               (plist (read msg)))
          (should (eq 'grammar-missing (plist-get plist :kind)))
-         (should (eq 'typescript (plist-get plist :lang))))))))
+         (should (eq 'typescript (plist-get plist :lang)))))))))
 
 ;;;; --- TS locators vs fixture ---------------------------------------------
 
@@ -282,7 +308,8 @@ body parses without an error."
                   :type 'user-error)))
 
 (ert-deftest anvil-ts-test-list-imports-errors-on-nil-file ()
-  (should-error (anvil-ts-list-imports nil) :type 'user-error))
+ (anvil-ts-test--ide-required
+  (should-error (anvil-ts-list-imports nil) :type 'user-error)))
 
 ;;;; --- Phase 2: edit helpers ---------------------------------------------
 

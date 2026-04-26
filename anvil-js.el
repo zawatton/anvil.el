@@ -27,7 +27,10 @@
 (require 'cl-lib)
 (require 'subr-x)
 (require 'anvil-server)
-(require 'anvil-ide-treesit)
+;; Doc 38 Phase E — anvil-ide-treesit lives in zawatton/anvil-ide.el now.
+;; Soft-require keeps anvil.el loadable in standalone tarball; treesit-*
+;; tools signal at call time when the IDE layer is absent.
+(require 'anvil-ide-treesit nil 'noerror)
 (require 'anvil-ts)
 
 (defconst anvil-js--server-id "emacs-eval"
