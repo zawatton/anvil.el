@@ -1093,6 +1093,15 @@ MCP Parameters:
          (error nil))
        (user-error "anvil-py: could not parse spec string %S" spec)))))
 
+(defun anvil-py--coerce-name (name)
+  "Coerce a single import NAME element to a string.
+Accepts strings (returned unchanged) and symbols (rendered via
+`symbol-name'); anything else is rejected so render paths don't
+emit `(wrong-type-argument sequencep …)' on a list of symbols."
+  (cond ((stringp name) name)
+        ((and name (symbolp name)) (symbol-name name))
+        (t (user-error "anvil-py: invalid import name %S" name))))
+
 (defun anvil-py--coerce-spec (spec)
   "Normalize an MCP-bridge SPEC into the elisp plist shape.
 MCP tool calls can arrive as a plist, an alist / hash-table decoded
@@ -1126,6 +1135,19 @@ a plist whose values are ready for the elisp planners."
     (when (stringp names)
       (setq s (plist-put s :names
                          (split-string names "[ ,]+" t))))
+    ;; Identifier-shaped fields can arrive as symbols when SPEC was
+    ;; parsed from an elisp-style string like `(:name Dict)' — Emacs's
+    ;; reader produces symbols, but downstream rendering (`mapconcat',
+    ;; `format' into rewrite plans) expects strings.  Coerce the
+    ;; scalar `:name' and every element of `:names' so callers can
+    ;; pass either shape interchangeably.
+    (let ((name (plist-get s :name)))
+      (when (and name (symbolp name))
+        (setq s (plist-put s :name (symbol-name name)))))
+    (let ((ns (plist-get s :names)))
+      (when (consp ns)
+        (setq s (plist-put s :names
+                           (mapcar #'anvil-py--coerce-name ns)))))
     s))
 
 (defun anvil-py--tool-add-import (file spec apply)
