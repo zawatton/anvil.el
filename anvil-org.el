@@ -29,6 +29,49 @@
 ;; This package implements a Model Context Protocol (MCP) server for
 ;; Org-mode.
 
+;; -------------------------------------------------------------------
+;; Doc 38 Phase B4 — anvil-ide split classification (manifest)
+;; -------------------------------------------------------------------
+;;
+;; This module currently mixes two kinds of org operations:
+;;
+;;   :headline-only — the result depends only on row-shaped data
+;;     (file, level, title, line, properties).  Such tools can
+;;     delegate to the SQLite-backed `anvil-org-index' fast-path
+;;     (which itself is a candidate to delegate further to
+;;     `nelisp-org-index' under the architecture-α plan), and stay
+;;     headless-friendly.  No `org-element', no `org-edit-body',
+;;     no buffer narrowing required.
+;;
+;;   :tree-walk — the result requires a real Org buffer to navigate
+;;     a parsed AST, narrow the body, mutate text, save, etc.
+;;     These need full Emacs + org.el and cannot delegate to an
+;;     index.  They are the candidates that move into a future
+;;     `anvil-ide' split (Phase C of Doc 38).
+;;
+;; Manifest (MCP-registered tools, kept in sync with `anvil-org-enable'):
+;;
+;;   org-get-todo-config       :headline-only   reads `org-todo-keywords' only
+;;   org-get-tag-config        :headline-only   reads tag-related defcustoms only
+;;   org-get-allowed-files     :headline-only   reads `anvil-org-allowed-files' only
+;;   org-read-file             :tree-walk       full file read; no row data
+;;   org-read-outline          :headline-only   index fast-path already wired
+;;   org-read-headline         :headline-only   index fast-path already wired
+;;   org-read-by-id            :headline-only   index fast-path already wired
+;;   org-update-todo-state     :tree-walk       writes via `org-todo' in buffer
+;;   org-add-todo              :tree-walk       inserts heading + props in buffer
+;;   org-rename-headline       :tree-walk       writes via `org-edit-headline'
+;;   org-edit-body             :tree-walk       narrows + replaces body content
+;;
+;; Phase B4 wires the three "already-wired" read tools through a
+;; common `fboundp' guard so that the delegate path is feature-flagged
+;; against the live `anvil-org-index' module rather than the mere
+;; presence of a buffer-local var.  Phase C (= the actual ide split)
+;; will move every :tree-walk function into a separate file behind
+;; an `anvil-ide' feature gate.  Functions marked
+;; ;; PHASE-C-IDE-SPLIT-CANDIDATE are the migration list.
+;; -------------------------------------------------------------------
+
 ;;; Code:
 
 (require 'cl-lib)
@@ -859,6 +902,7 @@ BODY-END is the buffer position where body ends."
   "Return the list of allowed Org files."
   (json-encode `((files . ,(vconcat anvil-org-allowed-files)))))
 
+;; PHASE-C-IDE-SPLIT-CANDIDATE: writes via org-todo in real buffer
 (defun anvil-org--tool-update-todo-state (uri current_state new_state)
   "Update the TODO state of a headline at URI.
 Creates an Org ID for the headline if one doesn't exist.
@@ -896,6 +940,7 @@ MCP Parameters:
       ;; Update the state
       (org-todo new_state))))
 
+;; PHASE-C-IDE-SPLIT-CANDIDATE: inserts heading + ID + tags + body in real buffer
 (defun anvil-org--tool-add-todo
     (title todo_state tags body parent_uri &optional after_uri)
   "Add a new TODO item to an Org file.
@@ -1057,6 +1102,7 @@ PARAMS is an alist containing the uuid parameter."
         (anvil-org--resource-file-access-error id))
       (anvil-org--get-content-by-id allowed-file id))))
 
+;; PHASE-C-IDE-SPLIT-CANDIDATE: writes via org-edit-headline in real buffer
 (defun anvil-org--tool-rename-headline (uri current_title new_title)
   "Rename headline title at URI from CURRENT_TITLE to NEW_TITLE.
 Preserves the current TODO state and tags, creates an Org ID for the
@@ -1093,6 +1139,7 @@ MCP Parameters:
 
       (org-edit-headline new_title))))
 
+;; PHASE-C-IDE-SPLIT-CANDIDATE: narrows body + org-end-of-meta-data + buffer mutation
 (defun anvil-org--tool-edit-body
     (resource_uri old_body new_body replace_all)
   "Edit body content of an Org node using partial string replacement.
@@ -1212,6 +1259,7 @@ MCP Parameters:
 
 ;; Tools duplicating resource templates
 
+;; PHASE-C-IDE-SPLIT-CANDIDATE: reads full file via temp buffer (= no row substrate)
 (defun anvil-org--tool-read-file (file)
   "Tool wrapper for org://{filename} resource template.
 FILE is the absolute path to an Org file.
@@ -1247,7 +1295,12 @@ MCP Parameters:
 (defun anvil-org--index-available-p ()
   "Return non-nil when the `anvil-org-index' fast-path can be tried.
 Checks the feature-flag, the library itself, and the live DB
-handle so callers do not need to repeat those guards."
+handle so callers do not need to repeat those guards.
+
+Doc 38 Phase B4: `featurep' alone is not sufficient when only a
+subset of the delegate API is loaded (= partial autoload, stale
+.elc, alternate backend), so callers add an `fboundp' guard for
+the specific delegate they intend to call before invoking it."
   (and anvil-org-use-index
        (featurep 'anvil-org-index)
        (boundp 'anvil-org-index--db)
@@ -1255,23 +1308,35 @@ handle so callers do not need to repeat those guards."
 
 (defun anvil-org--try-index-read-by-id (uuid)
   "Try `anvil-org-index-read-by-id' for UUID; return the body or nil.
-A nil return means fall back to the org-element handler."
-  (when (anvil-org--index-available-p)
+A nil return means fall back to the org-element handler.
+
+Doc 38 Phase B4: :headline-only delegate — the index resolves
+ID→(file, line-range) without ever parsing the org tree."
+  (when (and (anvil-org--index-available-p)
+             (fboundp 'anvil-org-index-read-by-id))
     (condition-case _err
         (anvil-org-index-read-by-id uuid)
       (error nil))))
 
 (defun anvil-org--try-index-read-headline (file headline-path)
-  "Try `anvil-org-index-read-headline'; return the body or nil."
-  (when (anvil-org--index-available-p)
+  "Try `anvil-org-index-read-headline'; return the body or nil.
+
+Doc 38 Phase B4: :headline-only delegate — title-segment lookup
+resolves to a single subtree row range, no AST walk needed."
+  (when (and (anvil-org--index-available-p)
+             (fboundp 'anvil-org-index-read-headline))
     (condition-case _err
         (anvil-org-index-read-headline file headline-path)
       (error nil))))
 
 (defun anvil-org--try-index-read-outline (file &optional max-depth)
   "Try `anvil-org-index-read-outline-json'; return JSON string or nil.
-MAX-DEPTH, when non-nil, caps the outline at that heading level."
-  (when (anvil-org--index-available-p)
+MAX-DEPTH, when non-nil, caps the outline at that heading level.
+
+Doc 38 Phase B4: :headline-only delegate — outline is rendered
+straight from row data (level + title + line), no parse buffer."
+  (when (and (anvil-org--index-available-p)
+             (fboundp 'anvil-org-index-read-outline-json))
     (condition-case _err
         (anvil-org-index-read-outline-json file max-depth)
       (error nil))))
