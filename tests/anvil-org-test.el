@@ -157,4 +157,48 @@
        (should (string-match-p "^\\*\\* TODO Child$" content))
        (should-not (string-match-p "^\\*\\* TODO Child[ \t]+:" content))))))
 
+(ert-deftest anvil-org-test-normalize-tags-json-array-string ()
+  "MCP callers must be able to send multiple tags as a JSON array string."
+  (should (equal '("work" "urgent")
+                 (anvil-org--normalize-tags-to-list
+                  "[\"work\",\"urgent\"]")))
+  (should (equal '("solo")
+                 (anvil-org--normalize-tags-to-list "[\"solo\"]")))
+  (should-not (anvil-org--normalize-tags-to-list "[]"))
+  (should-not (anvil-org--normalize-tags-to-list "  []  ")))
+
+(ert-deftest anvil-org-test-normalize-tags-json-malformed ()
+  "Malformed JSON array strings must surface a validation error."
+  (should-error (anvil-org--normalize-tags-to-list "[unterminated")
+                :type 'anvil-server-tool-error)
+  (should-error (anvil-org--normalize-tags-to-list "[\"a\",\"b\"")
+                :type 'anvil-server-tool-error))
+
+(ert-deftest anvil-org-test-normalize-tags-single-string-preserved ()
+  "Single-tag plain strings keep wrapping behavior unchanged."
+  (should (equal '("urgent")
+                 (anvil-org--normalize-tags-to-list "urgent")))
+  (should-not (anvil-org--normalize-tags-to-list ""))
+  (should-not (anvil-org--normalize-tags-to-list "   ")))
+
+(ert-deftest anvil-org-test-add-todo-json-array-tags ()
+  "Add-todo accepts a JSON array literal as the tags argument."
+  (anvil-org-test--with-temp-org
+   "* Parent\nBody.\n"
+   (lambda (path)
+     (let* ((anvil-org-allowed-files (list path))
+            (anvil-org-allowed-files-enabled t)
+            (parent-uri (concat "org-headline://" path "#Parent"))
+            (response
+             (json-parse-string
+              (anvil-org--tool-add-todo
+               "Child" "TODO" "[\"work\",\"urgent\"]"
+               "Child body." parent-uri)
+              :object-type 'alist))
+            (content (anvil-org-test--read path)))
+       (should (eq t (alist-get 'success response)))
+       (should (string-match-p
+                "^\\*\\* TODO Child[ \t]+:work:urgent:$"
+                content))))))
+
 ;;; anvil-org-test.el ends here
