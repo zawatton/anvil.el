@@ -153,6 +153,10 @@ ENABLED defaults to t."
     (when (and task (plist-get task :enabled))
       (plist-put task :last-run (current-time))
       (plist-put task :last-status 'running)
+      ;; Clear the previous run's result so a concurrent `--tool-status'
+      ;; landing in the running window cannot pair the stale value with
+      ;; the fresh `running' state.
+      (plist-put task :last-result nil)
       (let ((fn (plist-get task :fn))
             (expr (plist-get task :expression))
             (start (float-time)))
