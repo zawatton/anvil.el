@@ -175,11 +175,17 @@ one-time setup cost pays itself back almost immediately.
 
 * Feature Highlights
 
-Anvil exposes *198+ MCP tools* (as of v0.4.0), letting an AI call Emacs's
-capabilities directly.  Highlights:
+Anvil exposes *200+ MCP tools* across the v1.0.0 surface
+(=anvil.el= core + the [[https://github.com/zawatton/anvil-ide.el][anvil-ide.el]] split + the [[https://github.com/zawatton/anvil-pkg][anvil-pkg]]
+sister package), letting an AI call Emacs's capabilities directly.
+Highlights:
 
 | Capability | What it does |
 |------------+--------------|
+| =bin/anvil mcp serve --no-emacs= (v1.0) | *Standalone path — no Emacs install required.*  A ~421 KB Rust binary (=anvil-runtime=) reads + evaluates Elisp and serves anvil's MCP tools over stdio.  Single 2.3 MB tarball (NeLisp Stage D v3.0) for new users; existing Emacs users keep =bin/anvil mcp serve= unchanged |
+| =anvil-pkg= (v1.0) | Elisp-DSL package manager backed by the Nix store.  =(pkg-install "ripgrep")= for nixpkgs attributes; =(pkg-define …)= macro for custom builds (=stdenv= / =rust= / =python= / =go= / =emacs-package= build systems).  Same idea as Guix in Scheme — but in Elisp, integrated with anvil's MCP surface so an AI agent can install its own dependencies in one Lisp form.  Lives in [[https://github.com/zawatton/anvil-pkg][zawatton/anvil-pkg]] |
+| =anvil-ide.el= split (v1.0) | Emacs-only IDE layer (treesit nav, =worker-ui= dashboard, =info-lookup-symbol=) moved out to [[https://github.com/zawatton/anvil-ide.el][zawatton/anvil-ide.el]].  Install both for the original feature set; install only =anvil.el= if you want the AI-side workbench without the human IDE surface |
+| Treesit subprocess fallback (v1.0) | Doc 38 Phase F + G — =anvil-ts= / =-js= / =-py= structural ops keep working on hosts without an Emacs tree-sitter (e.g. NeLisp standalone) via Python =ast= / acorn subprocess fallback.  Token-efficient AST queries preserved on the Rust substrate |
 | =anvil-orchestrator= | Fan out one prompt to up to five AI CLIs (=claude= / =aider= / =gemini= / =ollama= / =codex=) in parallel. Jaccard consensus + meta-LLM judge + DAG dependencies + =anvil-cron= integration for nightly PDCA loops |
 | =anvil-memory= (v0.4.0) | Auto-memory engine with Bayesian TTL + FTS5 full-text search.  16 MCP tools: memory-scan / -audit / -search / -duplicates / -promote, etc.  Surfaces stale rows, detects contradictions, tracks URL liveness.  Multi-provider: auto-detects =~/.claude/projects/*/memory/=, =~/.codex/memories/=, =~/.gemini/memories/=, Continue / Aider / Cline / Cursor — one SQLite DB shared across every AI CLI the user has installed |
 | =anvil-tools-by-intent= + =anvil-manifest= (v0.4.0) | Intent-based tool discovery plus =ANVIL_PROFILE= filter.  Tools tagged with =:intent / :layer / :stability= are discoverable via runtime query; =agent= / =edit= / =ultra= profiles shrink =tools/list= ~3-7× for orchestrator child sessions (full ~20k → ultra ~2.7k tokens of manifest) |
@@ -395,6 +401,31 @@ past ~50 KB inside an MCP request. Anvil's org tools use streaming
 regex scanners, so heading lookups and outline reads stay fast on
 multi-megabyte org trees (the kind of monolithic =init.org= or
 journal file power users actually maintain).
+
+** Standalone runtime — no Emacs daemon startup cost (v1.0)
+
+NeLisp Doc 44 ships =bin/anvil mcp serve --no-emacs=, which spawns
+the ~421 KB =anvil-runtime= Rust binary instead of an Emacs
+daemon.  For short-lived MCP sessions (CI runs, one-shot agent
+dispatches, ephemeral containers), this skips Emacs's daemon
+cold-start and keeps the resident process under ~50 MB instead of
+the ~200-300 MB a fully-loaded Emacs daemon settles at.
+
+Architecture α (anvil-http / anvil-state / anvil-defs /
+anvil-org-index delegating their core helpers to NeLisp via
+=fboundp= guard + fallback) makes the same MCP tool surface
+reachable from either substrate:
+
+| Deployment       | Tarball | Resident RSS | Cold start | Tool surface          |
+|------------------+---------+--------------+------------+-----------------------|
+| Bundled-Emacs (v2.0) | ~25 MB  | ~200-300 MB  | ~1-3 s     | full =anvil.el= + =anvil-ide.el= |
+| Rust-only (v3.0)     | ~2.3 MB | <50 MB       | <100 ms    | full =anvil.el= (IDE via subprocess fallback) |
+
+Existing Emacs users keep =bin/anvil mcp serve= as before.
+Containers / ephemeral runners / "I just want the AI workbench
+without learning Emacs" users now have a single small tarball
+that brings up the same MCP tools without any =apt install emacs=
+step.
 
 ** Case study: TypeScript refactoring at scale
 
