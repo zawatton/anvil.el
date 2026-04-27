@@ -5,10 +5,13 @@
 
 * Status
 :PROPERTIES:
-:STATE: PHASE-B-SHIPPED (= 5/5 wave merged develop, Phase C-D pending)
+:STATE: PHASE-D-E-SHIPPED (= 全 phase 完了、anvil-ide.el extract repo は user 判断で GitHub 公開)
 :CREATED: 2026-04-26
 :PHASE-A-SHIPPED: 2026-04-26
 :PHASE-B-SHIPPED: 2026-04-26
+:PHASE-C-SHIPPED: 2026-04-27
+:PHASE-D-SHIPPED: 2026-04-27
+:PHASE-E-SHIPPED: 2026-04-27
 :OWNER: zawatton
 :END:
 
@@ -20,7 +23,40 @@
   - B4 anvil-org = +72/-7, classification + 5 PHASE-C marker (= f89161a)
   - B5 anvil-browser = +4/-2 docstring-only (= e74ece1)
   - make test-all 1601/1607 pass / 0 failed.
-- Phase C-D (= rename + split) await separate user signoff.
+- Phase C (= rename) SHIPPED 2026-04-27 b0f6506:
+  anvil-treesit/-worker-ui を anvil-ide-* に rename + anvil-ide-elisp.el
+  新規 (= info-lookup-symbol split from anvil-elisp) + 全 require 更新。
+- Phase D (= git filter-repo extract) SHIPPED 2026-04-27:
+  =/tmp/anvil-ide.el-extract/= 作成、12 historical commits 保持 + 1
+  split-init commit (= README + LICENSE + Package-Requires header)、
+  244K、no remote (= GitHub 公開判断 user 待ち)。
+- Phase E (= anvil.el 側 cleanup + inter-repo wire) SHIPPED 2026-04-27:
+  6 ide file rm + ts/js/py を soft-noerror require + test に
+  =--ide-ready= predicate gating + README update。
+  make test-all 1472/1599 pass / 0 failed / 127 skipped (= 119 IDE-gated)。
+
+** Audit corrections from Phase B + D-E execution
+
+Phase A の audit には 3 件の精度補正:
+
+- §2.1 *anvil-buffer*: "drop-in compatible" 表現は不正確。NeLisp の
+  =nelisp-emacs-compat.el= は drop-in 置換でなく、=nelisp-ec-*= prefix
+  の **namespace-disjoint な parallel buffer world**。Stage D = NeLisp
+  が Emacs *内*で動く構成、anvil-buffer はネイティブ Emacs buffer 使用、
+  両 buffer world が共存。PURE 分類は実用上正解だが理由が違う。
+
+- §1.1 *anvil-browser*: "1 ヶ所の =org-capture-templates= 参照" は
+  実は **docstring 内 backquote ref** (= =anvil-browser.el:119=)、
+  runtime read/write でない。byte-compiler は docstring backquote の
+  bind-check しない、anvil-browser は org-mode 不要で既に load 可能。
+  Phase B5 では docstring を明確化 (= 4 行修正) のみ実施。
+
+- §2.1 *anvil-ts / anvil-js / anvil-py*: PURE 誤分類。実態は
+  =treesit-*= wrap で Emacs 29+ tree-sitter binding 必須。Phase E で
+  =(require 'anvil-ide-treesit nil 'noerror)= に soft 化 + test
+  =--ide-ready= predicate gating で対応 (= ide layer 抜きでは skip)。
+  将来 *Phase F* で 3 module 自体を anvil-ide.el 行きに再分類するか、
+  もしくは NeLisp 側に tree-sitter binding 追加で PURE 維持か再判断。
 
 ** Audit corrections from Phase B execution
 
