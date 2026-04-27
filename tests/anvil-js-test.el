@@ -13,9 +13,11 @@
 
 (require 'ert)
 (require 'cl-lib)
-;; Doc 38 Phase E — anvil-ide-treesit lives in zawatton/anvil-ide.el now.
-;; Soft-require keeps loading clean when the IDE layer is absent;
-;; grammar-dependent tests already auto-skip on missing grammars.
+;; Doc 38 Phase F — anvil-treesit-backend re-exports the legacy
+;; anvil-treesit-* helpers, so `anvil-js-test--ide-ready' (= fboundp
+;; anvil-treesit-language-for-file) becomes true on Emacs without the
+;; extracted IDE layer.  Legacy soft-require kept for compat.
+(require 'anvil-treesit-backend nil 'noerror)
 (require 'anvil-ide-treesit nil 'noerror)
 (require 'anvil-ts)
 (require 'anvil-js)

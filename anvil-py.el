@@ -29,9 +29,11 @@
 (require 'cl-lib)
 (require 'subr-x)
 (require 'anvil-server)
-;; Doc 38 Phase E — anvil-ide-treesit lives in zawatton/anvil-ide.el now.
-;; Soft-require keeps anvil.el loadable in standalone tarball; treesit-*
-;; tools signal at call time when the IDE layer is absent.
+;; Doc 38 Phase F — anvil-treesit-backend (architecture α: backend
+;; abstraction with treesit + subprocess dispatch).  See anvil-ts.el
+;; for the full rationale.  The legacy anvil-ide-treesit soft-require
+;; stays for downstream compat.
+(require 'anvil-treesit-backend nil 'noerror)
 (require 'anvil-ide-treesit nil 'noerror)
 
 (defconst anvil-py--server-id "emacs-eval"

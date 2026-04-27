@@ -35,10 +35,15 @@
 (require 'cl-lib)
 (require 'subr-x)
 (require 'anvil-server)
-;; Doc 38 Phase E — anvil-ide-treesit lives in zawatton/anvil-ide.el now.
-;; We soft-require so anvil.el loads cleanly in NeLisp standalone tarball
-;; (= no IDE layer); the treesit-* tools below will then signal at call
-;; time, which is acceptable since they require Emacs anyway.
+;; Doc 38 Phase F — anvil-treesit-backend provides a backend abstraction
+;; so anvil-ts works on BOTH Emacs (= treesit-* binding, today's path)
+;; AND NeLisp standalone (= subprocess fallback to tsc / tree-sitter
+;; CLI, stubbed pending Phase G).  The backend re-exports the legacy
+;; anvil-treesit-* helper API, so call sites below stay unchanged.
+;; We additionally soft-require anvil-ide-treesit (= the pre-Phase-F
+;; home of these helpers, now in zawatton/anvil-ide.el) for any
+;; downstream user still wiring it in.
+(require 'anvil-treesit-backend nil 'noerror)
 (require 'anvil-ide-treesit nil 'noerror)
 
 (defconst anvil-ts--server-id "emacs-eval"

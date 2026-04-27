@@ -13,10 +13,13 @@
 
 (require 'ert)
 (require 'cl-lib)
-;; Doc 38 Phase E — anvil-ide-treesit lives in zawatton/anvil-ide.el now.
-;; Tests requiring tree-sitter grammars already auto-skip via
-;; `anvil-ts-test--requires'; soft-require keeps loading clean when the
-;; IDE layer is absent.
+;; Doc 38 Phase F — anvil-treesit-backend (= backend abstraction with
+;; treesit + subprocess dispatch).  Re-exports the legacy anvil-treesit-*
+;; helper symbols so the predicate `anvil-ts-test--ide-ready' below
+;; (= fboundp anvil-treesit-language-for-file) becomes true on Emacs
+;; without needing the extracted IDE layer.  The legacy soft-require
+;; stays for downstream compat.
+(require 'anvil-treesit-backend nil 'noerror)
 (require 'anvil-ide-treesit nil 'noerror)
 (require 'anvil-ts)
 
