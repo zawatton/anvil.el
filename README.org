@@ -203,6 +203,65 @@ For the full module list, see [[*Modules]].
 - *Org-mode native* — first-class org read/write/refactor support
 - *Large file safe* — handles 1.2MB+ files without data loss or truncation
 - *Cross-platform* — Linux, macOS, Windows, WSL
+
+* Standalone deployment via NeLisp (2026-04-27)
+
+Anvil is now usable *without an Emacs install on the host*, by way of
+the sister project [[https://github.com/zawatton/nelisp][NeLisp]] v1.0
+(tagged 2026-04-27).  Two paths are available:
+
+- *Bundled-Emacs tarball* — NeLisp Stage D v2.0 ships a stripped Emacs
+  inside the archive (~25 MB compressed); =bin/anvil mcp serve= works
+  on hosts that never ran =apt install emacs=.
+- *Rust binary, zero Emacs spawn* — =bin/anvil mcp serve --no-emacs=
+  dispatches to a ~421 KB Rust binary (=anvil-runtime=) implementing
+  the Elisp reader, evaluator, MCP stdio JSON-RPC server, and an
+  =anvil-host-*= tool registry.  An MCP client can call anvil tools
+  through this path with no Emacs process spawn (NeLisp Doc 44 LOCKED
+  2026-04-27).
+
+** Architecture α — NeLisp delegate active
+
+Several anvil modules now delegate their core helpers to NeLisp when
+available (=fboundp= guard + fallback for standalone usage).  Modules
+ported as of 2026-04-25 architecture α 11-commit run:
+
+- =anvil-http= — 8 commits, 25 helpers (~467 LOC) delegate to
+  =nelisp-http=
+- =anvil-state= — 5 pure helpers delegate to =nelisp-state=
+- =anvil-defs= — 2 commits delegating SQLite Elisp index to
+  =nelisp-defs-index= (Doc 25 SHIPPED)
+- =anvil-org-index= — 2 functions delegate to =nelisp-org-index=
+  (Doc 26 SHIPPED)
+
+Total ≈ 37 helpers / ~573 LOC delegated.  Behaviour with NeLisp
+absent is unchanged (tests cover both paths).
+
+** Doc 38 — anvil-ide split SHIPPED (2026-04)
+
+The Emacs-only IDE layer (xref / diagnostics / imenu / tree-sitter
+wrappers / info-lookup / worker-ui dashboard) extracted to
+[[https://github.com/zawatton/anvil-ide.el][zawatton/anvil-ide.el]].
+Phases B-G all SHIPPED:
+
+- *Phase B* — soft NeLisp compatibility (=anvil-elisp= /
+  =anvil-org-index= / =anvil-org= / =anvil-browser= delegate where
+  feasible).
+- *Phase C* — module rename to =anvil-ide-*= prefix.
+- *Phase D + E* — IDE files extracted; =require= chains made
+  =noerror=; tests gated on =--ide-ready= predicate.
+- *Phase F* — tree-sitter backend abstraction (=anvil-treesit-backend.el=,
+  484 LOC) so =ts= / =js= / =py= work over either an in-process Emacs
+  tree-sitter or a subprocess backend.
+- *Phase G* — subprocess backend impl (Python full ast / JavaScript
+  acorn full / TypeScript degraded acorn fallback).  Lets NeLisp
+  standalone consumers do TS/JS/Python structural analysis through
+  the subprocess fallback.
+
+Net result: =anvil.el= itself runs under NeLisp; install
+=anvil-ide.el= alongside if you want the full IDE feature set in a
+real Emacs.  Doc 38 in =docs/design/= for the full audit and
+phase-by-phase decisions.
 - *Modular* — load only what you need, extend with your own modules
 
 * Efficiency — why Anvil saves AI tokens
