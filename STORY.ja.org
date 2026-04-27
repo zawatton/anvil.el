@@ -89,7 +89,7 @@ Emacs ならそれが可能です。
 同じ workbench を Emacs を install したくない人にも届ける段階です。
 
 軸は [[https://github.com/zawatton/nelisp][NeLisp]] ── Elisp 解釈系を pure Elisp で再実装し、独自 native
-compiler と小さな Rust binary (=anvil-runtime=、~421KB) を持つ
+compiler と小さな Rust binary (=anvil-runtime=) を持つ
 プロジェクト。Emacs C コアを使わずに Elisp を読み + 評価できます。
 
 実際何ができるようになったか:
@@ -102,15 +102,8 @@ compiler と小さな Rust binary (=anvil-runtime=、~421KB) を持つ
 - 既存 Emacs ユーザーは何も変わらない (= bundled-emacs path =
   =bin/anvil mcp serve= は default 維持)。
 
-新規ユーザーの配布は tarball 1 つ:
-
-#+BEGIN_SRC sh
-tar xzf anvil-stage-d-v3.0-linux-x86_64.tar.gz   # ~2.3 MB
-./anvil-stage-d-v3.0/bin/anvil mcp serve --no-emacs
-#+END_SRC
-
-Emacs install 不要、Cask 不要、MELPA 設定不要 ── Rust binary +
-anvil source + NeLisp library だけ。
+新規ユーザーの配布は tarball 1 つ ── Emacs install 不要、Cask 不要、
+MELPA 設定不要、Rust binary + anvil source + NeLisp library だけ。
 
 IDE 側機能 (treesit code navigation、worker dashboard、Info/Help
 lookup) は同 release で [[https://github.com/zawatton/anvil-ide.el][anvil-ide.el]] に分離。残った =anvil.el= は

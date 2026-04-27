@@ -45,11 +45,10 @@ binary).  Hence the jump 0.4.x → 1.0.0.
 
 ### Added — Standalone deployment paths
 
-- **Stage D v2.0** (bundled-Emacs tarball, ~25 MB) and **v3.0**
-  (Rust-only tarball, ~2.3 MB) ship as part of NeLisp v1.0; both
-  expose the same MCP tools so existing Claude Code `.mcp.json`
-  entries keep working.  See `dist/anvil-stage-d-v3.0-*` in the
-  NeLisp repo for the artifact.
+- **Stage D v2.0** (bundled-Emacs path) and **v3.0** (Rust-only
+  path via `bin/anvil mcp serve --no-emacs`) ship as part of
+  NeLisp v1.0; both expose the same MCP tools so existing Claude
+  Code `.mcp.json` entries keep working.
 
 ### Removed — anvil-ide.el extraction (BREAKING)
 

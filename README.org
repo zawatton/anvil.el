@@ -182,7 +182,7 @@ Highlights:
 
 | Capability | What it does |
 |------------+--------------|
-| =bin/anvil mcp serve --no-emacs= (v1.0) | *Standalone path — no Emacs install required.*  A ~421 KB Rust binary (=anvil-runtime=) reads + evaluates Elisp and serves anvil's MCP tools over stdio.  Single 2.3 MB tarball (NeLisp Stage D v3.0) for new users; existing Emacs users keep =bin/anvil mcp serve= unchanged |
+| =bin/anvil mcp serve --no-emacs= (v1.0) | *Standalone path — no Emacs install required.*  The =anvil-runtime= Rust binary reads + evaluates Elisp and serves anvil's MCP tools over stdio.  Existing Emacs users keep =bin/anvil mcp serve= unchanged |
 | =anvil-pkg= (v1.0) | Elisp-DSL package manager backed by the Nix store.  =(pkg-install "ripgrep")= for nixpkgs attributes; =(pkg-define …)= macro for custom builds (=stdenv= / =rust= / =python= / =go= / =emacs-package= build systems).  Same idea as Guix in Scheme — but in Elisp, integrated with anvil's MCP surface so an AI agent can install its own dependencies in one Lisp form.  Lives in [[https://github.com/zawatton/anvil-pkg][zawatton/anvil-pkg]] |
 | =anvil-ide.el= split (v1.0) | Emacs-only IDE layer (treesit nav, =worker-ui= dashboard, =info-lookup-symbol=) moved out to [[https://github.com/zawatton/anvil-ide.el][zawatton/anvil-ide.el]].  Install both for the original feature set; install only =anvil.el= if you want the AI-side workbench without the human IDE surface |
 | Treesit subprocess fallback (v1.0) | Doc 38 Phase F + G — =anvil-ts= / =-js= / =-py= structural ops keep working on hosts without an Emacs tree-sitter (e.g. NeLisp standalone) via Python =ast= / acorn subprocess fallback.  Token-efficient AST queries preserved on the Rust substrate |
@@ -216,15 +216,15 @@ Anvil is now usable *without an Emacs install on the host*, by way of
 the sister project [[https://github.com/zawatton/nelisp][NeLisp]] v1.0
 (tagged 2026-04-27).  Two paths are available:
 
-- *Bundled-Emacs tarball* — NeLisp Stage D v2.0 ships a stripped Emacs
-  inside the archive (~25 MB compressed); =bin/anvil mcp serve= works
-  on hosts that never ran =apt install emacs=.
+- *Bundled-Emacs tarball* — NeLisp Stage D v2.0 ships a stripped
+  Emacs inside the archive; =bin/anvil mcp serve= works on hosts
+  that never ran =apt install emacs=.
 - *Rust binary, zero Emacs spawn* — =bin/anvil mcp serve --no-emacs=
-  dispatches to a ~421 KB Rust binary (=anvil-runtime=) implementing
-  the Elisp reader, evaluator, MCP stdio JSON-RPC server, and an
+  dispatches to the =anvil-runtime= Rust binary, implementing the
+  Elisp reader, evaluator, MCP stdio JSON-RPC server, and an
   =anvil-host-*= tool registry.  An MCP client can call anvil tools
-  through this path with no Emacs process spawn (NeLisp Doc 44 LOCKED
-  2026-04-27).
+  through this path with no Emacs process spawn (NeLisp Doc 44
+  LOCKED 2026-04-27).
 
 ** Architecture α — NeLisp delegate active
 
@@ -405,27 +405,26 @@ journal file power users actually maintain).
 ** Standalone runtime — no Emacs daemon startup cost (v1.0)
 
 NeLisp Doc 44 ships =bin/anvil mcp serve --no-emacs=, which spawns
-the ~421 KB =anvil-runtime= Rust binary instead of an Emacs
-daemon.  For short-lived MCP sessions (CI runs, one-shot agent
-dispatches, ephemeral containers), this skips Emacs's daemon
-cold-start and keeps the resident process under ~50 MB instead of
-the ~200-300 MB a fully-loaded Emacs daemon settles at.
+the =anvil-runtime= Rust binary instead of an Emacs daemon.  For
+short-lived MCP sessions (CI runs, one-shot agent dispatches,
+ephemeral containers), this skips Emacs's daemon cold-start
+entirely and keeps the resident process much smaller than a
+fully-loaded Emacs daemon.
 
 Architecture α (anvil-http / anvil-state / anvil-defs /
 anvil-org-index delegating their core helpers to NeLisp via
 =fboundp= guard + fallback) makes the same MCP tool surface
 reachable from either substrate:
 
-| Deployment       | Tarball | Resident RSS | Cold start | Tool surface          |
-|------------------+---------+--------------+------------+-----------------------|
-| Bundled-Emacs (v2.0) | ~25 MB  | ~200-300 MB  | ~1-3 s     | full =anvil.el= + =anvil-ide.el= |
-| Rust-only (v3.0)     | ~2.3 MB | <50 MB       | <100 ms    | full =anvil.el= (IDE via subprocess fallback) |
+| Deployment    | Tool surface                                    |
+|---------------+--------------------------------------------------|
+| Bundled-Emacs | full =anvil.el= + =anvil-ide.el=                |
+| Rust-only     | full =anvil.el= (IDE via subprocess fallback)    |
 
 Existing Emacs users keep =bin/anvil mcp serve= as before.
 Containers / ephemeral runners / "I just want the AI workbench
-without learning Emacs" users now have a single small tarball
-that brings up the same MCP tools without any =apt install emacs=
-step.
+without learning Emacs" users get the same MCP tools through the
+Rust path with no =apt install emacs= step.
 
 ** Case study: TypeScript refactoring at scale
 
