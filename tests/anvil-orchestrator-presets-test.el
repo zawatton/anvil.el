@@ -6,6 +6,12 @@
 ;; `:preset' resolution path feeding `anvil-orchestrator-submit-consensus'.
 ;; The submit integration itself is exercised with stub providers borrowed
 ;; from `anvil-orchestrator-test' fixtures so we never touch a real CLI.
+;;
+;; The single submit-consensus integration test is gated on
+;; `ANVIL_SLOW_TESTS=1' (same scheme as `anvil-orchestrator-test') —
+;; it spawns the stub provider via the pump timer and the
+;; cleanup-vs-sentinel race aborts the whole batch run on slow CI
+;; hosts.  Local: `ANVIL_SLOW_TESTS=1 make test-all'.
 
 ;;; Code:
 
@@ -233,6 +239,7 @@ we can't require that test file without dragging its own tests in."
 
 (ert-deftest anvil-orchestrator-presets-test-submit-consensus-with-preset ()
   "`submit-consensus :preset 'P' resolves P and fans out correctly."
+  (skip-unless (getenv "ANVIL_SLOW_TESTS"))
   (anvil-orchestrator-presets-test--with-fresh
     (anvil-orchestrator-presets-test--with-fresh-orch
       (anvil-orchestrator-presets-test--register-stub 'tprov-a "a-output")

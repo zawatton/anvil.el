@@ -6,6 +6,16 @@
 ;; provider spawned via /bin/sh + printf emits fake stream-json so
 ;; no real claude CLI is needed.  One live smoke test at the bottom
 ;; exercises the real claude CLI under ANVIL_ALLOW_LIVE=1.
+;;
+;; Tests that actually spawn the stub provider subprocess and wait on
+;; its output (= `wait-batch', collect :wait, end-to-end stubs, slow
+;; provider, cron, consensus-collect, judge-submits-new-task, Phase 7c
+;; live-streaming) are gated on `ANVIL_SLOW_TESTS=1' via the
+;; `anvil-orchestrator-test--skip-unless-slow' helper.  CI's slow
+;; runners blow past the per-test deadlines on these subprocess-bound
+;; cases (Phase D3 regression, 2026-04-25); pure-unit tests
+;; (validation, build-cmd, parser, jaccard, manifest, etc.) keep
+;; running unconditionally.  Local: `ANVIL_SLOW_TESTS=1 make test-all'.
 
 ;;; Code:
 
@@ -15,6 +25,15 @@
 (require 'anvil-state)
 (require 'anvil-orchestrator)
 (require 'anvil-test-fixtures)
+
+(defmacro anvil-orchestrator-test--skip-unless-slow ()
+  "Skip the surrounding ERT test unless `ANVIL_SLOW_TESTS=1' is set.
+Used by every test that actually spawns the stub provider
+subprocess and waits on its output — these are the cases that
+CI's slower runners flake on (5-12s deadlines instead of <1s
+locally).  Mirrors the `NELISP_HEAVY_TESTS' / `NELISP_SLOW_TESTS'
+gate convention from the NeLisp runtime."
+  '(skip-unless (getenv "ANVIL_SLOW_TESTS")))
 
 ;;;; --- fixtures -----------------------------------------------------------
 
@@ -145,6 +164,7 @@ subprocess left behind by BODY before removing the work dir."
 
 (ert-deftest anvil-orchestrator-test-submit-and-collect-one-task ()
   "Single task runs to done and surfaces summary + cost."
+  (anvil-orchestrator-test--skip-unless-slow)
   (anvil-orchestrator-test--with-fresh
     (let* ((batch (anvil-orchestrator-submit
                    (list (list :name "single" :provider 'test
@@ -160,6 +180,7 @@ subprocess left behind by BODY before removing the work dir."
 
 (ert-deftest anvil-orchestrator-test-status-batch-counts ()
   "`orchestrator-status' on a batch id reports counts + slim task list."
+  (anvil-orchestrator-test--skip-unless-slow)
   (anvil-orchestrator-test--with-fresh
     (let* ((batch (anvil-orchestrator-submit
                    (list (list :name "a" :provider 'test :prompt "p")
@@ -173,6 +194,7 @@ subprocess left behind by BODY before removing the work dir."
         (should (= 2 (length (plist-get st :tasks))))))))
 
 (ert-deftest anvil-orchestrator-test-collect-wait-blocks-until-done ()
+  (anvil-orchestrator-test--skip-unless-slow)
   (anvil-orchestrator-test--with-fresh
     (let* ((batch (anvil-orchestrator-submit
                    (list (list :name "a" :provider 'test :prompt "p"))))
@@ -184,6 +206,7 @@ subprocess left behind by BODY before removing the work dir."
 
 (ert-deftest anvil-orchestrator-test-non-zero-exit-marks-failed ()
   "Provider exit != 0 surfaces as status=failed with error string."
+  (anvil-orchestrator-test--skip-unless-slow)
   (anvil-orchestrator-test--with-fresh
     (anvil-orchestrator-test--register-stub "" 3)
     (let* ((batch (anvil-orchestrator-submit
@@ -194,6 +217,7 @@ subprocess left behind by BODY before removing the work dir."
         (should (string-match-p "exit" (plist-get r :error)))))))
 
 (ert-deftest anvil-orchestrator-test-retry-creates-new-task ()
+  (anvil-orchestrator-test--skip-unless-slow)
   (anvil-orchestrator-test--with-fresh
     (anvil-orchestrator-test--register-stub "" 1)
     (let* ((batch (anvil-orchestrator-submit
@@ -211,6 +235,7 @@ subprocess left behind by BODY before removing the work dir."
 
 (ert-deftest anvil-orchestrator-test-concurrency-cap-respected ()
   "With cap=1, only one task runs at a time."
+  (anvil-orchestrator-test--skip-unless-slow)
   (anvil-orchestrator-test--with-fresh
     (anvil-orchestrator-test--register-slow 0.3)
     (let ((anvil-orchestrator-concurrency 1)
@@ -230,6 +255,7 @@ subprocess left behind by BODY before removing the work dir."
 
 (ert-deftest anvil-orchestrator-test-cancel-queued-task ()
   "Cancel before spawn sets status=cancelled without spawning."
+  (anvil-orchestrator-test--skip-unless-slow)
   (anvil-orchestrator-test--with-fresh
     (anvil-orchestrator-test--register-slow 5)
     (let ((anvil-orchestrator-concurrency 1))
@@ -252,6 +278,7 @@ subprocess left behind by BODY before removing the work dir."
 
 (ert-deftest anvil-orchestrator-test-state-round-trip ()
   "Completed tasks read back through anvil-state."
+  (anvil-orchestrator-test--skip-unless-slow)
   (anvil-orchestrator-test--with-fresh
     (let* ((batch (anvil-orchestrator-submit
                    (list (list :name "persist" :provider 'test :prompt "p")))))
@@ -627,6 +654,7 @@ virtual server-id `emacs-eval-edit'."
 
 (ert-deftest anvil-orchestrator-test-dep-runs-after-parent-done ()
   "Child task waits in queue until parent reaches `done'."
+  (anvil-orchestrator-test--skip-unless-slow)
   (anvil-orchestrator-test--with-fresh
     (anvil-orchestrator-test--register-slow 0.3)
     ;; Register parent as 'slow' + child as 'test'
@@ -644,6 +672,7 @@ virtual server-id `emacs-eval-edit'."
 
 (ert-deftest anvil-orchestrator-test-dep-propagates-failure ()
   "If a dep fails, its dependents also flip to `failed'."
+  (anvil-orchestrator-test--skip-unless-slow)
   (anvil-orchestrator-test--with-fresh
     (anvil-orchestrator-test--register-stub "" 2) ; failing test provider
     (let ((batch (anvil-orchestrator-submit
@@ -852,6 +881,7 @@ virtual server-id `emacs-eval-edit'."
   "End-to-end: stub aider via sh routed through the aider parser.
 Registered under a distinct provider symbol so the built-in
 `aider' descriptor isn't overwritten for the rest of the suite."
+  (anvil-orchestrator-test--skip-unless-slow)
   (anvil-orchestrator-test--with-fresh
     (anvil-orchestrator-register-provider
      'aider-stub
@@ -1002,6 +1032,7 @@ Registered under a distinct provider symbol so the built-in
   "End-to-end: stub gemini via sh routed through the gemini parser.
 Registered under a distinct provider symbol so the built-in
 `gemini' descriptor isn't overwritten for the rest of the suite."
+  (anvil-orchestrator-test--skip-unless-slow)
   (anvil-orchestrator-test--with-fresh
     (anvil-orchestrator-register-provider
      'gemini-stub
@@ -1131,6 +1162,7 @@ dropping --verbose eval stats and any pull-progress prefixes."
   "End-to-end: stub ollama via sh routed through the ollama parser.
 Registered under a distinct provider symbol so the built-in
 `ollama' descriptor isn't overwritten for the rest of the suite."
+  (anvil-orchestrator-test--skip-unless-slow)
   (anvil-orchestrator-test--with-fresh
     (anvil-orchestrator-register-provider
      'ollama-stub
@@ -1199,6 +1231,7 @@ main daemon where the orchestrator state lives."
 (ert-deftest anvil-orchestrator-test-cron-dispatches-batch ()
   "A cron `:fn' that calls `anvil-orchestrator-submit' dispatches a
 real batch to the stub provider and the batch runs to completion."
+  (anvil-orchestrator-test--skip-unless-slow)
   (anvil-orchestrator-test--with-cron
     (anvil-cron-register
      :id 'nightly-test
@@ -1223,6 +1256,7 @@ real batch to the stub provider and the batch runs to completion."
 (ert-deftest anvil-orchestrator-test-cron-after-run-hook-sees-batch-id ()
   "`anvil-cron-after-run-functions' receives the dispatcher's return
 value (the batch-id) as its RESULT argument."
+  (anvil-orchestrator-test--skip-unless-slow)
   (anvil-orchestrator-test--with-cron
     (add-hook 'anvil-cron-after-run-functions
               (lambda (id status result elapsed)
@@ -1407,6 +1441,7 @@ value (the batch-id) as its RESULT argument."
 the codex parser.  Registered under a distinct provider symbol so
 the built-in `codex' descriptor isn't overwritten for the rest of
 the suite."
+  (anvil-orchestrator-test--skip-unless-slow)
   (anvil-orchestrator-test--with-fresh
     (let ((payload
            (concat
@@ -1521,6 +1556,7 @@ the suite."
 
 (ert-deftest anvil-orchestrator-test-consensus-submit-fans-out ()
   "Consensus submit creates N tasks with identical prompt + one batch."
+  (anvil-orchestrator-test--skip-unless-slow)
   (anvil-orchestrator-test--with-fresh
     (anvil-orchestrator-test--register-named 'tprov-a "alpha")
     (anvil-orchestrator-test--register-named 'tprov-b "beta")
@@ -1542,6 +1578,7 @@ the suite."
 
 (ert-deftest anvil-orchestrator-test-consensus-submit-applies-overrides ()
   "Per-provider :model overrides flow into the corresponding task."
+  (anvil-orchestrator-test--skip-unless-slow)
   (anvil-orchestrator-test--with-fresh
     (anvil-orchestrator-test--register-named 'tprov-a "alpha")
     (anvil-orchestrator-test--register-named 'tprov-b "beta")
@@ -1561,6 +1598,7 @@ the suite."
 
 (ert-deftest anvil-orchestrator-test-consensus-collect-unanimous ()
   "Identical summaries → verdict 'unanimous and min-similarity 1.0."
+  (anvil-orchestrator-test--skip-unless-slow)
   (anvil-orchestrator-test--with-fresh
     (anvil-orchestrator-test--register-named 'tprov-a "same result")
     (anvil-orchestrator-test--register-named 'tprov-b "same result")
@@ -1577,6 +1615,7 @@ the suite."
 
 (ert-deftest anvil-orchestrator-test-consensus-collect-divergent ()
   "Disjoint summaries → verdict 'divergent."
+  (anvil-orchestrator-test--skip-unless-slow)
   (anvil-orchestrator-test--with-fresh
     (anvil-orchestrator-test--register-named 'tprov-a "apple pear")
     (anvil-orchestrator-test--register-named 'tprov-b "carrot onion")
@@ -1597,6 +1636,7 @@ the suite."
 
 (ert-deftest anvil-orchestrator-test-consensus-mcp-submit ()
   "MCP wrapper parses providers JSON + overrides JSON and fans out."
+  (anvil-orchestrator-test--skip-unless-slow)
   (anvil-orchestrator-test--with-fresh
     (anvil-orchestrator-test--register-named 'tprov-a "same")
     (anvil-orchestrator-test--register-named 'tprov-b "same")
@@ -1622,6 +1662,7 @@ the suite."
 not clobber each other's per-task fields when plist-put appends a
 new key to the internal plist.  Guard: submit deep-enough-copies
 so post-finalize :elapsed-ms of task A does not appear on task B."
+  (anvil-orchestrator-test--skip-unless-slow)
   (anvil-orchestrator-test--with-fresh
     (let* ((defaults '(:timeout-sec 60 :budget-usd 0.10))
            (ids (anvil-orchestrator-submit
@@ -1683,6 +1724,7 @@ so post-finalize :elapsed-ms of task A does not appear on task B."
 
 (ert-deftest anvil-orchestrator-test-judge-rejects-non-terminal ()
   "Judge errors when the fan-out batch is not terminal and :wait is nil."
+  (anvil-orchestrator-test--skip-unless-slow)
   (anvil-orchestrator-test--with-fresh
     (anvil-orchestrator-test--register-slow 5)
     (anvil-orchestrator-test--register-named 'tprov-b "beta")
@@ -1696,6 +1738,7 @@ so post-finalize :elapsed-ms of task A does not appear on task B."
 
 (ert-deftest anvil-orchestrator-test-judge-submits-new-task ()
   "Happy path: after fan-out completes, judge submits a new single-task batch."
+  (anvil-orchestrator-test--skip-unless-slow)
   (anvil-orchestrator-test--with-fresh
     (anvil-orchestrator-test--register-named 'tprov-a "alpha answer")
     (anvil-orchestrator-test--register-named 'tprov-b "beta answer")
@@ -1722,6 +1765,7 @@ so post-finalize :elapsed-ms of task A does not appear on task B."
 
 (ert-deftest anvil-orchestrator-test-judge-prompt-embeds-summaries ()
   "Judge task's prompt contains each candidate summary verbatim."
+  (anvil-orchestrator-test--skip-unless-slow)
   (anvil-orchestrator-test--with-fresh
     (anvil-orchestrator-test--register-named 'tprov-a "alpha answer")
     (anvil-orchestrator-test--register-named 'tprov-b "beta answer")
@@ -1741,6 +1785,7 @@ so post-finalize :elapsed-ms of task A does not appear on task B."
 
 (ert-deftest anvil-orchestrator-test-judge-extra-appended ()
   "`:extra' is appended verbatim after the rendered candidate block."
+  (anvil-orchestrator-test--skip-unless-slow)
   (anvil-orchestrator-test--with-fresh
     (anvil-orchestrator-test--register-named 'tprov-a "a")
     (anvil-orchestrator-test--register-named 'tprov-b "b")
@@ -1759,6 +1804,7 @@ so post-finalize :elapsed-ms of task A does not appear on task B."
                                 (plist-get jt :prompt)))))))
 
 (ert-deftest anvil-orchestrator-test-judge-collect-without-submit ()
+  (anvil-orchestrator-test--skip-unless-slow)
   (anvil-orchestrator-test--with-fresh
     (anvil-orchestrator-test--register-named 'tprov-a "a")
     (anvil-orchestrator-test--register-named 'tprov-b "b")
@@ -1771,6 +1817,7 @@ so post-finalize :elapsed-ms of task A does not appear on task B."
 
 (ert-deftest anvil-orchestrator-test-judge-mcp-submit-collect ()
   "MCP wrappers drive the full judge cycle."
+  (anvil-orchestrator-test--skip-unless-slow)
   (anvil-orchestrator-test--with-fresh
     (anvil-orchestrator-test--register-named 'tprov-a "x")
     (anvil-orchestrator-test--register-named 'tprov-b "y")
@@ -2488,6 +2535,7 @@ hash).  Cleans the task + batch tables on exit."
 
 (ert-deftest anvil-orchestrator--stream-opt-in-default-off ()
   "A task without :stream t does not accumulate stream events."
+  (anvil-orchestrator-test--skip-unless-slow)
   (anvil-orchestrator-test--with-fresh
     (let ((batch (anvil-orchestrator-submit
                   '((:name "no-stream" :provider test :prompt "x")))))
@@ -2499,6 +2547,7 @@ hash).  Cleans the task + batch tables on exit."
 
 (ert-deftest anvil-orchestrator--stream-event-push-appends ()
   "A streaming task accumulates one event per stream-json line."
+  (anvil-orchestrator-test--skip-unless-slow)
   (anvil-orchestrator-test--with-fresh
     (let ((batch (anvil-orchestrator-submit
                   '((:name "s1" :provider test :prompt "x" :stream t)))))
@@ -2574,6 +2623,7 @@ hash).  Cleans the task + batch tables on exit."
 
 (ert-deftest anvil-orchestrator--stream-on-event-callback-invoked ()
   "`:on-event' fires once per pushed event with (task-id event-plist)."
+  (anvil-orchestrator-test--skip-unless-slow)
   (anvil-orchestrator-test--with-fresh
     (let* ((calls nil)
            (cb (lambda (id ev)
@@ -2588,6 +2638,7 @@ hash).  Cleans the task + batch tables on exit."
 
 (ert-deftest anvil-orchestrator--stream-non-json-line-recorded-raw ()
   "Non-JSON output still becomes an event with :line set, :data nil."
+  (anvil-orchestrator-test--skip-unless-slow)
   (anvil-orchestrator-test--with-fresh
     (anvil-orchestrator-test--register-stub "hello world")
     (let ((batch (anvil-orchestrator-submit

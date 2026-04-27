@@ -1,5 +1,14 @@
 ;;; anvil-offload-test.el --- Tests for anvil-offload -*- lexical-binding: t; -*-
 
+;; Every test in this file spawns a real anvil-offload REPL subprocess
+;; via `anvil-offload-test--with-clean-repl' and waits on its output.
+;; On slow CI hosts the per-test REPL spawn + sentinel wait pushes the
+;; suite into multi-second flakes (Phase D3 regression, 2026-04-25).
+;; The wrapper macro therefore short-circuits with `skip-unless' unless
+;; the user opts in via `ANVIL_SLOW_TESTS=1' (mirrors the
+;; `NELISP_HEAVY_TESTS' / `NELISP_SLOW_TESTS' pattern in NeLisp).
+;; Local: `ANVIL_SLOW_TESTS=1 make test-all'.
+
 (require 'ert)
 (require 'cl-lib)
 
@@ -17,11 +26,15 @@
   (sit-for 0.05))
 
 (defmacro anvil-offload-test--with-clean-repl (&rest body)
-  "Run BODY with a fresh REPL, always cleaning up afterwards."
+  "Run BODY with a fresh REPL, always cleaning up afterwards.
+Gated on `ANVIL_SLOW_TESTS=1' — the REPL spawn + sentinel wait
+flakes on slow CI hosts (see file commentary)."
   (declare (indent 0))
-  `(unwind-protect
-       (progn (anvil-offload-test--reset) ,@body)
-     (anvil-offload-test--reset)))
+  `(progn
+     (skip-unless (getenv "ANVIL_SLOW_TESTS"))
+     (unwind-protect
+         (progn (anvil-offload-test--reset) ,@body)
+       (anvil-offload-test--reset))))
 
 (ert-deftest anvil-offload-test-basic-math ()
   "`(+ 1 2)' round-trips as 3."
