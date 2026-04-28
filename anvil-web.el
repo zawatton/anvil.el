@@ -67,6 +67,15 @@ Matches the id used by `anvil-http', `anvil-file', etc. so that all
 anvil MCP tools end up on the same transport.")
 
 ;;;; --- internal HTTP + JSON helpers --------------------------------------
+;;
+;; All anvil-web fetches pass `:skip-robots-check t' to `anvil-http-get'.
+;; These tools are first-party wrappers around specific public endpoints
+;; (Reddit `.json', Twitter syndication, ...) that the user invokes one
+;; URL at a time through a browser-style User-Agent.  Reddit's robots.txt
+;; in particular blocks every UA except a small allow-list, so the
+;; default robots-aware path raises `user-error' before any network
+;; round-trip and the dedicated tool ends up unable to reach its own
+;; target endpoint.  The opt-out is scoped to this module.
 
 (defun anvil-web--merge-ua (headers user-agent)
   "Return HEADERS alist with a User-Agent entry guaranteed.
@@ -91,7 +100,8 @@ Returns whatever `json-parse-string' produces (plists + vectors)."
                                :headers merged
                                :accept (or accept "application/json")
                                :timeout-sec timeout-sec
-                               :no-cache no-cache))
+                               :no-cache no-cache
+                               :skip-robots-check t))
          (status (plist-get resp :status))
          (body (plist-get resp :body)))
     (unless (and (integerp status) (>= status 200) (< status 300))
@@ -115,7 +125,8 @@ Returns URL unchanged if the server didn't redirect."
                                :headers (anvil-web--merge-ua nil user-agent)
                                :accept "text/html"
                                :timeout-sec anvil-web-default-timeout-sec
-                               :no-cache t))
+                               :no-cache t
+                               :skip-robots-check t))
          (final (plist-get resp :final-url)))
     (or (and (stringp final) (not (string-empty-p final)) final)
         url)))

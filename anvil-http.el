@@ -1634,11 +1634,14 @@ Keyword args:
   :header-filter   nil (uses `anvil-http-header-filter-default'),
                    `minimal' (only `anvil-http-minimal-header-keys'),
                    `all' (full response headers)
-  :skip-robots-check  Internal — bypass the robots.txt pre-check.
-                   Set by `anvil-http--robots-fetch' on its own GET to
-                   avoid recursion; callers should normally leave this
-                   nil.  robots.txt URLs are auto-detected and skip
-                   the check regardless.
+  :skip-robots-check  Bypass the robots.txt pre-check for this call.
+                   Used by `anvil-http--robots-fetch' on its own GET to
+                   avoid recursion, and by first-party endpoint wrappers
+                   (e.g. `anvil-web-reddit-thread', `anvil-web-tweet-fetch')
+                   that fetch a single user-requested resource through a
+                   browser-style User-Agent.  Generic crawling code
+                   should leave this nil.  robots.txt URLs are
+                   auto-detected and skip the check regardless.
 
 Returns (:status :headers :body :from-cache :cached-at :final-url
 :elapsed-ms).  When :selector or :json-path is supplied the plist
