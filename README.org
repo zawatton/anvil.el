@@ -1,117 +1,39 @@
-#+title: Anvil — Forge Emacs into an AI's Weapon
+#+title: anvil.el — Emacs as an MCP workbench for AI agents
 #+author: zawatton
 
 *Languages:* English / [[file:README.ja.org][日本語]]
 
 #+begin_quote
-*Note on language:* I'm a non-native English speaker. The phrasing in this
-README is shaped with help from an LLM, but the thinking and the design
-decisions are entirely mine. The LLM is acting as a translator/editor, not
-the author. If something reads oddly, please read it with that in mind.
-#+end_quote
-
-#+begin_quote
-Your AI's workbench. Turn Emacs into a tool server for any LLM
-agent — and let the agent extend its own toolset, mid-session, in
-elisp.
+*Note on language:* I'm a non-native English speaker. The phrasing in
+this README is shaped with help from an LLM, but the thinking and the
+design decisions are entirely mine. The LLM is acting as a translator
+/ editor, not the author. If something reads oddly, please read it
+with that in mind.
 #+end_quote
 
 #+html: <a href="https://github.com/zawatton/anvil.el/actions"><img src="https://img.shields.io/github/actions/workflow/status/zawatton/anvil.el/ci.yml?branch=master&style=flat-square" alt="CI"></a>
 #+html: <a href="https://github.com/sponsors/zawatton"><img src="https://img.shields.io/badge/Sponsor_%E2%9D%A4_Support_this_project-pink?style=for-the-badge" alt="Sponsor"></a>
 
-* The idea
+* TL;DR
 
-#+begin_example
-       ┌──────────────────────────┐
-       │  Claude Code  (or any    │
-       │  MCP-speaking agent)     │
-       └────────────┬─────────────┘
-                    │ MCP protocol
-       ┌────────────▼─────────────┐
-       │        anvil.el          │
-       │  ┌──────┬──────┬──────┐  │
-       │  │ file │ org  │ proc │  │
-       │  └──────┴──────┴──────┘  │
-       └────────────┬─────────────┘
-                    │
-       ┌────────────▼─────────────┐
-       │   Running Emacs image    │
-       │   (buffers, org files,   │
-       │    init.el, your config) │
-       └──────────────────────────┘
-#+end_example
+anvil.el is an *MCP server* that exposes a running Emacs (or a small
+Rust runtime called NeLisp) as 200+ tools an AI agent can call.
+Claude Code, Claude Desktop, GPT, local LLMs via Ollama — anything
+that speaks [[https://modelcontextprotocol.io/][Model Context Protocol]] can edit files, navigate org-mode,
+run elisp, query SQLite, and more *through Emacs primitives* instead
+of generic =sed= / =grep= / =read-whole-file= round-trips.  That
+swap is where the token savings come from.
 
-Until now, humans have used text editors with AI assistance.
-With Anvil installed, /the AI uses the text editor./
+v1.0 (2026-04) ships the first stable release, plus a Rust runtime
+that lets you run anvil *without an Emacs install at all*.
 
-And to an AI, Emacs is not merely an "editor."
+[[file:STORY.org][STORY.org]] ([[file:STORY.ja.org][日本語]]) tells the longer "why this exists" story.
 
-Emacs has org-mode, dired, magit, comint, EAT, calc — and is also a Lisp REPL
-with the filesystem mounted.
+* Why does this save tokens?
 
-#+begin_quote
-Decades of Emacs history — every feature it has accumulated — becomes the AI's arsenal.
-#+end_quote
-
-AI is no longer just a code-completion sidekick.
-An AI equipped with Emacs can do so much more.
-
-
-Modern editors (VSCode, Cursor, Zed, JetBrains) are configured by code the
-vendor decided to expose.
-
-AI-powered extensions can only operate within the extension API the vendor
-chose to ship.
-
-Emacs is different.
-Emacs is built from Emacs Lisp — a LISP interpreter whose capabilities can be
-extended without limit.
-Whatever capability the AI needs, it can be realized through Emacs (it all
-comes down to your ideas).
-
-Humans set themselves apart from other animals through tool use, and went on
-to build civilizations.
-
-#+begin_quote
-When the AI gains Emacs as its tool, what kind of history is about to begin?
-#+end_quote
-
-#+begin_quote
-Background — why Anvil was built — [[file:STORY.org][STORY.org]] ([[file:STORY.ja.org][日本語]]).
-#+end_quote
-
-* What is Anvil?
-
-Anvil exposes Emacs capabilities as [[https://modelcontextprotocol.io/][Model Context Protocol (MCP)]] tools
-that any AI coding assistant can call — Claude Code, Claude Desktop,
-GPT, local models via Ollama/llama.cpp, or anything that speaks MCP.
-
-One ~(anvil-enable)~ and your Emacs becomes an AI-accessible workbench
-with 198+ tools: file editing, org-mode operations, git inspection,
-Elisp evaluation, and more — all through a safe, sandboxed interface.
-
-* For Non-Emacs Users — Adopting Anvil for Token Reduction
-
-"I don't use Emacs, but I want to cut down Claude Code / Cursor's
-token consumption" — this section is for readers who landed here with
-that motivation.
-
-** You never have to open the Emacs UI
-
-Anvil runs in the background as an MCP server. You don't have to
-change the editor you already use (VSCode / Cursor / Neovim /
-Claude Code itself / anything else).
-
-#+begin_example
-  AI client ──MCP──▶ Anvil (Emacs daemon, headless) ──▶ file ops
-  (VSCode / Cursor /                                    (only diffs cross)
-   Claude Code, …)
-#+end_example
-
-Emacs runs as a single background daemon. You don't have to open an
-Emacs window or write =init.el=.
-
-** Where it pays off — typical savings patterns
+LLM agents pay per token.  A naive =Read file → Edit file= loop
+ships the whole file twice across the wire.  Anvil's primitives
+operate on regions, headings, buffer state — only diffs cross.
 
 | Scenario                                                | Reduction | What's happening                      |
 |---------------------------------------------------------+-----------+----------------------------------------|
@@ -122,15 +44,83 @@ Emacs window or write =init.el=.
 | Extracting repeating structured records from huge files | *~50%*    | Legacy migration, ETL                  |
 | Bulk docstring change across N files                    | *~60-80%* | All files in a single call             |
 
-Numbers are measured (case studies in [[*Efficiency — why Anvil saves AI tokens][the Efficiency section]]).
-Workload-dependent, but a typical refactoring session saves
-*15,000-25,000 tokens* consistently.
+Numbers are measured; case studies in [[*Efficiency — why Anvil saves AI tokens][the Efficiency section]].
+A typical refactoring session saves *15,000-25,000 tokens*.
 
-** Minimal setup (no prior Emacs experience required)
+* Architecture
 
-*Fastest path* — one command per OS.  Full walkthrough in
-[[file:docs/QUICKSTART.org][docs/QUICKSTART.org]] (recommended if you
-are new to Emacs):
+#+begin_example
+       ┌──────────────────────────┐
+       │  Claude Code  /  Cursor  │
+       │  (any MCP-speaking AI)   │
+       └────────────┬─────────────┘
+                    │ MCP / stdio JSON-RPC
+       ┌────────────▼─────────────┐
+       │       anvil.el           │  ← 200+ Emacs primitives
+       │  ┌──────┬──────┬──────┐  │     exposed as MCP tools
+       │  │ file │ org  │ elisp│  │
+       │  └──────┴──────┴──────┘  │
+       └────┬─────────────────┬───┘
+            │                 │
+   ┌────────▼─────────┐ ┌─────▼──────────────┐
+   │ Running Emacs    │ │ NeLisp (Rust)      │
+   │ daemon           │ │ no-Emacs runtime   │
+   │ (default path)   │ │ (--no-emacs flag)  │
+   └──────────────────┘ └────────────────────┘
+#+end_example
+
+The AI client speaks MCP to anvil.el.  anvil.el dispatches to a
+running Emacs daemon (default — full feature set) or to the NeLisp
+Rust runtime (=--no-emacs= path — smaller surface, no Emacs install
+needed).
+
+* Components
+
+The anvil project is split across four repos so each part stays
+small and has its own release cadence:
+
+| Repo | Role | Required? |
+|------+------+-----------|
+| [[https://github.com/zawatton/anvil.el][anvil.el]]      | The AI brain — MCP server + 200+ tools | yes |
+| [[https://github.com/zawatton/anvil-ide.el][anvil-ide.el]]  | Human IDE layer — treesit nav, dashboard, info-look | optional, Emacs users |
+| [[https://github.com/zawatton/anvil-pkg][anvil-pkg]]     | Nix-backed pkg manager — lets the AI install its own dependencies | optional |
+| [[https://github.com/zawatton/nelisp][NeLisp]]        | Rust runtime — runs Elisp without Emacs | optional, =--no-emacs= path |
+
+* Installation
+
+Pick a path based on what you want.
+
+** Path A — no Emacs install required (NeLisp Rust runtime)
+
+For users who want the MCP tool surface without an Emacs daemon —
+CI runners, ephemeral containers, or "I don't use Emacs but want to
+cut Claude Code token use."
+
+#+begin_src bash
+# 1. Clone NeLisp + build the Rust runtime
+git clone https://github.com/zawatton/nelisp.git
+cd nelisp/nelisp-runtime
+cargo build --release
+cd ../..
+
+# 2. Clone anvil.el (provides the Elisp source loaded by the runtime)
+git clone https://github.com/zawatton/anvil.el.git
+
+# 3. Run the MCP server (no Emacs daemon spawned)
+ANVIL_EL_DIR="$(pwd)/anvil.el" \
+  ./nelisp/bin/anvil mcp serve --no-emacs
+#+end_src
+
+The Rust binary reads + evaluates Elisp itself; the Emacs C core is
+not invoked.  Surface today via this path: =file-*= / =shell-*= /
+=data-*= / =anvil-host-*= / =directory-list= (42 tools).
+
+** Path B — Emacs integrated (recommended for Emacs users)
+
+For day-to-day Emacs users.  Pin to v1.0.0 via your favourite
+package manager.
+
+*** Quick install (one command)
 
 #+begin_src bash
 # Linux / macOS
@@ -142,43 +132,128 @@ curl -fsSL https://raw.githubusercontent.com/zawatton/anvil.el/master/install.sh
 iwr -useb https://raw.githubusercontent.com/zawatton/anvil.el/master/install.ps1 | iex
 #+end_src
 
-The installer auto-installs Emacs (via =apt= / =dnf= / =brew= /
+The installer auto-installs Emacs (=apt= / =dnf= / =brew= /
 =winget=), clones the repo, starts the daemon, drops the MCP bridge
 into =~/.emacs.d/=, and registers the server in =~/.claude.json=.
 Add =--skip-emacs= (or =-SkipEmacs= on Windows) if Emacs is already
 installed.
 
-*Manual path* — if you prefer to do it step-by-step:
+*** Manual via Emacs package manager
 
-1. *Install Emacs* — only the daemon needs to run; no day-to-day config required
-   - Linux: =sudo apt install emacs= / =sudo dnf install emacs=
-   - macOS: =brew install --cask emacs=
-   - Windows: via [[https://www.msys2.org/][MSYS2]] or the [[https://www.gnu.org/software/emacs/download.html][gnu.org binary]]
-2. *Install anvil* — see [[*Installation][Installation]] (=async-installer= is the quickest path)
-3. *Start the daemon and bring up the MCP server* — see [[*Quick Start][Quick Start]]
-4. *Connect from your AI client* — see [[*Client setup — connecting your AI to Anvil][Client setup]] (snippets for Claude Code / Claude Desktop)
-5. *Add Anvil-preferring guidance to CLAUDE.md (or equivalent)* — see [[*Recommended snippet (Claude Code =CLAUDE.md=)][Recommended snippet]] (optional but high-impact)
+#+begin_src emacs-lisp
+;; async-installer
+(async-installer-git-add "https://github.com/zawatton/anvil.el.git"
+                         :tag "v1.0.0"
+                         :main "anvil.el")
 
-Your day-to-day VSCode / Cursor / Neovim / Claude Code stays exactly
-the same. You can capture the AI-token reduction without picking up
-any meaningful amount of Emacs Lisp.
+;; or straight.el
+(straight-use-package
+ '(anvil :type git :host github :repo "zawatton/anvil.el"
+         :branch "v1.0.0"))
 
-** What it costs — being honest
+;; or elpaca
+(elpaca (anvil :host github :repo "zawatton/anvil.el"
+               :ref "v1.0.0"))
+#+end_src
 
-- *15-30 minutes of first-time setup* — install Emacs, clone anvil, wire up MCP
-- *An Emacs daemon stays resident* — roughly 50-200 MB at idle
-- *One more dependency to maintain* — Emacs updates and OS migrations include it
+After installing:
 
-In exchange you get the savings in the table above. If you spend
-30+ minutes per agent session and have a few sessions a month, the
-one-time setup cost pays itself back almost immediately.
+#+begin_src emacs-lisp
+(require 'anvil)
+(anvil-enable)
+(anvil-server-start)
+#+end_src
+
+** Path C — anvil-pkg for Nix-backed AI tooling (optional)
+
+Lets the AI install its own system dependencies (=ripgrep=, =fd=,
+language servers, anything in nixpkgs) via one Lisp form.  Requires
+Nix on the host.
+
+#+begin_src emacs-lisp
+(async-installer-git-add "https://github.com/zawatton/anvil-pkg.git"
+                         :main "anvil-pkg.el")
+(require 'anvil-pkg)
+(require 'anvil-pkg-dsl)        ; for `pkg-define' macro
+(anvil-pkg-enable)              ; registers pkg-* MCP tools
+#+end_src
+
+Now the agent can call =(pkg-install "ripgrep")= or define custom
+builds with =(pkg-define ...)=.  Repo: [[https://github.com/zawatton/anvil-pkg][zawatton/anvil-pkg]].
+
+** Path D — anvil-ide.el for the Emacs IDE layer (optional)
+
+Adds the human-side IDE features (treesit navigation, the worker
+dashboard, =info-lookup-symbol=).
+
+#+begin_src emacs-lisp
+(async-installer-git-add "https://github.com/zawatton/anvil-ide.el.git"
+                         :main "anvil-ide.el")
+(require 'anvil-ide)
+#+end_src
+
+Repo: [[https://github.com/zawatton/anvil-ide.el][zawatton/anvil-ide.el]].
+
+* Quick Start
+
+After installing via Path B:
+
+1. Start the daemon — ~M-x anvil-enable~ then ~M-x anvil-server-start~
+2. Print the MCP config snippet — ~M-x anvil-describe-setup~
+3. Paste the snippet into =~/.claude.json= (or your client's MCP
+   config file)
+4. Restart your AI client; you should see =anvil-*= tools in its
+   tool-list
+
+Full walkthrough including Claude Code / Claude Desktop config:
+[[file:docs/QUICKSTART.org][docs/QUICKSTART.org]].
+
+* Why anvil?
+
+- *LLM-agnostic* — works with any MCP-compatible client
+- *Token-efficient* — primitives operate on regions, headings,
+  buffer state, not whole files
+- *Multi-agent coordination* — fan out to five AI CLIs in parallel
+  with consensus and a meta-LLM judge, all from inside Emacs
+- *Safe by design* — long-running tasks dispatched to a background
+  Emacs, so the interactive Emacs is never blocked
+- *Org-mode native* — first-class org read / write / refactor
+- *Large file safe* — handles 1.2 MB+ files without truncation
+- *Cross-platform* — Linux, macOS, Windows, WSL
+- *Modular* — load only what you need, extend with your own modules
+
+* For non-Emacs users — what setup costs you
+
+Anvil runs in the background as an MCP server.  Your day-to-day
+editor (VSCode / Cursor / Neovim / Claude Code itself) does not
+change.
+
+#+begin_example
+  AI client ──MCP──▶ Anvil (Emacs daemon, headless) ──▶ file ops
+  (VSCode / Cursor /                                    (only diffs cross)
+   Claude Code, …)
+#+end_example
+
+You don't have to open an Emacs window or write =init.el=.
+
+*Honest costs:*
+
+- *15-30 minutes of first-time setup* on Path B (install Emacs,
+  clone anvil, wire up MCP) — or zero on Path A (no Emacs at all)
+- *Resident memory* — Path B keeps an Emacs daemon at ~50-200 MB
+  idle; Path A's Rust runtime stays under ~50 MB
+- *One more dependency to maintain* — Emacs updates and OS
+  migrations include it (Path B only)
+
+For 30+ minute agent sessions a few times a month, the one-time
+setup pays itself back almost immediately via the token savings
+above.
 
 * Feature Highlights
 
 Anvil exposes *200+ MCP tools* across the v1.0.0 surface
 (=anvil.el= core + the [[https://github.com/zawatton/anvil-ide.el][anvil-ide.el]] split + the [[https://github.com/zawatton/anvil-pkg][anvil-pkg]]
-sister package), letting an AI call Emacs's capabilities directly.
-Highlights:
+sister package).  Highlights:
 
 | Capability | What it does |
 |------------+--------------|
@@ -201,74 +276,21 @@ Highlights:
 For numerical evidence and detailed case studies, see [[*Efficiency — why Anvil saves AI tokens]].
 For the full module list, see [[*Modules]].
 
-* Why Anvil?
+* Architecture α — NeLisp delegate active
 
-- *Multi-agent coordination* — fan out to five AI CLIs in parallel with consensus and a meta-LLM judge, all from inside Emacs
-- *LLM-agnostic* — works with any MCP-compatible client
-- *Safe by design* — long-running tasks are dispatched to a background Emacs, so your interactive Emacs is never affected
-- *Org-mode native* — first-class org read/write/refactor support
-- *Large file safe* — handles 1.2MB+ files without data loss or truncation
-- *Cross-platform* — Linux, macOS, Windows, WSL
+Several anvil modules now delegate their core helpers to NeLisp
+when available (=fboundp= guard + fallback for standalone usage).
+Modules ported as of 2026-04-25 architecture α:
 
-* Standalone deployment via NeLisp (2026-04-27)
-
-Anvil is now usable *without an Emacs install on the host*, by way of
-the sister project [[https://github.com/zawatton/nelisp][NeLisp]] v1.0
-(tagged 2026-04-27).  Two paths are available:
-
-- *Bundled-Emacs tarball* — NeLisp Stage D v2.0 ships a stripped
-  Emacs inside the archive; =bin/anvil mcp serve= works on hosts
-  that never ran =apt install emacs=.
-- *Rust binary, zero Emacs spawn* — =bin/anvil mcp serve --no-emacs=
-  dispatches to the =anvil-runtime= Rust binary, implementing the
-  Elisp reader, evaluator, MCP stdio JSON-RPC server, and an
-  =anvil-host-*= tool registry.  An MCP client can call anvil tools
-  through this path with no Emacs process spawn (NeLisp Doc 44
-  LOCKED 2026-04-27).
-
-** Architecture α — NeLisp delegate active
-
-Several anvil modules now delegate their core helpers to NeLisp when
-available (=fboundp= guard + fallback for standalone usage).  Modules
-ported as of 2026-04-25 architecture α 11-commit run:
-
-- =anvil-http= — 8 commits, 25 helpers (~467 LOC) delegate to
-  =nelisp-http=
+- =anvil-http= — 25 helpers (~467 LOC) delegate to =nelisp-http=
 - =anvil-state= — 5 pure helpers delegate to =nelisp-state=
-- =anvil-defs= — 2 commits delegating SQLite Elisp index to
-  =nelisp-defs-index= (Doc 25 SHIPPED)
+- =anvil-defs= — SQLite Elisp index delegates to =nelisp-defs-index=
+  (Doc 25)
 - =anvil-org-index= — 2 functions delegate to =nelisp-org-index=
-  (Doc 26 SHIPPED)
+  (Doc 26)
 
 Total ≈ 37 helpers / ~573 LOC delegated.  Behaviour with NeLisp
 absent is unchanged (tests cover both paths).
-
-** Doc 38 — anvil-ide split SHIPPED (2026-04)
-
-The Emacs-only IDE layer (xref / diagnostics / imenu / tree-sitter
-wrappers / info-lookup / worker-ui dashboard) extracted to
-[[https://github.com/zawatton/anvil-ide.el][zawatton/anvil-ide.el]].
-Phases B-G all SHIPPED:
-
-- *Phase B* — soft NeLisp compatibility (=anvil-elisp= /
-  =anvil-org-index= / =anvil-org= / =anvil-browser= delegate where
-  feasible).
-- *Phase C* — module rename to =anvil-ide-*= prefix.
-- *Phase D + E* — IDE files extracted; =require= chains made
-  =noerror=; tests gated on =--ide-ready= predicate.
-- *Phase F* — tree-sitter backend abstraction (=anvil-treesit-backend.el=,
-  484 LOC) so =ts= / =js= / =py= work over either an in-process Emacs
-  tree-sitter or a subprocess backend.
-- *Phase G* — subprocess backend impl (Python full ast / JavaScript
-  acorn full / TypeScript degraded acorn fallback).  Lets NeLisp
-  standalone consumers do TS/JS/Python structural analysis through
-  the subprocess fallback.
-
-Net result: =anvil.el= itself runs under NeLisp; install
-=anvil-ide.el= alongside if you want the full IDE feature set in a
-real Emacs.  Doc 38 in =docs/design/= for the full audit and
-phase-by-phase decisions.
-- *Modular* — load only what you need, extend with your own modules
 
 * Efficiency — why Anvil saves AI tokens
 
@@ -640,118 +662,6 @@ budget goes to reasoning about your code, not re-reading it.
 | =git-msg= (v0.4.0) | git-commit-message (from staged diff) + git-pr-body (from branch log) (opt.) | =git= |
 | =lint= (v0.4.0) | Repo hygiene scanner with pluggable registry: conflict-markers / orphan-ids / broken-scheduled (opt.) | — |
 | =uri= (v0.4.0) | URI-based =anvil-uri-fetch= cross-layer resolver (opt.) | =disclosure= |
-
-* Quick Start
-
-#+begin_src emacs-lisp
-(require 'anvil)
-(anvil-enable)
-(anvil-server-start)
-#+end_src
-
-Then run =M-x anvil-describe-setup= for client configuration instructions.
-
-* Installation
-
-Two tracks are supported. Pick *stable* unless you know why you
-want master.
-
-** Stable (recommended) — tag =v0.4.1=
-
-=v0.4.1= is the current stable tag.  New features and fixes
-land on =master= continuously; periodically a tag is cut once
-the surface has settled enough to recommend.  Pin to this tag
-unless you have a reason to track =master=.
-
-*** async-installer
-
-[[https://github.com/zawatton/async-installer][async-installer]] — a small, non-blocking package manager for Emacs. Pure Elisp syntax — no macro DSL required.
-
-#+begin_src emacs-lisp
-(async-installer-git-add "https://github.com/zawatton/anvil.el.git"
-                            :tag "v0.4.1"
-                            :main "anvil.el")
-#+end_src
-
-*** straight.el
-
-#+begin_src emacs-lisp
-(straight-use-package
- '(anvil :type git :host github :repo "zawatton/anvil.el"
-         :branch "v0.4.1"))
-#+end_src
-
-*** elpaca
-
-#+begin_src emacs-lisp
-(elpaca (anvil :host github :repo "zawatton/anvil.el"
-               :ref "v0.4.1"))
-#+end_src
-
-*** use-package (with straight or elpaca)
-
-#+begin_src emacs-lisp
-;; with straight
-(use-package anvil
-  :straight (anvil :type git :host github :repo "zawatton/anvil.el"
-                   :branch "v0.4.1"))
-
-;; with elpaca
-(use-package anvil
-  :ensure (:host github :repo "zawatton/anvil.el" :ref "v0.4.1"))
-#+end_src
-
-** Bleeding edge — =master= (strongly discouraged)
-
-Features land on master daily.  It is *highly unstable and may
-break your environment*.  Not recommended — use only if you can
-accept the risk.
-
-*** async-installer
-
-#+begin_src emacs-lisp
-(async-installer-git-add "https://github.com/zawatton/anvil.el.git"
-                            :branch "master"
-                            :main "anvil.el")
-#+end_src
-
-*** straight.el
-
-#+begin_src emacs-lisp
-(straight-use-package
- '(anvil :type git :host github :repo "zawatton/anvil.el"))
-#+end_src
-
-*** elpaca
-
-#+begin_src emacs-lisp
-(elpaca (anvil :host github :repo "zawatton/anvil.el"))
-#+end_src
-
-*** use-package (with straight or elpaca)
-
-#+begin_src emacs-lisp
-;; with straight
-(use-package anvil
-  :straight (anvil :type git :host github :repo "zawatton/anvil.el"))
-
-;; with elpaca
-(use-package anvil
-  :ensure (:host github :repo "zawatton/anvil.el"))
-#+end_src
-
-** Manual
-
-Clone this repository and add it to your =load-path=:
-
-#+begin_src emacs-lisp
-(add-to-list 'load-path "/path/to/anvil")
-(require 'anvil)
-#+end_src
-
-When cloning manually, check out the =v0.4.1= tag for the stable
-track (=git checkout v0.4.1=), or stay on =master= at your own
-risk.
 
 * Configuration
 
@@ -1346,7 +1256,7 @@ What you actually need:
 A full walkthrough lives in [[*For Non-Emacs Users — Adopting Anvil for Token Reduction][For Non-Emacs Users]]. No Emacs Lisp
 knowledge required to capture the AI-token savings.
 
-* Architecture
+* Internals — bridge + worker pool
 
 #+begin_example
   Claude / GPT / Local LLM
