@@ -44,6 +44,18 @@ Improves performance ~4x on large org files."
   :type 'boolean
   :group 'anvil-eval)
 
+(defcustom anvil-eval-nelisp-binary nil
+  "Absolute path to the NeLisp interpreter `nelisp' binary.
+When nil (default) `anvil-eval--locate-nelisp-binary' performs a PATH
+lookup plus a small list of well-known dev / install locations."
+  :type '(choice (const :tag "Auto-detect" nil) file)
+  :group 'anvil-eval)
+
+(defcustom anvil-eval-nelisp-timeout 30
+  "Hard timeout in seconds for synchronous `nelisp-eval' tool calls."
+  :type 'integer
+  :group 'anvil-eval)
+
 ;;; Tool timeout
 
 (defun anvil-eval--timeout-advice (orig-fn &rest args)
@@ -109,6 +121,92 @@ Only available in Emacs with thread support.")
    (let* ((form (car (read-from-string expression)))
           (result (eval form t)))
      (format "%S" result))))
+
+;;; NeLisp interpreter eval tool (architecture α: anvil → NeLisp)
+
+(defvar anvil-eval--nelisp-binary-cache 'unset
+  "Cached result of `anvil-eval--locate-nelisp-binary'.
+Symbol `unset' means \"not yet probed\" so a successful nil result
+(= binary genuinely absent) is also memoised.")
+
+(defun anvil-eval--locate-nelisp-binary ()
+  "Return absolute path to the NeLisp `nelisp' binary, or nil.
+Resolution order: `anvil-eval-nelisp-binary' override, `$NELISP_BIN'
+env, PATH lookup, then a small set of known dev / install locations.
+Result is cached for the daemon lifetime; reset the cache via
+\\(setq anvil-eval--nelisp-binary-cache \\='unset\\)."
+  (cond
+   ((not (eq anvil-eval--nelisp-binary-cache 'unset))
+    anvil-eval--nelisp-binary-cache)
+   (t
+    (let ((found
+           (or (and anvil-eval-nelisp-binary
+                    (file-executable-p anvil-eval-nelisp-binary)
+                    anvil-eval-nelisp-binary)
+               (let ((env (getenv "NELISP_BIN")))
+                 (and env (file-executable-p env) env))
+               (executable-find "nelisp")
+               (cl-some (lambda (p) (and (file-executable-p p) p))
+                        (list (expand-file-name
+                               "Cowork/Notes/dev/nelisp/nelisp-runtime/target/release/nelisp"
+                               (or (getenv "HOME") "~"))
+                              (expand-file-name
+                               "Notes/dev/nelisp/nelisp-runtime/target/release/nelisp"
+                               (or (getenv "HOME") "~"))
+                              "/usr/local/bin/nelisp")))))
+      (setq anvil-eval--nelisp-binary-cache found)))))
+
+(defun anvil-eval--nelisp (expression)
+  "Evaluate EXPRESSION on the NeLisp interpreter (= subprocess) and
+return the result as a string.
+
+Spawns the standalone `nelisp' Rust binary via `nelisp eval EXPR' so
+the evaluation is fully isolated from the host Emacs daemon — useful
+for portability validation, sandbox eval, and exercising the
+NeLisp-only code path that anvil.el delegates to via
+fboundp guard + fallback (architecture α).
+
+MCP Parameters:
+  expression - NeLisp / Elisp expression to evaluate (string, required)
+               Example: \"(+ 1 2 3)\"
+               Example: \"(length \\\"hello\\\")\"
+
+Errors when the binary cannot be located, the subprocess exits
+non-zero, or `anvil-eval-nelisp-timeout' fires."
+  (anvil-server-with-error-handling
+   (let ((bin (anvil-eval--locate-nelisp-binary)))
+     (unless bin
+       (error "nelisp binary not found — set anvil-eval-nelisp-binary or NELISP_BIN"))
+     (with-temp-buffer
+       (let* ((stderr-file (make-temp-file "anvil-nelisp-eval-stderr-"))
+              (exit-code
+               (unwind-protect
+                   (with-timeout (anvil-eval-nelisp-timeout
+                                  (error "nelisp-eval timed out after %ds"
+                                         anvil-eval-nelisp-timeout))
+                     (call-process bin nil
+                                   (list (current-buffer) stderr-file)
+                                   nil
+                                   "eval" expression))
+                 (when (file-exists-p stderr-file)
+                   (when (zerop (or (nth 7 (file-attributes stderr-file)) 0))
+                     (delete-file stderr-file)))))
+              (stdout (string-trim (buffer-string)))
+              (stderr (and (file-exists-p stderr-file)
+                           (with-temp-buffer
+                             (insert-file-contents stderr-file)
+                             (string-trim (buffer-string))))))
+         (when (and stderr-file (file-exists-p stderr-file))
+           (delete-file stderr-file))
+         (cond
+          ((not (eq exit-code 0))
+           (error "nelisp exit %S: %s"
+                  exit-code (or stderr stdout "(no output)")))
+          ((and stderr (not (string-empty-p stderr)))
+           ;; Non-zero stderr but exit 0 — surface it to the caller as
+           ;; a string suffix so they can see warnings / messages.
+           (format "%s\n;; stderr:\n%s" stdout stderr))
+          (t stdout)))))))
 
 ;;; Async eval tools
 
@@ -253,6 +351,19 @@ Poll this until status is 'done' or 'error'."
    :description
    "List all async jobs and their statuses.
 Useful for checking what's running or debugging stuck jobs."
+   :server-id anvil-eval--server-id)
+  (anvil-server-register-tool
+   #'anvil-eval--nelisp
+   :id "nelisp-eval"
+   :intent '(eval)
+   :layer 'dev
+   :description
+   "Evaluate expression on the NeLisp interpreter (= subprocess) and
+return the result.  Architecture α companion to emacs-eval — runs
+the form fully isolated from the host Emacs daemon, so it doubles as
+a portability check (= form behaves the same on NeLisp's pure Elisp
+runtime) and a sandbox evaluator (= no access to anvil-* / Emacs
+state)."
    :server-id anvil-eval--server-id))
 
 (defun anvil-eval-disable ()
@@ -261,6 +372,7 @@ Useful for checking what's running or debugging stuck jobs."
   (anvil-server-unregister-tool "emacs-eval-async" anvil-eval--server-id)
   (anvil-server-unregister-tool "emacs-eval-result" anvil-eval--server-id)
   (anvil-server-unregister-tool "emacs-eval-jobs" anvil-eval--server-id)
+  (anvil-server-unregister-tool "nelisp-eval" anvil-eval--server-id)
   (advice-remove 'anvil-server--handle-tools-call
                  #'anvil-eval--timeout-advice)
   (advice-remove 'anvil-server--handle-tools-call
