@@ -1,4 +1,5 @@
 ;;; anvil-worklog.el --- AI worklog org → SQLite index  -*- lexical-binding: t; -*-
+;;; anvil-audit: tools-wrapped-at-registration
 
 ;; Copyright (C) 2026 zawatton
 
