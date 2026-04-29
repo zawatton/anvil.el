@@ -340,11 +340,79 @@
       (let ((elc (concat tmp "c")))
         (when (file-exists-p elc) (delete-file elc))))))
 
+(ert-deftest anvil-sexp-test-verify-captures-checkdoc-warnings ()
+  "A checkdoc-only issue surfaces as a checkdoc warning diagnostic."
+  (let ((tmp (make-temp-file "anvil-sexp-checkdoc-" nil ".el")))
+    (unwind-protect
+        (progn
+          (with-temp-file tmp
+            (insert ";;; anvil-sexp-checkdoc.el --- bad -*- lexical-binding: t; -*-\n"
+                    "\n"
+                    "(defun anvil-sexp-test-undocumented (x)\n"
+                    "  (+ x 1))\n"
+                    "\n"
+                    "(provide 'wrong-feature)\n"
+                    ";;; wrong-footer.el ends here\n"))
+          (let ((r (anvil-sexp--tool-verify tmp "nil" t)))
+            (should (plist-get r :passed))
+            (should
+             (cl-find-if
+              (lambda (d)
+                (and (eq (plist-get d :source) 'checkdoc)
+                     (string-match-p
+                      "Commentary"
+                      (plist-get d :message))))
+              (plist-get r :diagnostics)))
+            (should
+             (cl-find-if
+              (lambda (d)
+                (and (eq (plist-get d :source) 'checkdoc)
+                     (string-match-p
+                      "documentation string"
+                      (plist-get d :message))))
+              (plist-get r :diagnostics)))))
+      (when (file-exists-p tmp) (delete-file tmp)))))
+
+(ert-deftest anvil-sexp-test-verify-checkdoc-does-not-display-windows ()
+  "checkdoc verification must not alter windows or warning buffers."
+  (let ((tmp (make-temp-file "anvil-sexp-checkdoc-ui-" nil ".el")))
+    (cl-labels ((buffer-text
+                 (name)
+                 (when (get-buffer name)
+                   (with-current-buffer name
+                     (buffer-substring-no-properties
+                      (point-min) (point-max))))))
+      (unwind-protect
+          (progn
+            (with-temp-file tmp
+              (insert ";;; anvil-sexp-checkdoc-ui.el --- bad -*- lexical-binding: t; -*-\n"
+                      "\n"
+                      "(defun anvil-sexp-test-ui-warning (x)\n"
+                      "  (+ x 1))\n"
+                      "\n"
+                      "(provide 'wrong-feature)\n"
+                      ";;; wrong-footer.el ends here\n"))
+            (let ((windows-before (mapcar (lambda (w)
+                                            (window-buffer w))
+                                          (window-list (selected-frame)
+                                                       'no-minibuf)))
+                  (warn-before (buffer-text "*warn*"))
+                  (warnings-before (buffer-text "*Warnings*")))
+              (anvil-sexp--tool-verify tmp "nil" t)
+              (should (equal (mapcar (lambda (w)
+                                       (window-buffer w))
+                                     (window-list (selected-frame)
+                                                  'no-minibuf))
+                             windows-before))
+              (should (equal (buffer-text "*warn*") warn-before))
+              (should (equal (buffer-text "*Warnings*") warnings-before))))
+        (when (file-exists-p tmp) (delete-file tmp))))))
+
 (ert-deftest anvil-sexp-test-verify-leaves-no-visiting-buffer ()
-  "verify must not leave a `checkdoc-file' visiting buffer behind.
-`checkdoc-file' uses `find-file-noselect' internally; the previous
-implementation never killed that buffer, which clashed with the
-apply path's `with-temp-buffer' + `write-region' writes and caused
+  "verify must not leave a checkdoc visiting buffer behind.
+Checkdoc verification opens FILE via `find-file-noselect'; keeping
+that buffer after verification would clash with the apply path's
+`with-temp-buffer' + `write-region' writes and cause
 `ask-user-about-supersession-threat' on the next interactive edit."
   (anvil-sexp-test--with-sample
    (lambda (path)

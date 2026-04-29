@@ -29,7 +29,7 @@
 ;; Dynamic variables owned by `checkdoc'; declared so that the
 ;; byte compiler treats the `let' bindings in
 ;; `anvil-sexp--run-checkdoc' as dynamic (they are read by
-;; `checkdoc-file' internally).  The feature itself is loaded
+;; `checkdoc-current-buffer' internally).  The feature itself is loaded
 ;; lazily inside the function to avoid a top-level recursive
 ;; require when users load anvil-sexp during an active checkdoc
 ;; session.
@@ -37,6 +37,8 @@
 (defvar checkdoc-autofix-flag)
 (defvar checkdoc-spellcheck-documentation-flag)
 (defvar checkdoc-verb-check-experimental-flag)
+(defvar checkdoc--batch-flag)
+(defvar checkdoc-pending-errors)
 
 
 ;;;; --- group + constants ---------------------------------------------------
@@ -1060,14 +1062,18 @@ leak in."
       (when (buffer-live-p log-buf) (kill-buffer log-buf)))))
 
 (defun anvil-sexp--run-checkdoc (file)
-  "Run `checkdoc-file' on FILE, return list of diagnostic plists.
-`checkdoc-file' visits FILE via `find-file-noselect' and never
-kills the resulting buffer.  Subsequent apply-path writes go
-through `with-temp-buffer' + `write-region' (anvil-file's
-no-buffer-side-effects pattern) and would leave that visiting
-buffer stale, triggering `ask-user-about-supersession-threat'
-the next time the user touches it.  Track whether a visiting
-buffer existed before the call and kill the one we created."
+  "Run `checkdoc-current-buffer' on FILE, return diagnostic plists.
+`checkdoc-file' visits FILE via `find-file-noselect', overrides
+`checkdoc-diagnostic-buffer' with \"*warn*\", and may display
+diagnostic windows.  Drive `checkdoc-current-buffer' directly so
+the MCP tool can collect diagnostics in an internal buffer without
+touching the user's window layout.
+
+Track whether a visiting buffer existed before the call and kill
+only the buffer we create.  Otherwise subsequent apply-path writes
+that use `with-temp-buffer' + `write-region' can leave the visited
+buffer stale and trigger `ask-user-about-supersession-threat' on
+the next interactive edit."
   (require 'checkdoc)
   (let ((pre-buf (find-buffer-visiting file))
         (warn-buf (get-buffer-create "*anvil-sexp-cd*"))
@@ -1078,9 +1084,13 @@ buffer existed before the call and kill the one we created."
           (let ((checkdoc-diagnostic-buffer (buffer-name warn-buf))
                 (checkdoc-autofix-flag 'never)
                 (checkdoc-spellcheck-documentation-flag nil)
-                (checkdoc-verb-check-experimental-flag nil))
+                (checkdoc-verb-check-experimental-flag nil)
+                (checkdoc--batch-flag t)
+                (checkdoc-pending-errors nil))
             (condition-case err
-                (checkdoc-file file)
+                (save-window-excursion
+                  (with-current-buffer (find-file-noselect file)
+                    (checkdoc-current-buffer t)))
               (error
                (push (list :kind 'error :source 'checkdoc :line 0
                            :message (error-message-string err))
