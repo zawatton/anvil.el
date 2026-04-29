@@ -88,8 +88,31 @@
 
 (defcustom anvil-memory-db-path
   (expand-file-name "anvil-memory-index.db" user-emacs-directory)
-  "SQLite file backing the memory metadata index."
+  "SQLite file backing the memory metadata index.
+
+When left at its default value, `anvil-memory--resolve-db-path' may
+redirect the open DB to a shared location declared in
+`anvil-memory-shared-db-roots' or the `ANVIL_MEMORY_DB' env var.
+Setting this option to a path other than the default disables the
+auto-detect chain and pins the DB to that path."
   :type 'file
+  :group 'anvil-memory)
+
+(defcustom anvil-memory-shared-db-roots nil
+  "Directory roots to search for a shared anvil-memory DB.
+
+Each entry is a directory.  When `anvil-memory-db-path' has its default
+value, `anvil-memory--open' probes each root for
+`.anvil-memory/anvil-memory-index.db' and uses the first match.  Point
+this at a notes-style git repo to share auto-memory across machines
+that pull the same repo (e.g. Linux + Windows).
+
+Resolution order at open time:
+  1. `ANVIL_MEMORY_DB' env var (if set and non-empty)
+  2. Explicit `anvil-memory-db-path' (if customized away from default)
+  3. First existing file under any `anvil-memory-shared-db-roots' entry
+  4. Default: `<user-emacs-directory>/anvil-memory-index.db'"
+  :type '(repeat directory)
   :group 'anvil-memory)
 
 (defcustom anvil-memory-roots nil
@@ -221,6 +244,44 @@ type.  Durations match the Doc 29 Phase 1 policy table.")
 (defvar anvil-memory--db nil
   "Open handle on `anvil-memory-db-path' (nil when the module is idle).")
 
+(defvar anvil-memory--resolved-db-path nil
+  "Cached path returned by `anvil-memory--resolve-db-path' on first open.
+Reset by `anvil-memory--close' so a re-open re-runs detection.")
+
+(defun anvil-memory--default-db-path ()
+  "Return the un-redirected default DB path."
+  (expand-file-name "anvil-memory-index.db" user-emacs-directory))
+
+(defun anvil-memory--shared-db-candidate (root)
+  "Return `<ROOT>/.anvil-memory/anvil-memory-index.db' when it exists."
+  (let ((cand (expand-file-name
+               ".anvil-memory/anvil-memory-index.db"
+               (expand-file-name root))))
+    (and (file-exists-p cand) cand)))
+
+(defun anvil-memory--resolve-db-path ()
+  "Return the effective DB path per the documented override order.
+See the docstrings of `anvil-memory-db-path' and
+`anvil-memory-shared-db-roots' for the precedence rules."
+  (let ((env (getenv "ANVIL_MEMORY_DB"))
+        (default (anvil-memory--default-db-path)))
+    (cond
+     ((and env (not (string-empty-p env)))
+      (expand-file-name env))
+     ((not (equal anvil-memory-db-path default))
+      anvil-memory-db-path)
+     (t
+      (or (cl-some #'anvil-memory--shared-db-candidate
+                   anvil-memory-shared-db-roots)
+          default)))))
+
+(defun anvil-memory-effective-db-path ()
+  "Return the path the DB is currently (or would be) opened at.
+When the DB is already open, returns the cached resolved path; when
+idle, runs the resolver to return what the next open would pick."
+  (or anvil-memory--resolved-db-path
+      (anvil-memory--resolve-db-path)))
+
 (defun anvil-memory--require-sqlite ()
   (unless (and (fboundp 'sqlite-available-p) (sqlite-available-p))
     (user-error
@@ -230,15 +291,18 @@ type.  Durations match the Doc 29 Phase 1 policy table.")
   "Open the backing DB and apply schema."
   (anvil-memory--require-sqlite)
   (unless anvil-memory--db
-    (make-directory (file-name-directory anvil-memory-db-path) t)
-    (setq anvil-memory--db (sqlite-open anvil-memory-db-path))
-    (anvil-memory--ensure-schema))
+    (let ((path (anvil-memory--resolve-db-path)))
+      (setq anvil-memory--resolved-db-path path)
+      (make-directory (file-name-directory path) t)
+      (setq anvil-memory--db (sqlite-open path))
+      (anvil-memory--ensure-schema)))
   anvil-memory--db)
 
 (defun anvil-memory--close ()
   (when anvil-memory--db
     (ignore-errors (sqlite-close anvil-memory--db))
-    (setq anvil-memory--db nil)))
+    (setq anvil-memory--db nil))
+  (setq anvil-memory--resolved-db-path nil))
 
 (defun anvil-memory--db ()
   (or anvil-memory--db (anvil-memory--open)))

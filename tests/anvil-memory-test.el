@@ -1934,6 +1934,78 @@ ROOT-VAR is the temp memory root.  Binds `port' (int) and `info'
       (ignore-errors (delete-directory sandbox t)))))
 
 
+
+;;;; --- shared-db-roots / resolve-db-path ---------------------------------
+
+(ert-deftest anvil-memory-test/resolve-db-path-default ()
+  "When neither env nor shared roots are set, resolver returns the default."
+  (skip-unless (fboundp 'anvil-memory--resolve-db-path))
+  (let* ((default (anvil-memory--default-db-path))
+         (anvil-memory-db-path default)
+         (anvil-memory-shared-db-roots nil)
+         (process-environment (cons "ANVIL_MEMORY_DB=" process-environment)))
+    (should (equal default (anvil-memory--resolve-db-path)))))
+
+(ert-deftest anvil-memory-test/resolve-db-path-explicit-override ()
+  "When `anvil-memory-db-path' is customized, resolver returns it verbatim."
+  (skip-unless (fboundp 'anvil-memory--resolve-db-path))
+  (let* ((custom-path (make-temp-file "anvil-memtest-explicit-" nil ".db"))
+         (anvil-memory-db-path custom-path)
+         (anvil-memory-shared-db-roots (list "/nonexistent/notes"))
+         (process-environment (cons "ANVIL_MEMORY_DB=" process-environment)))
+    (unwind-protect
+        (should (equal custom-path (anvil-memory--resolve-db-path)))
+      (ignore-errors (delete-file custom-path)))))
+
+(ert-deftest anvil-memory-test/resolve-db-path-shared-root-match ()
+  "When shared root has the marker file, resolver returns it."
+  (skip-unless (fboundp 'anvil-memory--resolve-db-path))
+  (let* ((root (make-temp-file "anvil-memtest-root-" t))
+         (mem-dir (expand-file-name ".anvil-memory" root))
+         (db-file (expand-file-name "anvil-memory-index.db" mem-dir))
+         (anvil-memory-db-path (anvil-memory--default-db-path))
+         (anvil-memory-shared-db-roots (list root))
+         (process-environment (cons "ANVIL_MEMORY_DB=" process-environment)))
+    (unwind-protect
+        (progn
+          (make-directory mem-dir t)
+          (with-temp-file db-file (insert ""))
+          (should (equal db-file (anvil-memory--resolve-db-path))))
+      (ignore-errors (delete-directory root t)))))
+
+(ert-deftest anvil-memory-test/resolve-db-path-shared-root-no-marker ()
+  "Shared roots without the marker fall through to default."
+  (skip-unless (fboundp 'anvil-memory--resolve-db-path))
+  (let* ((root (make-temp-file "anvil-memtest-empty-" t))
+         (default (anvil-memory--default-db-path))
+         (anvil-memory-db-path default)
+         (anvil-memory-shared-db-roots (list root))
+         (process-environment (cons "ANVIL_MEMORY_DB=" process-environment)))
+    (unwind-protect
+        (should (equal default (anvil-memory--resolve-db-path)))
+      (ignore-errors (delete-directory root t)))))
+
+(ert-deftest anvil-memory-test/resolve-db-path-env-wins ()
+  "`ANVIL_MEMORY_DB' env var beats both explicit and shared roots."
+  (skip-unless (fboundp 'anvil-memory--resolve-db-path))
+  (let* ((env-path (make-temp-file "anvil-memtest-env-" nil ".db"))
+         (anvil-memory-db-path "/should/be/ignored.db")
+         (anvil-memory-shared-db-roots '("/also/ignored"))
+         (process-environment
+          (cons (concat "ANVIL_MEMORY_DB=" env-path) process-environment)))
+    (unwind-protect
+        (should (equal env-path (anvil-memory--resolve-db-path)))
+      (ignore-errors (delete-file env-path)))))
+
+(ert-deftest anvil-memory-test/effective-db-path-uses-cache-when-open ()
+  "`anvil-memory-effective-db-path' returns the cached path while DB is open."
+  (skip-unless (fboundp 'anvil-memory-effective-db-path))
+  (let* ((cached "/cached/path/from/open.db")
+         (anvil-memory--resolved-db-path cached)
+         (anvil-memory-db-path "/something/else.db"))
+    (should (equal cached (anvil-memory-effective-db-path)))))
+
+
 (provide 'anvil-memory-test)
 
 ;;; anvil-memory-test.el ends here

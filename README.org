@@ -924,6 +924,31 @@ MCP server; the module never writes into =.md= files (promote is
 the only file operation, and that is a rename), so it is safe to
 point at memory directories managed by other tools.
 
+*** Sharing the DB across machines
+
+The metadata DB defaults to =<user-emacs-directory>/anvil-memory-index.db=,
+but you can point one or more machines at the same SQLite file
+(commonly stored inside a notes git repo) without symlinks:
+
+#+begin_src emacs-lisp
+(setq anvil-memory-shared-db-roots
+      '("~/Cowork/Notes"))
+#+end_src
+
+When =anvil-memory-db-path= is left at its default, the open path
+is resolved on first DB access by checking, in order:
+
+1. =ANVIL_MEMORY_DB= environment variable
+2. =anvil-memory-db-path= (when explicitly customized)
+3. First entry of =anvil-memory-shared-db-roots= containing
+   =.anvil-memory/anvil-memory-index.db=
+4. Default =<user-emacs-directory>/anvil-memory-index.db=
+
+Use =(anvil-memory-effective-db-path)= to confirm which path the
+module is using.  The DB is binary, so commit / pull it through
+git as-is (run a =PRAGMA wal_checkpoint(FULL)= before commit so
+the WAL writes flush into the main file).
+
 ** Git helpers
 
 The =git= module is part of the default =anvil-modules= list.  It
