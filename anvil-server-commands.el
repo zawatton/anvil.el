@@ -291,9 +291,12 @@ Stage D distribution.  Equivalent shell invocation:
   (require 'anvil)
   ;; Stage D needs http + state to expose the architecture α delegate
   ;; chain (anvil-http → nelisp-http etc).  Honour any prior user
-  ;; customisation but ensure the two are present.
+  ;; customisation but ensure the two are present.  memory + worklog
+  ;; carry the DB-direct cross-AI interchange surface and are required
+  ;; from the headless launcher's first invocation (Doc 29 Phase 5 +
+  ;; Doc 42 Phase 2).
   (when (boundp 'anvil-optional-modules)
-    (dolist (m '(http state))
+    (dolist (m '(http state memory worklog))
       (cl-pushnew m anvil-optional-modules)))
   (when (fboundp 'anvil-enable)
     (anvil-enable))

@@ -203,6 +203,12 @@ here to keep the `learning workload' path slim.")
     "http-head" "http-cache-get" "http-cache-clear" "http-cache-index"
     ;; Data / state — Phase 5-F.1 state port で追加予定
     "data-list-keys" "data-delete-path"
+    ;; Memory — Doc 29 Phase 5 DB-direct surface (org 依存系は除外)
+    "memory-search" "memory-list" "memory-get"
+    "memory-add" "memory-save-check" "memory-access"
+    "memory-export-md" "memory-regenerate-index"
+    ;; Worklog — Doc 42 Phase 2 DB-direct surface (org-scan/export は除外)
+    "worklog-add" "worklog-search" "worklog-list" "worklog-get"
     ;; Manifest 自己診断
     "manifest-cost")
   "Stage D (Doc 18) MVP = non-Emacs user distribution。
@@ -215,8 +221,9 @@ nav/core との差:
   dev tool は含めない (headless 環境で誤爆防止)
 - defs-* / elisp-describe-* / py-list-* 等 interactive 探索系も除外
   (non-Emacs user は別手段で IDE 内検索)
-- memory-* は Stage D では user 書き込みを想定せず除外 (Phase 6.x
-  で memory-search のみ opt-in 追加を検討)
+- memory-* / worklog-* の DB-direct surface は cross-AI interchange
+  に必須なので opt-in (memory-scan / worklog-scan / worklog-export-org
+  などの org 依存 tool は引き続き除外)
 
 Phase 5-F.1 state port 完了後、state-* tool 6 本を追加予定。")
 
