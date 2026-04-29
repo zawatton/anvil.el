@@ -296,6 +296,124 @@ Binds:
         (should-not hits)))))
 
 
+;;;; --- Phase 2: DB-direct add ------------------------------------------
+
+(ert-deftest anvil-worklog-test/add-inserts-row ()
+  "worklog-add stores a row + FTS body and returns its synthetic key."
+  (skip-unless (anvil-worklog-test--supported-p 'add))
+  (anvil-worklog-test--with-env
+    (let ((id (anvil-worklog-add
+               "Phase 2 着地ログ"
+               "**実施内容**\n- データベース primary に切替\n"
+               :date "2026-04-29"
+               :machine "linux-debian"
+               :year 2026)))
+      (should (string-prefix-p "anvil-worklog:db:" (plist-get id :file)))
+      (should (= 1 (plist-get id :start-line)))
+      (should (equal "linux-debian" (plist-get id :machine)))
+      (should (= 2026 (plist-get id :year))))
+    (let ((rows (anvil-worklog-list :limit 5 :machine "linux-debian")))
+      (should (= 1 (length rows)))
+      (should (equal "Phase 2 着地ログ" (plist-get (car rows) :title))))
+    (let ((hits (anvil-worklog-search "データベース")))
+      (should hits))))
+
+(ert-deftest anvil-worklog-test/add-defaults-machine-and-date ()
+  "machine + date default to the current host + today when omitted."
+  (skip-unless (anvil-worklog-test--supported-p 'add))
+  (anvil-worklog-test--with-env
+    (let* ((today (format-time-string "%Y-%m-%d"))
+           (anvil-worklog-platform "linux")
+           (anvil-worklog-hostname "test-host")
+           (id (anvil-worklog-add "Default test" "body")))
+      (should (equal today (plist-get id :date)))
+      (should (equal "linux-test-host" (plist-get id :machine))))))
+
+(ert-deftest anvil-worklog-test/add-auto-increments-start-line ()
+  "Successive calls with the same (machine, year) get consecutive
+start_line values; switching namespace resets the counter."
+  (skip-unless (anvil-worklog-test--supported-p 'add))
+  (anvil-worklog-test--with-env
+    (let ((a (anvil-worklog-add "a" "x" :date "2026-04-29"
+                                :machine "m1" :year 2026))
+          (b (anvil-worklog-add "b" "y" :date "2026-04-29"
+                                :machine "m1" :year 2026))
+          (c (anvil-worklog-add "c" "z" :date "2026-04-29"
+                                :machine "m2" :year 2026)))
+      (should (= 1 (plist-get a :start-line)))
+      (should (= 2 (plist-get b :start-line)))
+      (should (= 1 (plist-get c :start-line))))))
+
+
+;;;; --- Phase 2: prune skips synthetic ----------------------------------
+
+(ert-deftest anvil-worklog-test/prune-skips-synthetic-paths ()
+  "DB-direct rows must survive a global prune even though their `file'
+sentinel does not exist on disk."
+  (skip-unless (and (anvil-worklog-test--supported-p 'prune)
+                    (anvil-worklog-test--supported-p 'add)))
+  (anvil-worklog-test--with-env
+    (anvil-worklog-add "DB row" "body" :date "2026-04-29"
+                       :machine "linux-debian" :year 2026)
+    (let ((before (length (anvil-worklog-list :limit 50)))
+          (n (anvil-worklog-prune)))
+      (should (= 1 before))
+      (should (= 0 n)))
+    (should (= 1 (length (anvil-worklog-list :limit 50))))))
+
+
+;;;; --- Phase 2: export-org ----------------------------------------------
+
+(ert-deftest anvil-worklog-test/export-org-roundtrip ()
+  "export-org emits an org file whose entries match the DB rows."
+  (skip-unless (and (anvil-worklog-test--supported-p 'export)
+                    (anvil-worklog-test--supported-p 'add)))
+  (anvil-worklog-test--with-env
+    (anvil-worklog-add "First" "body 1\n" :date "2026-04-28"
+                       :machine "test-m" :year 2026)
+    (anvil-worklog-add "Second" "body 2\n" :date "2026-04-29"
+                       :machine "test-m" :year 2026)
+    (let* ((path (expand-file-name "out.org" root))
+           (result (anvil-worklog-export-org
+                    :machine "test-m" :year 2026 :path path))
+           (content (with-temp-buffer
+                      (insert-file-contents path)
+                      (buffer-substring-no-properties (point-min) (point-max)))))
+      (should (= 2 (plist-get result :entries)))
+      (should (string-match-p "\\*\\* NOTE 作業ログ <2026-04-28>" content))
+      (should (string-match-p "\\*\\* NOTE 作業ログ <2026-04-29>" content))
+      (should (string-match-p "\\*\\*\\* MEMO AI: First <2026-04-28>" content))
+      (should (string-match-p "\\*\\*\\* MEMO AI: Second <2026-04-29>" content))
+      (should (string-match-p "body 1" content))
+      (should (string-match-p "body 2" content)))))
+
+(ert-deftest anvil-worklog-test/export-org-merges-org-and-db-rows ()
+  "Org-scanned and DB-direct rows for the same (machine, year) appear in
+one export, ordered by date ASC."
+  (skip-unless (and (anvil-worklog-test--supported-p 'export)
+                    (anvil-worklog-test--supported-p 'add)
+                    (anvil-worklog-test--supported-p 'scan)))
+  (anvil-worklog-test--with-env
+    ;; Seed an org-scanned row from a real ai-logs file (linux 2026).
+    (anvil-worklog-test--seed root)
+    (anvil-worklog-scan)
+    ;; Add a DB-direct row for the same (machine, year).
+    (anvil-worklog-add "Phase 2 entry" "from worklog-add"
+                       :date "2026-04-29"
+                       :machine "linux-debian"
+                       :year 2026)
+    (let* ((path (expand-file-name "merged.org" root))
+           (result (anvil-worklog-export-org
+                    :machine "linux-debian" :year 2026 :path path))
+           (content (with-temp-buffer
+                      (insert-file-contents path)
+                      (buffer-substring-no-properties (point-min) (point-max)))))
+      (should (>= (plist-get result :entries) 4))
+      (should (string-match-p "Phase 2 entry" content))
+      (should (string-match-p "from worklog-add" content))
+      (should (string-match-p "anvil-worklog 設計" content)))))
+
+
 ;;;; --- DB path resolver -------------------------------------------------
 
 (ert-deftest anvil-worklog-test/effective-db-path-shared-root ()

@@ -4,11 +4,18 @@
 
 * STATUS
 
-| Phase   | Scope                                              | State          | Estimate |
-|---------+----------------------------------------------------+----------------+----------|
-| 1       | read-only scan + search + list MCP tools + ERT     | DRAFT (本書)   | 4–6h     |
-| 2       | write helper (=anvil-worklog-append-memo=)         | not started    | 2–3h     |
-| 3       | bridge integration (=anvil-memory-bridge= 経由公開)| deferred       | —        |
+| Phase   | Scope                                                | State          | Estimate |
+|---------+------------------------------------------------------+----------------+----------|
+| 1       | read-only scan + search + list MCP tools + ERT       | SHIPPED        | (done)   |
+| 2       | DB-primary write (=worklog-add=) + opt export to org | DRAFT (本書)   | 3–4h     |
+| 3       | bridge integration (=anvil-memory-bridge= 経由公開)  | deferred       | —        |
+
+Phase 2 は「org-canonical + DB-index」の中間設計を捨てて DB-primary に
+振り直す決定 (2026-04-29 user 確認)。理由は読み書き両端を Claude が
+専有しているため org-mode tool との互換は要件ではなく、二重の write
+path が認知負荷を増やすだけだったため。anvil-memory は cross-AI
+portability のため `.md` canonical のままで良いが、worklog は Claude
+専用なので DB を canonical にできる。
 
 ** Why a separate module / DB
 
@@ -24,10 +31,12 @@
 
 ** Non-goals
 
-- org → SQLite の双方向同期はしない。書き込みは Phase 2 の helper でも
-  「org に append する」のが先で、index は scan で追従する。
 - user 編集を許す journals-*.org / todo.org は対象外 — 触れない。
 - 全文表示・editor integration は対象外 (Phase 3 で bridge 経由検討)。
+- (Phase 2 以降) org-mode との双方向同期はしない。export は片方向 (DB → org)、
+  org file 編集は DB に反映されない。
+- anvil-memory のように cross-AI portability を提供しない。Claude 専用で
+  クローズする。
 
 * Phase 1 — read-only scan + MCP search/list
 
@@ -195,13 +204,105 @@ Server id = =emacs-eval= (anvil-memory と同じ MCP server)。
   CLAUDE.md の命名規約 (=hostname -s=) で実用的に衝突しない。明示衝突検出は不要。
 - *R4: digest 衝突 (sha1 collision)*: 実用上ゼロリスク扱い。
 
-* Phase 2 — write helper (deferred)
+* Phase 2 — DB-primary write + optional org export
 
-`(anvil-worklog-append-memo TITLE BODY &key date file)` で
-~** NOTE 作業ログ <DATE>~ section の自動探索 + 無ければ作成 + ~*** MEMO AI:~ 追記、
-そのあと scan を 1 ファイル分だけ呼ぶ。CLAUDE.md の作業ログ規約を機械的に守れる。
+** Architectural pivot
 
-実装トリガー: Phase 1 が安定して 2 週間程度運用して使い勝手が固まってから。
+Phase 1 で実装した「org が canonical / DB は index」は、Claude の作業
+ログ用途では意味のない二重化だった。今後は DB を canonical にし、書く
+パスを一本化する。
+
+- 書く: =worklog-add TITLE BODY &key date machine year= MCP tool で
+  SQLite に直接 INSERT (org への append 廃止)
+- 読む: 既存の =worklog-search / -list / -get= をそのまま再利用
+- 既存 `capture/ai-logs-*.org` は Phase 1 までの履歴 archive として
+  git に温存。Phase 2 以降の write はこのファイルを書き換えない
+- org export はオプション機能 (=worklog-export-org= MCP tool) として
+  提供。hook / cron には組まない — user が必要な時だけ呼ぶ
+
+** Schema 互換戦略
+
+既存 schema (=worklog_entry= の =PRIMARY KEY (file, start_line)=) を
+壊さずに DB-direct 行を共存させる:
+
+- DB-direct 行の =file= は synthetic prefix =anvil-worklog:db:<machine>:<year>=
+  を使う (例 =anvil-worklog:db:linux-debian:2026=)
+- =start_line= は同 namespace 内の =MAX(start_line)+1= で auto-increment。
+  org 由来行とは file 値が分離されるので衝突しない
+- =anvil-worklog-prune= は synthetic prefix を skip (=file-exists-p=
+  チェックを掛けるとどの synthetic も「missing」扱いされて全削除に
+  なるため)
+- これにより migration 不要 — 既存 453 行 (org scan 由来) は手付かず、
+  新規分は synthetic file で並行投入
+
+** =worklog-add= API
+
+#+begin_src elisp
+(anvil-worklog-add TITLE BODY
+                   &key date machine year)
+#+end_src
+
+| Param   | Default                                              |
+|---------+------------------------------------------------------|
+| date    | 今日の =YYYY-MM-DD= (current local time)             |
+| machine | =anvil-worklog--current-machine-token= (platform-host) |
+| year    | =date= から派生                                      |
+
+挙動:
+1. =synthetic-file = (format "anvil-worklog:db:%s:%d" machine year)=
+2. =start_line = (next id within synthetic-file namespace)=
+3. =worklog_entry= に INSERT (digest = sha1(body))
+4. =worklog_fts= にも INSERT
+5. 戻り値 =(:file SYNTHETIC :start-line N :date DATE :machine MACHINE)=
+
+副作用は SQLite write のみ。org / 他ファイルは触らない。
+
+** =worklog-export-org= API (optional)
+
+#+begin_src elisp
+(anvil-worklog-export-org &key path machine year since until)
+#+end_src
+
+| Param      | Behaviour                                                |
+|------------+----------------------------------------------------------|
+| =path=     | 出力ファイル (default: =capture/ai-logs-<machine>-<year>.org=) |
+| =machine=  | 必須 (1 file = 1 machine の慣習を維持)                    |
+| =year=     | 必須                                                      |
+| =since= / =until= | エントリ範囲を限定 (default: =year= 全部)           |
+
+挙動:
+1. SELECT entries WHERE machine=? AND year=? ORDER BY date ASC, start_line ASC
+2. =** NOTE 作業ログ <DATE>= section ごとに group
+3. 各 entry を =*** MEMO AI: <title> <date>= で出力
+4. =path= に書き込み (上書き)。=path= 省略時は default paths
+
+返り値: =(:path PATH :entries N)=
+
+org 由来行 (file = real path) と DB-direct 行 (file = synthetic) は
+=machine + year= が同じなら同じ出力ファイルにマージされる。orderring
+は =date ASC, start_line ASC=。
+
+** Test surface (Phase 2 追加分)
+
+| Test                                          | Verifies                                          |
+|-----------------------------------------------+---------------------------------------------------|
+| =worklog-add-inserts-row=                     | minimal call で entry + FTS 行が増える            |
+| =worklog-add-defaults-machine-and-date=       | machine/date 省略時に当日 + 現 machine token       |
+| =worklog-add-auto-increments-start-line=      | 同 namespace で連番、別 namespace で再 1 開始     |
+| =worklog-add-fts-searchable=                  | 投入直後に =worklog-search= で hit                |
+| =prune-skips-synthetic-paths=                 | file が =anvil-worklog:db:= で始まる行は prune 対象外 |
+| =export-org-roundtrip=                        | export → 同 export 同等 (idempotent)              |
+| =export-org-merges-org-and-db-rows=           | 同 machine/year の org 由来 + DB-direct を統合出力 |
+
+合計 +7 ERT、Phase 2 全体で 14 + 7 = 21 ERT を目標。
+
+** Migration (既存 daemon)
+
+- DB schema は不変なので migration script 不要
+- 新コードを daemon に load → =worklog-add= が即時利用可
+- 既存 org scan + prune は無効化しない (Phase 1 までに書かれた org の
+  追加 entry を救う safety net)。CLAUDE.md だけ「以後は worklog-add 推奨」
+  に書き換える
 
 * Phase 3 — bridge integration (deferred)
 

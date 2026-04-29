@@ -106,10 +106,23 @@ Non-existent directories are silently skipped."
   :group 'anvil-worklog)
 
 (defconst anvil-worklog-supported
-  '(scan prune search list get)
+  '(scan prune search list get add export)
   "Capability tags this module currently provides.
 Tests gate `skip-unless' on membership here so a half-shipped
 feature never breaks CI.")
+
+(defconst anvil-worklog--synthetic-prefix "anvil-worklog:db:"
+  "Sentinel prefix that marks DB-direct entries (Phase 2).
+The `file' column for these rows is a synthetic identifier of the
+shape `anvil-worklog:db:<machine>:<year>' so they coexist with
+org-scanned rows under the same (file, start_line) primary key.
+`anvil-worklog-prune' skips rows whose file starts with this prefix
+because there is no on-disk file to check existence against.")
+
+(defun anvil-worklog--synthetic-file-p (path)
+  "Return non-nil when PATH is a Phase 2 DB-direct synthetic file id."
+  (and (stringp path)
+       (string-prefix-p anvil-worklog--synthetic-prefix path)))
 
 
 ;;;; --- sqlite backend ----------------------------------------------------
@@ -519,7 +532,12 @@ org files and (re-)populate the worklog index.  Returns a plist
   "Remove worklog rows whose backing org file no longer exists.
 When ROOTS is non-nil, only rows whose file lives under one of those
 directories are inspected.  Keeps FTS in sync.  Returns the number
-of rows deleted."
+of rows deleted.
+
+Phase 2: rows whose `file' starts with `anvil-worklog--synthetic-prefix'
+are skipped because they are DB-direct entries with no on-disk
+counterpart — pruning them by missing-file check would erase every
+worklog-add row."
   (let* ((db (anvil-worklog--db))
          (rows (sqlite-select
                 db
@@ -535,7 +553,9 @@ of rows deleted."
                            (cl-some (lambda (r)
                                       (string-prefix-p r path-abs))
                                     roots*))))
-        (when (and in-scope (not (file-exists-p path)))
+        (when (and in-scope
+                   (not (anvil-worklog--synthetic-file-p path))
+                   (not (file-exists-p path)))
           (let ((deleted (sqlite-select
                           db
                           "SELECT COUNT(*) FROM worklog_entry WHERE file = ?1"
@@ -550,6 +570,113 @@ of rows deleted."
            "DELETE FROM worklog_fts WHERE file = ?1"
            (list path)))))
     n))
+
+
+;;;; --- DB-direct add (Phase 2) ----------------------------------------
+
+(defcustom anvil-worklog-platform
+  (cond ((memq system-type '(gnu/linux gnu)) "linux")
+        ((memq system-type '(darwin)) "macos")
+        ((memq system-type '(windows-nt cygwin ms-dos)) "windows")
+        (t (symbol-name system-type)))
+  "Platform token for the current machine, used by `anvil-worklog-add'.
+Mirrors the convention in CLAUDE.md (linux / macos / windows)."
+  :type 'string
+  :group 'anvil-worklog)
+
+(defcustom anvil-worklog-hostname nil
+  "Host token for the current machine, or nil to derive from `system-name'.
+When nil, the leading component of `system-name' (everything before
+the first dot) is used."
+  :type '(choice (const :tag "Auto (system-name)" nil) string)
+  :group 'anvil-worklog)
+
+(defun anvil-worklog--current-hostname ()
+  "Return the configured or auto-derived hostname token."
+  (or anvil-worklog-hostname
+      (let ((sn (system-name)))
+        (if (string-match "\\`\\([^.]+\\)" sn)
+            (match-string 1 sn)
+          sn))))
+
+(defun anvil-worklog--current-machine-token ()
+  "Return the `<platform>-<host>' token used as default for new entries."
+  (format "%s-%s" anvil-worklog-platform (anvil-worklog--current-hostname)))
+
+(defun anvil-worklog--today-iso ()
+  "Return today's date in ISO `YYYY-MM-DD' (local time)."
+  (format-time-string "%Y-%m-%d"))
+
+(defun anvil-worklog--year-from-date (date)
+  "Return the integer year parsed from ISO DATE string (YYYY-MM-DD)."
+  (and (stringp date)
+       (string-match "\\`\\([0-9]\\{4\\}\\)" date)
+       (string-to-number (match-string 1 date))))
+
+(defun anvil-worklog--synthetic-file (machine year)
+  "Return the synthetic file id for (MACHINE, YEAR) DB-direct rows."
+  (format "%s%s:%d" anvil-worklog--synthetic-prefix machine year))
+
+(defun anvil-worklog--next-start-line (db file)
+  "Return the next auto-increment start_line for FILE in DB."
+  (let ((rows (sqlite-select
+               db
+               "SELECT COALESCE(MAX(start_line), 0) + 1
+                  FROM worklog_entry
+                  WHERE file = ?1"
+               (list file))))
+    (or (caar rows) 1)))
+
+;;;###autoload
+(cl-defun anvil-worklog-add (title body &key date machine year)
+  "Insert a DB-direct worklog entry and return its identity plist.
+
+TITLE / BODY are required strings.  Optional keys:
+  :date    — ISO `YYYY-MM-DD' (default: today)
+  :machine — `<platform>-<host>' token (default: current machine)
+  :year    — integer (default: derived from DATE)
+
+The row is stored with a synthetic file id of the shape
+`anvil-worklog:db:<machine>:<year>' and a start_line that
+auto-increments within that namespace, so DB-direct rows coexist with
+Phase 1 org-scanned rows under the existing primary key.
+
+Returns =(:file SYNTHETIC :start-line N :machine M :year Y :date D
+:digest SHA1)=."
+  (unless (and (stringp title) (not (string-empty-p title)))
+    (user-error "anvil-worklog-add: TITLE must be a non-empty string"))
+  (unless (stringp body)
+    (user-error "anvil-worklog-add: BODY must be a string"))
+  (let* ((db (anvil-worklog--db))
+         (date* (or date (anvil-worklog--today-iso)))
+         (machine* (or machine (anvil-worklog--current-machine-token)))
+         (year* (or year (anvil-worklog--year-from-date date*)
+                    (string-to-number (format-time-string "%Y"))))
+         (file (anvil-worklog--synthetic-file machine* year*))
+         (start-line (anvil-worklog--next-start-line db file))
+         (body-trimmed (replace-regexp-in-string "[ \t\n]+\\'" "" body))
+         (digest (anvil-worklog--digest body-trimmed))
+         (now (truncate (float-time))))
+    (sqlite-execute
+     db
+     "INSERT INTO worklog_entry
+        (file, start_line, end_line, machine, year, date,
+         title, body, digest, scanned_at)
+        VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+     (list file start-line machine* year* date*
+           title body-trimmed digest now))
+    (sqlite-execute
+     db
+     "INSERT INTO worklog_fts
+        (file, start_line, machine, date, title, body)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+     (list file start-line machine* date* title body-trimmed))
+    (list :file file
+          :start-line start-line
+          :machine machine*
+          :year year*
+          :date date*
+          :digest digest)))
 
 
 ;;;; --- search / list / get ---------------------------------------------
@@ -648,6 +775,89 @@ ordered by FTS rank (best first).  Empty / whitespace QUERY returns nil."
                    WHERE file = ?1 AND start_line = ?2"
                 (list file start-line))))
     (and rows (anvil-worklog--row->plist (car rows)))))
+
+
+;;;; --- DB → org export (Phase 2, optional) ---------------------------
+
+(defun anvil-worklog--default-export-path (machine year)
+  "Return the conventional `capture/ai-logs-<MACHINE>-<YEAR>.org' path.
+The returned path lives under the first existing directory in
+`anvil-worklog-default-roots'."
+  (let ((dir (cl-some (lambda (root)
+                        (and (file-directory-p root) root))
+                      anvil-worklog-default-roots)))
+    (and dir
+         (expand-file-name
+          (format "ai-logs-%s-%d.org" machine year)
+          dir))))
+
+(defun anvil-worklog--render-org (rows machine year)
+  "Render ROWS (list of plists, sorted ASC by date) as an org buffer
+string for (MACHINE, YEAR).  Inserts `** NOTE 作業ログ <DATE>'
+section headers when the date changes, and one `*** MEMO AI:'
+heading per row."
+  (let ((header (format "#+title: AI 作業ログ %d (%s)\n#+date: %d-01-01\n#+startup: overview\n\nClaude による作業ログ (anvil-worklog DB → org export)。\n"
+                        year machine year))
+        (current-date nil)
+        (buf (generate-new-buffer " *anvil-worklog-export*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (insert header)
+          (dolist (row rows)
+            (let ((date (plist-get row :date))
+                  (title (plist-get row :title))
+                  (body (plist-get row :body)))
+              (unless (equal date current-date)
+                (insert (format "\n** NOTE 作業ログ <%s>\n" date))
+                (setq current-date date))
+              (insert (format "*** MEMO AI: %s <%s>\n" title date))
+              (when (and (stringp body) (not (string-empty-p body)))
+                (insert body)
+                (unless (string-suffix-p "\n" body)
+                  (insert "\n")))))
+          (buffer-substring-no-properties (point-min) (point-max)))
+      (kill-buffer buf))))
+
+;;;###autoload
+(cl-defun anvil-worklog-export-org (&key path machine year since until)
+  "Export worklog entries to an org file (DB → org, one-way).
+
+MACHINE and YEAR are required; SINCE / UNTIL clip by date.  PATH
+defaults to the conventional
+`capture/ai-logs-<MACHINE>-<YEAR>.org' under the first existing
+`anvil-worklog-default-roots' directory.
+
+Existing PATH is overwritten — this is a snapshot, not an append.
+Returns =(:path PATH :entries N)=."
+  (unless machine
+    (user-error "anvil-worklog-export-org: :machine is required"))
+  (unless year
+    (user-error "anvil-worklog-export-org: :year is required"))
+  (let* ((db (anvil-worklog--db))
+         (where (list "machine = ?" "year = ?"))
+         (args (list machine year)))
+    (when (and since (not (string-empty-p since)))
+      (push "date >= ?" where) (push since args))
+    (when (and until (not (string-empty-p until)))
+      (push "date <= ?" where) (push until args))
+    (let* ((sql (concat
+                 "SELECT file, start_line, end_line, machine, year,
+                         date, title, body, digest
+                    FROM worklog_entry
+                    WHERE " (mapconcat #'identity (nreverse where) " AND ")
+                 " ORDER BY date ASC, start_line ASC"))
+           (rows (mapcar #'anvil-worklog--row->plist
+                         (sqlite-select db sql (nreverse args))))
+           (resolved-path (or path
+                              (anvil-worklog--default-export-path machine year)))
+           (content (anvil-worklog--render-org rows machine year)))
+      (unless resolved-path
+        (user-error "anvil-worklog-export-org: no PATH and no default root exists"))
+      (make-directory (file-name-directory resolved-path) t)
+      (with-temp-file resolved-path
+        (let ((coding-system-for-write 'utf-8))
+          (insert content)))
+      (list :path resolved-path :entries (length rows)))))
 
 
 ;;;; --- MCP wrappers ----------------------------------------------------
@@ -754,6 +964,50 @@ Returns =(:entry PLIST-OR-NIL)=."
           (entry (and file sl (anvil-worklog-get file sl))))
      (list :entry entry))))
 
+(defun anvil-worklog--tool-add (title body &optional date machine year)
+  "Insert a DB-direct worklog entry (Phase 2 write path).
+
+MCP Parameters:
+  title   - Required heading text (e.g. `anvil-worklog Phase 2 着地ログ').
+  body    - Required body block (org-formatted text; embedded newlines
+            and `**' subsections are kept verbatim).
+  date    - Optional ISO YYYY-MM-DD (default: today).
+  machine - Optional `<platform>-<host>' override (default:
+            `anvil-worklog-platform' + `system-name').
+  year    - Optional 4-digit year (default: derived from DATE).
+
+Returns =(:file SYNTHETIC :start-line N :machine M :year Y :date D
+:digest SHA1)=."
+  (anvil-server-with-error-handling
+   (anvil-worklog-add
+    (or title "")
+    (or body "")
+    :date (anvil-worklog--coerce-string date)
+    :machine (anvil-worklog--coerce-string machine)
+    :year (anvil-worklog--coerce-int year nil))))
+
+(defun anvil-worklog--tool-export-org (machine year &optional path since until)
+  "Export worklog entries for (MACHINE, YEAR) to an org file.
+
+MCP Parameters:
+  machine - Required `<platform>-<host>' token (equality filter).
+  year    - Required 4-digit year.
+  path    - Optional output path (default:
+            `<roots>/capture/ai-logs-<MACHINE>-<YEAR>.org').
+  since   - Optional ISO date lower bound.
+  until   - Optional ISO date upper bound.
+
+Existing path is overwritten — this is a snapshot, not an append.
+Returns =(:path PATH :entries N)=."
+  (anvil-server-with-error-handling
+   (let* ((m (anvil-worklog--coerce-string machine))
+          (y (anvil-worklog--coerce-int year nil))
+          (p (anvil-worklog--coerce-string path))
+          (s (anvil-worklog--coerce-string since))
+          (u (anvil-worklog--coerce-string until)))
+     (anvil-worklog-export-org
+      :machine m :year y :path p :since s :until u))))
+
 
 ;;;; --- module lifecycle ------------------------------------------------
 
@@ -809,7 +1063,37 @@ this to answer 'what did I do last week' style queries."
 key.  Pair with `worklog-search' / `worklog-list' (which return the
 key) when a downstream tool needs the full body without re-parsing
 the source org."
-     :read-only t))
+     :read-only t)
+
+    (,(anvil-server-encode-handler #'anvil-worklog--tool-add)
+     :id "worklog-add"
+     :intent '(worklog)
+     :layer 'workflow
+     :description
+     "Phase 2 DB-direct write path — insert a `*** MEMO AI:' entry
+straight into the SQLite index without touching the org file.  Used
+as the primary write API in place of editing capture/ai-logs-*.org.
+Required: `title', `body'.  Optional: `date' (default today),
+`machine' (default `<platform>-<host>'), `year' (default derived
+from date).  Body is stored verbatim and indexed in FTS5 immediately,
+so `worklog-search' returns the new row in the same session.
+Returns the synthetic (file, start_line) key so the caller can fetch
+the row back via `worklog-get'.")
+
+    (,(anvil-server-encode-handler #'anvil-worklog--tool-export-org)
+     :id "worklog-export-org"
+     :intent '(worklog admin)
+     :layer 'workflow
+     :description
+     "Phase 2 optional: render worklog entries for one (machine, year)
+as an org file (`** NOTE 作業ログ <DATE>' + `*** MEMO AI:' tree).
+DB-direct (worklog-add) and org-scanned rows are merged in date order.
+Caller-driven — no automatic hook / cron writes through this tool.
+Used to keep a human-readable git snapshot of the SQLite index when
+desired.  Required: `machine', `year'.  Optional: `path' (default:
+capture/ai-logs-<machine>-<year>.org under the first existing
+`anvil-worklog-default-roots' entry), `since' / `until' to clip the
+date range.  Existing path is overwritten."))
   "Spec list consumed by `anvil-server-register-tools'.")
 
 (defun anvil-worklog--register-tools ()
