@@ -535,8 +535,19 @@ Resets the per-lane dispatch indices."
 
 ;;; Worker lifecycle
 
+(defun anvil-worker--emacsclient-server-args (server-file)
+  "Return the `emacsclient' option list to address SERVER-FILE.
+Uses `-f' (TCP authentication file) when `server-use-tcp' is
+non-nil, and `-s' (Unix socket name) otherwise.  Required because
+emacsclient on Emacs.app / Emacs 31 enforces this distinction —
+passing `-f' to a Unix socket fails with \"error accessing server
+file\" (issue #16)."
+  (if server-use-tcp
+      (list "-f" server-file)
+    (list "-s" server-file)))
+
 (defun anvil-worker--probe-emacsclient (server-file)
-  "Return non-nil if `emacsclient -f SERVER-FILE -e t' exits 0 in time.
+  "Return non-nil if `emacsclient' liveness probe on SERVER-FILE exits 0 in time.
 The probe is run asynchronously via `make-process' and hard-killed
 after `anvil-worker-alive-check-timeout' seconds.  This prevents a
 stale SERVER-FILE pointing at a reused TCP port from blocking the
@@ -545,7 +556,10 @@ caller indefinitely."
          (proc (make-process
                 :name "anvil-worker-probe"
                 :buffer buf
-                :command (list "emacsclient" "-f" server-file "-e" "t")
+                :command (append (list "emacsclient")
+                                 (anvil-worker--emacsclient-server-args
+                                  server-file)
+                                 (list "-e" "t"))
                 :noquery t
                 :connection-type 'pipe))
          (deadline (+ (float-time) anvil-worker-alive-check-timeout))
@@ -621,8 +635,10 @@ silently and the expressions are simply not sent."
     (let ((server-file (plist-get worker :server-file))
           (sent '()))
       (dolist (expr anvil-worker-batch-warmup-expressions)
-        (call-process "emacsclient" nil 0 nil
-                      "-n" "-f" server-file "-e" expr)
+        (apply #'call-process "emacsclient" nil 0 nil
+               "-n"
+               (append (anvil-worker--emacsclient-server-args server-file)
+                       (list "-e" expr)))
         (push expr sent))
       (anvil-worker--log
        'warmup
@@ -725,9 +741,10 @@ while four Emacs daemons are starting up."
    (lambda (worker)
      (when (anvil-worker--worker-alive-p worker)
        (ignore-errors
-         (call-process "emacsclient" nil nil nil
-                       "-f" (plist-get worker :server-file)
-                       "-e" "(kill-emacs)"))
+         (apply #'call-process "emacsclient" nil nil nil
+                (append (anvil-worker--emacsclient-server-args
+                         (plist-get worker :server-file))
+                        (list "-e" "(kill-emacs)"))))
        (anvil-worker--log 'killed (plist-get worker :name)))))
   (message "Anvil worker pool: all workers killed"))
 
@@ -892,11 +909,12 @@ Records per-call latency into `anvil-worker--metrics-latency'."
          (t0 (float-time))
          t1 t-end)
     (with-current-buffer buf (erase-buffer))
-    (let* ((proc (start-process
-                  "anvil-worker-call" buf
-                  "emacsclient"
-                  "-f" server-file
-                  "-e" expression)))
+    (let* ((proc (apply #'start-process
+                        "anvil-worker-call" buf
+                        "emacsclient"
+                        (append (anvil-worker--emacsclient-server-args
+                                 server-file)
+                                (list "-e" expression)))))
       (setq t1 (float-time))
       (set-process-query-on-exit-flag proc nil)
       (while (and (process-live-p proc)

@@ -340,15 +340,38 @@ Disable health timer + spawning so no real subprocesses start."
                (lambda (&rest args) (push args recorded) 0))
               ((symbol-function 'anvil-worker--log)
                (lambda (&rest _) nil)))
-      (let ((sent (anvil-worker--send-warmup worker)))
+      (let* ((server-use-tcp nil)
+             (sent (anvil-worker--send-warmup worker)))
         (should (= 2 (length sent)))
         (should (= 2 (length recorded)))
-        ;; Every dispatch goes through emacsclient -n -f SERVER-FILE -e EXPR.
+        ;; Unix socket path: emacsclient -n -s SERVER-FILE -e EXPR.
+        (dolist (call recorded)
+          (should (equal "emacsclient" (nth 0 call)))
+          (should (member "-n" call))
+          (should (member "-s" call))
+          (should-not (member "-f" call))
+          (should (member "/tmp/sf" call))))
+      (setq recorded '())
+      (let* ((server-use-tcp t)
+             (sent (anvil-worker--send-warmup worker)))
+        (should (= 2 (length sent)))
+        (should (= 2 (length recorded)))
+        ;; TCP auth-file path: emacsclient -n -f SERVER-FILE -e EXPR.
         (dolist (call recorded)
           (should (equal "emacsclient" (nth 0 call)))
           (should (member "-n" call))
           (should (member "-f" call))
+          (should-not (member "-s" call))
           (should (member "/tmp/sf" call)))))))
+
+(ert-deftest anvil-worker-test-emacsclient-server-args-tcp-vs-socket ()
+  "`anvil-worker--emacsclient-server-args' picks `-s' for Unix sockets, `-f' for TCP."
+  (let ((server-use-tcp nil))
+    (should (equal '("-s" "/tmp/sf")
+                   (anvil-worker--emacsclient-server-args "/tmp/sf"))))
+  (let ((server-use-tcp t))
+    (should (equal '("-f" "/tmp/sf")
+                   (anvil-worker--emacsclient-server-args "/tmp/sf")))))
 
 (ert-deftest anvil-worker-test-maybe-schedule-warmup-only-batch ()
   "Read- and write-lane spawns must NOT trigger warmup scheduling."
