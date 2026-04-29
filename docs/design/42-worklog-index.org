@@ -1,0 +1,252 @@
+#+title: anvil-worklog — AI 作業ログ org → SQLite index (per-machine logs)
+#+date: 2026-04-29
+#+startup: overview
+
+* STATUS
+
+| Phase   | Scope                                              | State          | Estimate |
+|---------+----------------------------------------------------+----------------+----------|
+| 1       | read-only scan + search + list MCP tools + ERT     | DRAFT (本書)   | 4–6h     |
+| 2       | write helper (=anvil-worklog-append-memo=)         | not started    | 2–3h     |
+| 3       | bridge integration (=anvil-memory-bridge= 経由公開)| deferred       | —        |
+
+** Why a separate module / DB
+
+- ~capture/ai-logs-<platform>-<hostname>-YYYY.org~ は Claude 専用の append-only ログ。
+  user は触らず、Linux / Windows で物理的に分離した別ファイルに書く。
+- 既存の anvil-memory は「.md 横断知識ベース (永続)」が責務。worklog は
+  「時系列 / machine 別の作業実績ログ」で、prune ロジック・ranking 概念
+  (=decay-score=, =validity-prior= 等) も全く別物。
+- 同じ DB に同居させると schema が肥大化し migrations が癒着する。
+  別 DB (=Notes/.anvil-worklog/anvil-worklog-index.db=) で独立させる。
+- ファイル本体 (org) は今まで通り canonical。SQLite は scan で再生成可能な
+  index にすぎない (anvil-memory と同パターン)。
+
+** Non-goals
+
+- org → SQLite の双方向同期はしない。書き込みは Phase 2 の helper でも
+  「org に append する」のが先で、index は scan で追従する。
+- user 編集を許す journals-*.org / todo.org は対象外 — 触れない。
+- 全文表示・editor integration は対象外 (Phase 3 で bridge 経由検討)。
+
+* Phase 1 — read-only scan + MCP search/list
+
+** Source format (既存、変更しない)
+
+#+begin_src org
+,#+title: AI 作業ログ 2026 (Linux/debian)
+,#+date: 2026-01-01
+
+,** NOTE 作業ログ <2026-04-20 Mon>
+,*** MEMO AI: 案件名 <2026-04-20 Mon>
+,**** 実施内容
+,- ...
+,**** 成果物
+,- ...
+,**** 次のアクション
+,- ...
+
+,*** MEMO AI: 別の案件 <2026-04-20 Mon>
+... 同上
+#+end_src
+
+抽出単位は ~*** MEMO AI: <title> <date>~ section (level-3) 1 つ。
+date は heading の inactive-timestamp、または親 ~** NOTE 作業ログ <date>~
+からの fallback (level-3 に date が無い場合に備える)。
+
+** Filename convention
+
+~capture/ai-logs-<platform>-<hostname>-<year>.org~
+
+例:
+- ~capture/ai-logs-linux-debian-2026.org~ → machine = =linux-debian=, year = 2026
+- ~capture/ai-logs-windows-ThinkPad-E14-Gen5-2026.org~ → machine = =windows-ThinkPad-E14-Gen5=, year = 2026
+
+machine は filename から抽出する正規表現で得る:
+~^ai-logs-\\(.+\\)-\\([0-9]\\{4\\}\\)\\.org$~
+
+** SQLite schema
+
+#+begin_src sql
+CREATE TABLE IF NOT EXISTS worklog_entry (
+  file        TEXT    NOT NULL,
+  start_line  INTEGER NOT NULL,
+  end_line    INTEGER NOT NULL,
+  machine     TEXT    NOT NULL,
+  year        INTEGER NOT NULL,
+  date        TEXT    NOT NULL,            -- ISO "YYYY-MM-DD"
+  title       TEXT    NOT NULL,
+  body        TEXT    NOT NULL,
+  digest      TEXT    NOT NULL,            -- sha1(body), used for upsert
+  scanned_at  INTEGER NOT NULL,
+  PRIMARY KEY (file, start_line)
+);
+
+CREATE INDEX IF NOT EXISTS worklog_entry_date_idx
+  ON worklog_entry(date);
+
+CREATE INDEX IF NOT EXISTS worklog_entry_machine_idx
+  ON worklog_entry(machine);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS worklog_fts
+  USING fts5(file UNINDEXED, start_line UNINDEXED,
+             machine UNINDEXED, date UNINDEXED,
+             title, body, tokenize='trigram');
+#+end_src
+
+CJK substring が引きたいので tokenize='trigram' を default。
+SQLite が trigram 非対応だった場合は anvil-memory と同じく unicode61 に fallback。
+
+** DB path resolver (anvil-memory と同型)
+
+順序:
+1. ~ANVIL_WORKLOG_DB~ env (set されていれば最優先)
+2. =anvil-worklog-db-path= が default 以外に customize されていればそれ
+3. =anvil-worklog-shared-db-roots= の各 root 配下に
+   =.anvil-worklog/anvil-worklog-index.db= が **既に存在** すればそれ
+4. default: =<user-emacs-directory>/anvil-worklog-index.db=
+
+`(anvil-worklog-effective-db-path)` で実効パスを返す public API を提供。
+
+** Scan algorithm
+
+- 各 root (default = =capture/= ディレクトリ) を =directory-files= で歩く
+- ファイル名の正規表現 ~ai-logs-.+-[0-9]{4}\\.org$~ にマッチするものだけ対象
+- ファイル毎に temp-buffer で UTF-8 で開き、=org-mode= に入れず regex 走査
+  - level-3 ~^\\*\\*\\* MEMO AI:~ の position を順に取得
+  - 各 entry の終端は次の同等 level (~^\\*\\*\\* ~) または上位 (~^\\* ~ / ~^\\*\\* ~)
+  - title = 行末の inactive-timestamp 直前まで
+  - date = 行末の =<YYYY-MM-DD ...>= から抽出。失敗時は親 ~** NOTE 作業ログ
+    <DATE>~ から fallback。両方失敗時は entry を skip (warn-only)
+- digest = sha1(body) で upsert: 既存行の digest と一致なら skip、
+  異なれば DELETE + re-INSERT (worklog_fts も同期)
+- 戻り値は plist =(:files N :entries M :inserted I :updated U :unchanged S)=
+
+`anvil-memory-scan` と違い、source ファイル数 = ai-logs-*.org の数だけ
+(普通 1–3 個) なので scan は msec オーダー。
+
+** Public API
+
+| Name                                   | Returns                                                     |
+|----------------------------------------+-------------------------------------------------------------|
+| =anvil-worklog-effective-db-path=      | path string                                                 |
+| =anvil-worklog-scan &optional roots=   | plist counts                                                |
+| =anvil-worklog-prune &optional roots=  | int (rows deleted for missing files)                        |
+| =anvil-worklog-search QUERY &key …=    | list of entry plists (FTS5 matched)                         |
+| =anvil-worklog-list &key …=            | list of entry plists (date DESC)                            |
+| =anvil-worklog-get FILE START-LINE=    | entry plist or nil                                          |
+
+Search / list は共通のフィルタ:
+- =:limit= INT (default 20)
+- =:machine= STRING (filename machine token と equal 比較)
+- =:since= ISO date — 含む
+- =:until= ISO date — 含む
+- =:year= INT
+
+Entry plist の shape:
+=(:file path :start-line N :end-line M :machine "linux-debian"
+  :year 2026 :date "2026-04-29" :title "anvil-worklog Phase 1"
+  :body "..." :digest "...")=
+
+** MCP tools
+
+| Tool name        | Intent             | Layer    | Maps to                  |
+|------------------+--------------------+----------+--------------------------|
+| =worklog-scan=   | =worklog admin=    | workflow | =anvil-worklog-scan=     |
+| =worklog-prune=  | =worklog admin=    | workflow | =anvil-worklog-prune=    |
+| =worklog-search= | =worklog query=    | workflow | =anvil-worklog-search=   |
+| =worklog-list=   | =worklog query=    | workflow | =anvil-worklog-list=     |
+| =worklog-get=    | =worklog query=    | workflow | =anvil-worklog-get=      |
+
+Server id = =emacs-eval= (anvil-memory と同じ MCP server)。
+
+** Test surface (Phase 1)
+
+| Test                                        | Verifies                                                  |
+|---------------------------------------------+-----------------------------------------------------------|
+| =worklog-scan-detects-memo-entries=         | level-3 MEMO AI block を 1 entry / 1 行範囲で抽出         |
+| =worklog-scan-fallback-date-from-parent=    | level-3 に date が無い時 ** NOTE 作業ログ <DATE> を継承   |
+| =worklog-scan-skips-unrelated-org=          | filename が ~ai-logs-*-YYYY.org~ 以外なら無視             |
+| =worklog-scan-machine-token-extraction=     | filename → machine = "linux-debian", "windows-T..."       |
+| =worklog-scan-upsert-digest-skip=           | 同 digest で 2 回 scan しても重複 row 増加無し            |
+| =worklog-scan-upsert-on-body-change=        | body 変更時に digest 更新 + FTS row が同期                |
+| =worklog-search-fts-matches=                | trigram で本文部分一致 hit                                |
+| =worklog-search-machine-filter=             | =:machine= で hit を限定                                  |
+| =worklog-search-since-until-filter=         | =:since= / =:until= で日付絞込                            |
+| =worklog-list-recent-N-by-date-desc=        | 直近 N 件、date DESC ordering                             |
+| =worklog-prune-removes-missing-file-rows=   | 元ファイル削除後 prune で row + FTS 削除                  |
+| =worklog-effective-db-path-shared-root=     | shared-db-roots での auto-detect                          |
+| =worklog-effective-db-path-env-wins=        | =ANVIL_WORKLOG_DB= が他より優先                           |
+
+合計: 13 ERT 想定。
+
+** Schema impact
+
+新規 DB のため migration 不要。既存 anvil-memory DB には触らない。
+
+** Risks
+
+- *R1: 巨大 ai-logs ファイルでの scan コスト*: 14000 行を超える linux-debian
+  ログでも regex 走査は msec オーダー (実測予定)。万一遅ければ
+  =mtime + size= を file ごとに記録して skip する optimization を Phase 1.5 で追加。
+- *R2: org timestamp 形式バリエーション*: =<2026-04-29 Wed>= / =<2026-04-29>=
+  / =<2026-04-29 Wed 12:00>= の 3 形式を許容。曜日や時刻は捨てて ISO date のみ抽出。
+- *R3: machine 衝突*: 異なる物理マシンで同一 hostname を使うと混ざるが、
+  CLAUDE.md の命名規約 (=hostname -s=) で実用的に衝突しない。明示衝突検出は不要。
+- *R4: digest 衝突 (sha1 collision)*: 実用上ゼロリスク扱い。
+
+* Phase 2 — write helper (deferred)
+
+`(anvil-worklog-append-memo TITLE BODY &key date file)` で
+~** NOTE 作業ログ <DATE>~ section の自動探索 + 無ければ作成 + ~*** MEMO AI:~ 追記、
+そのあと scan を 1 ファイル分だけ呼ぶ。CLAUDE.md の作業ログ規約を機械的に守れる。
+
+実装トリガー: Phase 1 が安定して 2 週間程度運用して使い勝手が固まってから。
+
+* Phase 3 — bridge integration (deferred)
+
+Doc 41 の =anvil-memory-bridge= が SHIPPED 後、=GET /worklog/search= /
+=GET /worklog/list= を生やして browser extension からの照会を可能に。
+
+別 DB なので bridge の resolver も =anvil-worklog-effective-db-path= を呼んで
+両 DB を独立に open する。
+
+* Cross-PC sharing
+
+Phase 2A の anvil-memory パターンと同型:
+
+#+begin_src elisp
+;; init.el (Linux + Windows 共通)
+(with-eval-after-load 'anvil-worklog
+  (setq anvil-worklog-shared-db-roots
+        '("~/Cowork/Notes")))   ; or "C:/path/to/Notes" on Windows
+#+end_src
+
+DB は git tracked file =Notes/.anvil-worklog/anvil-worklog-index.db= に置く。
+WAL checkpoint を commit 前に必ず実行 (CLAUDE.md の anvil-memory 規約と同じ)。
+
+* Implementation order
+
+1. =defgroup= + defcustoms (db-path / shared-db-roots / roots) + resolver
+2. =defun anvil-worklog--open / --close / --db= + =--ensure-schema=
+3. =defun anvil-worklog--parse-file= (regex scanner, returns entries list)
+4. =defun anvil-worklog-scan / -prune / -list / -search / -get= (public API)
+5. =defun anvil-worklog--tool-*= MCP wrappers + =anvil-worklog--tool-specs=
+   + =anvil-worklog-enable / -disable=
+6. =tests/anvil-worklog-test.el= — 13 ERT
+7. =bin/regenerate-claude-worklog-index.sh= — SessionStart hook
+8. CLAUDE.md update + README.org update
+
+* References
+
+- =Notes/CLAUDE.md= 「作業ログ記録」 section
+- =anvil-memory.el= = anvil-memory-* 全体 (DB path / scan / FTS5 patterns)
+- =bin/regenerate-claude-memory-index.sh= = SessionStart hook 雛形
+- =docs/design/29-memory-engine.org= = 関連設計書
+- =docs/design/41-memory-bridge.org= = Phase 3 連携先
+
+* TODO [0/3]
+
+- [ ] Phase 1 実装
+- [ ] live smoke (linux + windows ai-logs を実 scan、件数確認)
+- [ ] CLAUDE.md に「作業ログ検索は worklog-search MCP tool 経由」を追記
