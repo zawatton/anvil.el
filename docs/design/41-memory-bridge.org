@@ -1,0 +1,409 @@
+#+title: anvil-memory-bridge — HTTP API + cross-AI extensions + mobile
+#+date: 2026-04-29
+#+author: zawatton
+#+property: status DRAFT
+#+property: scope GENERIC
+
+* STATUS
+  :PROPERTIES:
+  :ID:       4f1b9c8a-2e3d-4a5b-9c6e-1a2b3c4d5e6f
+  :END:
+~Phase 0 DRAFT~ (2026-04-29、Phase 2C of the memory cross-PC sharing
+roadmap that started with Phases 1 / 2A / 2B).
+
+This document describes a network bridge in front of =anvil-memory= so
+that:
+
+1. Multiple AI agents (Claude Code, ChatGPT browser, Gemini browser,
+   Codex CLI, etc.) on the *same machine* can read and write a single
+   shared memory index — not just Claude Code through MCP.
+2. Multiple machines (Linux daemon ↔ Windows daemon, two laptops, a
+   server + thin clients) can converge on the same row set without
+   relying on filesystem-level git pulls (which currently work but are
+   manual and binary-merge prone).
+3. Mobile clients can query and append rows from a phone / tablet
+   without running a full Emacs.
+
+No Phase here is implemented yet.  Phases 1 and 2 are the cheapest
+pieces with clear value; Phase 3 and 4 are deferred until 1 / 2 are
+proven.  The whole document is technical only — payment, billing, or
+service-tier discussion belongs outside the anvil.el repo (see the
+memory-side strategy notes).
+
+* Motivation
+
+Phase 2A landed cross-PC sharing through a git-tracked SQLite file
+(=Notes/.anvil-memory/anvil-memory-index.db=).  This is fast and
+zero-infrastructure but has three known limits:
+
+- *Liveness:* a row written on Linux is invisible on Windows until
+  =git push= + =git pull= run.  Same-day collaboration lags.
+- *Conflict cost:* the SQLite file is binary; concurrent writes on
+  two machines produce a binary merge conflict that the
+  =git checkout --theirs / --ours + memory-scan= recipe resolves only
+  at the cost of losing one side's metadata.
+- *Single-client assumption:* the SQLite handle inside the Emacs
+  daemon is opened with default flags.  Multi-process readers are OK,
+  but multi-process *writers* (a Codex CLI on the same box that wants
+  to add a row directly) collide with the daemon's connection.
+
+A bridge process — a tiny HTTP server in front of =anvil-memory--db=
+— solves all three: it serializes writes through one Emacs daemon,
+streams events to other clients, and gives non-Emacs callers (browsers,
+phones) an HTTP API instead of MCP-over-stdio.
+
+The bridge does *not* replace MCP.  Claude Code keeps its existing
+=memory-search= / =memory-scan= MCP path; the HTTP API is an additional
+surface for clients that cannot speak MCP.
+
+* Non-goals
+
+- *Replacing MCP for Claude Code.*  MCP stays as the primary surface
+  inside an Emacs daemon.  HTTP is for *out-of-Emacs* callers.
+- *Becoming a generic key-value store.*  Schema stays anvil-memory's
+  (memory_meta + memory_body_fts).  A row is always a memory entry.
+- *Replacing the SQLite-on-disk substrate.*  The daemon still owns
+  the DB file.  HTTP requests are turned into the same elisp calls
+  =anvil-memory-search= / =anvil-memory-scan= / =anvil-memory-prune=
+  the MCP path uses.
+- *Distributed consensus.*  No Raft, no CRDT.  One daemon = one
+  authoritative index.  Other daemons are read-replicas (Phase 2c) or
+  cross-machine clients (Phase 1).
+
+* Phased roadmap (no impl, just design)
+
+** Phase 1 — read-only HTTP API (~5–8 hours work)
+
+Goal: any localhost HTTP client can issue =GET /memory/search?q=…=
+and =GET /memory/list?type=…= and get JSON back.
+
+*** Endpoints
+
+#+begin_example
+GET  /memory/search?q=<query>&type=<feedback|project|user|reference>&limit=<n>
+GET  /memory/list?type=<...>&with_decay=true&sort=decay
+GET  /memory/get/<basename>            # body of one .md
+GET  /memory/health                    # {:db <path>, :rows N, :uptime-sec N}
+GET  /memory/effective-db-path
+#+end_example
+
+Bodies are JSON (=application/json=, UTF-8).  Each row is a
+straight serialisation of the elisp plist returned by
+=anvil-memory-list= / =anvil-memory-search= today, with =:keyword=
+keys converted to bare JSON keys (=file=, =type=, =snippet=, =rank=,
+=decay-score=, …).  Numeric fields are JSON numbers, strings are
+JSON strings, =nil= becomes JSON =null=.
+
+*** Implementation notes
+
+- Reuse =anvil-http= server bits (Doc 09) as the front; the
+  search / list handler is just =(anvil-server-encode-handler
+  #'anvil-memory--tool-search)= flipped to take query-string args
+  instead of MCP-shaped args.
+- Bind to =127.0.0.1= only.  Phase 1 has no auth; localhost is the
+  trust boundary.  Phase 2 adds auth so non-localhost binding
+  becomes safe.
+- Port = =anvil-memory-bridge-port=, default 8730 (one above the
+  existing serve port).  Configurable defcustom.
+- =M-x anvil-memory-bridge-start= / =-stop= for manual control.
+  =M-x anvil-memory-bridge-status= shows port + binding.
+- Existing =anvil-memory-serve= command (the HTML browser) is
+  unrelated; this is the JSON API.
+
+*** Test surface
+
+- ERT: hit each endpoint with =url-retrieve-synchronously=, decode
+  JSON, assert shapes.  6–8 tests covers it.
+- Smoke: =curl http://127.0.0.1:8730/memory/search?q=anvil-disk |
+  jq '.[].file'= from a shell.
+
+*** Out of scope for Phase 1
+
+- Writes (POST/PUT/DELETE).  Read-only Phase 1 cannot accidentally
+  corrupt the index.
+- TLS.  Localhost-only.
+- Auth.  Localhost-only.
+- Streaming / SSE.  Pull-based polling is fine for a 1-machine MVP.
+
+** Phase 2 — write + auth + cross-machine (~12–20 hours work)
+
+Goal: a second machine on the LAN (or over Tailscale / a tunnel)
+can write rows that show up live on the daemon owning the DB.
+
+*** New endpoints
+
+#+begin_example
+POST /memory/save        body = {file, type, body, ttl_policy?}
+PUT  /memory/access      body = {file}                  # bumps access_count
+POST /memory/scan        body = {roots?}                # invokes anvil-memory-scan
+POST /memory/prune       body = {roots?}                # invokes anvil-memory-prune
+DELETE /memory/<basename>                               # removes row + .md
+GET  /memory/events?since=<id>                          # SSE stream of writes
+#+end_example
+
+*** Auth model
+
+- Symmetric token stored in =~/.config/anvil/memory-bridge.token=
+  (auto-generated on first start, 256-bit random).
+- Sent as =Authorization: Bearer <token>= on every non-/health
+  endpoint.  =/health= is anonymous so monitoring scripts work.
+- Token rotation: =M-x anvil-memory-bridge-rotate-token=.  All
+  active clients re-authenticate.
+- For *cross-machine* deployments the operator copies the token
+  file to each client (Tailscale + scp, or any OOB channel).  The
+  bridge does not bootstrap auth itself.
+
+*** Binding model
+
+- Default still =127.0.0.1=.  =anvil-memory-bridge-bind= defcustom
+  controls the bind address.
+- Tailscale users set =bind = "100.x.y.z"=.  Lan users typically
+  set =bind = "0.0.0.0"= and rely on a firewall.
+- TLS is *not* in the bridge.  Operators terminate TLS in nginx /
+  Caddy / Tailscale Funnel and reverse-proxy to the bridge.  This
+  keeps the elisp surface tiny and hands TLS to a hardened front.
+
+*** Conflict resolution
+
+Phase 2 is single-writer: only the daemon that owns the DB writes.
+Other machines POST to that daemon over HTTP.  No two-writer
+conflict can exist because there is one writer.
+
+If a user runs *two* daemons each owning their own
+=Notes/.anvil-memory/anvil-memory-index.db= (i.e. two independent
+Notes checkouts), Phase 2A's git-merge resolution still applies —
+the bridge does not invent a sync protocol.  Phase 2c below adds an
+optional =read-replica= mode for that case.
+
+*** Phase 2c — read-replicas (optional)
+
+A second daemon can be configured to *follow* a primary daemon's
+event stream (=GET /memory/events?since=…= over SSE) and apply
+those events to its local DB.  Useful when:
+
+- A laptop wants a fast local copy of memory but does not want to
+  be the writer (write-through HTTP to the desktop primary).
+- An offline-capable phone-side cache wants to converge on the
+  primary on reconnect.
+
+Replicas are read-only locally; user writes round-trip through the
+primary.  This is *not* multi-master replication and explicitly
+forbids it.
+
+** Phase 3 — browser extensions (~ unknown, weeks)
+
+Goal: a Claude.ai chat, ChatGPT chat, or Gemini chat can read /
+write the same memory index by hitting the local bridge from the
+browser.
+
+*** Architecture
+
+#+begin_example
+[browser tab: claude.ai]
+        |
+        v  fetch("http://127.0.0.1:8730/memory/search?q=…")
+[anvil-memory-bridge in the local Emacs daemon]
+        |
+        v  same-process elisp calls
+[anvil-memory--db (SQLite)]
+#+end_example
+
+*** Per-AI shim
+
+Each provider gets a thin browser extension (Manifest V3) that:
+
+1. Reads the chat textarea before a user sends.
+2. Issues =GET /memory/search?q=<keywords>= with a budget (top 5
+   rows).
+3. Prefixes the user's prompt with a compact memory excerpt block
+   (=<memory>{title}: {snippet}</memory>=).
+4. After the model replies, optionally captures stable facts and
+   issues =POST /memory/save= so they land in the same index Claude
+   Code's MCP path uses.
+
+The extension has no model-side intelligence — that lives in the
+chat itself.  The extension is just a courier for memory <-> browser.
+
+*** CORS
+
+The bridge needs to allow:
+
+#+begin_example
+Access-Control-Allow-Origin: https://claude.ai
+Access-Control-Allow-Origin: https://chatgpt.com
+Access-Control-Allow-Origin: https://gemini.google.com
+#+end_example
+
+(Plus =OPTIONS= preflight + the bearer-token header.)  The exact
+origin list is a defcustom so users can add Aider / Cline / Cursor
+when they ship.
+
+*** Extension distribution
+
+- v0: side-load instructions (=chrome://extensions= → "Load
+  unpacked").
+- v0.1: signed packages on Chrome Web Store / Firefox AMO if the
+  shipping ergonomics warrant it.
+
+Extension code lives in =extensions/= under the anvil.el repo,
+versioned alongside the bridge protocol it talks to.
+
+*** Phase 3 risks
+
+- Browser sandbox restrictions on connecting to =127.0.0.1= —
+  Chrome currently allows it but each major version changes the
+  rules.  Plan: track =web.dev= "Local network access" updates;
+  fall back to =wss://= via stunnel + a CA-signed local cert if
+  raw fetch is killed.
+- Extension review delays.  Side-load remains the default.
+
+** Phase 4 — mobile (~ unknown, biggest unknown)
+
+Goal: a phone can issue the same =GET /memory/search= and =POST
+/memory/save= against the user's home daemon while on cellular
+data, and replay deferred writes on reconnect.
+
+*** Two practical patterns
+
+**** Pattern A — phone tethered through Tailscale
+
+If the user already runs Tailscale on their phone + their desktop,
+the bridge bound to =100.x.y.z= is reachable from the phone the
+same way a LAN client reaches it.  No new server software needed.
+
+The mobile *app* is then a thin native or Capacitor / Tauri-mobile
+shell that:
+
+1. Lets the user paste / type a memory entry.
+2. Fires =POST /memory/save=.
+3. Lets the user search via =GET /memory/search=.
+
+This is the cheapest Phase 4 path and is fully covered by Phase 2's
+auth / binding model.
+
+**** Pattern B — relay over a public service
+
+If the user does *not* run Tailscale, a relay server (anvil-memory's
+own hosted endpoint, eventually) terminates HTTPS and tunnels back
+to the home daemon over a long-lived WebSocket the daemon dialed
+out at start-up.  This is harder, has cost, and is explicitly
+out of scope for this design doc.  Mention only — the work is
+deferred until Pattern A's audience asks for it.
+
+*** Mobile-specific concerns
+
+- *Offline writes:* the mobile app should queue =POST /memory/save=
+  in local storage when offline and replay on reconnect.  The
+  bridge is idempotent on =file= primary key, so a duplicate POST
+  during retry is safe.
+- *Battery:* SSE event streams are expensive on cellular.  Phase 4
+  apps poll on user action only, never in the background.
+
+* Schema impact
+
+Phase 1–2 do not change the SQLite schema.  Phase 3–4 may want a
+=memory_event= table to track per-row write history for the SSE
+stream.  Sketch:
+
+#+begin_example
+CREATE TABLE IF NOT EXISTS memory_event (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts          INTEGER NOT NULL,                  -- unix epoch
+  kind        TEXT NOT NULL CHECK (kind IN
+              ('save','prune','access','scan','promote')),
+  file        TEXT NOT NULL,
+  client_id   TEXT                               -- bridge-issued opaque id
+);
+CREATE INDEX IF NOT EXISTS memory_event_ts_idx ON memory_event (ts);
+#+end_example
+
+Decision: introduce =memory_event= in Phase 2 (write API needs it
+for the SSE stream).  Phase 1 lives without it.
+
+* Risks and unresolved questions
+
+** R1 — Multi-daemon write conflicts
+
+If a user mistakenly runs the bridge on two daemons each owning a
+=Notes/.anvil-memory/anvil-memory-index.db=, both will accept POSTs
+and the SQLite files will diverge.  Phase 2A's git-merge recipe is
+the only correct resolution today.
+
+Mitigation: bridge startup checks for *another* anvil-memory-bridge
+on a known port + does =GET /memory/effective-db-path=.  If the
+remote daemon answers and points at the *same* path on disk that
+this daemon does, refuse to start ("another bridge already owns
+this DB").
+
+** R2 — Schema drift across versions
+
+A Phase 3 browser extension built against bridge v0.4 may be
+talking to a v0.5 daemon.  HTTP API needs a version header
+(=anvil-memory-bridge-version: <semver>=) and the extension must
+gate on it.
+
+Decision: every endpoint includes the header in responses; the
+extension reads =/memory/health= once at startup and refuses to
+proceed if the major version differs.
+
+** R3 — Browser CORS / private-network rules
+
+Open question; depends on Chromium / Firefox release pace.
+
+** R4 — Token leakage through curl history / logs
+
+The bearer token in =Authorization: Bearer <…>= can leak through
+shell history (=curl -H "Authorization: Bearer xxx" …=).  The
+bridge logs *never* echo the header value.  Doc the
+=$(cat ~/.config/anvil/memory-bridge.token)= pattern in README
+so users do not paste raw tokens into command lines.
+
+* Test surface (cumulative)
+
+| Phase | new ERT | new smoke | new fixture |
+|-------+---------+-----------+-------------|
+| 1     |       8 | 1 (curl)  |           0 |
+| 2     |      12 | 2         |           1 |
+| 2c    |       6 | 1         |           0 |
+| 3     |       4 | 1         |           1 |
+| 4     |       2 | 0         |           0 |
+
+Phase 1 + 2 should keep =make test-all= within 60s wallclock.
+
+* Implementation order (when impl actually starts)
+
+1. Phase 1 endpoints + ERT (=memory-bridge-phase1=).  Ship to
+   develop, verify against running daemon for 1 week.
+2. Phase 2 auth + write endpoints (=memory-bridge-phase2a=).
+   Ship.
+3. Phase 2 SSE stream + memory_event table (=memory-bridge-phase2b=).
+   Ship.
+4. (Optional) Phase 2c read-replicas — only if the user actually
+   asks.
+5. Phase 3 browser extensions, separate sub-tree under
+   =extensions/=.  Ship behind feature flag.
+6. Phase 4 mobile patterns A / B.  Pattern B is the largest unknown;
+   defer until at least three Phase 1 / 2 users ask for it.
+
+Each phase is an independent feat branch off develop, merged
+=--no-ff= as usual.  No phase merges to master until the design-gate
+condition (all docs SHIPPED) clears.
+
+* References
+
+- Doc 29 — anvil-memory-engine (substrate this bridge fronts)
+- Doc 09 — anvil-http (Phase 1 reuses the server bits)
+- Phase 2A commit =fc7a8ac= — anvil-memory-shared-db-roots resolver
+- Phase 2B commit =85fc9f6= — anvil-memory-prune
+
+* TODO when implementation begins
+
+- [ ] Reserve port 8730 in anvil's port-registry doc (if any) so it
+      does not collide with anvil-orchestrator / anvil-pty-broker.
+- [ ] Decide whether =anvil-memory-bridge= is a separate elisp module
+      (=anvil-memory-bridge.el=) or inlined into =anvil-memory.el=.
+      Current preference: separate file, =anvil-optional-modules= load
+      (so users who do not need the bridge do not pay for it).
+- [ ] Pick a JSON serialiser: =json.el= (built-in) vs the slightly
+      faster =json-rpc.el= path.  Built-in is enough for Phase 1's
+      throughput; revisit only if benchmark says so.
