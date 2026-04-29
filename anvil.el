@@ -115,6 +115,15 @@ These are not loaded by default.  Available modules:
                 `session' (Stop event).  Five MCP tools: compact-
                 estimate / -should-trigger / -snapshot / -restore /
                 -hook.
+- `claude-watchdog' — Detect Claude Code (Anthropic CLI) TUI deadlock
+                via /proc + jsonl mtime polling.  When wchar stops
+                advancing while State=R and the session jsonl goes
+                stale, raises a desktop notification + records the
+                event under `anvil-state' ns=claude-watchdog-events.
+                One MCP tool `anvil-claude-watchdog-recent' for
+                debugging.  Phase 1 = detection only; auto-recovery
+                is deferred to Phase 2.  Linux only (procfs);
+                requires `state' (Doc 40 Phase 1).
 - `http'      — HTTP client via `url-retrieve-synchronously' with a
                 state-backed ETag/TTL cache (Doc 09 Phase 1a)
 - `orchestrator' — Parallel AI CLI dispatcher (claude today, more

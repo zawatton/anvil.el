@@ -1,0 +1,200 @@
+#+title: anvil-claude-watchdog — Detect Claude Code TUI deadlock
+#+date: 2026-04-29
+#+author: zawatton
+#+property: status DRAFT
+#+property: scope GENERIC
+
+* STATUS
+  :PROPERTIES:
+  :ID:       3a4d1ec0-7b5f-4e6a-9b21-9c4d40b6d8c1
+  :END:
+~Phase 1 DRAFT~ (2026-04-29、feat/doc-40-claude-watchdog-phase1)。
+
+*Phase 1 MVP:* Linux procfs + jsonl mtime での Claude Code (Anthropic
+CLI) deadlock 検知 + desktop 通知 + anvil-state event ログ。
+auto-recovery は含めない (false positive リスクのため Phase 2 に分離)。
+
+*Phase 2 (deferred):* =M-x anvil-claude-watchdog-recover= 手動起動の
+recovery コマンド。対象 PID 選択 → 確認 prompt → SIGKILL → tmux pane
+探索 → =claude --resume <session-id>= を Enter なしで stage。
+
+*module placement:* =anvil-optional-modules= (procfs/Linux/SIGKILL/
+tmux 依存のため default 非搭載、opt-in)。
+
+* Motivation
+
+2026-04-29 09:32 JST に user の長期 Claude Code session で完全 hang
+が発生 (詳細は memory =feedback_claude_code_concurrent_mcp_hang.md=)。
+症状:
+
+- Anthropic API stream 受信は継続 (=rchar= 増加)
+- TUI render と jsonl write は完全停止 (=wchar= 静止)
+- =SIGINT= / =SIGTERM= が signal handler に届かない
+  (= JS event loop 自体が固着、callback 配送不能)
+- 唯一の回復手段は =SIGKILL= → =claude --resume <session-id>=
+
+ユーザーは画面が固まったときにそれが「処理中の沈黙」なのか
+「真の hang」なのか判別できず、放置 → 入力消失のリスクが大きい。
+本 module は外部 process supervisor の役を担い、procfs と jsonl
+mtime を 30s 周期で sample して **rchar 増加 + wchar 静止 + State R**
+の確定シグネチャを検知し、desktop 通知で user に判別を促す。
+
+* Goals
+
+1. *検知精度*: false positive を抑える (長 thinking turn の正常な
+   静止と区別)。最低 60s の wchar 連続静止 + jsonl mtime > 120s + State
+   R + CPU > 0% を満たした時のみ確定。
+2. *非介入*: Phase 1 では SIGKILL を自動発行しない。通知のみ。
+3. *観測可能性*: 全イベントを =anvil-state= に永続化、後から
+   再現条件を調査できる。
+4. *軽量*: 30s 周期 + procfs read のみ → CPU/IO 負荷無視可能。
+
+* Non-Goals
+
+- macOS / Windows サポート (procfs 専用、Phase 1 では out of scope)
+- 自動 recovery (Phase 2 で別 PR、user 確認 prompt 必須)
+- claude 以外のプロセス監視 (本 module 名は claude-watchdog)
+
+* Detection algorithm
+
+** Sampling
+
+30 秒周期 (=anvil-claude-watchdog-poll-interval=) で:
+
+1. =pgrep -f 'claude --'= 相当で全 claude PID 列挙
+2. 各 PID について:
+   - =/proc/PID/io= から =rchar=, =wchar=, =syscw= 取得
+   - =/proc/PID/status= から =State= 取得
+   - =/proc/PID/cwd= → project dir を解決
+   - 直近 jsonl ファイル mtime を取得 (cwd-derived project dir 配下)
+3. PID ごとに直前 sample との delta を計算
+
+** Hang verdict
+
+以下 *全て* 真なら =:hang= 判定:
+
+| 条件 | 閾値 (defcustom) |
+|------+------------------|
+| =wchar_delta= が 0 | 60s 連続 (=stagnation-threshold=) |
+| =rchar_delta= が > 0 *or* jsonl mtime age > 閾値 | 120s (=jsonl-staleness=) |
+| =State= が =R= | (running) |
+| CPU 使用率 > 0% | (busy not idle) |
+
+正常な thinking turn は通常 wchar が定期的に増加する (spinner update,
+jsonl partial write) ため 60s 連続静止は強いシグナル。
+
+** State machine
+
+#+begin_example
+  healthy --(wchar=0 30s)--> suspicious
+  suspicious --(wchar++)----> healthy
+  suspicious --(wchar=0 60s + staleness)--> hang
+  hang --(process exits / new PID)--> healthy
+#+end_example
+
+* Actions
+
+** Phase 1 (実装)
+
+- 確定 hang 時:
+  - =notifications-notify= で desktop 通知 (D-Bus)
+  - =anvil-state-set= で event 記録 (ns: =claude-watchdog-events=,
+    TTL: 7 days)
+  - =anvil-claude-watchdog-on-hang-functions= hook 起動
+    (user 拡張可能、e.g. journal 追記、tmux status-line 更新)
+
+** Phase 2 (deferred)
+
+- =M-x anvil-claude-watchdog-recover=:
+  - 確定 hang 中の PID 一覧から 1 つ選択
+  - 確認 prompt: PID NNN を SIGKILL し =claude --resume <id>= を
+    stage しますか?
+  - Yes: =kill -KILL=, tmux pane 探索 (=tmux list-clients=),
+    =tmux send-keys 'claude --resume <session-id>'= (Enter なし)
+  - No: cancel
+
+* Public API
+
+** Customization
+
+- =anvil-claude-watchdog-poll-interval= (default 30s)
+- =anvil-claude-watchdog-stagnation-threshold= (default 60s)
+- =anvil-claude-watchdog-jsonl-staleness= (default 120s)
+- =anvil-claude-watchdog-on-hang-functions= (hook, args =(plist)=)
+- =anvil-claude-watchdog-event-ttl= (default 7 days)
+
+** Commands
+
+- =M-x anvil-claude-watchdog-enable= — register MCP tool + start timer
+- =M-x anvil-claude-watchdog-disable= — stop timer + unregister
+- =M-x anvil-claude-watchdog-status= — show currently watched PIDs
+
+** MCP tool
+
+- =anvil-claude-watchdog-recent= — 直近 N 件の suspicious / hang event
+  を返す (default N=10)。debug + 再現条件調査用。
+
+* Tests
+
+- =tests/anvil-claude-watchdog-test.el=:
+  - heuristic 単体テスト (mock io sample で healthy/suspicious/hang
+    全 branch)
+  - jsonl mtime fallback (mock /proc 不在時)
+  - event ring buffer の TTL 期限切れ
+  - hook 起動の dispatch 確認
+
+* Dependencies
+
+- =anvil-server= (MCP tool registration)
+- =anvil-state= (event log persistence)
+- =notifications= (built-in, D-Bus)
+- procfs (Linux only)
+- =pgrep= / =awk= (coreutils, system available)
+
+* Implementation phases
+
+- Phase 1a: 基本骨格 (sampling + heuristic + 通知) ← 本 PR
+- Phase 1b: hook + MCP tool ← 本 PR
+- Phase 1c (別 PR): State=S 亜種シグネチャ対応 (下記)
+- Phase 2 (別 PR): recovery コマンド (=M-x anvil-claude-watchdog-recover=)
+
+** Phase 1c — State=S 亜種シグネチャ (follow-up)
+
+2026-04-29 10:24 JST に上記 Phase 1 設計後、別の hang variant が
+実測された (memory =feedback_claude_code_concurrent_mcp_hang.md=
+亜種シグネチャ参照)。要旨:
+
+- claude PID itself: =State S=, wchar 微増 (spinner render 分のみ)
+- *MCP server 子プロセス側* (=anvil-stdio.sh= + =emacs --batch=
+  Stage-D headless) が両方 =unix_stream_read_generic= で stdin 待機 +
+  IO 完全停止 (3s 連続 0 delta)
+- 解釈: claude は MCP tool_result 受領後の処理で固着、MCP server は
+  前 response を返し終え次 request を待っている
+
+Phase 1 の heuristic (=State R + wchar=0=) はこれを miss する。
+Phase 1c で追加判定軸:
+
+#+begin_example
+  variant-hang := claude-state in (R, S) AND
+                  spinner-active (jsonl mtime within 30s) AND
+                  for each child PID matching MCP tooling
+                  (anvil-stdio.sh, emacs --batch ...stage-d...,
+                   github-mcp-server, ...):
+                    wchar_delta == 0 AND rchar_delta == 0
+                  for >= 30s
+#+end_example
+
+実装: =anvil-claude-watchdog--list-mcp-children= helper を足し、
+各 child の =/proc/PID/io= も sample。全 child が IO 完全静止 + claude
+spinner 表示中なら =:hang-variant= verdict を立てて同 dispatch flow に
+合流。
+
+* Open questions
+
+- 通知 backend を D-Bus (=notifications-notify=) 固定で良いか?
+  → 後で =anvil-claude-watchdog-notify-function= を customize 可能に
+  すれば tmux status-line / mode-line 等への切替もできる。
+  Phase 1 では D-Bus + hook で十分 (hook 経由で user が拡張)。
+
+- macOS/Windows ports
+  → Phase 1 では Linux 専用。port 要望があれば別 issue。
