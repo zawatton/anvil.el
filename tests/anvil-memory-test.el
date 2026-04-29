@@ -2163,6 +2163,76 @@ sentinel does not exist on disk."
       (should (plist-get res :written)))))
 
 
+
+;;;; --- Phase 5: memory-get (read-side completion) -----------------------
+
+(ert-deftest anvil-memory-test/get-by-basename-db-direct ()
+  "memory-get resolves a bare basename to its DB-direct synthetic id
+and returns the body verbatim."
+  (skip-unless (and (anvil-memory-test--supported-p 'get)
+                    (anvil-memory-test--supported-p 'add)))
+  (anvil-memory-test--with-env
+    (anvil-memory-add "feedback_get_target" 'feedback
+                      "Line A\nLine B"
+                      :description "round-trip get")
+    (let ((entry (anvil-memory-get "feedback_get_target")))
+      (should entry)
+      (should (string-prefix-p "anvil-memory:db:" (plist-get entry :file)))
+      (should (eq 'feedback (plist-get entry :type)))
+      (should (equal "feedback_get_target" (plist-get entry :name)))
+      (should (equal "Line A\nLine B" (plist-get entry :body))))))
+
+(ert-deftest anvil-memory-test/get-by-synthetic-id ()
+  "memory-get accepts the synthetic id verbatim."
+  (skip-unless (and (anvil-memory-test--supported-p 'get)
+                    (anvil-memory-test--supported-p 'add)))
+  (anvil-memory-test--with-env
+    (anvil-memory-add "feedback_get_synthetic" 'feedback "x")
+    (let ((entry (anvil-memory-get
+                  "anvil-memory:db:feedback_get_synthetic")))
+      (should entry)
+      (should (equal "x" (plist-get entry :body))))))
+
+(ert-deftest anvil-memory-test/get-scan-from-md-parses-frontmatter ()
+  "memory-get on a scan-from-md row parses YAML frontmatter for
+:name / :description and exposes the verbatim body."
+  (skip-unless (and (anvil-memory-test--supported-p 'get)
+                    (anvil-memory-test--supported-p 'scan)))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--write
+     (expand-file-name "feedback_md_target.md" root)
+     "---\nname: Md target rule\ndescription: short hook\ntype: feedback\n---\nBody from disk.\n")
+    (anvil-memory-scan)
+    (let ((entry (anvil-memory-get "feedback_md_target")))
+      (should entry)
+      (should (equal "Md target rule" (plist-get entry :name)))
+      (should (equal "short hook" (plist-get entry :description)))
+      (should (string-match-p "Body from disk" (plist-get entry :body))))))
+
+(ert-deftest anvil-memory-test/get-unknown-returns-nil ()
+  "memory-get returns nil for an unknown key (does not error)."
+  (skip-unless (anvil-memory-test--supported-p 'get))
+  (anvil-memory-test--with-env
+    (should-not (anvil-memory-get "nonexistent_basename"))
+    (should-not (anvil-memory-get "anvil-memory:db:does_not_exist"))
+    (should-not (anvil-memory-get nil))
+    (should-not (anvil-memory-get ""))))
+
+(ert-deftest anvil-memory-test/get-bump-access-updates-count ()
+  ":bump-access t increments access-count and last-accessed."
+  (skip-unless (and (anvil-memory-test--supported-p 'get)
+                    (anvil-memory-test--supported-p 'add)
+                    (anvil-memory-test--supported-p 'access)))
+  (anvil-memory-test--with-env
+    (anvil-memory-add "feedback_bump_target" 'feedback "x")
+    (let ((before (anvil-memory-get "feedback_bump_target")))
+      (should (= 0 (plist-get before :access-count))))
+    (anvil-memory-get "feedback_bump_target" :bump-access t)
+    (let ((after (anvil-memory-get "feedback_bump_target")))
+      (should (= 1 (plist-get after :access-count)))
+      (should (plist-get after :last-accessed)))))
+
+
 (provide 'anvil-memory-test)
 
 ;;; anvil-memory-test.el ends here

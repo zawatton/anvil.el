@@ -152,7 +152,7 @@ onto this alist; built-ins stay in the list for defaults."
          search save-check duplicates audit-urls
          decay promote regenerate reindex-fts llm-verdict
          mdl-distill export-html serve contradictions
-         add export-md)
+         add export-md get)
   "Capability tags this module currently provides.
 Tests in tests/anvil-memory-test.el gate their `skip-unless' on
 membership here so a half-shipped feature never breaks CI.")
@@ -732,6 +732,107 @@ Returns =(:path PATH :written t)=."
           (unless (string-suffix-p "\n" body)
             (insert "\n"))))
       (list :path out :written t))))
+
+
+;;;; --- get (Phase 5 read-side completion) -----------------------------
+
+(defun anvil-memory--resolve-get-key (file-or-name)
+  "Coerce FILE-OR-NAME into a `memory_meta' primary key, or nil.
+Accepts: synthetic id (`anvil-memory:db:<basename>'), absolute
+path of an indexed .md file, or a bare basename (with or without
+`.md').  When the basename matches multiple indexed paths the
+lookup signals `user-error' so the caller asks for disambiguation
+rather than silently returning the wrong entry."
+  (let ((db (anvil-memory--db)))
+    (cond
+     ((or (null file-or-name) (not (stringp file-or-name))) nil)
+     ((string-empty-p file-or-name) nil)
+     ((anvil-memory--synthetic-file-p file-or-name) file-or-name)
+     ((or (string-prefix-p "/" file-or-name)
+          (string-match-p "\\`[A-Za-z]:[/\\\\]" file-or-name)
+          (string-match-p "\\`~" file-or-name))
+      (expand-file-name file-or-name))
+     (t
+      (let* ((base (file-name-sans-extension file-or-name))
+             (synthetic (concat anvil-memory--synthetic-prefix base))
+             (syn-rows (sqlite-select
+                        db
+                        "SELECT file FROM memory_meta WHERE file = ?1 LIMIT 1"
+                        (list synthetic))))
+        (if syn-rows
+            (caar syn-rows)
+          (let ((md-rows (sqlite-select
+                          db
+                          "SELECT file FROM memory_meta
+                             WHERE file LIKE ?1 LIMIT 2"
+                          (list (concat "%/" base ".md")))))
+            (cond
+             ((null md-rows) nil)
+             ((= 1 (length md-rows)) (caar md-rows))
+             (t (user-error
+                 "anvil-memory-get: ambiguous basename %s matches multiple files"
+                 base))))))))))
+
+;;;###autoload
+(cl-defun anvil-memory-get (file-or-name &key bump-access)
+  "Return the memory entry plist for FILE-OR-NAME, or nil when absent.
+
+FILE-OR-NAME accepts three shapes so callers do not need to know
+whether a row is DB-direct or scan-from-md:
+
+  - synthetic id `anvil-memory:db:<basename>' (DB-direct rows)
+  - absolute path to an indexed .md file (scan-from-md rows)
+  - bare basename (`feedback_my_rule' or `feedback_my_rule.md');
+    resolved to either a synthetic id or a `.md' path via the
+    metadata index.  An ambiguous basename signals `user-error'.
+
+The returned plist carries `:file', `:type', `:created',
+`:last-accessed', `:access-count', `:validity-prior',
+`:ttl-policy', `:decay-score', `:tags' (from `memory_meta') plus
+`:body' (verbatim from `memory_body_fts'), `:name', and
+`:description'.  For scan-from-md rows the YAML frontmatter is
+parsed for `:name' / `:description' so callers see the same
+display strings `MEMORY.md' renders.  For DB-direct rows the
+name falls back to the basename and the description to the
+fallback display name (mirrors `memory-add' insertion semantics).
+
+Pass `:bump-access t' to update access-count / last-accessed as
+a side effect — equivalent to also calling `memory-access'.
+
+This is the read-side of the Phase 5 DB-direct round-trip
+(`memory-add' writes, `memory-get' reads, `memory-export-md'
+renders).  Pair with `memory-search' / `memory-list' to skip a
+bare Read on the .md file when only the body is needed."
+  (let* ((db (anvil-memory--db))
+         (file (anvil-memory--resolve-get-key file-or-name)))
+    (when file
+      (let ((rows (sqlite-select
+                   db
+                   "SELECT file, type, created, last_accessed, access_count,
+                           validity_prior, ttl_policy, decay_score, tags
+                      FROM memory_meta WHERE file = ?1 LIMIT 1"
+                   (list file))))
+        (when rows
+          (let* ((meta (anvil-memory--row->plist (car rows)))
+                 (raw-body (or (anvil-memory--get-fts-body db file) ""))
+                 (synthetic (anvil-memory--synthetic-file-p file))
+                 (basename (if synthetic
+                               (substring file
+                                          (length
+                                           anvil-memory--synthetic-prefix))
+                             (file-name-sans-extension
+                              (file-name-nondirectory file))))
+                 (fm (and (not synthetic)
+                          (anvil-memory--parse-frontmatter raw-body)))
+                 (name (or (and fm (plist-get fm :name)) basename))
+                 (desc (or (and fm (plist-get fm :description))
+                           (anvil-memory--fallback-display-name basename))))
+            (when bump-access
+              (ignore-errors (anvil-memory-access file)))
+            (append (list :name name
+                          :description desc
+                          :body raw-body)
+                    meta)))))))
 
 
 ;;;; --- list ---------------------------------------------------------------
@@ -2414,6 +2515,33 @@ Returns =(:file SYNTHETIC :name BASENAME :type TYPE :description DESC
       :tags (anvil-memory--coerce-string tags)
       :ttl-policy (anvil-memory--coerce-type ttl_policy)))))
 
+(defun anvil-memory--tool-get (file_or_name &optional bump_access)
+  "Return one memory entry plist by synthetic id / basename / path.
+
+MCP Parameters:
+  file_or_name - Required key.  Accepts a synthetic id
+                 (`anvil-memory:db:<basename>'), the absolute path
+                 of an indexed `.md' file, or a bare basename
+                 (`feedback_my_rule' / `feedback_my_rule.md').  An
+                 ambiguous basename signals `user-error'.
+  bump_access  - Optional truthy flag.  When set, access-count and
+                 last-accessed are bumped (same effect as
+                 `memory-access') as a side effect.
+
+Returns =(:entry PLIST-OR-NIL)= so callers can distinguish
+`not found' (nil) from a successful read.  The entry plist
+carries :file :type :name :description :body :created
+:last-accessed :access-count :validity-prior :ttl-policy
+:decay-score :tags."
+  (anvil-server-with-error-handling
+   (let* ((key (anvil-memory--coerce-string file_or_name))
+          (entry (and key
+                      (anvil-memory-get
+                       key
+                       :bump-access
+                       (anvil-memory--coerce-bool bump_access)))))
+     (list :entry entry))))
+
 (defun anvil-memory--tool-export-md (file_or_name
                                           &optional path overwrite)
   "Render a DB-direct memory entry to a .md file (DB → md, one-way).
@@ -2654,6 +2782,22 @@ Optional: `description', `tags', `ttl_policy'.  Body should NOT
 include YAML frontmatter — it is synthesized on `memory-export-md'.
 Returns the synthetic file id so callers can later round-trip the
 entry to disk via `memory-export-md'.")
+
+    (,(anvil-server-encode-handler #'anvil-memory--tool-get)
+     :id "memory-get"
+     :intent '(memory)
+     :layer 'workflow
+     :description
+     "Phase 5 read-side completion — return one memory entry plist
+for a synthetic id / basename / absolute .md path.  Pair with
+`memory-search' / `memory-list' (which return the file key) to
+fetch the full body without falling back to bare Read on the
+`.md' file.  For scan-from-md rows the YAML frontmatter is
+parsed for `:name' / `:description'; for DB-direct rows the
+name falls back to the basename.  Pass `bump_access=true' to
+update access-count / last-accessed as a side effect.  Returns
+=(:entry PLIST-OR-NIL)=."
+     :read-only t)
 
     (,(anvil-server-encode-handler #'anvil-memory--tool-export-md)
      :id "memory-export-md"

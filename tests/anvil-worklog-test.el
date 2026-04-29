@@ -456,6 +456,36 @@ one export, ordered by date ASC."
       (ignore-errors (delete-directory root t)))))
 
 
+
+;;;; --- Phase 2: get-by-digest (key-flexible read) ---------------------
+
+(ert-deftest anvil-worklog-test/get-by-digest-roundtrip ()
+  "anvil-worklog-get-by-digest looks up an entry by its sha1 digest."
+  (skip-unless (and (anvil-worklog-test--supported-p 'add)
+                    (anvil-worklog-test--supported-p 'get)))
+  (anvil-worklog-test--with-env
+    (let* ((id (anvil-worklog-add
+                "Digest target"
+                "**実施内容**\n- digest 経由で引きたい\n"
+                :date "2026-04-29"
+                :machine "linux-debian"
+                :year 2026))
+           (digest (plist-get id :digest))
+           (entry (anvil-worklog-get-by-digest digest)))
+      (should entry)
+      (should (equal "Digest target" (plist-get entry :title)))
+      (should (equal digest (plist-get entry :digest))))))
+
+(ert-deftest anvil-worklog-test/get-by-digest-unknown-returns-nil ()
+  "Unknown / blank digest returns nil rather than erroring."
+  (skip-unless (anvil-worklog-test--supported-p 'get))
+  (anvil-worklog-test--with-env
+    (should-not (anvil-worklog-get-by-digest
+                 "0000000000000000000000000000000000000000"))
+    (should-not (anvil-worklog-get-by-digest ""))
+    (should-not (anvil-worklog-get-by-digest nil))))
+
+
 (provide 'anvil-worklog-test)
 
 ;;; anvil-worklog-test.el ends here

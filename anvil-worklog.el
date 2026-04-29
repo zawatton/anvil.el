@@ -777,6 +777,23 @@ ordered by FTS rank (best first).  Empty / whitespace QUERY returns nil."
                 (list file start-line))))
     (and rows (anvil-worklog--row->plist (car rows)))))
 
+(defun anvil-worklog-get-by-digest (digest)
+  "Return the worklog entry plist whose body sha1 equals DIGEST, or nil.
+When DIGEST matches more than one row (would only happen if two
+entries have byte-identical bodies in distinct (machine, year)
+namespaces) the first match is returned — callers wanting full
+disambiguation should fall back to `anvil-worklog-list'."
+  (when (and (stringp digest) (not (string-empty-p digest)))
+    (let* ((db (anvil-worklog--db))
+           (rows (sqlite-select
+                  db
+                  "SELECT file, start_line, end_line, machine, year,
+                          date, title, body, digest
+                     FROM worklog_entry
+                     WHERE digest = ?1 LIMIT 1"
+                  (list digest))))
+      (and rows (anvil-worklog--row->plist (car rows))))))
+
 
 ;;;; --- DB → org export (Phase 2, optional) ---------------------------
 
@@ -952,17 +969,34 @@ Returns =(:rows ROWS)=."
           :until (anvil-worklog--coerce-string until)
           :year (anvil-worklog--coerce-int year nil)))))
 
-(defun anvil-worklog--tool-get (file start_line)
-  "Return one worklog entry by FILE + START_LINE (the natural primary key).
+(defun anvil-worklog--tool-get (&optional file start_line digest)
+  "Return one worklog entry by primary key OR digest.
 
 MCP Parameters:
-  file       - Absolute path to the source `ai-logs-*-YYYY.org' file.
-  start_line - 1-indexed line of the `*** MEMO AI:' heading.
+  file       - Optional absolute path to the source
+               `ai-logs-*-YYYY.org' file.  Pair with `start_line'
+               for the natural (file, start_line) primary key.
+               For DB-direct rows pass the synthetic id
+               `anvil-worklog:db:<machine>:<year>'.
+  start_line - Optional 1-indexed line of the `*** MEMO AI:'
+               heading.  Required when `file' is given.
+  digest     - Optional sha1 hex of the entry body.  When set,
+               `file' / `start_line' are ignored and a digest
+               lookup is performed instead — convenient when the
+               caller only kept the digest from a previous
+               `worklog-add' / `worklog-search' result.
 
+Exactly one of (file + start_line) or (digest) should be provided.
 Returns =(:entry PLIST-OR-NIL)=."
   (anvil-server-with-error-handling
-   (let* ((sl (anvil-worklog--coerce-int start_line nil))
-          (entry (and file sl (anvil-worklog-get file sl))))
+   (let* ((dig (anvil-worklog--coerce-string digest))
+          (entry
+           (cond
+            ((and dig (not (string-empty-p dig)))
+             (anvil-worklog-get-by-digest dig))
+            (t
+             (let ((sl (anvil-worklog--coerce-int start_line nil)))
+               (and file sl (anvil-worklog-get file sl)))))))
      (list :entry entry))))
 
 (defun anvil-worklog--tool-add (title body &optional date machine year)
@@ -1061,9 +1095,11 @@ this to answer 'what did I do last week' style queries."
      :layer 'workflow
      :description
      "Return a single worklog entry plist for the (file, start_line)
-key.  Pair with `worklog-search' / `worklog-list' (which return the
-key) when a downstream tool needs the full body without re-parsing
-the source org."
+key, or by `digest' (sha1 hex) when only the digest is on hand.
+Pair with `worklog-search' / `worklog-list' / `worklog-add'
+(which return both keys) when a downstream tool needs the full
+body without re-parsing the source org.  Exactly one of
+(file + start_line) or (digest) should be provided."
      :read-only t)
 
     (,(anvil-server-encode-handler #'anvil-worklog--tool-add)
