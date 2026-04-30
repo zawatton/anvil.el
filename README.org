@@ -117,7 +117,7 @@ not invoked.  Surface today via this path: =file-*= / =shell-*= /
 
 ** Path B — Emacs integrated (recommended for Emacs users)
 
-For day-to-day Emacs users.  Pin to v1.0.0 via your favourite
+For day-to-day Emacs users.  Pin to v1.1.1 via your favourite
 package manager.
 
 *** Quick install (one command)
@@ -143,17 +143,17 @@ installed.
 #+begin_src emacs-lisp
 ;; async-installer
 (async-installer-git-add "https://github.com/zawatton/anvil.el.git"
-                         :tag "v1.0.0"
+                         :tag "v1.1.1"
                          :main "anvil.el")
 
 ;; or straight.el
 (straight-use-package
  '(anvil :type git :host github :repo "zawatton/anvil.el"
-         :branch "v1.0.0"))
+         :branch "v1.1.1"))
 
 ;; or elpaca
 (elpaca (anvil :host github :repo "zawatton/anvil.el"
-               :ref "v1.0.0"))
+               :ref "v1.1.1"))
 #+end_src
 
 After installing:

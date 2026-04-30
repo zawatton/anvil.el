@@ -516,9 +516,9 @@ Anvil を使うと:
 インストール方法は 2 系統あります。特別な理由がなければ *安定版*
 を選んでください。
 
-** 安定版 (推奨) — タグ =v0.4.1=
+** 安定版 (推奨) — タグ =v1.1.1=
 
-=v0.4.1= は現在の安定版タグです。新機能や修正は =master= に随時
+=v1.1.1= は現在の安定版タグです。新機能や修正は =master= に随時
 取り込まれており、表面が落ち着いたタイミングで適宜タグを切ります。
 =master= を追う理由が無ければ、このタグに固定して使ってください。
 
@@ -529,7 +529,7 @@ Anvil を使うと:
 
 #+begin_src emacs-lisp
 (async-installer-git-add "https://github.com/zawatton/anvil.el.git"
-                            :tag "v0.4.1"
+                            :tag "v1.1.1"
                             :main "anvil.el")
 #+end_src
 
@@ -538,14 +538,14 @@ Anvil を使うと:
 #+begin_src emacs-lisp
 (straight-use-package
  '(anvil :type git :host github :repo "zawatton/anvil.el"
-         :branch "v0.4.1"))
+         :branch "v1.1.1"))
 #+end_src
 
 *** elpaca
 
 #+begin_src emacs-lisp
 (elpaca (anvil :host github :repo "zawatton/anvil.el"
-               :ref "v0.4.1"))
+               :ref "v1.1.1"))
 #+end_src
 
 *** use-package (straight または elpaca と組み合わせて)
@@ -554,11 +554,11 @@ Anvil を使うと:
 ;; straight 利用時
 (use-package anvil
   :straight (anvil :type git :host github :repo "zawatton/anvil.el"
-                   :branch "v0.4.1"))
+                   :branch "v1.1.1"))
 
 ;; elpaca 利用時
 (use-package anvil
-  :ensure (:host github :repo "zawatton/anvil.el" :ref "v0.4.1"))
+  :ensure (:host github :repo "zawatton/anvil.el" :ref "v1.1.1"))
 #+end_src
 
 ** 最新版 — =master= (強く非推奨)
@@ -609,7 +609,7 @@ user 向けです。
 (require 'anvil)
 #+end_src
 
-手動で clone する場合、安定版を使うなら =git checkout v0.4.1= で
+手動で clone する場合、安定版を使うなら =git checkout v1.1.1= で
 タグに切り替えてください。=master= のままは自己責任です。
 
 * 設定
