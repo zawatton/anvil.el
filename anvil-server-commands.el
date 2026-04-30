@@ -72,6 +72,17 @@ See also: `anvil-server-start'"
     (message "%s" (anvil-server-metrics-summary)))
   t)
 
+;;;###autoload
+(defun anvil-server-status ()
+  "Display the main MCP server's running state.
+Prints `Running' or `Stopped' via `message', mirroring
+`anvil-worker-status' for the worker pool.
+
+For full setup details (registered tools, resources, client config
+snippet), use `anvil-server-describe-setup'."
+  (interactive)
+  (message "MCP server: %s" (if anvil-server--running "Running" "Stopped")))
+
 (defun anvil-server--batch-emit-response (resp framing-p)
   "Emit RESP to stdout, framed if FRAMING-P is non-nil.
 

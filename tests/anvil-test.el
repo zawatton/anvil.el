@@ -10,6 +10,7 @@
 (require 'json)
 (require 'anvil)
 (require 'anvil-server)
+(require 'anvil-server-commands)
 (require 'anvil-server-metrics)
 ;; `anvil-offload-stub' provides tiny fixture handlers (pid / boom) so
 ;; the `:offload' dispatch tests can load them into the subprocess by
@@ -36,6 +37,21 @@
 (ert-deftest anvil-test-describe-setup-command ()
   "Verify describe-setup is callable."
   (should (fboundp 'anvil-describe-setup)))
+
+(ert-deftest anvil-test-server-status-command ()
+  "`anvil-server-status' is bound, interactive, and reports the
+running flag in the format the README documents (`Running' /
+`Stopped')."
+  (should (fboundp 'anvil-server-status))
+  (should (commandp 'anvil-server-status))
+  (let ((anvil-server--running t))
+    (should (string-match-p "Running"
+                            (let ((inhibit-message t))
+                              (anvil-server-status)))))
+  (let ((anvil-server--running nil))
+    (should (string-match-p "Stopped"
+                            (let ((inhibit-message t))
+                              (anvil-server-status))))))
 
 ;;;; --- MCP parameter validator ------------------------------------------
 
