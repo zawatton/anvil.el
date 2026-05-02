@@ -34,6 +34,13 @@
 
 (require 'cl-lib)
 (require 'subr-x)
+;; Doc 50 — load the user config loader.  Under regular Emacs this is
+;; a cheap no-op; under the NeLisp standalone path (= `bin/anvil mcp
+;; serve' via the Rust anvil-runtime binary) it resolves
+;; `$ANVIL_CONFIG_DIR/config.el' so defcustom overrides land before
+;; any other anvil module's init code runs.  See anvil-config.el for
+;; the detection contract.
+(require 'anvil-config)
 
 ;;;; --- defaults / constants -----------------------------------------------
 

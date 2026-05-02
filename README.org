@@ -679,6 +679,43 @@ budget goes to reasoning about your code, not re-reading it.
 (anvil-server-start)
 #+end_src
 
+** User config — Emacs vs NeLisp standalone
+
+Two entry paths, two config locations:
+
+| Entry path                                | Config source                |
+|-------------------------------------------+------------------------------|
+| Emacs (~emacs --daemon~ + ~emacsclient~)  | your existing ~init.el~      |
+| NeLisp standalone (~bin/anvil mcp serve~) | ~$ANVIL_CONFIG_DIR/config.el~ |
+
+Under regular Emacs nothing changes — keep putting your =setq=
+overrides in =init.el=.  Under the NeLisp standalone path (= the
+Rust =anvil-runtime= binary spawned by =bin/anvil=, no =init.el= to
+read) anvil resolves a config file from these env vars in order:
+
+1. =$ANVIL_CONFIG_DIR=
+2. =$XDG_CONFIG_HOME/anvil=  (XDG default)
+3. =~/.config/anvil=          (POSIX fallback)
+
+The file inside that directory is always =config.el=.  Missing file
+is silent (= optional).  Parse / eval failure is surfaced via
+=display-warning= but never aborts the MCP server — a broken user
+config must not wedge bootstrap.
+
+Example =~/.config/anvil/config.el=:
+
+#+begin_src emacs-lisp
+;; Codex tasks need write access for any non-trivial dispatch.
+(setq anvil-orchestrator-codex-sandbox "workspace-write")
+;; Truncate gain summary lines aggressively.
+(setq anvil-shell-filter-default-truncate-lines-at 200)
+#+end_src
+
+The branch on which path is in effect is fully automatic — anvil
+detects it via =(featurep 'nelisp)= which is true only after the
+NeLisp interpreter bootstrap.  See =anvil-config.el= for the
+implementation.
+
 ** Browser module (optional)
 
 The =browser= module wraps the [[https://agent-browser.dev/][agent-browser]] CLI so an MCP
