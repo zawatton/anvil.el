@@ -610,6 +610,44 @@ Restores both globals on exit so registered test tags do not leak."
           (copy-sequence anvil-shell-filter--match-command-table)))
      ,@body))
 
+(ert-deftest anvil-shell-filter-test/register-rust-regex-translator-basic ()
+  "Translator handles \\s / \\d / capturing groups / alternation."
+  (skip-unless (anvil-shell-filter-test--supported-p 'register))
+  (let ((xlat #'anvil-shell-filter--rust-regex-to-elisp))
+    (should (equal (funcall xlat "^df(\\s|$)")
+                   "^df\\([[:space:]]\\|$\\)"))
+    (should (equal (funcall xlat "^brew\\s+(install|upgrade)\\b")
+                   "^brew[[:space:]]+\\(install\\|upgrade\\)\\b"))
+    (should (equal (funcall xlat "Audited \\d+ package")
+                   "Audited [0-9]+ package"))
+    ;; Empty / nil pass through.
+    (should (null (funcall xlat nil)))
+    (should (equal (funcall xlat "") ""))))
+
+(ert-deftest anvil-shell-filter-test/register-rust-regex-translator-noncap-and-class ()
+  "Translator preserves non-capturing groups + leaves char class contents alone."
+  (skip-unless (anvil-shell-filter-test--supported-p 'register))
+  (let ((xlat #'anvil-shell-filter--rust-regex-to-elisp))
+    ;; (?:foo|bar) → \(?:foo\|bar\)
+    (should (equal (funcall xlat "(?:^|/)liquibase(?:\\s|$)")
+                   "\\(?:^\\|/\\)liquibase\\(?:[[:space:]]\\|$\\)"))
+    ;; Char class contents stay verbatim — `(' / `|' inside [...] are literal.
+    (should (equal (funcall xlat "[a-z(|)]+")
+                   "[a-z(|)]+"))
+    ;; \b is preserved verbatim — Elisp shares this escape.
+    (should (string-match-p "\\\\b" (funcall xlat "^foo\\b")))))
+
+(ert-deftest anvil-shell-filter-test/register-rust-regex-end-to-end-df ()
+  "After register, df.toml-style match_command actually matches `df -h'."
+  (skip-unless (anvil-shell-filter-test--supported-p 'register))
+  (anvil-shell-filter-test--with-clean-registry
+    (anvil-shell-filter-register
+     'df-spec :match-command "^df(\\s|$)" :max-lines 5)
+    (should (eq (anvil-shell-filter-lookup "df -h") 'df-spec))
+    (should (eq (anvil-shell-filter-lookup "df") 'df-spec))
+    ;; Doesn't overreach to `dfu' or `differ'.
+    (should (null (anvil-shell-filter-lookup "differ a b")))))
+
 (ert-deftest anvil-shell-filter-test/register-pipeline-order ()
   "Verify the 8-stage pipeline runs every stage in the documented order.
 

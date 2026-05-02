@@ -603,6 +603,108 @@ returns a tag that hasn't been implemented yet."
 ;; (vendor/rtk-filters/), but the same API serves user-defined filters
 ;; in `~/.emacs.d/anvil-shell-filters.el'.
 
+;; rtk specs author regex against Rust's `regex' crate; Elisp's regex
+;; dialect differs (capturing groups need `\\(', alternation needs
+;; `\\|', `\\s' / `\\d' / `\\w' need POSIX class equivalents).  The
+;; translator below covers the small subset rtk filters actually use,
+;; so vendored TOMLs stay byte-identical to upstream and only the
+;; in-Emacs registration translates.
+
+(defun anvil-shell-filter--rust-regex-to-elisp (pattern)
+  "Translate a (small subset of) Rust regex PATTERN into Elisp regex.
+
+Handles the idioms rtk filters use:
+
+  \\s → [[:space:]]      \\S → [^[:space:]]
+  \\d → [0-9]            \\D → [^0-9]
+  \\w → [A-Za-z0-9_]     \\W → [^A-Za-z0-9_]
+
+Capturing / alternation differences (outside character classes):
+
+  (        → \\(
+  )        → \\)
+  |        → \\|
+
+Non-capturing groups `(?:' become Elisp's `\\(?:'.  Named captures
+`(?P<name>...)' are downgraded to `\\(?:...\\)' — the captured text
+is unused by the filter pipeline.  `\\b' / `\\n' / `\\t' / `\\\\'
+pass through unchanged."
+  (if (or (null pattern) (not (stringp pattern)) (string-empty-p pattern))
+      pattern
+    (let ((out (make-string 0 0))
+          (i 0)
+          (n (length pattern))
+          (in-class nil))
+      (while (< i n)
+        (let ((c (aref pattern i)))
+          (cond
+           ;; Inside [...] keep everything verbatim except an escape pair.
+           (in-class
+            (cond
+             ((eq c ?\\)
+              (when (< (1+ i) n)
+                (setq out (concat out (string c (aref pattern (1+ i))))))
+              (cl-incf i 2))
+             ((eq c ?\])
+              (setq out (concat out "]"))
+              (setq in-class nil)
+              (cl-incf i))
+             (t
+              (setq out (concat out (string c)))
+              (cl-incf i))))
+           ;; Backslash escapes outside char class.
+           ((eq c ?\\)
+            (let ((nx (and (< (1+ i) n) (aref pattern (1+ i)))))
+              (cond
+               ((eq nx ?s) (setq out (concat out "[[:space:]]"))   (cl-incf i 2))
+               ((eq nx ?S) (setq out (concat out "[^[:space:]]"))  (cl-incf i 2))
+               ((eq nx ?d) (setq out (concat out "[0-9]"))         (cl-incf i 2))
+               ((eq nx ?D) (setq out (concat out "[^0-9]"))        (cl-incf i 2))
+               ((eq nx ?w) (setq out (concat out "[A-Za-z0-9_]"))  (cl-incf i 2))
+               ((eq nx ?W) (setq out (concat out "[^A-Za-z0-9_]")) (cl-incf i 2))
+               ;; Passthrough: \b \n \t \\ \. \( \) \| etc.
+               ;; In particular \( / \) / \| stay as literal escapes.
+               (t (setq out (concat out (string c (or nx ?\\))))
+                  (cl-incf i (if nx 2 1))))))
+           ((eq c ?\[)
+            (setq out (concat out "["))
+            (setq in-class t)
+            (cl-incf i))
+           ;; Group open: detect (?: and (?P<name>
+           ((eq c ?\()
+            (cond
+             ;; (?:...
+             ((and (< (+ i 2) n)
+                   (eq (aref pattern (1+ i)) ?\?)
+                   (eq (aref pattern (+ i 2)) ?:))
+              (setq out (concat out "\\(?:"))
+              (cl-incf i 3))
+             ;; (?P<name>... → downgrade to (?: by skipping past ">"
+             ((and (< (+ i 3) n)
+                   (eq (aref pattern (1+ i)) ?\?)
+                   (eq (aref pattern (+ i 2)) ?P)
+                   (eq (aref pattern (+ i 3)) ?<))
+              (let ((close (cl-position ?> pattern :start (+ i 4))))
+                (setq out (concat out "\\(?:"))
+                (setq i (if close (1+ close) (+ i 4)))))
+             (t
+              (setq out (concat out "\\("))
+              (cl-incf i))))
+           ((eq c ?\))
+            (setq out (concat out "\\)"))
+            (cl-incf i))
+           ((eq c ?|)
+            (setq out (concat out "\\|"))
+            (cl-incf i))
+           (t
+            (setq out (concat out (string c)))
+            (cl-incf i)))))
+      out)))
+
+(defun anvil-shell-filter--xlat-cell-pattern (cell)
+  "Translate the car of CELL (a (PATTERN . X) cons) via the Rust→Elisp helper."
+  (cons (anvil-shell-filter--rust-regex-to-elisp (car cell)) (cdr cell)))
+
 (defconst anvil-shell-filter--ansi-csi-re
   "\x1b\\[[0-9;?]*[a-zA-Z]"
   "Regex matching ANSI CSI escape sequences (SGR + cursor moves).")
@@ -705,9 +807,21 @@ DESCRIPTION and FILTER-STDERR are accepted for spec parity with the rtk
 TOML schema but are currently advisory only — stderr is already merged
 into stdout by `anvil-shell-filter-run'.
 
-Returns TAG."
+Returns TAG.
+
+Every regex in PROPS (`:match-command' / `:strip-lines-matching' /
+`:keep-lines-matching' / patterns in `:replace' and `:match-output')
+is run through `anvil-shell-filter--rust-regex-to-elisp' before
+storage so vendored rtk TOMLs (Rust regex dialect) work as-is."
   (ignore filter-stderr description)
-  (let ((closure
+  (let* ((match-command (anvil-shell-filter--rust-regex-to-elisp match-command))
+         (replace (mapcar #'anvil-shell-filter--xlat-cell-pattern replace))
+         (match-output (mapcar #'anvil-shell-filter--xlat-cell-pattern match-output))
+         (strip-lines-matching
+          (mapcar #'anvil-shell-filter--rust-regex-to-elisp strip-lines-matching))
+         (keep-lines-matching
+          (mapcar #'anvil-shell-filter--rust-regex-to-elisp keep-lines-matching))
+         (closure
          (lambda (raw)
            (let* ((s (if strip-ansi
                          (anvil-shell-filter--strip-ansi raw)
