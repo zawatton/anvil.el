@@ -59,6 +59,75 @@ load.  Drained once by `anvil-nelisp-shims-drain' which the Rust
 `AnvilModuleRegistry' invokes after the load sequence completes.")
 
 
+;;;; --- Emacs builtin function polyfills -----------------------------------
+
+;; Doc 51 Phase 1.5 — anvil.el provides polyfills for Emacs builtins that
+;; the NeLisp interpreter's standard surface does not currently expose.
+;; The user's directive (= 2026-05-02): NeLisp stays a MINIMAL Elisp
+;; runtime.  Filling Emacs-compat gaps belongs in anvil.el, not in NeLisp.
+;;
+;; Each polyfill is gated on the Emacs name being unbound; under regular
+;; Emacs the real implementation wins and the polyfill is skipped.  Each
+;; polyfill is written using only bootstrap-eval primitives so the file
+;; loads even when NeLisp's full interpreter coverage is incomplete.
+
+;; `declare-function' — Emacs's bytecomp hint.  Emit a no-op macro so the
+;; load-time form does not error.  Safe under both runtimes because the
+;; macro's body is `nil' (= return value ignored).
+(unless (fboundp 'declare-function)
+  (defmacro declare-function (fn file &optional arglist fileonly)
+    "Polyfill: no-op macro (NeLisp standalone has no byte compiler)."
+    nil))
+
+;; `getenv' — environment variable lookup.  NeLisp's bootstrap evaluator
+;; lacks OS env access, and the full interpreter's `getenv' is not yet
+;; reachable at module-load time.  Phase 1 polyfill returns nil so callers
+;; fall through to their default branch (e.g. `anvil-memory-effective-db-path'
+;; uses the default `~/.emacs.d/anvil-memory-index.db' path when
+;; ANVIL_MEMORY_DB is unset).  Phase 2+ enhancement: bridge to NeLisp's
+;; syscall extension via `nelisp-syscall-types-getenv' once it is loaded
+;; in the standard module init sequence.
+(unless (fboundp 'getenv)
+  (defun getenv (variable &optional frame)
+    "Polyfill: returns nil under NeLisp standalone (Phase 1 limitation)."
+    nil))
+
+;; `mapcar' — apply FUNCTION to each element of SEQUENCE, return list.
+;; Implemented manually because the bootstrap evaluator does not provide
+;; it.  Walks SEQUENCE forward, builds result in reverse via `cons', then
+;; reverses (also manually because `nreverse' is not available).
+(unless (fboundp 'mapcar)
+  (defun mapcar (function sequence)
+    "Polyfill: apply FUNCTION to each element of SEQUENCE."
+    (let ((result nil)
+          (cur sequence))
+      (while cur
+        (setq result (cons (funcall function (car cur)) result))
+        (setq cur (cdr cur)))
+      (let ((reversed nil))
+        (while result
+          (setq reversed (cons (car result) reversed))
+          (setq result (cdr result)))
+        reversed))))
+
+;; `plist-get' — scan PLIST (alternating key/value list) for PROPERTY.
+;; Returns the value cell or nil.  Uses `eq' for key comparison since
+;; that is the Emacs `plist-get' default (keyword symbols are interned
+;; so `eq' works correctly).
+(unless (fboundp 'plist-get)
+  (defun plist-get (plist property)
+    "Polyfill: scan PLIST for PROPERTY using eq comparison."
+    (let ((cur plist)
+          (found nil)
+          (result nil))
+      (while (and cur (not found))
+        (if (eq (car cur) property)
+            (progn (setq result (car (cdr cur)))
+                   (setq found t))
+          (setq cur (cdr (cdr cur)))))
+      result)))
+
+
 ;;;; --- Emacs builtin variable shims ---------------------------------------
 
 ;; Variables Emacs ships out of the box that anvil modules consume.

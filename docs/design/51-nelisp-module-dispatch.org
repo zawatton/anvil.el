@@ -45,32 +45,64 @@ The shim was rewritten to use only bootstrap-eval primitives
 ~push~ / ~plist-get~ / ~mapcar~ extensively and rewriting them
 en masse would defeat the "anvil modules unchanged" goal.
 
-* Phase 2 plan
+* Phase 1.5 — anvil.el polyfill layer (REVISED)
 
-Add the missing primitives to ~build-tool/src/eval/builtins.rs~ +
-~special_forms.rs~.  Each is a small Rust function (≈ 10-30 LoC).
-Estimated effort: 1-2 days for full coverage of what
-~anvil-state~ / ~anvil-memory~ need.  After that, drop the rewritten
-shim drain helpers in favour of the natural ~mapcar~ / ~nreverse~
-implementations.
+User directive (2026-05-02): NeLisp stays a MINIMAL Elisp runtime.
+Polyfilling Emacs builtins belongs in anvil.el, NOT in NeLisp.
 
-** Per-builtin sketch
+Approach revised: ~anvil-nelisp-shims.el~ adds polyfills using only
+bootstrap-eval primitives.  Each polyfill is gated on the Emacs name
+being unbound so the regular Emacs path remains unaffected.
 
-#+begin_src rust
-// In build-tool/src/eval/builtins.rs dispatch():
+** Polyfilled this session (Phase 1.5)
 
-"getenv"     => bi_getenv(args),       // std::env::var
-"setenv"     => bi_setenv(args),       // std::env::set_var
-"plist-get"  => bi_plist_get(args),    // walk pairs
-"plist-put"  => bi_plist_put(args),    // cons-rebuild
-"nreverse"   => bi_nreverse(args),     // in-place if cons mutability
-"reverse"    => bi_reverse(args),      // copy
-"mapcar"     => bi_mapcar(args, env),  // funcall in loop
-"mapconcat"  => bi_mapconcat(args, env),
-"defalias"   => bi_defalias(args, env), // env.set_function(name, target_fn)
-"fset"       => bi_fset(args, env),
-"push"       => sf_push(args, env),    // macro: (setq L (cons X L))
-#+end_src
+| Symbol             | Strategy                                                        |
+|--------------------+-----------------------------------------------------------------|
+| ~declare-function~ | no-op `defmacro' (return nil — bytecomp hint is a runtime nop)  |
+| ~getenv~           | always-nil stub (= callers fall through to default branch)      |
+| ~mapcar~           | manual `while' + `funcall' + `cons' + manual reverse loop       |
+| ~plist-get~        | manual `while' + `eq' + `car' / `cdr' walk                      |
+
+After these polyfills landed, ~anvil-state.el~ loads cleanly via
+Pattern C.  ~anvil-memory.el~ still fails — see next section.
+
+** Phase 2 blocker — NeLisp's own ~backquote~ roadmap
+
+~anvil-memory.el~ uses the backquote macro (` `\`(...)` / `,foo` / `,@foo`)
+extensively.  NeLisp's reader produces `(backquote ...)' forms but
+NeLisp itself does NOT yet implement the `backquote' macro — see
+~src/nelisp-macro.el:39~ comment "Phase 2 ships backquote".
+
+This is on NeLisp's own roadmap, NOT something anvil.el should
+polyfill: backquote is a sophisticated macro with nested-context
+semantics (= a pure-elisp polyfill would duplicate ~150 LoC of subtle
+recursion that NeLisp will eventually ship its own version of).
+
+Pattern C is therefore feature-complete on the anvil.el side.  Real
+modules (~anvil-memory~, ~anvil-worklog~, ~anvil-orchestrator~)
+become loadable once NeLisp's Phase 2 ships ~backquote~.
+
+** What works today (= verified end-to-end)
+
+  * Synthetic demo modules without backquote → ✓
+    (~anvil-nelisp-shims-demo.el~ exposes ~nelisp-shims-demo-ping~,
+    Rust dispatches, NeLisp evaluates, MCP returns "pong".)
+  * ~anvil-state.el~ loads under polyfilled shim → ✓
+    (= but does not register MCP tools — it's infrastructure used by
+    anvil-memory; tool registration awaits backquote unblock.)
+  * Any user-side module that avoids backquote → ✓
+    (= user can write custom anvil modules using only `defun' /
+    `let' / `setq' etc. and they will Pattern-C-register correctly
+    today.)
+
+** What is blocked (= waiting on NeLisp Phase 2)
+
+  * ~anvil-memory~ load → blocked by backquote
+  * ~anvil-worklog~ load → blocked by backquote (likely; uses similar
+    macro patterns)
+  * ~anvil-orchestrator~ load → blocked by backquote + needs
+    process / timer / sentinel infra (= NeLisp Phase 4 territory)
+  * ~anvil-org~ — out of scope (org-mode is genuinely Emacs-dependent)
 
 ** Phase plan
 
