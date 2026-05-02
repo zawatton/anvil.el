@@ -227,6 +227,75 @@ Three distinct paths out of the deadlock; pick based on appetite:
 its crash isolation property.  3-A keeps the work entirely in the
 elisp layer.  3-C is the cleanest long-term but a wider Rust change.
 
+* Phase 3-A' — vendor full Emacs elisp tree (2026-05-02)
+
+User directive (2026-05-02 #5): "Emacs にある elisp の機能を再実装
+する必要はまったくありません。emacs の elisp コードを全て vendor
+してください" — vendor all Emacs elisp instead of reimplementing.
+
+** What shipped
+
+- *nelisp-emacs/vendor/emacs-lisp/* (= commit ~0787c77~).  GNU Emacs
+  30.1 lisp/ tree, 1654 ~*.el~ files, 74MB.  All ~*.el.gz~ Debian
+  ships decompressed, ~*.elc~ stripped.  License: GPL-3.0-or-later,
+  per-file headers preserved.  ~vendor/emacs-lisp/COPYING~ +
+  ~VENDOR.md~ documents bundle origin + modification policy (= none).
+
+- Verified under host Emacs (= where the upstream cl-lib loads from
+  the vendor path):
+    ~(require 'cl-lib)~ → t
+    ~(cl-defstruct foo bar baz)~ + ~(make-foo :bar 42 :baz 7)~ → ok
+    ~(foo-bar (make-foo :bar 42 :baz 7))~ → 42
+
+** Phase 3-A' BOUNDARY — NeLisp reader strictness
+
+Loading the vendored ~cl-lib.el~ under ~bin/anvil-runtime~ surfaces
+a NeLisp reader limitation:
+
+  bridge eval error in <self-host-fallback>:
+    failed to parse cl-lib.el: lex error at 208:2: unknown escape: \(
+
+The offending input is the standard Emacs docstring idiom:
+
+  "Return multiple values, Common Lisp style.
+
+\(fn &rest VALUES)"
+
+Emacs's reader treats `\X' inside a string as literal `\X' for any
+unknown escape character `X'.  NeLisp's lexer
+(`build-tool/src/reader/lexer.rs:262') rejects unknown escapes
+strictly, breaking compatibility with the vendored Emacs source.
+
+This idiom appears across most Emacs source files (= used by
+`help-function-arglist' to override the displayed argument list);
+patching every occurrence in the 74MB vendor tree would defeat the
+"byte-identical to upstream" property the VENDOR.md guarantees.
+
+** Phase 3-A'' resolution paths
+
+  - *3-A''-1: relax NeLisp lexer.*  Change `lexer.rs:262' to fall
+    through unknown `\X' as literal `\X' (= match Emacs reader
+    semantics).  ~5 LoC Rust.  Strictly speaking a *bug-compatibility
+    fix* with Emacs, not a new feature — the change makes NeLisp
+    able to parse the source format it claims to support.
+
+  - *3-A''-2: pre-process vendor at copy time.*  Vendor sync script
+    rewrites `\(' → `\\(' (and similarly for `\)' / `\,' / `\.' /
+    other Emacs literals) before commit.  Source still loads under
+    host Emacs (= the extra escape is idempotent).  Cons: vendor is
+    no longer byte-identical to upstream; updates require rerunning
+    the script.
+
+  - *3-A''-3: dual-source the vendor.*  Keep upstream-identical
+    files as `vendor/emacs-lisp.upstream/' and have the build chain
+    materialize a `vendor/emacs-lisp.processed/' with fixes applied.
+    Most invasive but transparent.
+
+3-A''-1 is the minimum-blast-radius option (= one Rust line, fixes
+the entire vendor tree).  Pending user decision on whether the
+"don't add to NeLisp" directive applies to lexer bug-compatibility
+fixes.
+
 ** What works today (= verified end-to-end)
 
   * Synthetic demo modules without backquote → ✓
