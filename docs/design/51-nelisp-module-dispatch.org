@@ -45,14 +45,39 @@ The shim was rewritten to use only bootstrap-eval primitives
 ~push~ / ~plist-get~ / ~mapcar~ extensively and rewriting them
 en masse would defeat the "anvil modules unchanged" goal.
 
-* Phase 1.5 — anvil.el polyfill layer (REVISED)
+* Phase 1.6 — Layer split: nelisp-emacs owns Emacs C-core polyfills
 
-User directive (2026-05-02): NeLisp stays a MINIMAL Elisp runtime.
-Polyfilling Emacs builtins belongs in anvil.el, NOT in NeLisp.
+User directive (2026-05-02 #2): Polyfills belong in ~nelisp-emacs/~
+(= the "Emacs C core in Elisp on NeLisp" project), NOT in anvil.el.
+anvil.el is application-layer; mixing it with Emacs-builtin-compat
+code forces every other nelisp-emacs consumer to duplicate.
 
-Approach revised: ~anvil-nelisp-shims.el~ adds polyfills using only
-bootstrap-eval primitives.  Each polyfill is gated on the Emacs name
-being unbound so the regular Emacs path remains unaffected.
+Final layer split:
+
+| Layer | repo                              | content                                                       |
+|-------+-----------------------------------+---------------------------------------------------------------|
+| L1    | =nelisp/build-tool/=              | Rust eval substrate (= MINIMAL: special forms + ~100 builtin) |
+| L1.5  | =nelisp/src/=                     | NeLisp self-hosted Lisp internals + editor API (=nelisp-ec-*=) |
+| L2    | =nelisp-emacs/src/emacs-*.el=     | Emacs C-core ports (= unprefixed =mapcar=, =plist-get=, etc.) |
+| L3    | =anvil.el/=                       | application layer (= MCP tools, anvil-server)                 |
+
+L2 files added in Phase 1.6 (= ports from corresponding Emacs C
+core files):
+
+| nelisp-emacs file       | Emacs C origin           | Symbols ported                                              |
+|-------------------------+--------------------------+-------------------------------------------------------------|
+| =src/emacs-fns.el=      | =fns.c=                  | mapcar, mapconcat, mapc, nreverse, reverse, plist-{get,put,member} |
+| =src/emacs-callproc.el= | =callproc.c=             | getenv (stub), setenv, process-environment                  |
+| =src/emacs-eval.el=     | =eval.c= / =data.c=      | defalias, fset, declare-function (no-op macro)              |
+| =src/emacs-vars.el=     | =globals.c=              | user-emacs-directory, temporary-file-directory, locale-coding-system, system-type |
+| =src/emacs-sqlite.el=   | =sqlite.c=               | sqlite-* forwarders to nelisp-sqlite-*                       |
+| =src/emacs-init.el=     | (loader)                 | one-line aggregator: =(require '...)= the five above         |
+
+Each polyfill is gated on `unless (fboundp ...)' so loading these
+files under regular Emacs (= where the C-core originals exist) is
+a cheap no-op.  Implementations use only bootstrap-eval primitives
+so they load even when NeLisp's full interpreter coverage is
+incomplete.
 
 ** Polyfilled this session (Phase 1.5)
 

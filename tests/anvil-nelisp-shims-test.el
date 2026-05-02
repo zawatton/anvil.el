@@ -88,21 +88,6 @@
 
 ;;;; --- sqlite alias coverage ----------------------------------------------
 
-(ert-deftest anvil-nelisp-shims-test/sqlite-alias-table-is-complete ()
-  "Every sqlite-* symbol used by anvil-state / anvil-memory has an alias entry."
-  ;; Must mirror the dolist in the shim source; if either side grows,
-  ;; this test catches the drift.
-  (let ((covered '(sqlite-open sqlite-close sqlite-execute sqlite-select
-                               sqlitep sqlite-pragma sqlite-transaction
-                               sqlite-commit sqlite-rollback))
-        (used    '(sqlite-open sqlite-close sqlite-execute sqlite-select
-                               sqlite-transaction sqlite-available-p
-                               sqlite-supports-trigram-p)))
-    (dolist (sym used)
-      (should (or (memq sym covered)
-                  (memq sym '(sqlite-available-p sqlite-supports-trigram-p)))))))
-
-
 ;;;; --- inertness when nelisp feature absent --------------------------------
 
 (ert-deftest anvil-nelisp-shims-test/inert-under-emacs ()
