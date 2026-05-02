@@ -145,6 +145,88 @@ loading is bottlenecked on raw L2 coverage of standard Emacs builtins
 — not on any architectural gap.  Continuing the grind = pure expansion
 of ~nelisp-emacs/src/emacs-*.el~ until enough surface lands.
 
+* Phase 3 — FFI substrate via skeeto/elisp-ffi fork (2026-05-02)
+
+User directive (2026-05-02 #4): instead of implementing the full
+Emacs Dynamic Module API in NeLisp Rust (= ~500 LoC, 1-2 weeks), fork
+skeeto/elisp-ffi as zawatton/nelisp-ffi and adapt its libffi-based
+subprocess driver for the NeLisp runtime.  This unblocks SQLite + any
+other extern-C library WITHOUT adding to NeLisp itself.
+
+** What shipped
+
+- *zawatton/nelisp-ffi* (= new repo, commit ~b44650c~).  Adapted from
+  skeeto/elisp-ffi (UNLICENSE).  Uses ~nelisp-make-process~ /
+  ~nelisp-process-send-string~ when ~(featurep 'nelisp)~ at load time;
+  host Emacs ~make-process~ otherwise.  String-accumulator output via
+  process filter — no buffer dependencies.  C++ glue (~ffi-glue.cc~)
+  unchanged from upstream.  ~(ffi-call ...)~ alias preserved.
+
+  Verified under host Emacs:
+    ~(nelisp-ffi-call nil "rand" [:sint32])~ → 1804289383
+    ~(nelisp-ffi-call "libnelisp_runtime.so" "nl_sqlite_open"
+                       [:sint64 :pointer] ":memory:")~ → 1
+    ~(nelisp-ffi-call ... "nl_sqlite_alive" [:sint64 :sint64] 1)~ → 1
+
+- *nelisp-emacs/src/emacs-sqlite-ffi.el* (= commit ~d3e1ad5~).
+  ~sqlite-open~ / ~sqlite-close~ / ~sqlite-execute~ / ~sqlitep~ /
+  ~sqlite-available-p~ as polyfills that route through ~nelisp-ffi-call~
+  to ~libnelisp_runtime.so:nl_sqlite_*~.  Naive JSON encoding for
+  args (= nil / strings / integers / floats).  ~sqlite-select~ stub
+  pending Phase 4 (= needs caller-allocated output buffer support in
+  the FFI substrate).
+
+  Verified under host Emacs after fmakunbound override of the C
+  builtins:
+    ~(sqlite-available-p)~ → t
+    ~(sqlite-open ":memory:")~ → integer handle
+    ~CREATE TABLE~ + ~INSERT VALUES (?, ?)~ → both succeed
+
+** Phase 3 BOUNDARY — NeLisp standalone subprocess deadlock
+
+Getting the FFI chain running under ~bin/anvil-runtime mcp serve~
+revealed an *architectural* deadlock distinct from the polyfill grind:
+
+  - ~nelisp-ffi.el~ spawns ~nelisp-ffi-glue~ via ~nelisp-make-process~.
+  - ~nelisp-make-process~ lives in
+    ~nelisp/packages/nelisp-process/src/nelisp-process.el~.
+  - That file ~require~'s ~cl-lib~ + uses ~cl-defstruct~ + ~autoload~
+    + many helpers — none of which are in NeLisp's bootstrap evaluator.
+  - Bootstrap evaluator has 73 builtins covering arithmetic, list, string,
+    regex, file metadata.  Zero process-spawn primitives.
+
+Resulting deadlock: subprocess spawn needs nelisp-process load, which
+needs cl-lib polyfilled, which is ~200 LoC of L2 work.  OR — the FFI
+substrate needs to bypass elisp subprocess entirely.
+
+** Phase 3 escape hatches
+
+Three distinct paths out of the deadlock; pick based on appetite:
+
+  - *3-A: cl-lib polyfill push.*  Add ~cl-defstruct~ + ~cl-loop~ + the
+    rest of cl-lib core to ~nelisp-emacs/src/emacs-cl-*.el~.  Pure L2
+    work, fits the user directive.  Effort 1-2 days.  Unblocks
+    ~nelisp-process~ load → ~nelisp-ffi~ subprocess spawn → SQLite via
+    ffi-glue.
+
+  - *3-B: anvil-runtime owns the FFI subprocess.*  Have the Rust
+    ~anvil-runtime~ binary pre-spawn ~nelisp-ffi-glue~ at startup and
+    expose its stdio file descriptors as NeLisp builtins
+    (~nelisp-ffi--write~ / ~nelisp-ffi--read~).  ~nelisp-ffi.el~ skips
+    the spawn step entirely.  Effort ~half day Rust.  Cleanest
+    decoupling — no cl-lib dependency for FFI.
+
+  - *3-C: in-process FFI via libffi crate in anvil-runtime.*  Add
+    libffi-rs to anvil-runtime's Cargo.toml; implement ~nelisp-ffi-call~
+    as a Rust-side NeLisp builtin that uses libffi directly inside the
+    anvil-runtime process.  No subprocess at all.  Effort 1 day Rust.
+    Best performance, no glue binary to ship, but largest
+    anvil-runtime surface change.
+
+3-B is the smallest delta that preserves the elisp-ffi protocol +
+its crash isolation property.  3-A keeps the work entirely in the
+elisp layer.  3-C is the cleanest long-term but a wider Rust change.
+
 ** What works today (= verified end-to-end)
 
   * Synthetic demo modules without backquote → ✓
