@@ -1,0 +1,259 @@
+#+title: NeLisp standalone — generic module load + tool dispatch
+#+date: 2026-05-02
+#+author: zawatton
+#+property: status DRAFT
+
+* STATUS
+
+~Phase 1 SHIPPED~ (2026-05-02、feat/anvil-config-loader + feat/anvil-module-registry)
+— shim layer + ~AnvilModuleRegistry~ + 1-tool round-trip PoC.
+
+End-to-end verified: ~bin/anvil-runtime mcp serve~ with
+=ANVIL_MODULE_FILES=anvil-nelisp-shims.el:anvil-nelisp-shims-demo.el=
+exposes the synthetic ~nelisp-shims-demo-ping~ tool, ~tools/list~
+includes it, ~tools/call~ returns ="pong"=.
+
+* Phase 1 result — what works
+
+- Pattern C accumulator (~anvil-server-register-tools~ stub) — ✓
+- Rust ~AnvilModuleRegistry~ generic loader — ✓ (4 unit tests)
+- ~AnvilToolsRegistry~ wiring (= optional ~module: Option<...>~) — ✓
+- Tool dispatch via Rust → NeLisp eval — ✓ (zero-arg PoC)
+- ~ANVIL_MODULE_FILES~ env-var contract — ✓
+- shim's ~anvil-config~ ~(require 'anvil-nelisp-shims)~ early — ✓
+
+* Phase 1 result — empirical NeLisp bootstrap-eval gaps
+
+When loading the real ~anvil-state.el~ / ~anvil-memory.el~ via Pattern C,
+the following Emacs built-ins came back as ~void-function~ /
+~void-variable~ in the bootstrap eval (= ~build_tool::eval~ + the
+self-host fallback layer):
+
+| Symbol                | Used by                | Phase 2 fix                              |
+|-----------------------+------------------------+------------------------------------------|
+| ~getenv~              | shim user-emacs-dir    | add to bootstrap builtins (= os::env_var) |
+| ~push~                | shim accumulator       | add as macro OR keep current setq+cons   |
+| ~defalias~            | shim sqlite aliases    | add to special-forms / use ~fset~        |
+| ~plist-get~           | shim register-tool     | add as builtin                            |
+| ~nreverse~            | shim drain             | add as builtin                            |
+| ~mapcar~              | shim count             | add as builtin                            |
+| ~declare-function~    | bytecomp hint          | add as no-op macro                       |
+
+The shim was rewritten to use only bootstrap-eval primitives
+(=defun=, =defvar=, =setq=, =cons=, =append=, manual loops with
+=while= + =cdr=).  Real anvil modules cannot do the same — they use
+~push~ / ~plist-get~ / ~mapcar~ extensively and rewriting them
+en masse would defeat the "anvil modules unchanged" goal.
+
+* Phase 2 plan
+
+Add the missing primitives to ~build-tool/src/eval/builtins.rs~ +
+~special_forms.rs~.  Each is a small Rust function (≈ 10-30 LoC).
+Estimated effort: 1-2 days for full coverage of what
+~anvil-state~ / ~anvil-memory~ need.  After that, drop the rewritten
+shim drain helpers in favour of the natural ~mapcar~ / ~nreverse~
+implementations.
+
+** Per-builtin sketch
+
+#+begin_src rust
+// In build-tool/src/eval/builtins.rs dispatch():
+
+"getenv"     => bi_getenv(args),       // std::env::var
+"setenv"     => bi_setenv(args),       // std::env::set_var
+"plist-get"  => bi_plist_get(args),    // walk pairs
+"plist-put"  => bi_plist_put(args),    // cons-rebuild
+"nreverse"   => bi_nreverse(args),     // in-place if cons mutability
+"reverse"    => bi_reverse(args),      // copy
+"mapcar"     => bi_mapcar(args, env),  // funcall in loop
+"mapconcat"  => bi_mapconcat(args, env),
+"defalias"   => bi_defalias(args, env), // env.set_function(name, target_fn)
+"fset"       => bi_fset(args, env),
+"push"       => sf_push(args, env),    // macro: (setq L (cons X L))
+#+end_src
+
+** Phase plan
+
+| Phase | Scope                                                                 | Acceptance                                          |
+|-------+-----------------------------------------------------------------------+-----------------------------------------------------|
+|     1 | shim layer + Rust ~AnvilModuleRegistry~ + ~memory-list~ end-to-end PoC | ~bin/anvil-runtime mcp serve~ exposes ~memory-list~ |
+|     2 | full ~memory-*~ + ~worklog-*~ tools (~10 each)                        | parity with Emacs path for those 2 modules          |
+|     3 | ~file-*~ + ~git-*~ tools                                              | most CLAUDE.md daily-use tools work standalone      |
+|     4 | ~orchestrator-*~ (process / timer-heavy)                              | submit-one + status round-trip                      |
+|     5 | ~org-*~ — out of scope or external shim                               | (see "Genuinely Emacs-only" below)                  |
+
+* Motivation
+
+Per Doc 18 / Doc 44 the NeLisp standalone path (= ~bin/anvil mcp serve~ via
+the Rust ~anvil-runtime~ binary) is meant to remove the Emacs runtime
+dependency for AI MCP clients.  Today it exposes ~30 tools — ~anvil-host-*~,
+~shell-*~, ~data-*~, ~file-*~ — out of the ~120+ that the Emacs path serves.
+The missing 90 (~memory-*~, ~worklog-*~, ~file-batch~, ~git-*~,
+~orchestrator-*~, etc.) are NOT genuinely Emacs-dependent: their Elisp source
+calls SQLite / shell-out / regex / buffer APIs that NeLisp already provides
+via ~nelisp-sqlite-rs~ / ~nelisp-syscall-process~ / ~nelisp-syscall-fileio~.
+
+The actual blocker is architectural:
+
+- The Rust runtime currently uses /per-module Rust registries/ (Pattern A —
+  ~AnvilShellFilterRegistry~, ~AnvilDataRegistry~, ~AnvilFileRegistry~) plus
+  one /static-defun-discovery/ path (Pattern B — ~AnvilHostRegistry~ scans
+  for ~(defun anvil-host-FOO ...)~ at parse time).
+- The standard anvil-module pattern (~anvil-memory~ / ~anvil-worklog~ /
+  ~anvil-orchestrator~ / ...) registers its tools at /runtime/ via
+  ~(anvil-server-register-tools SERVER-ID SPECS)~ — Pattern C.  The Rust
+  runtime has no Pattern C support.
+
+This doc adds Pattern C: a shim that intercepts the runtime registration
+calls into a global accumulator the Rust side can read after module load,
+plus a generic ~AnvilModuleRegistry~ that does load → query → dispatch.
+
+* Design
+
+** Pattern C — shim + accumulator (Elisp side)
+
+New file ~anvil-nelisp-shims.el~ (loaded via the same ~(require 'anvil-config)~
+path that already fires from ~anvil-host.el~, gated on ~(featurep 'nelisp)~):
+
+#+begin_src emacs-lisp
+;; SQLite API: NeLisp has nelisp-sqlite-* (via nelisp-sqlite-rs extension);
+;; Emacs uses sqlite-* (built-in 29+).  The shim aliases the Emacs names
+;; to the NeLisp ones so anvil-state.el etc. work unmodified.
+(defalias 'sqlite-open       'nelisp-sqlite-open)
+(defalias 'sqlite-execute    'nelisp-sqlite-execute)
+(defalias 'sqlite-select     'nelisp-sqlite-select)
+(defalias 'sqlite-close      'nelisp-sqlite-close)
+(defalias 'sqlitep           'nelisp-sqlitep)
+;; ... same for pragma / transaction / commit / rollback
+
+;; anvil-server-register-tool[s]: in standalone mode the Rust runtime
+;; reads the tool registry directly, so the shim just collects specs.
+(defvar anvil-nelisp-shims--collected-specs nil
+  "Reverse-order alist of (SERVER-ID . SPEC-LIST) collected by the
+shim.  Read once by AnvilModuleRegistry::collect after each module
+load.")
+
+(defun anvil-server-register-tools (server-id specs)
+  "Standalone shim — accumulate SPECS for SERVER-ID."
+  (push (cons server-id specs) anvil-nelisp-shims--collected-specs)
+  specs)
+
+(defun anvil-server-register-tool (handler &rest props)
+  "Standalone shim — synthesize a 1-element spec from HANDLER + PROPS
+and route through `anvil-server-register-tools'."
+  (let* ((id (plist-get props :id))
+         (server-id (or (plist-get props :server-id) "default"))
+         (spec (list :id id :handler handler
+                     :description (plist-get props :description)
+                     :title (plist-get props :title)
+                     :read-only (plist-get props :read-only))))
+    (anvil-server-register-tools server-id (list spec))))
+
+(defun anvil-nelisp-shims-drain ()
+  "Return collected specs as a flat list and reset the accumulator."
+  (prog1 (apply #'append
+                (mapcar #'cdr (nreverse anvil-nelisp-shims--collected-specs)))
+    (setq anvil-nelisp-shims--collected-specs nil)))
+#+end_src
+
+Loaded only when ~(featurep 'nelisp)~ — the regular Emacs path
+keeps using the real ~anvil-server~ implementation.
+
+** Pattern C — Rust generic loader
+
+New file ~anvil-runtime/src/anvil_module_registry.rs~:
+
+#+begin_src rust
+pub struct AnvilModuleRegistry {
+    env: Mutex<Env>,
+    tools: Vec<ToolDef>,
+}
+
+impl AnvilModuleRegistry {
+    pub fn new(env: Env, module_paths: &[PathBuf]) -> Result<Self, Error> {
+        // 1. Load each .el via read_all + eval (in order — modules may
+        //    require each other, so the caller orders deps first).
+        // 2. After all loads, eval (anvil-nelisp-shims-drain) to get the
+        //    accumulated tool spec list.
+        // 3. Parse each spec into a ToolDef holding the elisp handler
+        //    symbol name + a ToolSpec (id / description / input_schema).
+    }
+}
+
+impl ToolRegistry for AnvilModuleRegistry {
+    fn list(&self) -> Vec<ToolSpec> { ... }
+    fn call(&self, name: &str, args: Value) -> Result<Value, JsonRpcError> {
+        // 1. Find ToolDef by name.
+        // 2. Build elisp form: (HANDLER ARG1 ARG2 ...) with arg coercion
+        //    via build_call_form (already in anvil_host_registry.rs).
+        // 3. eval_via_self_host(env, form).
+        // 4. sexp_tool_result(out).
+    }
+}
+#+end_src
+
+Wired into ~AnvilToolsRegistry::new~ alongside the existing host /
+shell-filter / data / file registries.  Module path list comes from a
+new env var ~ANVIL_MODULE_FILES~ (colon-separated absolute paths) — the
+~bin/anvil~ wrapper sets it from the resolved ~anvil-lib~ dir + each
+profile's module list.
+
+** Module load order (Phase 1)
+
+#+begin_src
+1. anvil-nelisp-shims.el       (must come first — establishes shim alises)
+2. anvil-state.el              (SQLite KV / TTL — most modules require it)
+3. anvil-memory.el             (Phase 1 PoC target)
+4. (Phase 2:) anvil-worklog.el
+5. (Phase 3:) anvil-file.el / anvil-git.el / anvil-http.el / ...
+#+end_src
+
+** Tool dispatch contract
+
+Each spec in the accumulator must include:
+
+| Key            | Type              | Meaning                          |
+|----------------+-------------------+----------------------------------|
+| ~:id~          | string            | MCP tool name                    |
+| ~:handler~     | symbol / function | elisp callable to invoke         |
+| ~:description~ | string            | MCP tool description             |
+| ~:title~       | string (optional) | display name                     |
+| ~:read-only~   | bool (optional)   | hint                             |
+
+Rust dispatch builds ~(HANDLER ARG1 ARG2 ...)~ where args come from
+JSON-RPC ~params~ deserialized via ~sexp_arg_from_json~ (existing helper
+in ~anvil_host_registry.rs~).  One-arg handlers receive a positional
+arg; multi-arg handlers — TBD.  Phase 1 supports zero / one positional
+arg only; multi-arg expansion deferred to Phase 2.
+
+* Genuinely Emacs-only modules
+
+Out of scope for D-3 (= keep on Emacs path or out of NeLisp standalone):
+
+- ~anvil-org~ — uses Emacs' org-mode parser (~10k LoC of Elisp + heavy
+  buffer / overlay / property semantics).  Porting org-mode to NeLisp
+  is a separate multi-month project.  Workaround = dual-server or
+  fall back to Emacs spawn for ~org-*~ tools only.
+- ~anvil-org-index~ — same dependency.
+- Anything that uses Emacs' ~display-buffer~ / window / overlay APIs
+  (= UI code).  No anvil tools currently in this category.
+
+* Risks
+
+- Shim defalias cycles: if a NeLisp module ~require~'s a feature that
+  itself shims back, we get infinite require.  Mitigate by gating the
+  shim load with ~(unless (fboundp 'sqlite-open) ...)~.
+- Pattern A/B coexistence: ~AnvilShellFilterRegistry~ already provides
+  ~shell-*~ via Rust compat.  If anvil-shell-filter.el is also loaded
+  via Pattern C, we get duplicate tool registration.  Mitigate by
+  a /skip-list/ in the module loader.
+- SQLite path divergence: Emacs uses ~~/.emacs.d/anvil-memory-index.db~,
+  NeLisp standalone may write to a different path.  Use the existing
+  ~anvil-memory-shared-db-roots~ + symlinks to keep both in sync.
+
+* References
+
+- Doc 18 — Stage D standalone launcher
+- Doc 44 — anvil-runtime crate split
+- Doc 50 — anvil-config user config loader (= sibling work, this doc
+  builds on the same `(require 'anvil-config)' bridge in anvil-host.el)

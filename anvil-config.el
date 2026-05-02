@@ -45,6 +45,13 @@
 
 ;;; Code:
 
+;; Doc 51 — load the NeLisp standalone compatibility shims FIRST so
+;; later anvil modules (memory / worklog / etc.) see the sqlite-* /
+;; anvil-server-register-tools shims they depend on.  Under regular
+;; Emacs this require is a cheap no-op (the module's auto-arm gating
+;; on `(featurep 'nelisp)' returns nil — see anvil-nelisp-shims.el).
+(require 'anvil-nelisp-shims)
+
 (defgroup anvil-config nil
   "User configuration loader for the anvil NeLisp standalone path."
   :group 'anvil
