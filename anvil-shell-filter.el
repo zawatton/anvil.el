@@ -80,7 +80,8 @@
                emacs-batch make dispatch tee gain
                gh git-log-graph pip-install npm-install
                docker-ps docker-logs kubectl-get aws-s3-ls
-               prettier ruff phase2a-dispatch tee-grep)
+               prettier ruff phase2a-dispatch tee-grep
+               register)
   "Capability tags this module currently provides.
 Tests in tests/anvil-shell-filter-test.el gate their `skip-unless'
 on membership here so a half-shipped filter never breaks CI.  The
@@ -522,8 +523,18 @@ The trailing `Found N errors.' summary is preserved when present."
     (prettier       . ,#'anvil-shell-filter--prettier)
     (ruff           . ,#'anvil-shell-filter--ruff))
   "Alist mapping filter tag → pure `(RAW) -> COMPRESSED' function.
-Users can `setf' new entries to register additional filters before
-Phase 3 adds a public register API.")
+Phase 3 adds `anvil-shell-filter-register' as the public way to install
+additional declarative filters; the alist is still publicly readable
+for legacy callers that walked the entries directly.")
+
+(defvar anvil-shell-filter--match-command-table nil
+  "Alist of (REGEX . TAG) populated by `anvil-shell-filter-register'.
+Consulted by `anvil-shell-filter-lookup' as a fallback when the
+hand-written cond-tree returns nil.  Order = registration order;
+first match wins so later registrations shadow earlier ones with
+the same regex.  Each `anvil-shell-filter-register' call removes
+any prior cell whose cdr equals TAG before pushing the fresh entry,
+so re-registering a tag never leaves orphan rows.")
 
 (defun anvil-shell-filter-lookup (cmd)
   "Return the filter tag for the first token(s) of shell command CMD, or nil.
@@ -565,7 +576,9 @@ is expected to fall through to raw passthrough."
        ((equal first "ls") 'ls)
        ((equal first "pytest") 'pytest)
        ((equal first "make") 'make)
-       (t nil)))))
+       (t (cl-loop for (regex . tag) in anvil-shell-filter--match-command-table
+                   when (string-match-p regex cmd)
+                   return tag))))))
 
 (defun anvil-shell-filter-apply (name raw)
   "Apply filter tag NAME to string RAW.
@@ -580,6 +593,168 @@ returns a tag that hasn't been implemented yet."
       (if (functionp fn)
           (funcall fn raw)
         raw)))))
+
+
+;;;; --- declarative register API (Phase 3) ---------------------------------
+
+;; Doc 27 Phase 3 — register API + 8-stage pipeline.  Lets a filter be
+;; declared as data (a plist of regex / int / string knobs) instead of
+;; a hand-coded `(defun ...)'.  The seed corpus is the rtk TOML import
+;; (vendor/rtk-filters/), but the same API serves user-defined filters
+;; in `~/.emacs.d/anvil-shell-filters.el'.
+
+(defconst anvil-shell-filter--ansi-csi-re
+  "\x1b\\[[0-9;?]*[a-zA-Z]"
+  "Regex matching ANSI CSI escape sequences (SGR + cursor moves).")
+
+(defun anvil-shell-filter--strip-ansi (raw)
+  "Strip ANSI CSI / SGR escape sequences from RAW string."
+  (replace-regexp-in-string anvil-shell-filter--ansi-csi-re "" raw))
+
+(defun anvil-shell-filter--apply-replace (raw replace-list)
+  "Apply REPLACE-LIST `((PATTERN . REPLACEMENT) ...)' to RAW in order."
+  (let ((out raw))
+    (dolist (cell replace-list out)
+      (setq out (replace-regexp-in-string (car cell) (cdr cell) out)))))
+
+(defun anvil-shell-filter--apply-strip-lines (raw regex-list)
+  "Drop every line of RAW matching ANY regex in REGEX-LIST.
+A nil REGEX-LIST returns RAW unchanged."
+  (if (null regex-list)
+      raw
+    (let* ((lines (split-string raw "\n"))
+           (kept  (cl-remove-if
+                   (lambda (line)
+                     (cl-some (lambda (re) (string-match-p re line))
+                              regex-list))
+                   lines)))
+      (string-join kept "\n"))))
+
+(defun anvil-shell-filter--apply-keep-lines (raw regex-list)
+  "Keep only lines of RAW matching at least one regex in REGEX-LIST.
+A nil REGEX-LIST returns RAW unchanged (= no filtering)."
+  (if (null regex-list)
+      raw
+    (let* ((lines (split-string raw "\n"))
+           (kept  (cl-remove-if-not
+                   (lambda (line)
+                     (cl-some (lambda (re) (string-match-p re line))
+                              regex-list))
+                   lines)))
+      (string-join kept "\n"))))
+
+(defun anvil-shell-filter--apply-truncate (raw n)
+  "Right-trim each line of RAW to N chars; lines longer get `...' appended.
+Nil or non-positive N returns RAW unchanged."
+  (if (or (not (numberp n)) (<= n 0))
+      raw
+    (string-join
+     (mapcar (lambda (line)
+               (if (> (length line) n)
+                   (concat (substring line 0 (max 0 (- n 3))) "...")
+                 line))
+             (split-string raw "\n"))
+     "\n")))
+
+(defun anvil-shell-filter--apply-tail-lines (raw n)
+  "Keep only the last N lines of RAW.  Nil / non-positive N returns RAW."
+  (if (or (not (numberp n)) (<= n 0))
+      raw
+    (let ((lines (split-string raw "\n")))
+      (string-join (last lines n) "\n"))))
+
+(defun anvil-shell-filter--apply-max-lines (raw n)
+  "Keep only the first N lines of RAW.  Nil / non-positive N returns RAW."
+  (if (or (not (numberp n)) (<= n 0))
+      raw
+    (let* ((lines (split-string raw "\n"))
+           (cut   (cl-subseq lines 0 (min n (length lines)))))
+      (string-join cut "\n"))))
+
+(defun anvil-shell-filter--match-output-short-circuit (raw match-list)
+  "Return MESSAGE for the first regex in MATCH-LIST that matches RAW, else nil.
+MATCH-LIST is `((PATTERN . MESSAGE) ...)'."
+  (cl-loop for (pat . msg) in match-list
+           when (string-match-p pat raw)
+           return msg))
+
+;;;###autoload
+(cl-defun anvil-shell-filter-register
+    (tag &key match-command strip-ansi filter-stderr replace match-output
+         strip-lines-matching keep-lines-matching truncate-lines-at
+         max-lines tail-lines on-empty description)
+  "Register a declarative filter under TAG (a symbol).
+
+The pipeline runs in this order on every call:
+
+  1. strip-ansi          (when non-nil — drops ANSI CSI / SGR escapes)
+  2. replace             ((PATTERN . REPLACEMENT) cells, in order)
+  3. match-output        ((PATTERN . MESSAGE) cells; first match short-circuits)
+  4. strip-lines-matching (drop any line matching ANY regex in the list)
+  5. keep-lines-matching  (keep only lines matching ANY regex; nil = no-op)
+  6. truncate-lines-at   (right-trim each line to N chars; appends `...')
+  7. tail-lines          (keep only last N lines)
+  8. max-lines           (keep only first N lines AFTER tail)
+  9. on-empty fallback   (return :on-empty verbatim when result trims empty)
+
+Existing entries with the same TAG are replaced; the previous match-command
+entry (if any) is removed from `anvil-shell-filter--match-command-table'
+before the new one is pushed, so re-registering never leaves orphans.
+
+DESCRIPTION and FILTER-STDERR are accepted for spec parity with the rtk
+TOML schema but are currently advisory only — stderr is already merged
+into stdout by `anvil-shell-filter-run'.
+
+Returns TAG."
+  (ignore filter-stderr description)
+  (let ((closure
+         (lambda (raw)
+           (let* ((s (if strip-ansi
+                         (anvil-shell-filter--strip-ansi raw)
+                       raw))
+                  (s (anvil-shell-filter--apply-replace s replace))
+                  (mo (and match-output
+                           (anvil-shell-filter--match-output-short-circuit
+                            s match-output))))
+             (if mo
+                 mo
+               (let* ((s (anvil-shell-filter--apply-strip-lines
+                          s strip-lines-matching))
+                      (s (anvil-shell-filter--apply-keep-lines
+                          s keep-lines-matching))
+                      (s (anvil-shell-filter--apply-truncate
+                          s truncate-lines-at))
+                      (s (anvil-shell-filter--apply-tail-lines
+                          s tail-lines))
+                      (s (anvil-shell-filter--apply-max-lines
+                          s max-lines)))
+                 (if (and on-empty (string-empty-p (string-trim s)))
+                     on-empty
+                   s)))))))
+    (setf (alist-get tag anvil-shell-filter-handlers) closure)
+    (when match-command
+      (setq anvil-shell-filter--match-command-table
+            (cl-remove-if (lambda (cell) (eq (cdr cell) tag))
+                          anvil-shell-filter--match-command-table))
+      (push (cons match-command tag)
+            anvil-shell-filter--match-command-table))
+    tag))
+
+;;;###autoload
+(defun anvil-shell-filter-register-from-spec (spec)
+  "Register a filter from SPEC, a plist with :tag plus the same keys
+accepted by `anvil-shell-filter-register'.
+
+Used by the auto-generated `anvil-shell-filter-builtin.el' bridge so
+each rtk-derived call site stays one line.  SPEC must contain :tag;
+all other keywords are forwarded verbatim."
+  (let ((tag (plist-get spec :tag))
+        (kw  (cl-loop for (k v) on spec by #'cddr
+                      unless (eq k :tag)
+                      append (list k v))))
+    (unless tag
+      (error "anvil-shell-filter-register-from-spec: SPEC missing :tag — %S" spec))
+    (apply #'anvil-shell-filter-register tag kw)))
 
 
 ;;;; --- tee + gain statistics ----------------------------------------------
