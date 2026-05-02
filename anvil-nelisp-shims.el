@@ -53,14 +53,55 @@ load.  Drained once by `anvil-nelisp-shims-drain' which the Rust
 
 ;;;; --- anvil-server registration accumulator ------------------------------
 
+(defun anvil-nelisp-shims--normalize-spec (spec)
+  "Normalize SPEC to a plist starting with `:id'.
+
+Anvil module spec forms come in two shapes:
+  * `(HANDLER :id ID :description ... :read-only t)' — handler-first form
+    used by `anvil-memory--tool-specs', `anvil-worklog--tool-specs', etc.
+  * `(:id ID :handler HANDLER :description ...)' — already-plist form
+    produced by `anvil-server-register-tool' (singular).
+
+The Rust drain parser (`parse_drained_specs') only understands the
+plist form, so we re-shape handler-first specs by splicing
+`:handler HANDLER' into the plist tail."
+  (cond
+   ;; Already-plist form: starts with :id keyword (a symbol whose name
+   ;; begins with `:').
+   ((and (consp spec)
+         (symbolp (car spec))
+         (let ((sn (symbol-name (car spec))))
+           (and (> (length sn) 0) (eq (aref sn 0) ?:))))
+    spec)
+   ;; Handler-first form: prepend (:handler HANDLER) to the rest.
+   ((and (consp spec) (consp (cdr spec)))
+    (cons :handler (cons (car spec) (cdr spec))))
+   ;; Unknown shape: pass through untouched (= Rust will skip it).
+   (t spec)))
+
 (unless (fboundp 'anvil-server-register-tools)
   (defun anvil-server-register-tools (server-id specs)
     "Standalone shim — accumulate SPECS for SERVER-ID.
 Returns SPECS unchanged so callers that chain on the return value
-behave the same as under the real `anvil-server'."
-    (setq anvil-nelisp-shims--collected-specs
-          (cons (cons server-id specs)
-                anvil-nelisp-shims--collected-specs))
+behave the same as under the real `anvil-server'.
+
+SPECS may be in either handler-first or plist form; each spec is
+normalized to plist form before storage so the Rust drain parser can
+consume them uniformly."
+    (let ((norm nil)
+          (cur specs))
+      (while cur
+        (setq norm (cons (anvil-nelisp-shims--normalize-spec (car cur))
+                         norm))
+        (setq cur (cdr cur)))
+      ;; Reverse `norm' back to original order.
+      (let ((forward nil))
+        (while norm
+          (setq forward (cons (car norm) forward))
+          (setq norm (cdr norm)))
+        (setq anvil-nelisp-shims--collected-specs
+              (cons (cons server-id forward)
+                    anvil-nelisp-shims--collected-specs))))
     specs))
 
 (unless (fboundp 'anvil-server-unregister-tools)
