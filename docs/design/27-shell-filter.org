@@ -8,10 +8,11 @@
   :PROPERTIES:
   :ID:       c6f05c1e-72a6-4e3b-87a6-d0a6a3b7c002
   :END:
-~Phase 1 + 2a SHIPPED~ (2026-04-22、feat branches) — Week-3 Ship 2。
-競合 rtk (Rust Token Killer) 由来の per-command 出力圧縮 +
-=anvil-state= tee + gain 累計。Phase 2b (streaming) / Phase 3
-(user-defined) / Phase 4 (業務固有) は DRAFT 維持。
+~Phase 1 + 2a + 2b + 3 SHIPPED~ (Phase 3 = 2026-05-02、
+feat/doc-27-shell-filter-phase3-register-api)。競合 rtk (Rust
+Token Killer) 由来の per-command 出力圧縮 + =anvil-state= tee +
+gain 累計 + 60 件規模の declarative spec import。Phase 4 (業務固有)
+は DRAFT 維持。
 
 *Phase 1 (feat/doc-27-shell-filter-phase1):* 10 filter
 (=git-status= / =git-log= / =git-diff= / =rg= / =find= / =ls= /
@@ -281,10 +282,39 @@ Tail semantics:
 
 commit: =7c86a8a= (test-lock) → Phase 2b impl (develop)。
 
-** Phase 3 — user-defined filter
+** Phase 3 — declarative register API + rtk seed (~SHIPPED~ 2026-05-02)
 
-=~/.emacs.d/anvil-shell-filters.el= で user 定義。
-=(anvil-shell-filter-register 'my-tool #'my-filter-fn)= API 公開。
+feat/doc-27-shell-filter-phase3-register-api。30 本超えの DSL
+化問題 (Q3) を解決:
+
+- =anvil-shell-filter-register= cl-defun (公開) — TAG + 11 keyword
+  spec で declarative filter 登録。8-stage pipeline:
+  =strip-ansi → replace → match-output → strip-lines → keep-lines
+  → truncate → tail-lines → max-lines → on-empty=。
+- =anvil-shell-filter-register-from-spec= — plist 一発登録 (auto-gen
+  builtin が利用)。
+- =anvil-shell-filter--rust-regex-to-elisp= — Rust =regex= crate →
+  Elisp regex 翻訳 (=\\s= / =\\d= / capturing / alternation /
+  =(?:= / =(?P<name>= 対応、char class 内は verbatim)。vendored
+  TOML を byte-identical で保つために必須。
+- =vendor/rtk-filters/*.toml= — rtk-ai/rtk @ =4338f029ec43= から
+  59 spec を verbatim vendor (Apache-2.0、=NOTICE= +
+  =vendor/rtk-filters/LICENSE= で attribution)。
+- =scripts/sync-rtk-filters.py= — TOML → =anvil-shell-filter-builtin.el=
+  build-time 変換 (Python 3.11+ stdlib =tomllib= のみ、=--check=
+  drift detection)。=make sync-toml-filters= / =make
+  check-toml-filters-sync=。
+- =anvil-shell-filter-builtin.el= — 自動生成、=(require ...)= で
+  59 builtin が install。=anvil-shell-filter-builtin-defer-install=
+  = t で defer 可能。
+- 既存 20 hand-coded handler + lookup cond-tree は無変更
+  (互換性保持)。新 filter は match-command-table fallback 経由。
+
+ERT: +14 (= 50/50 pass / 1 live skip)。Python: +10 unittest pass。
+
+User-defined filter (=~/.emacs.d/anvil-shell-filters.el= で
+=anvil-shell-filter-register= or =-register-from-spec= 直呼び) は
+本 Phase でそのまま使えるようになった。
 
 ** Phase 4 — 電気管理業務固有 filter
 
