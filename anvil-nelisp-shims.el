@@ -105,6 +105,28 @@ take a hard dependency on its load order)."
     (ignore args)
     nil))
 
+(unless (fboundp 'anvil-server-encode-handler)
+  (defun anvil-server-encode-handler (handler &rest opts)
+    "Standalone shim — return HANDLER unchanged.
+The Rust `anvil-runtime' owns MCP-side JSON encoding, so wrapping the
+handler with the host `anvil-server' encoder is unnecessary here."
+    (ignore opts)
+    handler))
+
+(unless (fboundp 'anvil-server-with-error-handling)
+  (defmacro anvil-server-with-error-handling (&rest body)
+    "Standalone shim — eval BODY without the host's MCP error wrapper.
+The Rust runtime translates Elisp errors into JSON-RPC error responses
+on its own, so the wrapping macro is a passthrough here."
+    (cons 'progn body)))
+
+(unless (fboundp 'anvil-server-tool-throw)
+  (defun anvil-server-tool-throw (msg &optional data)
+    "Standalone shim — signal an error.
+The Rust runtime catches it and translates to a JSON-RPC error."
+    (ignore data)
+    (error "%s" msg)))
+
 ;; Provide the feature so modules' `(require 'anvil-server)' is satisfied.
 (unless (featurep 'anvil-server)
   (provide 'anvil-server))

@@ -91,21 +91,59 @@ incomplete.
 After these polyfills landed, ~anvil-state.el~ loads cleanly via
 Pattern C.  ~anvil-memory.el~ still fails — see next section.
 
-** Phase 2 blocker — NeLisp's own ~backquote~ roadmap
+** Phase 2 — backquote SHIPPED in nelisp-emacs L2 (2026-05-02)
 
-~anvil-memory.el~ uses the backquote macro (` `\`(...)` / `,foo` / `,@foo`)
-extensively.  NeLisp's reader produces `(backquote ...)' forms but
-NeLisp itself does NOT yet implement the `backquote' macro — see
-~src/nelisp-macro.el:39~ comment "Phase 2 ships backquote".
+User directive (2026-05-02 #3): NeLisp stays minimal; backquote is
+implemented in nelisp-emacs L2 as a polyfill, not in NeLisp itself.
 
-This is on NeLisp's own roadmap, NOT something anvil.el should
-polyfill: backquote is a sophisticated macro with nested-context
-semantics (= a pure-elisp polyfill would duplicate ~150 LoC of subtle
-recursion that NeLisp will eventually ship its own version of).
+~nelisp-emacs/src/emacs-backquote.el~ ships a single-level backquote
+macro that handles `(comma X)' (= unquote) and `(comma-at X)' (=
+splice) substitution using a recursive cons / append builder.  13 ERT
+pass.  Loads cleanly via the L2 emacs-init.el chain.
 
-Pattern C is therefore feature-complete on the anvil.el side.  Real
-modules (~anvil-memory~, ~anvil-worklog~, ~anvil-orchestrator~)
-become loadable once NeLisp's Phase 2 ships ~backquote~.
+*** What works after backquote landed
+
+- ~anvil-state.el~ loads (= no register yet — it's infrastructure)
+- ~anvil-memory.el~ LOADS (= macros expand correctly)
+- Pattern C dispatch demonstrably reaches real anvil module bodies
+
+*** Additional Phase 2 polyfills shipped
+
+| Symbol               | File              | Reason                                |
+|----------------------+-------------------+---------------------------------------|
+| ~ignore~ / ~identity~ | emacs-fns.el      | trivial — needed by anvil-memory load |
+| ~interactive~        | emacs-eval.el     | defun marker, no-op fn polyfill       |
+| ~user-error~         | emacs-error.el    | error variant                         |
+| ~display-warning~    | emacs-error.el    | warning surface → message             |
+| ~define-error~       | emacs-error.el    | needs `put' (= next blocker)          |
+| ~string-trim~ / etc  | emacs-string.el   | subr-x string utilities               |
+| anvil-server stubs   | anvil-nelisp-shims | encode-handler / with-error-handling / tool-throw |
+
+*** Phase 2 BOUNDARY — symbol-property primitives still missing
+
+~anvil-memory-enable~ requires ~sqlite-available-p~ to return t,
+which means ~nelisp-sqlite~ extension must load, which needs:
+
+- ~put~ / ~get~ — symbol property accessors (= used by `define-error',
+  `nelisp-sqlite' module init, many other low-level Emacs primitives)
+- ~copy-sequence~ / ~copy-tree~ / ~last~ — list helpers
+- ~assoc~ / ~assq~ / ~rassoc~ / ~rassq~ — alist accessors
+- ~delete~ / ~delq~ — list element removal
+- + likely a long tail of other subr.el / fns.c primitives that surface
+  one-by-one as each load step proceeds.
+
+This is the *coverage grind* — each missing primitive is small (= 5-30
+LoC each) but the queue is long (= probably 30+ symbols to reach a
+functional `(memory-list)' dispatch).  Estimate: 1-2 days of focused
+work to completion, with each new symbol surfaced empirically by
+re-running the load chain.
+
+*** Phase 2 architectural conclusion
+
+The Pattern C plumbing is COMPLETE and CORRECT.  Real anvil module
+loading is bottlenecked on raw L2 coverage of standard Emacs builtins
+— not on any architectural gap.  Continuing the grind = pure expansion
+of ~nelisp-emacs/src/emacs-*.el~ until enough surface lands.
 
 ** What works today (= verified end-to-end)
 
