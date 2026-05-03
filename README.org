@@ -1,4 +1,4 @@
-#+title: anvil.el — Emacs as an MCP workbench for AI agents
+#+title: anvil.el — token-efficient MCP toolkit for AI agents
 #+author: zawatton
 
 *Languages:* English / [[file:README.ja.org][日本語]]
@@ -16,8 +16,7 @@ with that in mind.
 
 * TL;DR
 
-anvil.el is an *MCP server* that exposes a running Emacs (or a small
-Rust runtime called NeLisp) as 40+ tools an AI agent can call out of the box.  Optional modules (memory / orchestrator / session / http / …) each add their own tools when you enable them.
+anvil.el is a workbench for AI agents.  Optional modules (memory / orchestrator / session / http / …) each add their own tools when you enable them.
 Claude Code, Claude Desktop, GPT, local LLMs via Ollama — anything
 that speaks [[https://modelcontextprotocol.io/][Model Context Protocol]] can edit files, navigate org-mode,
 run elisp, query SQLite, and more *through Emacs primitives* instead
