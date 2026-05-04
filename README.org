@@ -1,4 +1,4 @@
-#+title: anvil.el — Emacs as an MCP workbench for AI agents
+#+title: anvil.el — token-efficient MCP toolkit for AI agents
 #+author: zawatton
 
 *Languages:* English / [[file:README.ja.org][日本語]]
@@ -16,8 +16,7 @@ with that in mind.
 
 * TL;DR
 
-anvil.el is an *MCP server* that exposes a running Emacs (or a small
-Rust runtime called NeLisp) as 40+ tools an AI agent can call out of the box.  Optional modules (memory / orchestrator / session / http / …) each add their own tools when you enable them.
+anvil.el is a workbench for AI agents.  Optional modules (memory / orchestrator / session / http / …) each add their own tools when you enable them.
 Claude Code, Claude Desktop, GPT, local LLMs via Ollama — anything
 that speaks [[https://modelcontextprotocol.io/][Model Context Protocol]] can edit files, navigate org-mode,
 run elisp, query SQLite, and more *through Emacs primitives* instead
@@ -678,6 +677,43 @@ budget goes to reasoning about your code, not re-reading it.
 (anvil-enable)
 (anvil-server-start)
 #+end_src
+
+** User config — Emacs vs NeLisp standalone
+
+Two entry paths, two config locations:
+
+| Entry path                                | Config source                |
+|-------------------------------------------+------------------------------|
+| Emacs (~emacs --daemon~ + ~emacsclient~)  | your existing ~init.el~      |
+| NeLisp standalone (~bin/anvil mcp serve~) | ~$ANVIL_CONFIG_DIR/config.el~ |
+
+Under regular Emacs nothing changes — keep putting your =setq=
+overrides in =init.el=.  Under the NeLisp standalone path (= the
+Rust =anvil-runtime= binary spawned by =bin/anvil=, no =init.el= to
+read) anvil resolves a config file from these env vars in order:
+
+1. =$ANVIL_CONFIG_DIR=
+2. =$XDG_CONFIG_HOME/anvil=  (XDG default)
+3. =~/.config/anvil=          (POSIX fallback)
+
+The file inside that directory is always =config.el=.  Missing file
+is silent (= optional).  Parse / eval failure is surfaced via
+=display-warning= but never aborts the MCP server — a broken user
+config must not wedge bootstrap.
+
+Example =~/.config/anvil/config.el=:
+
+#+begin_src emacs-lisp
+;; Codex tasks need write access for any non-trivial dispatch.
+(setq anvil-orchestrator-codex-sandbox "workspace-write")
+;; Truncate gain summary lines aggressively.
+(setq anvil-shell-filter-default-truncate-lines-at 200)
+#+end_src
+
+The branch on which path is in effect is fully automatic — anvil
+detects it via =(featurep 'nelisp)= which is true only after the
+NeLisp interpreter bootstrap.  See =anvil-config.el= for the
+implementation.
 
 ** Browser module (optional)
 
