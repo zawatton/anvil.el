@@ -117,7 +117,7 @@ Emacs はバックグラウンドで daemon 1 つを常駐させるだけ。Emac
 | 巨大ファイルから繰り返し構造データ抽出     | *~50%*    | レガシー移行、ETL                |
 | N ファイルの docstring を一括変更          | *~60-80%* | 1 コールで全ファイル分           |
 
-数値は実測ベース ([[*効率性 — Anvil が AI トークンを節約する理由][効率性節]] にケーススタディ)。
+数値は実測ベース ([[https://github.com/zawatton/anvil.el/blob/master/README.ja.org#効率性--anvil-が-ai-トークンを節約する理由][効率性節]] にケーススタディ)。
 内容次第ですが、典型的なリファクタリングセッションで *15,000〜25,000 トークン* の
 削減が安定して出ています。
 
@@ -147,10 +147,10 @@ iwr -useb https://raw.githubusercontent.com/zawatton/anvil.el/master/install.ps1
    - Linux: =sudo apt install emacs= / =sudo dnf install emacs=
    - macOS: =brew install --cask emacs=
    - Windows: [[https://www.msys2.org/][MSYS2]] 経由 or [[https://www.gnu.org/software/emacs/download.html][gnu.org binary]]
-2. *anvil を入れる* — [[*インストール][インストール]] 節の手順 (=async-installer= がもっとも手早い)
-3. *daemon を起動して MCP server を上げる* — [[*クイックスタート][クイックスタート]] 節
-4. *AI クライアントから接続* — [[*クライアント設定 — AI を Anvil に接続する][クライアント設定]] 節 (Claude Code / Claude Desktop のスニペットあり)
-5. *CLAUDE.md (or 相当) に Anvil 優先指示を入れる* — [[*推奨スニペット（Claude Code =CLAUDE.md=）][推奨スニペット]] (任意だが効果大)
+2. *anvil を入れる* — [[https://github.com/zawatton/anvil.el/blob/master/README.ja.org#インストール][インストール]] 節の手順 (=async-installer= がもっとも手早い)
+3. *daemon を起動して MCP server を上げる* — [[https://github.com/zawatton/anvil.el/blob/master/README.ja.org#クイックスタート][クイックスタート]] 節
+4. *AI クライアントから接続* — [[https://github.com/zawatton/anvil.el/blob/master/README.ja.org#クライアント設定--ai-を-anvil-に接続する][クライアント設定]] 節 (Claude Code / Claude Desktop のスニペットあり)
+5. *CLAUDE.md (or 相当) に Anvil 優先指示を入れる* — [[https://github.com/zawatton/anvil.el/blob/master/README.ja.org#推奨スニペットclaude-code-claudemd][推奨スニペット]] (任意だが効果大)
 
 普段使う VSCode / Cursor / Neovim / Claude Code はそのままで OK。これといって Emacs Lisp の知識を使うことなく、AI のトークン消費削減だけを得られます。
 
@@ -189,8 +189,8 @@ Anvil の default install は *約 40 個の MCP ツール* を提供します (
 | 大規模 org ファイルの編集 | 1.2 MB 以上の org も末尾欠損なく編集 (Windows ファイルマウント問題を回避) |
 | LLM クライアント非依存 | Claude Code / Claude Desktop / GPT / Ollama 経由のローカル LLM、すべて MCP で繋がる |
 
-数値の根拠と詳細なケーススタディは [[*効率性 — Anvil が AI トークンを節約する理由]] にあります。
-全モジュール一覧は [[*モジュール]] を参照。
+数値の根拠と詳細なケーススタディは [[https://github.com/zawatton/anvil.el/blob/master/README.ja.org#効率性--anvil-が-ai-トークンを節約する理由][効率性 — Anvil が AI トークンを節約する理由]] にあります。
+全モジュール一覧は [[https://github.com/zawatton/anvil.el/blob/master/README.ja.org#モジュール][モジュール]] を参照。
 
 * なぜ Anvil か？
 
@@ -1043,7 +1043,7 @@ org-mcp 単体で満足している場合、anvil は置換品ではなく /org-
 - =--fg-daemon= で常駐させる (起動スクリプトはリポジトリに同梱)
 - AI クライアントの MCP 設定に 1 ブロック追加
 
-詳しい手順は [[*Emacs ユーザーじゃない方へ — トークン削減目的で導入する場合][Emacs ユーザーじゃない方へ]] 節にまとめてあります。
+詳しい手順は [[https://github.com/zawatton/anvil.el/blob/master/README.ja.org#emacs-ユーザーじゃない方へ--トークン削減目的で導入する場合][Emacs ユーザーじゃない方へ]] 節にまとめてあります。
 Emacs Lisp の知識は不要、AI のトークン消費削減だけを得られます。
 
 * アーキテクチャ

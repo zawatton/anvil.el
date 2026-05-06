@@ -43,7 +43,7 @@ operate on regions, headings, buffer state — only diffs cross.
 | Extracting repeating structured records from huge files | *~50%*    | Legacy migration, ETL                  |
 | Bulk docstring change across N files                    | *~60-80%* | All files in a single call             |
 
-Numbers are measured; case studies in [[*Efficiency — why Anvil saves AI tokens][the Efficiency section]].
+Numbers are measured; case studies in [[https://github.com/zawatton/anvil.el#efficiency--why-anvil-saves-ai-tokens][the Efficiency section]].
 A typical refactoring session saves *15,000-25,000 tokens*.
 
 * Architecture
@@ -272,8 +272,8 @@ sister package).  Highlights:
 | Large org file editing | Edit org files of 1.2 MB or more without truncation (avoids the Windows file-mount issue) |
 | LLM client agnostic | Claude Code / Claude Desktop / GPT / local LLMs via Ollama — all speak through MCP |
 
-For numerical evidence and detailed case studies, see [[*Efficiency — why Anvil saves AI tokens]].
-For the full module list, see [[*Modules]].
+For numerical evidence and detailed case studies, see [[https://github.com/zawatton/anvil.el#efficiency--why-anvil-saves-ai-tokens][Efficiency — why Anvil saves AI tokens]].
+For the full module list, see [[https://github.com/zawatton/anvil.el#modules][Modules]].
 
 * Architecture α — NeLisp delegate active
 
@@ -1316,7 +1316,7 @@ What you actually need:
 - Run it as =--fg-daemon= (a launcher script ships with the repo)
 - Add a single block to your AI client's MCP config
 
-A full walkthrough lives in [[*For Non-Emacs Users — Adopting Anvil for Token Reduction][For Non-Emacs Users]]. No Emacs Lisp
+A full walkthrough lives in [[https://github.com/zawatton/anvil.el#for-non-emacs-users--what-setup-costs-you][For non-Emacs users]]. No Emacs Lisp
 knowledge required to capture the AI-token savings.
 
 * Internals — bridge + worker pool
