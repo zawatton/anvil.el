@@ -65,6 +65,16 @@
   :type 'file
   :group 'anvil-state)
 
+(defcustom anvil-state-vacuum-idle-interval 86400
+  "Seconds of idle time between automatic `anvil-state-vacuum' runs.
+The vacuum drops expired-TTL rows and runs SQLite VACUUM to reclaim
+space.  Default 86400 = once per idle day.  Set to nil to disable
+the automatic timer (callers can still invoke `anvil-state-vacuum'
+manually).  The timer is installed by `anvil-state-enable' and
+cancelled by `anvil-state-disable'."
+  :type '(choice integer (const :tag "Disabled" nil))
+  :group 'anvil-state)
+
 (defconst anvil-state-schema-version 1
   "Current schema version of the anvil-state database.
 Bump on incompatible changes; add a migration branch in
@@ -77,6 +87,11 @@ Bump on incompatible changes; add a migration branch in
 
 (defvar anvil-state--db nil
   "Open SQLite handle, or nil when `anvil-state-enable' has not run yet.")
+
+(defvar anvil-state--vacuum-timer nil
+  "Idle timer that periodically runs `anvil-state-vacuum'.
+Installed by `anvil-state-enable' when
+`anvil-state-vacuum-idle-interval' is non-nil.")
 
 ;;; Backend plumbing
 
@@ -381,16 +396,34 @@ Returns a plist with `:expired' (rows removed) and `:size-before'
 
 ;;; Lifecycle
 
+(defun anvil-state--ensure-vacuum-timer ()
+  "Install the idle vacuum timer when configured and not yet running."
+  (when (and (numberp anvil-state-vacuum-idle-interval)
+             (> anvil-state-vacuum-idle-interval 0)
+             (null anvil-state--vacuum-timer))
+    (setq anvil-state--vacuum-timer
+          (run-with-idle-timer anvil-state-vacuum-idle-interval t
+                               (lambda ()
+                                 (ignore-errors (anvil-state-vacuum)))))))
+
+(defun anvil-state--cancel-vacuum-timer ()
+  "Cancel the idle vacuum timer if it is running."
+  (when (timerp anvil-state--vacuum-timer)
+    (cancel-timer anvil-state--vacuum-timer))
+  (setq anvil-state--vacuum-timer nil))
+
 ;;;###autoload
 (defun anvil-state-enable ()
   "Initialize the anvil-state DB.  No MCP tools are registered."
   (interactive)
   (anvil-state--open)
+  (anvil-state--ensure-vacuum-timer)
   nil)
 
 (defun anvil-state-disable ()
   "Close the anvil-state DB handle.  Safe to call repeatedly."
   (interactive)
+  (anvil-state--cancel-vacuum-timer)
   (anvil-state--close)
   nil)
 

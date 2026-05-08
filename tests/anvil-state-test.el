@@ -178,5 +178,27 @@ and cleans up on exit."
     (anvil-state-enable)
     (should (equal "yes" (anvil-state-get "persist" :ns "soak")))))
 
+;;;; --- §7.4 vacuum idle-timer lifecycle ----------------------------------
+
+(ert-deftest anvil-state-test-vacuum-timer-installed-on-enable ()
+  "`anvil-state-enable' installs the vacuum idle-timer when configured."
+  (let ((anvil-state-vacuum-idle-interval 86400))
+    (anvil-state-test--with-db
+      (should (timerp anvil-state--vacuum-timer)))))
+
+(ert-deftest anvil-state-test-vacuum-timer-cancelled-on-disable ()
+  "`anvil-state-disable' cancels the vacuum idle-timer."
+  (let ((anvil-state-vacuum-idle-interval 86400))
+    (anvil-state-test--with-db
+      (should (timerp anvil-state--vacuum-timer)))
+    ;; After --with-db unwinds (which calls disable), timer must be gone.
+    (should (null anvil-state--vacuum-timer))))
+
+(ert-deftest anvil-state-test-vacuum-timer-disabled-when-nil ()
+  "Setting interval to nil keeps the timer slot empty."
+  (let ((anvil-state-vacuum-idle-interval nil))
+    (anvil-state-test--with-db
+      (should (null anvil-state--vacuum-timer)))))
+
 (provide 'anvil-state-test)
 ;;; anvil-state-test.el ends here

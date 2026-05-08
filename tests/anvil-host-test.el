@@ -82,5 +82,22 @@ line on exit; the wrapper silences it with `:sentinel #'ignore'
   (let ((res (anvil-shell "exit 7" '(:timeout 3))))
     (should (eql 7 (plist-get res :exit)))))
 
+;;;; --- §7.2 late stderr capture (stderr-pipe drain) ----------------------
+
+(ert-deftest anvil-host-test-shell-captures-late-stderr ()
+  "Stderr emitted just before exit must be fully captured.
+Regression for the race between proc and stderr-pipe-proc
+lifecycles: the kernel pipe may still hold bytes when proc dies,
+and the pipe-proc only reads them once Emacs services it.  The
+post-exit drain captures those late bytes."
+  (skip-unless (memq system-type '(gnu/linux darwin)))
+  (let ((res (anvil-shell
+              "for i in 1 2 3 4 5; do echo line$i >&2; done; exit 0"
+              '(:timeout 5))))
+    (should (eql 0 (plist-get res :exit)))
+    (let ((err (plist-get res :stderr)))
+      (should (string-match-p "line1" err))
+      (should (string-match-p "line5" err)))))
+
 (provide 'anvil-host-test)
 ;;; anvil-host-test.el ends here

@@ -75,6 +75,11 @@
 (defconst anvil-shell-filter--gain-ns "shell-gain"
   "`anvil-state' namespace holding per-day gain entries.")
 
+(defconst anvil-shell-filter--trace-ns "shell-trace"
+  "`anvil-state' namespace holding per-phase trace events for
+`anvil-shell-filter-run' invocations.  Populated only when
+`anvil-shell-filter-trace-events' is non-nil.")
+
 (defconst anvil-shell-filter-supported
   '(git-status git-log git-diff rg find ls pytest ert-batch
                emacs-batch make dispatch tee gain
@@ -93,6 +98,44 @@ same list so each test can self-describe its capability gate.")
   "Seconds raw output is retained under the shell-tee namespace.
 `anvil-state' prunes expired rows lazily on `GET' and eagerly on
 `anvil-state-vacuum'; callers do not need to sweep."
+  :type 'integer
+  :group 'anvil-shell-filter)
+
+(defcustom anvil-shell-tee-max-bytes (* 4 1024 1024)
+  "Maximum bytes stored per shell-run tee entry.
+Larger raw stdout is truncated with a sentinel before storage
+in `anvil-state'.  Caps the per-call cost of
+`anvil-shell-filter--tee-put' and prevents unbounded growth of
+`anvil-state.db' when commands emit large output (e.g. cargo
+test logs).  Set to nil to disable capping (the historical
+behaviour).  `anvil-shell-filter-tee-get' returns the capped
+string; for genuinely large output prefer file redirection."
+  :type '(choice integer (const :tag "No cap" nil))
+  :group 'anvil-shell-filter)
+
+(defcustom anvil-shell-filter-trace-events nil
+  "When non-nil, emit per-phase trace rows for each
+`anvil-shell-filter-run' invocation into `anvil-state' under
+namespace `shell-trace'.
+
+Each call produces five rows keyed by a unique trace id —
+`<id>-start', `<id>-exec-done', `<id>-filter-done',
+`<id>-tee-done', `<id>-return' — recording phase name, absolute
+Unix timestamp, and elapsed milliseconds since the run start.
+TTL = `anvil-shell-trace-ttl-sec'.
+
+Opt-in observability.  When nil the run path adds zero state
+writes (zero-cost).  Inspect by querying
+  SELECT k, v FROM kv WHERE ns = \\='shell-trace\\='
+during or after a suspected hang to learn which phase blocked."
+  :type 'boolean
+  :group 'anvil-shell-filter)
+
+(defcustom anvil-shell-trace-ttl-sec 600
+  "TTL (seconds) for trace events emitted when
+`anvil-shell-filter-trace-events' is non-nil.  Defaults to 10
+minutes — long enough to inspect a recent hang, short enough
+that traces do not accumulate."
   :type 'integer
   :group 'anvil-shell-filter)
 
@@ -879,10 +922,41 @@ all other keywords are forwarded verbatim."
           (truncate (float-time))
           (random #x1000000)))
 
+(defun anvil-shell-filter--trace-new-id ()
+  "Generate a short trace-id (`tr-<epoch>-<rand>')."
+  (format "tr-%x-%x"
+          (truncate (float-time))
+          (random #x1000000)))
+
+(defun anvil-shell-filter--trace (id phase start-time)
+  "Record a phase trace row for PHASE under trace ID.
+START-TIME is the timestamp captured when the run began; the
+record carries the elapsed milliseconds between START-TIME and
+now.  No-op when `anvil-shell-filter-trace-events' is nil."
+  (when anvil-shell-filter-trace-events
+    (ignore-errors
+      (anvil-state-set
+       (format "%s-%s" id phase)
+       (list :phase phase
+             :at (truncate (float-time))
+             :elapsed-ms (truncate (* 1000 (float-time
+                                            (time-since start-time)))))
+       :ns anvil-shell-filter--trace-ns
+       :ttl anvil-shell-trace-ttl-sec))))
+
 (defun anvil-shell-filter--tee-put (raw)
-  "Store RAW under a fresh tee-id, return the id string."
-  (let ((id (anvil-shell-filter--new-id)))
-    (anvil-state-set id raw
+  "Store RAW under a fresh tee-id, return the id string.
+When `anvil-shell-tee-max-bytes' is non-nil and RAW exceeds it,
+the stored value is truncated with a sentinel so `anvil-state.db'
+cannot grow unboundedly per invocation."
+  (let* ((id (anvil-shell-filter--new-id))
+         (cap anvil-shell-tee-max-bytes)
+         (capped (if (and (integerp cap) (> (length raw) cap))
+                     (concat (substring raw 0 cap)
+                             (format "\n…[anvil-shell-tee: truncated %d bytes]"
+                                     (- (length raw) cap)))
+                   raw)))
+    (anvil-state-set id capped
                      :ns anvil-shell-filter--tee-ns
                      :ttl anvil-shell-tee-ttl-sec)
     id))
@@ -969,34 +1043,47 @@ Returns a plist:
 Raw stdout is always tee'd so callers can fetch the full output
 via `anvil-shell-filter-tee-get' when compression hid material
 detail."
-  (let* ((filter-opt (or (plist-get opts :filter) 'auto))
+  (let* ((trace-id (and anvil-shell-filter-trace-events
+                        (anvil-shell-filter--trace-new-id)))
+         (trace-start (and trace-id (current-time)))
+         (filter-opt (or (plist-get opts :filter) 'auto))
          (timeout (or (plist-get opts :timeout)
                       anvil-shell-filter-default-timeout))
          (cwd (plist-get opts :cwd))
          (resolved (cond
                     ((eq filter-opt 'auto) (anvil-shell-filter-lookup cmd))
                     ((null filter-opt) nil)
-                    (t filter-opt)))
-         (result (anvil-shell cmd (list :timeout timeout :cwd cwd
-                                        :max-output nil)))
-         (exit (plist-get result :exit))
-         (raw (or (plist-get result :stdout) ""))
-         (stderr (or (plist-get result :stderr) ""))
-         (truncated (plist-get result :truncated))
-         (compressed (anvil-shell-filter-apply resolved raw))
-         (raw-size (length raw))
-         (compressed-size (length compressed))
-         (tee-id (anvil-shell-filter--tee-put raw)))
-    (when resolved
-      (anvil-shell-filter--gain-record resolved raw-size compressed-size))
-    (list :exit exit
-          :filter resolved
-          :compressed compressed
-          :raw-size raw-size
-          :compressed-size compressed-size
-          :tee-id tee-id
-          :stderr stderr
-          :truncated truncated)))
+                    (t filter-opt))))
+    (when trace-id
+      (anvil-shell-filter--trace trace-id "start" trace-start))
+    (let* ((result (anvil-shell cmd (list :timeout timeout :cwd cwd
+                                          :max-output nil)))
+           (_ (when trace-id
+                (anvil-shell-filter--trace trace-id "exec-done" trace-start)))
+           (exit (plist-get result :exit))
+           (raw (or (plist-get result :stdout) ""))
+           (stderr (or (plist-get result :stderr) ""))
+           (truncated (plist-get result :truncated))
+           (compressed (anvil-shell-filter-apply resolved raw))
+           (_ (when trace-id
+                (anvil-shell-filter--trace trace-id "filter-done" trace-start)))
+           (raw-size (length raw))
+           (compressed-size (length compressed))
+           (tee-id (anvil-shell-filter--tee-put raw))
+           (_ (when trace-id
+                (anvil-shell-filter--trace trace-id "tee-done" trace-start))))
+      (when resolved
+        (anvil-shell-filter--gain-record resolved raw-size compressed-size))
+      (when trace-id
+        (anvil-shell-filter--trace trace-id "return" trace-start))
+      (list :exit exit
+            :filter resolved
+            :compressed compressed
+            :raw-size raw-size
+            :compressed-size compressed-size
+            :tee-id tee-id
+            :stderr stderr
+            :truncated truncated))))
 
 
 ;;;; --- tee-grep: regex line filter + per-line truncate -------------------

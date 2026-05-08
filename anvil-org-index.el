@@ -106,6 +106,17 @@ is treated as the TODO state."
   :type '(repeat string)
   :group 'anvil-org-index)
 
+(defcustom anvil-org-index-checkpoint-idle-interval 3600
+  "Seconds of idle time between automatic WAL checkpoints on the
+org-index DB.  Default 3600 = once per idle hour.  Set to nil to
+disable.  Without periodic checkpoints the WAL file can grow
+unbounded — observed at 367 MB in production.  Each tick runs
+`PRAGMA wal_checkpoint(FULL)' against the live DB handle.  The
+timer is installed by `anvil-org-index-enable' and cancelled by
+`anvil-org-index-disable'."
+  :type '(choice integer (const :tag "Disabled" nil))
+  :group 'anvil-org-index)
+
 (defconst anvil-org-index-schema-version 1
   "Current schema version.  Bump on incompatible changes.")
 
@@ -117,6 +128,11 @@ Populated lazily by `anvil-org-index--detect-backend'.")
 
 (defvar anvil-org-index--db nil
   "Open database handle, or nil.")
+
+(defvar anvil-org-index--checkpoint-timer nil
+  "Idle timer that periodically runs `anvil-org-index-checkpoint'.
+Installed by `anvil-org-index-enable' when
+`anvil-org-index-checkpoint-idle-interval' is non-nil.")
 
 (defun anvil-org-index--detect-backend ()
   "Return the best available backend symbol, or signal `user-error'."
@@ -449,6 +465,36 @@ Return the new headline id."
 
 ;;; Public API — Phase 1
 
+(defun anvil-org-index-checkpoint ()
+  "Run `PRAGMA wal_checkpoint(FULL)' against the org-index DB.
+No-op when the DB is not open.  Returns t on success, nil otherwise."
+  (interactive)
+  (and anvil-org-index--db
+       (or (not (eq anvil-org-index--backend 'builtin))
+           (sqlitep anvil-org-index--db))
+       (progn
+         (ignore-errors
+           (anvil-org-index--execute anvil-org-index--db
+                                     "PRAGMA wal_checkpoint(FULL)"))
+         t)))
+
+(defun anvil-org-index--ensure-checkpoint-timer ()
+  "Install the idle WAL-checkpoint timer when configured."
+  (when (and (numberp anvil-org-index-checkpoint-idle-interval)
+             (> anvil-org-index-checkpoint-idle-interval 0)
+             (null anvil-org-index--checkpoint-timer))
+    (setq anvil-org-index--checkpoint-timer
+          (run-with-idle-timer
+           anvil-org-index-checkpoint-idle-interval t
+           (lambda ()
+             (ignore-errors (anvil-org-index-checkpoint)))))))
+
+(defun anvil-org-index--cancel-checkpoint-timer ()
+  "Cancel the idle WAL-checkpoint timer if running."
+  (when (timerp anvil-org-index--checkpoint-timer)
+    (cancel-timer anvil-org-index--checkpoint-timer))
+  (setq anvil-org-index--checkpoint-timer nil))
+
 ;;;###autoload
 (defun anvil-org-index-enable ()
   "Initialize backend, open DB, apply DDL.  Idempotent."
@@ -464,6 +510,8 @@ Return the new headline id."
           (anvil-org-index--open anvil-org-index-db-path))
     (anvil-org-index--apply-ddl anvil-org-index--db))
   (anvil-org-index--register-tools)
+  (anvil-org-index-checkpoint)
+  (anvil-org-index--ensure-checkpoint-timer)
   (message "anvil-org-index: enabled (backend=%s db=%s)"
            anvil-org-index--backend
            anvil-org-index-db-path))
@@ -521,8 +569,10 @@ call can re-run safely (idempotent per file)."
 (defun anvil-org-index-disable ()
   "Close DB.  Safe to call multiple times."
   (interactive)
+  (anvil-org-index--cancel-checkpoint-timer)
   (anvil-org-index--unregister-tools)
   (when anvil-org-index--db
+    (ignore-errors (anvil-org-index-checkpoint))
     (anvil-org-index--close anvil-org-index--db)
     (setq anvil-org-index--db nil))
   (message "anvil-org-index: disabled"))
