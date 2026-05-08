@@ -824,6 +824,57 @@ Pipeline order under test:
                            :key #'cdr)))))
 
 
+;;;; --- §7.3 tee-put cap (regression for state.db bloat) ----------------
+
+(ert-deftest anvil-shell-filter-test/tee-put-respects-max-bytes ()
+  "Tee-put truncates raw when it exceeds `anvil-shell-tee-max-bytes'."
+  (skip-unless (anvil-shell-filter-test--supported-p 'tee))
+  (anvil-shell-filter-test--with-state
+    (let* ((anvil-shell-tee-max-bytes 32)
+           (raw (concat (make-string 200 ?x) "TAIL"))
+           (id (anvil-shell-filter--tee-put raw))
+           (got (anvil-shell-filter-tee-get id)))
+      (should (stringp got))
+      (should (string-match-p "anvil-shell-tee: truncated" got))
+      (should (< (length got) (length raw))))))
+
+(ert-deftest anvil-shell-filter-test/tee-put-cap-nil-keeps-full ()
+  "Setting `anvil-shell-tee-max-bytes' to nil disables capping."
+  (skip-unless (anvil-shell-filter-test--supported-p 'tee))
+  (anvil-shell-filter-test--with-state
+    (let* ((anvil-shell-tee-max-bytes nil)
+           (raw (make-string 1000 ?y))
+           (id (anvil-shell-filter--tee-put raw))
+           (got (anvil-shell-filter-tee-get id)))
+      (should (equal raw got)))))
+
+
+;;;; --- §7.1 trace events ------------------------------------------------
+
+(ert-deftest anvil-shell-filter-test/trace-events-disabled-no-rows ()
+  "When `anvil-shell-filter-trace-events' is nil, no trace rows accrue."
+  (skip-unless (anvil-shell-filter-test--supported-p 'tee))
+  (anvil-shell-filter-test--with-state
+    (let ((anvil-shell-filter-trace-events nil))
+      (anvil-shell-filter--trace "tr-test" "start" (current-time))
+      (should (null (anvil-state-list-keys
+                     :ns anvil-shell-filter--trace-ns))))))
+
+(ert-deftest anvil-shell-filter-test/trace-events-enabled-records-phase ()
+  "When enabled, `--trace' writes a phase row with elapsed-ms."
+  (skip-unless (anvil-shell-filter-test--supported-p 'tee))
+  (anvil-shell-filter-test--with-state
+    (let* ((anvil-shell-filter-trace-events t)
+           (start (current-time)))
+      (anvil-shell-filter--trace "tr-x" "start" start)
+      (let ((row (anvil-state-get
+                  "tr-x-start" :ns anvil-shell-filter--trace-ns)))
+        (should (listp row))
+        (should (equal "start" (plist-get row :phase)))
+        (should (integerp (plist-get row :at)))
+        (should (integerp (plist-get row :elapsed-ms)))))))
+
+
 (provide 'anvil-shell-filter-test)
 
 ;;; anvil-shell-filter-test.el ends here
