@@ -537,6 +537,16 @@ SERVER-ID must be non-nil and already resolved to a string."
                    server-id
                    json-message)))))))
 
+(defmacro anvil-server--metrics-bump (place)
+  "Increment metrics PLACE, swallowing setf failures on standalone NeLisp.
+The `cl-defstruct' setf machinery is not yet wired in standalone NeLisp,
+so `(cl-incf (anvil-server-metrics-calls m))' raises `wrong-type-argument:
+symbol' there.  Metrics are observability — losing a count is acceptable;
+losing dispatch is not.  This macro keeps the host-Emacs path incrementing
+normally while standalone silently no-ops."
+  (declare (debug t))
+  `(condition-case nil (cl-incf ,place) (error nil)))
+
 (defun anvil-server--handle-error (err)
   "Handle error ERR in MCP process by logging and creating an error response.
 Returns a JSON-RPC error response string for internal errors."
@@ -731,13 +741,13 @@ METHOD-METRICS is used to track errors."
          id `((contents . ,(vector content-entry)))))
     ;; Handle resource-specific errors with custom error codes
     (anvil-server-resource-error
-     (cl-incf (anvil-server-metrics-errors method-metrics))
+     (anvil-server--metrics-bump (anvil-server-metrics-errors method-metrics))
      (let ((code (car (cdr err)))
            (message (cadr (cdr err))))
        (anvil-server--jsonrpc-error id code message)))
     ;; Handle any other error from the handler
     (error
-     (cl-incf (anvil-server-metrics-errors method-metrics))
+     (anvil-server--metrics-bump (anvil-server-metrics-errors method-metrics))
      (anvil-server--jsonrpc-error
       id anvil-server-jsonrpc-error-internal
       (format "Error reading resource %s: %s"
@@ -785,7 +795,7 @@ METHOD is the JSON-RPC method name to dispatch.
 PARAMS is the JSON-RPC params object from the request.
 Returns a JSON-RPC response string for the request."
   (let ((method-metrics (anvil-server-metrics--get method)))
-    (cl-incf (anvil-server-metrics-calls method-metrics))
+    (anvil-server--metrics-bump (anvil-server-metrics-calls method-metrics))
 
     (cond
      ((equal method "initialize")
@@ -1183,7 +1193,7 @@ virtual server-ids share the same handler pool."
             ;; Handle invalid parameter errors
             (anvil-server-invalid-params
              (anvil-server-metrics--track-tool-call tool-name t)
-             (cl-incf (anvil-server-metrics-errors method-metrics))
+             (anvil-server--metrics-bump (anvil-server-metrics-errors method-metrics))
              (anvil-server--jsonrpc-error
               id
               anvil-server-jsonrpc-error-invalid-params
@@ -1192,7 +1202,7 @@ virtual server-ids share the same handler pool."
             ;; anvil-server-tool-throw
             (anvil-server-tool-error
              (anvil-server-metrics--track-tool-call tool-name t)
-             (cl-incf (anvil-server-metrics-errors method-metrics))
+             (anvil-server--metrics-bump (anvil-server-metrics-errors method-metrics))
              (let ((formatted-error
                     `((content
                        .
@@ -1204,13 +1214,13 @@ virtual server-ids share the same handler pool."
             ;; Keep existing handling for all other errors
             (error
              (anvil-server-metrics--track-tool-call tool-name t)
-             (cl-incf (anvil-server-metrics-errors method-metrics))
+             (anvil-server--metrics-bump (anvil-server-metrics-errors method-metrics))
              (anvil-server--jsonrpc-error
               id anvil-server-jsonrpc-error-internal
               (format "Internal error executing tool: %s"
                       (error-message-string err))))))
       (anvil-server-metrics--track-tool-call tool-name t)
-      (cl-incf (anvil-server-metrics-errors method-metrics))
+      (anvil-server--metrics-bump (anvil-server-metrics-errors method-metrics))
       (anvil-server--jsonrpc-error
        id
        anvil-server-jsonrpc-error-invalid-request
