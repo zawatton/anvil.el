@@ -820,6 +820,39 @@ Uses a fixture whose target line is already on disk so no write fires."
                           (plist-get res :matches))))
          (should (equal '("1" "3") ids)))))))
 
+(ert-deftest anvil-code-extract-test-tool-required-false-is-optional ()
+  "MCP JSON `required: false' must not mark a field as required."
+  (anvil-file-test--with-tmp-ts
+   "ITEM 1\n  name = \"A\"\n"
+   (lambda (path)
+     (let* ((spec-json
+             (json-serialize
+              '((block-start . "^ITEM \\([0-9]+\\)")
+                (fields . [((name . "missing")
+                             (regexp . "missing = \\([0-9]+\\)")
+                             (required . :false))]))
+              :false-object :false))
+            (res (read (anvil-file--tool-code-extract-pattern path spec-json))))
+       (should (= 1 (plist-get res :total)))
+       (should (= 1 (plist-get res :returned)))
+       (should (= 0 (plist-get res :skipped)))))))
+
+(ert-deftest anvil-code-extract-test-tool-required-true-skips ()
+  "MCP JSON `required: true' still skips blocks with missing fields."
+  (anvil-file-test--with-tmp-ts
+   "ITEM 1\n  name = \"A\"\n"
+   (lambda (path)
+     (let* ((spec-json
+             (json-serialize
+              '((block-start . "^ITEM \\([0-9]+\\)")
+                (fields . [((name . "missing")
+                             (regexp . "missing = \\([0-9]+\\)")
+                             (required . t))]))))
+            (res (read (anvil-file--tool-code-extract-pattern path spec-json))))
+       (should (= 1 (plist-get res :total)))
+       (should (= 0 (plist-get res :returned)))
+       (should (= 1 (plist-get res :skipped)))))))
+
 (ert-deftest anvil-code-extract-test-required-error ()
   "Missing :required field with :on-missing-required 'error aborts."
   (anvil-file-test--with-tmp-ts
