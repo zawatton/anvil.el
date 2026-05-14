@@ -34,8 +34,46 @@ ANVIL_RUNTIME_VERSION="0.7.0-anvil-el"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ANVIL_EL_DIR="${ANVIL_EL_DIR:-$(cd "$script_dir/.." && pwd)}"
 
-NELISP_BIN="${NELISP_BIN:-$(cd "$ANVIL_EL_DIR/../nelisp" 2>/dev/null && pwd || true)/target/release/nelisp}"
-NELISP_EMACS_DIR="${NELISP_EMACS_DIR:-$(cd "$ANVIL_EL_DIR/../nelisp-emacs" 2>/dev/null && pwd || true)}"
+# Path discovery: try (1) sibling-checkout convention, (2) the user's
+# standard `Cowork/Notes/dev/' dev mirror, (3) PATH lookup.  First hit
+# wins.  `NELISP_BIN' / `NELISP_EMACS_DIR' env vars short-circuit
+# discovery when set.
+discover_nelisp_bin() {
+    local candidates=(
+        "$ANVIL_EL_DIR/../nelisp/target/release/nelisp"
+        "$HOME/Cowork/Notes/dev/nelisp/target/release/nelisp"
+        "$HOME/Notes/dev/nelisp/target/release/nelisp"
+    )
+    local p resolved_dir
+    for p in "${candidates[@]}"; do
+        if [ -x "$p" ]; then
+            resolved_dir="$(cd "$(dirname "$p")" && pwd -P)"
+            echo "$resolved_dir/$(basename "$p")"
+            return 0
+        fi
+    done
+    command -v nelisp 2>/dev/null && return 0
+    return 1
+}
+
+discover_nelisp_emacs_dir() {
+    local candidates=(
+        "$ANVIL_EL_DIR/../nelisp-emacs"
+        "$HOME/Cowork/Notes/dev/nelisp-emacs"
+        "$HOME/Notes/dev/nelisp-emacs"
+    )
+    local p
+    for p in "${candidates[@]}"; do
+        if [ -d "$p/src" ]; then
+            (cd "$p" && pwd -P)
+            return 0
+        fi
+    done
+    return 1
+}
+
+NELISP_BIN="${NELISP_BIN:-$(discover_nelisp_bin || echo /target/release/nelisp)}"
+NELISP_EMACS_DIR="${NELISP_EMACS_DIR:-$(discover_nelisp_emacs_dir || echo "")}"
 LOOP_EL="${LOOP_EL:-$ANVIL_EL_DIR/scripts/anvil-runtime-shell-loop.el}"
 SERVER_LOOP_EL="${SERVER_LOOP_EL:-$ANVIL_EL_DIR/scripts/anvil-runtime-server-loop.el}"
 
