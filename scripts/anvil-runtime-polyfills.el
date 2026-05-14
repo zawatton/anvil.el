@@ -51,11 +51,15 @@
 
 (let* ((nelisp-emacs-root
         ;; Resolution order:
-        ;;   1. explicit override (= caller `setq's the defvar).
-        ;;   2. NELISP_EMACS_DIR env var (= exported by bin/anvil-runtime).
-        ;;   3. sibling-checkout fallback (= ../nelisp-emacs relative to
+        ;;   1. `anvil-runtime-bootstrap-nelisp-emacs-dir' from bootstrap.el
+        ;;      (= primary channel, set by bin/anvil-runtime before any load).
+        ;;   2. explicit override (= caller `setq's the defvar).
+        ;;   3. NELISP_EMACS_DIR env var (= getenv works after emacs-init).
+        ;;   4. sibling-checkout fallback (= ../nelisp-emacs relative to
         ;;      anvil.el's repo root, which is one level above scripts/).
-        (or (and (boundp 'anvil-runtime-polyfills-nelisp-emacs-dir)
+        (or (and (boundp 'anvil-runtime-bootstrap-nelisp-emacs-dir)
+                 anvil-runtime-bootstrap-nelisp-emacs-dir)
+            (and (boundp 'anvil-runtime-polyfills-nelisp-emacs-dir)
                  anvil-runtime-polyfills-nelisp-emacs-dir)
             (and (fboundp 'getenv)
                  (let ((env (getenv "NELISP_EMACS_DIR")))
@@ -430,12 +434,10 @@ filesystem primitive is available."
 ;; load-path so `(require 'sqlite)' / `(require 'url)' / `(require
 ;; 'jsonrpc)' etc resolve to the vendored Emacs sources.
 (let* ((nelisp-emacs-root
-        ;; Resolution order:
-        ;;   1. explicit override (= caller `setq's the defvar).
-        ;;   2. NELISP_EMACS_DIR env var (= exported by bin/anvil-runtime).
-        ;;   3. sibling-checkout fallback (= ../nelisp-emacs relative to
-        ;;      anvil.el's repo root, which is one level above scripts/).
-        (or (and (boundp 'anvil-runtime-polyfills-nelisp-emacs-dir)
+        ;; Same chain as the vendor bulk-load §39 above.
+        (or (and (boundp 'anvil-runtime-bootstrap-nelisp-emacs-dir)
+                 anvil-runtime-bootstrap-nelisp-emacs-dir)
+            (and (boundp 'anvil-runtime-polyfills-nelisp-emacs-dir)
                  anvil-runtime-polyfills-nelisp-emacs-dir)
             (and (fboundp 'getenv)
                  (let ((env (getenv "NELISP_EMACS_DIR")))

@@ -39,26 +39,39 @@
   (let ((val (and (fboundp 'getenv) (getenv name))))
     (if (and val (> (length val) 0)) val default)))
 
-;; Path resolution: bin/anvil-runtime exports ANVIL_EL_DIR + NELISP_EMACS_DIR
-;; before invoking the nelisp interpreter, so `getenv' (= an emacs-init
-;; polyfill that consults the OS env) gives us the live values.  The
-;; hard-coded fallbacks below match the sibling-checkout convention
-;; (`<parent>/anvil.el', `<parent>/nelisp-emacs') and are only hit when
-;; this file is loaded directly (= without the bin launcher).
+;; Path resolution.  Priority order:
+;;
+;;   1. `anvil-runtime-bootstrap-{anvil-el,nelisp-emacs}-dir' set by
+;;      `bin/anvil-runtime' before loading us.  This is the primary
+;;      channel — env vars cannot work because standalone NeLisp's
+;;      `getenv' is itself a polyfill that only binds once
+;;      `emacs-callproc.el' is loaded inside `(load init-el)' below.
+;;
+;;   2. `getenv' fallback — useful when this file is loaded under host
+;;      Emacs for tests / interactive development.
+;;
+;;   3. `load-file-name'-derived sibling-checkout convention
+;;      (`<parent>/anvil.el', `<parent>/nelisp-emacs').
+;;
+;;   4. Hardcoded dev-mirror fallback.
 (let* ((anvil-el-dir
-        (anvil-runtime-shell--env
-         "ANVIL_EL_DIR"
-         (or (and (boundp 'load-file-name) load-file-name
-                  (file-name-directory
-                   (directory-file-name
-                    (file-name-directory load-file-name))))
-             "/home/madblack-21/Cowork/Notes/dev/anvil.el")))
+        (or (and (boundp 'anvil-runtime-bootstrap-anvil-el-dir)
+                 anvil-runtime-bootstrap-anvil-el-dir)
+            (anvil-runtime-shell--env
+             "ANVIL_EL_DIR"
+             (or (and (boundp 'load-file-name) load-file-name
+                      (file-name-directory
+                       (directory-file-name
+                        (file-name-directory load-file-name))))
+                 "/home/madblack-21/Cowork/Notes/dev/anvil.el"))))
        (nelisp-emacs-dir
-        (anvil-runtime-shell--env
-         "NELISP_EMACS_DIR"
-         (concat (file-name-directory
-                  (directory-file-name anvil-el-dir))
-                 "nelisp-emacs")))
+        (or (and (boundp 'anvil-runtime-bootstrap-nelisp-emacs-dir)
+                 anvil-runtime-bootstrap-nelisp-emacs-dir)
+            (anvil-runtime-shell--env
+             "NELISP_EMACS_DIR"
+             (concat (file-name-directory
+                      (directory-file-name anvil-el-dir))
+                     "nelisp-emacs"))))
        (server-id
         ;; Default `emacs-eval' matches the constant used by every
         ;; GREEN-bucket anvil-* module's `--server-id'.  Tools register
@@ -75,6 +88,39 @@
   ;; Bootstrap layer 2 + json / backquote fixes.
   (load init-el nil t)
   (load stub-el nil t)
+
+  ;; --- TEMPORARY alist-get override (= Doc 98 §98.2 workaround) ---
+  ;;
+  ;; The fixed `alist-get' lives in `nelisp/lisp/nelisp-stdlib-misc.el'
+  ;; on the source side, but standalone NeLisp's `.image' baker (= Doc 98
+  ;; §98.2) doesn't yet capture elisp-side `defun' / `fset' mutations that
+  ;; route through the env-shim, so the alist-get image baked into the
+  ;; binary is still the pre-fix version.  Direct-load the .el here so
+  ;; the corrected `alist-get' wins over the image-embedded one.
+  ;;
+  ;; Remove this block once Doc 98 §98.2 (= elisp-complete frozen-heap
+  ;; baker) ships and the .image carries the fixed alist-get.
+  (let* ((nelisp-lisp-dir
+          (or (and (boundp 'anvil-runtime-bootstrap-nelisp-lisp-dir)
+                   (> (length anvil-runtime-bootstrap-nelisp-lisp-dir) 0)
+                   anvil-runtime-bootstrap-nelisp-lisp-dir)
+              (concat (file-name-directory (directory-file-name anvil-el-dir))
+                      "nelisp/lisp")))
+         (stdlib-misc (concat nelisp-lisp-dir "/nelisp-stdlib-misc.el")))
+    (when (file-exists-p stdlib-misc)
+      (condition-case err
+          (load stdlib-misc nil t)
+        (error
+         (when (fboundp 'nelisp--write-stderr-line)
+           (nelisp--write-stderr-line
+            (concat "[shell-loop] nelisp-stdlib-misc override load ERR: "
+                    (format "%S" err))))))))
+
+  ;; Put `anvil-el-dir' on `load-path' so any `(require 'anvil-orchestrator-routing)'
+  ;; / `(require 'anvil-orchestrator-presets)' / etc. inside tool-module
+  ;; files resolve to siblings of `anvil-server.el'.  Without this the
+  ;; load/enable of those modules fails with "Cannot open load file".
+  (add-to-list 'load-path anvil-el-dir)
 
   ;; anvil-server module load chain.  Order: metrics → server → commands
   ;; (= matches anvil-server.el's `(require 'anvil-server-metrics)' and
