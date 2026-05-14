@@ -30,24 +30,29 @@
   (let ((val (and (fboundp 'getenv) (getenv name))))
     (if (and val (> (length val) 0)) val default)))
 
-;; Path resolution: bin/anvil-runtime exports ANVIL_EL_DIR + NELISP_EMACS_DIR
-;; before invoking the nelisp interpreter.  Sibling-checkout convention
-;; (`<parent>/anvil.el', `<parent>/nelisp-emacs') is the fallback when
-;; this file is loaded directly without the bin launcher.
+;; Path resolution — same chain as shell-loop.el §path-resolution.
+;; The primary channel is `anvil-runtime-bootstrap-{anvil-el,nelisp-emacs}-dir'
+;; set by `bin/anvil-runtime' before loading us; `getenv' is unreliable
+;; here because it's polyfilled by `emacs-callproc.el' which this file
+;; loads itself via `(load init-el)' below.
 (let* ((anvil-el-dir
-        (anvil-runtime-server--env
-         "ANVIL_EL_DIR"
-         (or (and (boundp 'load-file-name) load-file-name
-                  (file-name-directory
-                   (directory-file-name
-                    (file-name-directory load-file-name))))
-             "/home/madblack-21/Cowork/Notes/dev/anvil.el")))
+        (or (and (boundp 'anvil-runtime-bootstrap-anvil-el-dir)
+                 anvil-runtime-bootstrap-anvil-el-dir)
+            (anvil-runtime-server--env
+             "ANVIL_EL_DIR"
+             (or (and (boundp 'load-file-name) load-file-name
+                      (file-name-directory
+                       (directory-file-name
+                        (file-name-directory load-file-name))))
+                 "/home/madblack-21/Cowork/Notes/dev/anvil.el"))))
        (nelisp-emacs-dir
-        (anvil-runtime-server--env
-         "NELISP_EMACS_DIR"
-         (concat (file-name-directory
-                  (directory-file-name anvil-el-dir))
-                 "nelisp-emacs")))
+        (or (and (boundp 'anvil-runtime-bootstrap-nelisp-emacs-dir)
+                 anvil-runtime-bootstrap-nelisp-emacs-dir)
+            (anvil-runtime-server--env
+             "NELISP_EMACS_DIR"
+             (concat (file-name-directory
+                      (directory-file-name anvil-el-dir))
+                     "nelisp-emacs"))))
        (server-id
         (anvil-runtime-server--env "ANVIL_SERVER_ID" "emacs-eval"))
        (socket-path

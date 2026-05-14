@@ -39,26 +39,39 @@
   (let ((val (and (fboundp 'getenv) (getenv name))))
     (if (and val (> (length val) 0)) val default)))
 
-;; Path resolution: bin/anvil-runtime exports ANVIL_EL_DIR + NELISP_EMACS_DIR
-;; before invoking the nelisp interpreter, so `getenv' (= an emacs-init
-;; polyfill that consults the OS env) gives us the live values.  The
-;; hard-coded fallbacks below match the sibling-checkout convention
-;; (`<parent>/anvil.el', `<parent>/nelisp-emacs') and are only hit when
-;; this file is loaded directly (= without the bin launcher).
+;; Path resolution.  Priority order:
+;;
+;;   1. `anvil-runtime-bootstrap-{anvil-el,nelisp-emacs}-dir' set by
+;;      `bin/anvil-runtime' before loading us.  This is the primary
+;;      channel — env vars cannot work because standalone NeLisp's
+;;      `getenv' is itself a polyfill that only binds once
+;;      `emacs-callproc.el' is loaded inside `(load init-el)' below.
+;;
+;;   2. `getenv' fallback — useful when this file is loaded under host
+;;      Emacs for tests / interactive development.
+;;
+;;   3. `load-file-name'-derived sibling-checkout convention
+;;      (`<parent>/anvil.el', `<parent>/nelisp-emacs').
+;;
+;;   4. Hardcoded dev-mirror fallback.
 (let* ((anvil-el-dir
-        (anvil-runtime-shell--env
-         "ANVIL_EL_DIR"
-         (or (and (boundp 'load-file-name) load-file-name
-                  (file-name-directory
-                   (directory-file-name
-                    (file-name-directory load-file-name))))
-             "/home/madblack-21/Cowork/Notes/dev/anvil.el")))
+        (or (and (boundp 'anvil-runtime-bootstrap-anvil-el-dir)
+                 anvil-runtime-bootstrap-anvil-el-dir)
+            (anvil-runtime-shell--env
+             "ANVIL_EL_DIR"
+             (or (and (boundp 'load-file-name) load-file-name
+                      (file-name-directory
+                       (directory-file-name
+                        (file-name-directory load-file-name))))
+                 "/home/madblack-21/Cowork/Notes/dev/anvil.el"))))
        (nelisp-emacs-dir
-        (anvil-runtime-shell--env
-         "NELISP_EMACS_DIR"
-         (concat (file-name-directory
-                  (directory-file-name anvil-el-dir))
-                 "nelisp-emacs")))
+        (or (and (boundp 'anvil-runtime-bootstrap-nelisp-emacs-dir)
+                 anvil-runtime-bootstrap-nelisp-emacs-dir)
+            (anvil-runtime-shell--env
+             "NELISP_EMACS_DIR"
+             (concat (file-name-directory
+                      (directory-file-name anvil-el-dir))
+                     "nelisp-emacs"))))
        (server-id
         ;; Default `emacs-eval' matches the constant used by every
         ;; GREEN-bucket anvil-* module's `--server-id'.  Tools register
