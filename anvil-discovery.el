@@ -2,6 +2,7 @@
 
 ;; Author: zawatton
 ;; Keywords: tools, mcp
+;; Package-Requires: ((emacs "29.1"))
 
 ;;; Commentary:
 

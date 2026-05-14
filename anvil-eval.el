@@ -211,7 +211,11 @@ non-zero, or `anvil-eval-nelisp-timeout' fires."
 ;;; Async eval tools
 
 (defvar anvil-eval--async-jobs (make-hash-table :test 'equal)
-  "Hash table mapping job-id to plist (:status :result :start-time).")
+  "Hash table mapping job-id to async job plists.
+Each job records :status, :result, :expression and :start-time.
+Once the timer starts evaluating the form, :run-start-time is set;
+completed jobs also carry :finish-time, :queue-wait-sec and
+:runtime-sec.")
 
 (defvar anvil-eval--async-counter 0
   "Counter for generating unique job IDs.")
@@ -223,9 +227,11 @@ event loop iteration, so Emacs remains responsive.
 Use emacs-eval-result to retrieve the result.
 
 MCP Parameters:
-  expression - Emacs Lisp expression to evaluate asynchronously (string, required)
+  expression - Emacs Lisp expression to evaluate asynchronously
+               (string, required)
                Example: \"(byte-compile-file \\\"~/.emacs.d/init.el\\\")\"
-               Use for long-running operations that would timeout with emacs-eval."
+               Use for long-running operations that would timeout with
+               emacs-eval."
   (anvil-server-with-error-handling
     (let* ((job-id (format "job-%d-%d"
                            (setq anvil-eval--async-counter
@@ -241,18 +247,46 @@ MCP Parameters:
       (run-with-timer 0 nil
         (lambda ()
           (let ((job (gethash job-id anvil-eval--async-jobs)))
-            (condition-case err
-                (let ((result (eval form t)))
-                  (plist-put job :status 'done)
-                  (plist-put job :result (format "%S" result)))
-              (error
-               (plist-put job :status 'error)
-               (plist-put job :result (format "Error: %S" err)))))))
+            (when job
+              (let ((run-start (current-time))
+                    status result)
+                (setq job (plist-put job :run-start-time run-start))
+                (condition-case err
+                    (setq result (format "%S" (eval form t))
+                          status 'done)
+                  (error
+                   (setq result (format "Error: %S" err)
+                         status 'error)))
+                (let ((finish (current-time)))
+                  (setq job (plist-put job :status status))
+                  (setq job (plist-put job :result result))
+                  (setq job (plist-put job :finish-time finish))
+                  (setq
+                   job
+                   (plist-put
+                    job :queue-wait-sec
+                    (float-time
+                     (time-subtract run-start
+                                    (plist-get job :start-time)))))
+                  (setq
+                   job
+                   (plist-put
+                    job :runtime-sec
+                    (float-time
+                     (time-subtract finish run-start))))
+                  (puthash job-id job anvil-eval--async-jobs)))))))
       (format "Job started: %s" job-id))))
+
+(defun anvil-eval--format-seconds (seconds)
+  "Format SECONDS as a compact duration string, or return \"N/A\"."
+  (if (numberp seconds)
+      (format "%.1fs" seconds)
+    "N/A"))
 
 (defun anvil-eval--result (job-id)
   "Get the result of an async job.
-Returns status and result.  Completed results auto-clean after 10 minutes.
+Returns status, age, queue wait, runtime and result.  Completed
+results auto-clean after 10 minutes.
 
 MCP Parameters:
   job-id - The job ID returned by emacs-eval-async (string, required)
@@ -263,14 +297,38 @@ MCP Parameters:
           (format "Job not found: %s (may have been cleaned up)" job-id)
         (let ((status (plist-get job :status))
               (result (plist-get job :result))
-              (elapsed (float-time
-                        (time-subtract (current-time)
-                                       (plist-get job :start-time)))))
+              (now (current-time)))
+          (let* ((start-time (plist-get job :start-time))
+                 (run-start (plist-get job :run-start-time))
+                 (finish (plist-get job :finish-time))
+                 (elapsed (float-time
+                           (time-subtract now start-time)))
+                 (queue-wait
+                  (or (plist-get job :queue-wait-sec)
+                      (and run-start
+                           (float-time
+                            (time-subtract run-start start-time)))
+                      elapsed))
+                 (runtime
+                  (or (plist-get job :runtime-sec)
+                      (and run-start
+                           (float-time
+                            (time-subtract (or finish now)
+                                           run-start))))))
           (when (and (not (eq status 'running))
                      (> elapsed 600))
             (remhash job-id anvil-eval--async-jobs))
-          (format "status: %s\nelapsed: %.1fs\nresult: %s"
-                  status elapsed (or result "N/A")))))))
+          (format
+           (concat "status: %s\n"
+                   "elapsed: %.1fs\n"
+                   "age: %.1fs\n"
+                   "queue-wait: %s\n"
+                   "runtime: %s\n"
+                   "result: %s")
+           status elapsed elapsed
+           (anvil-eval--format-seconds queue-wait)
+           (anvil-eval--format-seconds runtime)
+           (or result "N/A"))))))))
 
 (defun anvil-eval--jobs ()
   "List all async jobs and their statuses.
@@ -340,7 +398,7 @@ Retrieve result with emacs-eval-result tool using the returned job ID."
    :layer 'dev
    :description
    "Get the result of an async job started by emacs-eval-async.
-Returns status (running/done/error), elapsed time, and result.
+Returns status (running/done/error), age, queue wait, runtime, and result.
 Poll this until status is 'done' or 'error'."
    :server-id anvil-eval--server-id)
   (anvil-server-register-tool

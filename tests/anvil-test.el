@@ -10,6 +10,7 @@
 (require 'json)
 (require 'anvil)
 (require 'anvil-server)
+(require 'anvil-server-commands)
 (require 'anvil-server-metrics)
 ;; `anvil-offload-stub' provides tiny fixture handlers (pid / boom) so
 ;; the `:offload' dispatch tests can load them into the subprocess by
@@ -36,6 +37,21 @@
 (ert-deftest anvil-test-describe-setup-command ()
   "Verify describe-setup is callable."
   (should (fboundp 'anvil-describe-setup)))
+
+(ert-deftest anvil-test-server-status-command ()
+  "`anvil-server-status' is bound, interactive, and reports the
+running flag in the format the README documents (`Running' /
+`Stopped')."
+  (should (fboundp 'anvil-server-status))
+  (should (commandp 'anvil-server-status))
+  (let ((anvil-server--running t))
+    (should (string-match-p "Running"
+                            (let ((inhibit-message t))
+                              (anvil-server-status)))))
+  (let ((anvil-server--running nil))
+    (should (string-match-p "Stopped"
+                            (let ((inhibit-message t))
+                              (anvil-server-status))))))
 
 ;;;; --- MCP parameter validator ------------------------------------------
 
@@ -157,6 +173,64 @@ MCP Parameters:
                  (text (alist-get 'text first)))
             (should (equal "ok-empty" text)))))
     (anvil-server-unregister-tool "anvil-test-underscore" "anvil-test")))
+
+(ert-deftest anvil-test-dispatch-converts-quit-to-tool-error ()
+  "A wrapped tool must turn `quit' into an MCP tool error result."
+  (defun anvil-test--tool-quit (_args)
+    "Signal quit through the helper wrapper.
+
+MCP Parameters:
+  (none)"
+    (anvil-server-with-error-handling
+      (signal 'quit '(minibuffer-quit))))
+  (unwind-protect
+      (progn
+        (anvil-server-register-tool
+         #'anvil-test--tool-quit
+         :id "anvil-test-tool-quit"
+         :description "test"
+         :server-id "anvil-test")
+          (let* ((params '((name . "anvil-test-tool-quit")
+                         (arguments . ())))
+               (resp (anvil-server--handle-tools-call
+                      "t-quit" params
+                      (make-anvil-server-metrics) "anvil-test"))
+               (decoded (json-read-from-string resp))
+               (result (alist-get 'result decoded))
+               (text (alist-get 'text
+                                (aref (alist-get 'content result) 0))))
+          (should (eq t (alist-get 'isError result)))
+          (should (string-match-p "Quit: .*minibuffer-quit" text))))
+    (anvil-server-unregister-tool "anvil-test-tool-quit" "anvil-test")))
+
+(ert-deftest anvil-test-process-jsonrpc-catches-raw-quit ()
+  "Top-level JSON-RPC dispatch must serialize uncaught `quit' as JSON."
+  (defun anvil-test--raw-quit (_args)
+    "Signal quit without wrapping.
+
+MCP Parameters:
+  (none)"
+    (signal 'quit '(minibuffer-quit)))
+  (unwind-protect
+      (progn
+        (anvil-server-register-tool
+         #'anvil-test--raw-quit
+         :id "anvil-test-raw-quit"
+         :description "test"
+         :server-id "anvil-test")
+        (let* ((anvil-server--running t)
+               (request
+                (anvil-server-create-tools-call-request
+                 "anvil-test-raw-quit" 77 nil))
+               (resp (anvil-server-process-jsonrpc request "anvil-test"))
+               (decoded (json-read-from-string resp))
+               (rpc-error (alist-get 'error decoded)))
+          (should rpc-error)
+          (should (= anvil-server-jsonrpc-error-internal
+                     (alist-get 'code rpc-error)))
+          (should (string-match-p "Quit"
+                                  (alist-get 'message rpc-error)))))
+    (anvil-server-unregister-tool "anvil-test-raw-quit" "anvil-test")))
 
 (ert-deftest anvil-test-schema-includes-real-params ()
   "JSON schema must still include non-underscore args."

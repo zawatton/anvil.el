@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# anvil-runtime-daemon — persistent UNIX-socket daemon for `bin/anvil-runtime'.
+#
+# K2 (= 2026-05-11) rewrite: replaces the G v1 FIFO-based scheme
+# (mkfifo + Linux O_RDWR keep-alive + `dd bs=1' bridge hacks) with a
+# proper UNIX domain socket listener.  Powered by the
+# `make-network-process' polyfill in nelisp-emacs/src/emacs-*.el
+# (commit `b662671' on nelisp-emacs main).
+#
+# Lifecycle:
+#   start    — cold-load `anvil-runtime server' once, leave it listening
+#              on `~/.anvil-runtime/sock'.  Subsequent bridges (=
+#              `anvil-runtime-stdio') just `socat - UNIX-CONNECT:...'.
+#   stop     — kill the daemon process; the socket file is removed by
+#              the daemon's accept loop on next start.
+#   status   — report running / stopped.
+#   logs     — tail the daemon stderr log.
+#
+# Drop-in for `.mcp.json' is `anvil-runtime-stdio' (sibling script).
+#
+# Multi-client concurrency: each connection becomes a separate
+# `network-connection' process in the standalone NeLisp registry, with
+# its own MCP parser state.  N bridges can run in parallel.
+
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ANVIL_RUNTIME="$script_dir/anvil-runtime"
+
+DIR="${ANVIL_RUNTIME_DAEMON_DIR:-$HOME/.anvil-runtime}"
+SOCKET="$DIR/sock"
+PID_FILE="$DIR/daemon.pid"
+LOG_FILE="$DIR/daemon.log"
+
+cmd="${1:-status}"
+
+is_running() {
+    [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
+}
+
+start_daemon() {
+    if is_running ; then
+        echo "anvil-runtime daemon already running (pid $(cat "$PID_FILE"))" >&2
+        return 0
+    fi
+    if [ ! -x "$ANVIL_RUNTIME" ] ; then
+        echo "anvil-runtime: launcher not found / not executable: $ANVIL_RUNTIME" >&2
+        exit 1
+    fi
+    mkdir -p "$DIR"
+    # Stale socket from previous run will be unlinked by the server-loop
+    # before it calls bind(2), but tidy up here as a courtesy so `ls'
+    # of the dir does not show a dangling file.
+    rm -f "$SOCKET"
+
+    nohup "$ANVIL_RUNTIME" server "$SOCKET" </dev/null >>"$LOG_FILE" 2>&1 &
+    local daemon_pid=$!
+    disown "$daemon_pid" 2>/dev/null || true
+    echo "$daemon_pid" > "$PID_FILE"
+
+    echo "anvil-runtime daemon started" >&2
+    echo "  daemon pid: $daemon_pid" >&2
+    echo "  socket:     $SOCKET" >&2
+    echo "  log:        $LOG_FILE" >&2
+    echo "" >&2
+    echo "Cold-load: ~5-7 minutes — wait for the registry-keys log line" >&2
+    echo "(\`pre-loop registry keys=...') before pointing MCP clients at" >&2
+    echo "$SOCKET via \`bin/anvil-runtime-stdio'." >&2
+}
+
+stop_daemon() {
+    local stopped=0
+    if [ -f "$PID_FILE" ] ; then
+        local pid
+        pid="$(cat "$PID_FILE")"
+        if kill -0 "$pid" 2>/dev/null ; then
+            local descendants
+            descendants="$(pgrep -P "$pid" 2>/dev/null || true)"
+            kill "$pid" $descendants 2>/dev/null || true
+            sleep 0.3
+            kill -9 "$pid" $descendants 2>/dev/null || true
+            stopped=1
+        fi
+        rm -f "$PID_FILE"
+    fi
+    rm -f "$SOCKET"
+    if [ "$stopped" = 1 ] ; then
+        echo "anvil-runtime daemon stopped" >&2
+    else
+        echo "anvil-runtime daemon was not running" >&2
+    fi
+}
+
+status_daemon() {
+    if is_running ; then
+        if [ -S "$SOCKET" ] ; then
+            echo "running (pid $(cat "$PID_FILE"), socket $SOCKET ready)"
+        else
+            echo "running (pid $(cat "$PID_FILE"), socket not yet bound — still cold-loading)"
+        fi
+        return 0
+    else
+        echo "stopped"
+        return 1
+    fi
+}
+
+logs_daemon() {
+    if [ ! -f "$LOG_FILE" ] ; then
+        echo "anvil-runtime daemon log not found: $LOG_FILE" >&2
+        exit 1
+    fi
+    exec tail -n 100 -f "$LOG_FILE"
+}
+
+case "$cmd" in
+    start)   start_daemon ;;
+    stop)    stop_daemon ;;
+    restart) stop_daemon ; sleep 0.5 ; start_daemon ;;
+    status)  status_daemon ;;
+    logs)    logs_daemon ;;
+    *)
+        cat >&2 <<EOF
+usage: anvil-runtime-daemon {start|stop|restart|status|logs}
+
+Environment:
+  ANVIL_RUNTIME_DAEMON_DIR   (default: ~/.anvil-runtime)
+                             — where socket / pid / log live.
+EOF
+        exit 2
+        ;;
+esac

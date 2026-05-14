@@ -282,37 +282,47 @@ variables."
   `(progn
      (anvil-org--fail-if-modified ,file-path ,operation)
      (with-temp-buffer
-       (set-visited-file-name ,file-path t)
-       (insert-file-contents ,file-path)
-       (org-mode)
-       (goto-char (point-min))
-       ,@body
-       (anvil-org--complete-and-save ,file-path ,response-alist))))
+       (unwind-protect
+           (progn
+             (insert-file-contents ,file-path)
+             (set-visited-file-name ,file-path t)
+             (set-buffer-modified-p nil)
+             (org-mode)
+             (goto-char (point-min))
+             ,@body
+             (anvil-org--complete-and-save ,file-path ,response-alist))
+         ;; Do not let failed tool calls prompt about killing the
+         ;; temporary file-visiting buffer.
+         (set-buffer-modified-p nil)))))
 
-(defun anvil-org--find-allowed-file-with-id (id)
+(defun anvil-org--find-allowed-file-with-id
+    (id &optional not-found-fn file-access-fn)
   "Find an allowed file containing the Org ID.
 First looks up in the org-id database, then validates the file is in
 the allowed list.
 Returns the expanded file path if found and allowed.
-Throws a tool error if ID exists but file is not allowed, or if ID
-is not found."
-  (if-let* ((id-file (org-id-find-id-file id)))
-    ;; ID found in database, check if file is allowed
-    (if-let* ((allowed-file (anvil-org--find-allowed-file id-file)))
-      allowed-file
-      (anvil-org--tool-file-access-error id))
-    ;; ID not in database - might not exist or DB is stale
-    ;; Fall back to searching allowed files manually (only when restriction is on)
-    (if (not anvil-org-allowed-files-enabled)
-        (anvil-org--id-not-found-error id)
-      (let ((found-file nil))
-        (dolist (allowed-file anvil-org-allowed-files)
-          (unless found-file
-            (when (file-exists-p allowed-file)
-              (anvil-org--with-org-file allowed-file
-                (when (org-find-property "ID" id)
-                  (setq found-file (expand-file-name allowed-file)))))))
-        (or found-file (anvil-org--id-not-found-error id))))))
+NOT-FOUND-FN and FILE-ACCESS-FN customize the error shape for tool
+versus resource callers."
+  (let ((not-found-fn (or not-found-fn #'anvil-org--id-not-found-error))
+        (file-access-fn
+         (or file-access-fn #'anvil-org--tool-file-access-error)))
+    (if-let* ((id-file (org-id-find-id-file id)))
+      ;; ID found in database, check if file is allowed
+      (if-let* ((allowed-file (anvil-org--find-allowed-file id-file)))
+        allowed-file
+        (funcall file-access-fn id))
+      ;; ID not in database - might not exist or DB is stale
+      ;; Fall back to searching allowed files manually (only when restriction is on)
+      (if (not anvil-org-allowed-files-enabled)
+          (funcall not-found-fn id)
+        (let ((found-file nil))
+          (dolist (allowed-file anvil-org-allowed-files)
+            (unless found-file
+              (when (file-exists-p allowed-file)
+                (anvil-org--with-org-file allowed-file
+                  (when (org-find-property "ID" id)
+                    (setq found-file (expand-file-name allowed-file)))))))
+          (or found-file (funcall not-found-fn id)))))))
 
 (defmacro anvil-org--with-uri-prefix-dispatch
     (uri headline-body id-body)
@@ -679,10 +689,16 @@ Throws an MCP tool error if unbalanced blocks are found."
   "Normalize TAGS parameter to a list format.
 TAGS can be:
 - nil or empty list -> returns nil
-- vector (JSON array) -> converts to list
-- string -> wraps in list
+- empty / whitespace-only string -> returns nil (no tags)
+- vector (JSON array, decoded form) -> converts to list
+- string starting with `[' -> parsed as a JSON array of tag strings
+  (multi-tag form for MCP callers, since `anvil-server-register-tool'
+  types every parameter as \"string\" and structured values must arrive
+  JSON-encoded — same convention as `file-batch.operations',
+  `json-object-add.pairs-json', etc.)
+- other string -> wraps in single-element list (single-tag convenience)
 - list -> returns as-is
-Throws error for invalid types."
+Throws error for invalid types or malformed JSON."
   (cond
    ((null tags)
     nil) ; No tags (nil or empty list)
@@ -691,7 +707,26 @@ Throws error for invalid types."
    ((listp tags)
     tags) ; Already a list
    ((stringp tags)
-    (list tags)) ; Single tag string
+    (let ((trimmed (string-trim tags)))
+      (cond
+       ((string-empty-p trimmed)
+        nil) ; "" / whitespace -> no tags (kept for MCP callers wanting
+             ; to express "no tags" without inventing a sentinel)
+       ((eq (aref trimmed 0) ?\[)
+        (condition-case err
+            (let ((parsed (json-parse-string trimmed
+                                             :array-type 'list
+                                             :null-object nil
+                                             :false-object nil)))
+              (unless (listp parsed)
+                (anvil-org--tool-validation-error
+                 "Tags JSON must encode an array, got: %s" tags))
+              parsed)
+          (json-error
+           (anvil-org--tool-validation-error
+            "Invalid tags JSON: %s" (error-message-string err)))))
+       (t
+        (list tags))))) ; Single tag string
    (t
     (anvil-org--tool-validation-error "Invalid tags format: %s" tags))))
 
@@ -929,10 +964,18 @@ MCP Parameters:
       (anvil-org--goto-headline-from-uri
        headline-path (string-prefix-p anvil-org--uri-id-prefix uri))
 
-      ;; Check current state matches
+      ;; Check current state matches.  `org-get-todo-state' returns
+      ;; nil for headlines without a TODO keyword; treat nil and ""
+      ;; (the documented "no state" sentinel on the MCP wire) as the
+      ;; same value so callers can transition from no-state to a real
+      ;; state without inventing a magic string.
       (beginning-of-line)
-      (let ((actual-state (org-get-todo-state)))
-        (unless (string= actual-state current_state)
+      (let* ((actual-state (org-get-todo-state))
+             (expected (if (or (null current_state)
+                               (string-empty-p current_state))
+                           nil
+                         current_state)))
+        (unless (equal actual-state expected)
           (anvil-org--state-mismatch-error
            (or current_state "(no state)")
            (or actual-state "(no state)") "State")))
@@ -947,7 +990,9 @@ MCP Parameters:
 Creates an Org ID for the new headline and returns its ID-based URI.
 TITLE is the headline text.
 TODO_STATE is the TODO state from `org-todo-keywords'.
-TAGS is a single tag string or list of tag strings.
+TAGS is a single tag string, a list/vector of tag strings, or a JSON
+array literal string (e.g. \"[\\\"a\\\",\\\"b\\\"]\") for the MCP wire form;
+empty string means no tags.
 BODY is optional body text.
 PARENT_URI is the URI of the parent item.
 AFTER_URI is optional URI of sibling to insert after.
@@ -955,7 +1000,7 @@ AFTER_URI is optional URI of sibling to insert after.
 MCP Parameters:
   title - The headline text
   todo_state - TODO state from `org-todo-keywords'
-  tags - Tags to add (single string or array of strings)
+  tags - Tags to add (single string, JSON array string, or empty for none)
   body - Optional body text content
   parent_uri - Parent item URI
                Formats:
@@ -1094,13 +1139,13 @@ The filename parameter includes both file and headline path."
   "Handler for org-id://{uuid} template.
 PARAMS is an alist containing the uuid parameter."
   (let* ((id (alist-get "uuid" params nil nil #'string=))
-         (file-path (org-id-find-id-file id)))
-    (unless file-path
-      (anvil-org--resource-not-found-error "ID" id))
-    (let ((allowed-file (anvil-org--find-allowed-file file-path)))
-      (unless allowed-file
-        (anvil-org--resource-file-access-error id))
-      (anvil-org--get-content-by-id allowed-file id))))
+         (allowed-file
+          (anvil-org--find-allowed-file-with-id
+           id
+           (lambda (missing-id)
+             (anvil-org--resource-not-found-error "ID" missing-id))
+           #'anvil-org--resource-file-access-error)))
+    (anvil-org--get-content-by-id allowed-file id)))
 
 ;; PHASE-C-IDE-SPLIT-CANDIDATE: writes via org-edit-headline in real buffer
 (defun anvil-org--tool-rename-headline (uri current_title new_title)
@@ -1179,83 +1224,89 @@ MCP Parameters:
          headline-path
          (string-prefix-p anvil-org--uri-id-prefix resource_uri))
 
-        (anvil-org--validate-body-no-headlines
-         new_body (org-current-level))
+        (let ((target-marker (point-marker)))
+          (unwind-protect
+              (progn
+                (anvil-org--validate-body-no-headlines
+                 new_body (org-current-level))
 
-        ;; Skip past headline and properties
-        (org-end-of-meta-data t)
+                ;; Skip past headline and properties
+                (org-end-of-meta-data t)
 
-        ;; Get body boundaries
-        (let ((body-begin (point))
-              (body-end nil)
-              (body-content nil)
-              (occurrence-count 0))
+                ;; Get body boundaries
+                (let ((body-begin (point))
+                      (body-end nil)
+                      (body-content nil)
+                      (occurrence-count 0))
 
-          ;; Find end of body (before next headline or end of subtree)
-          (save-excursion
-            (if (org-goto-first-child)
-                ;; Has children - body ends before first child
-                (setq body-end (point))
-              ;; No children - body extends to end of subtree
-              (org-end-of-subtree t)
-              (setq body-end (point))))
+                  ;; Find end of body (before next headline or end of subtree)
+                  (save-excursion
+                    (if (org-goto-first-child)
+                        ;; Has children - body ends before first child
+                        (setq body-end (point))
+                      ;; No children - body extends to end of subtree
+                      (org-end-of-subtree t)
+                      (setq body-end (point))))
 
-          ;; Extract body content
-          (setq body-content
-                (buffer-substring-no-properties body-begin body-end))
+                  ;; Extract body content
+                  (setq body-content
+                        (buffer-substring-no-properties body-begin body-end))
 
-          ;; Trim leading newline if present
-          ;; (`org-end-of-meta-data' includes it)
-          (when (and (> (length body-content) 0)
-                     (= (aref body-content 0) ?\n))
-            (setq body-content (substring body-content 1))
-            (setq body-begin (1+ body-begin)))
+                  ;; Trim leading newline if present
+                  ;; (`org-end-of-meta-data' includes it)
+                  (when (and (> (length body-content) 0)
+                             (= (aref body-content 0) ?\n))
+                    (setq body-content (substring body-content 1))
+                    (setq body-begin (1+ body-begin)))
 
-          ;; Check if body is empty
-          (when (string-match-p "\\`[[:space:]]*\\'" body-content)
-            ;; Empty oldBody + empty body -> add content
-            (if (string= old_body "")
-                ;; Treat as single replacement
-                (setq occurrence-count 1)
-              (anvil-org--tool-validation-error
-               "Node has no body content")))
+                  ;; Check if body is empty
+                  (when (string-match-p "\\`[[:space:]]*\\'" body-content)
+                    ;; Empty oldBody + empty body -> add content
+                    (if (string= old_body "")
+                        ;; Treat as single replacement
+                        (setq occurrence-count 1)
+                      (anvil-org--tool-validation-error
+                       "Node has no body content")))
 
-          ;; Count occurrences (unless already handled above)
-          (unless (= occurrence-count 1)
-            ;; Empty oldBody with non-empty body is an error
-            (if (and (string= old_body "")
-                     (not
-                      (string-match-p
-                       "\\`[[:space:]]*\\'" body-content)))
-                (anvil-org--tool-validation-error
-                 "Cannot use empty old_body with non-empty body")
-              ;; Normal occurrence counting
-              (let ((case-fold-search nil)
-                    (search-pos 0))
-                (while (string-match
-                        (regexp-quote old_body) body-content
-                        search-pos)
-                  (setq occurrence-count (1+ occurrence-count))
-                  (setq search-pos (match-end 0))))))
+                  ;; Count occurrences (unless already handled above)
+                  (unless (= occurrence-count 1)
+                    ;; Empty oldBody with non-empty body is an error
+                    (if (and (string= old_body "")
+                             (not
+                              (string-match-p
+                               "\\`[[:space:]]*\\'" body-content)))
+                        (anvil-org--tool-validation-error
+                         "Cannot use empty old_body with non-empty body")
+                      ;; Normal occurrence counting
+                      (let ((case-fold-search nil)
+                            (search-pos 0))
+                        (while (string-match
+                                (regexp-quote old_body) body-content
+                                search-pos)
+                          (setq occurrence-count (1+ occurrence-count))
+                          (setq search-pos (match-end 0))))))
 
-          ;; Validate occurrences
-          (cond
-           ((= occurrence-count 0)
-            (anvil-org--tool-validation-error "Body text not found: %s"
-                                            old_body))
-           ((and (> occurrence-count 1) (not replace_all))
-            (anvil-org--tool-validation-error
-             (concat "Text appears %d times (use replace_all)")
-             occurrence-count)))
+                  ;; Validate occurrences
+                  (cond
+                   ((= occurrence-count 0)
+                    (anvil-org--tool-validation-error
+                     "Body text not found: %s"
+                     old_body))
+                   ((and (> occurrence-count 1) (not replace_all))
+                    (anvil-org--tool-validation-error
+                     (concat "Text appears %d times (use replace_all)")
+                     occurrence-count)))
 
-          ;; Perform replacement
-          (anvil-org--replace-body-content
-           old_body
-           new_body
-           body-content
-           replace_all
-           body-begin
-           body-end))))))
+                  ;; Perform replacement
+                  (anvil-org--replace-body-content
+                   old_body
+                   new_body
+                   body-content
+                   replace_all
+                   body-begin
+                   body-end))
+                (goto-char target-marker))
+            (set-marker target-marker nil)))))))
 
 ;; Tools duplicating resource templates
 
@@ -1545,9 +1596,10 @@ Parameters:
           Cannot be empty or whitespace-only
           Cannot contain newlines
   todo_state - TODO keyword from org-todo-keywords (string, required)
-  tags - Tags for the headline (string or array, required)
+  tags - Tags for the headline (string, required)
          Single tag: \"urgent\"
-         Multiple tags: [\"work\", \"urgent\"]
+         Multiple tags: JSON array literal, e.g. \"[\\\"work\\\",\\\"urgent\\\"]\"
+         No tags: empty string \"\"
          Validated against org-tag-alist if configured
          Must follow Org tag rules (alphanumeric, _, @)
          Respects mutually exclusive tag groups

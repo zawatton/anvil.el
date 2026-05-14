@@ -1,0 +1,6 @@
+Source: https://github.com/rtk-ai/rtk
+Path:   src/filters/*.toml
+Commit: 4338f029ec43b69eb959748ec02cd7885200c264
+Date:   2026-05-02
+License: Apache-2.0
+See top-level NOTICE for attribution.

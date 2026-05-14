@@ -654,6 +654,17 @@ not a create (use `py-add-import' for that)."
                     (insert-file-contents f) (buffer-string))))
         (should (string-match-p "^import subprocess$" text))))))
 
+(ert-deftest anvil-py-test-tool-add-import-accepts-symbol-names ()
+  "Names parsed as symbols (e.g. `(:names (Dict))') should still render as strings."
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      (anvil-py--tool-add-import
+       f "(:kind from :from typing :names (Mapping Set))" "t")
+      (let ((text (with-temp-buffer
+                    (insert-file-contents f) (buffer-string))))
+        (should (string-match-p "Mapping" text))
+        (should (string-match-p "Set" text))))))
+
 (ert-deftest anvil-py-test-tool-add-import-accepts-json-spec ()
   "The MCP wrapper should accept JSON specs and coerce names arrays."
   (anvil-py-test--requires-grammar

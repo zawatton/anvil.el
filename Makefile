@@ -1,4 +1,4 @@
-.PHONY: test test-all lint byte-compile clean
+.PHONY: test test-all lint byte-compile clean sync-toml-filters check-toml-filters-sync
 
 # make on MSYS strips TEMP/TMP from the environment, which makes
 # `make-temp-file' in the subprocess fall back to `c:/' (unwritable)
@@ -22,3 +22,10 @@ byte-compile:
 
 clean:
 	eask clean all
+
+## Sync rtk-derived TOML filters -> anvil-shell-filter-builtin.el
+sync-toml-filters:
+	python3 scripts/sync-rtk-filters.py
+
+check-toml-filters-sync:
+	python3 scripts/sync-rtk-filters.py --check

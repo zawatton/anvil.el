@@ -1,0 +1,505 @@
+#+title: NeLisp standalone — generic module load + tool dispatch
+#+date: 2026-05-02
+#+author: zawatton
+#+property: status DRAFT
+
+* STATUS
+
+~Phase 1 SHIPPED~ (2026-05-02、feat/anvil-config-loader + feat/anvil-module-registry)
+— shim layer + ~AnvilModuleRegistry~ + 1-tool round-trip PoC.
+
+End-to-end verified: ~bin/anvil-runtime mcp serve~ with
+=ANVIL_MODULE_FILES=anvil-nelisp-shims.el:anvil-nelisp-shims-demo.el=
+exposes the synthetic ~nelisp-shims-demo-ping~ tool, ~tools/list~
+includes it, ~tools/call~ returns ="pong"=.
+
+* Phase 1 result — what works
+
+- Pattern C accumulator (~anvil-server-register-tools~ stub) — ✓
+- Rust ~AnvilModuleRegistry~ generic loader — ✓ (4 unit tests)
+- ~AnvilToolsRegistry~ wiring (= optional ~module: Option<...>~) — ✓
+- Tool dispatch via Rust → NeLisp eval — ✓ (zero-arg PoC)
+- ~ANVIL_MODULE_FILES~ env-var contract — ✓
+- shim's ~anvil-config~ ~(require 'anvil-nelisp-shims)~ early — ✓
+
+* Phase 1 result — empirical NeLisp bootstrap-eval gaps
+
+When loading the real ~anvil-state.el~ / ~anvil-memory.el~ via Pattern C,
+the following Emacs built-ins came back as ~void-function~ /
+~void-variable~ in the bootstrap eval (= ~build_tool::eval~ + the
+self-host fallback layer):
+
+| Symbol                | Used by                | Phase 2 fix                              |
+|-----------------------+------------------------+------------------------------------------|
+| ~getenv~              | shim user-emacs-dir    | add to bootstrap builtins (= os::env_var) |
+| ~push~                | shim accumulator       | add as macro OR keep current setq+cons   |
+| ~defalias~            | shim sqlite aliases    | add to special-forms / use ~fset~        |
+| ~plist-get~           | shim register-tool     | add as builtin                            |
+| ~nreverse~            | shim drain             | add as builtin                            |
+| ~mapcar~              | shim count             | add as builtin                            |
+| ~declare-function~    | bytecomp hint          | add as no-op macro                       |
+
+The shim was rewritten to use only bootstrap-eval primitives
+(=defun=, =defvar=, =setq=, =cons=, =append=, manual loops with
+=while= + =cdr=).  Real anvil modules cannot do the same — they use
+~push~ / ~plist-get~ / ~mapcar~ extensively and rewriting them
+en masse would defeat the "anvil modules unchanged" goal.
+
+* Phase 1.6 — Layer split: nelisp-emacs owns Emacs C-core polyfills
+
+User directive (2026-05-02 #2): Polyfills belong in ~nelisp-emacs/~
+(= the "Emacs C core in Elisp on NeLisp" project), NOT in anvil.el.
+anvil.el is application-layer; mixing it with Emacs-builtin-compat
+code forces every other nelisp-emacs consumer to duplicate.
+
+Final layer split:
+
+| Layer | repo                              | content                                                       |
+|-------+-----------------------------------+---------------------------------------------------------------|
+| L1    | =nelisp/build-tool/=              | Rust eval substrate (= MINIMAL: special forms + ~100 builtin) |
+| L1.5  | =nelisp/src/=                     | NeLisp self-hosted Lisp internals + editor API (=nelisp-ec-*=) |
+| L2    | =nelisp-emacs/src/emacs-*.el=     | Emacs C-core ports (= unprefixed =mapcar=, =plist-get=, etc.) |
+| L3    | =anvil.el/=                       | application layer (= MCP tools, anvil-server)                 |
+
+L2 files added in Phase 1.6 (= ports from corresponding Emacs C
+core files):
+
+| nelisp-emacs file       | Emacs C origin           | Symbols ported                                              |
+|-------------------------+--------------------------+-------------------------------------------------------------|
+| =src/emacs-fns.el=      | =fns.c=                  | mapcar, mapconcat, mapc, nreverse, reverse, plist-{get,put,member} |
+| =src/emacs-callproc.el= | =callproc.c=             | getenv (stub), setenv, process-environment                  |
+| =src/emacs-eval.el=     | =eval.c= / =data.c=      | defalias, fset, declare-function (no-op macro)              |
+| =src/emacs-vars.el=     | =globals.c=              | user-emacs-directory, temporary-file-directory, locale-coding-system, system-type |
+| =src/emacs-sqlite.el=   | =sqlite.c=               | sqlite-* forwarders to nelisp-sqlite-*                       |
+| =src/emacs-init.el=     | (loader)                 | one-line aggregator: =(require '...)= the five above         |
+
+Each polyfill is gated on `unless (fboundp ...)' so loading these
+files under regular Emacs (= where the C-core originals exist) is
+a cheap no-op.  Implementations use only bootstrap-eval primitives
+so they load even when NeLisp's full interpreter coverage is
+incomplete.
+
+** Polyfilled this session (Phase 1.5)
+
+| Symbol             | Strategy                                                        |
+|--------------------+-----------------------------------------------------------------|
+| ~declare-function~ | no-op `defmacro' (return nil — bytecomp hint is a runtime nop)  |
+| ~getenv~           | always-nil stub (= callers fall through to default branch)      |
+| ~mapcar~           | manual `while' + `funcall' + `cons' + manual reverse loop       |
+| ~plist-get~        | manual `while' + `eq' + `car' / `cdr' walk                      |
+
+After these polyfills landed, ~anvil-state.el~ loads cleanly via
+Pattern C.  ~anvil-memory.el~ still fails — see next section.
+
+** Phase 2 — backquote SHIPPED in nelisp-emacs L2 (2026-05-02)
+
+User directive (2026-05-02 #3): NeLisp stays minimal; backquote is
+implemented in nelisp-emacs L2 as a polyfill, not in NeLisp itself.
+
+~nelisp-emacs/src/emacs-backquote.el~ ships a single-level backquote
+macro that handles `(comma X)' (= unquote) and `(comma-at X)' (=
+splice) substitution using a recursive cons / append builder.  13 ERT
+pass.  Loads cleanly via the L2 emacs-init.el chain.
+
+*** What works after backquote landed
+
+- ~anvil-state.el~ loads (= no register yet — it's infrastructure)
+- ~anvil-memory.el~ LOADS (= macros expand correctly)
+- Pattern C dispatch demonstrably reaches real anvil module bodies
+
+*** Additional Phase 2 polyfills shipped
+
+| Symbol               | File              | Reason                                |
+|----------------------+-------------------+---------------------------------------|
+| ~ignore~ / ~identity~ | emacs-fns.el      | trivial — needed by anvil-memory load |
+| ~interactive~        | emacs-eval.el     | defun marker, no-op fn polyfill       |
+| ~user-error~         | emacs-error.el    | error variant                         |
+| ~display-warning~    | emacs-error.el    | warning surface → message             |
+| ~define-error~       | emacs-error.el    | needs `put' (= next blocker)          |
+| ~string-trim~ / etc  | emacs-string.el   | subr-x string utilities               |
+| anvil-server stubs   | anvil-nelisp-shims | encode-handler / with-error-handling / tool-throw |
+
+*** Phase 2 BOUNDARY — symbol-property primitives still missing
+
+~anvil-memory-enable~ requires ~sqlite-available-p~ to return t,
+which means ~nelisp-sqlite~ extension must load, which needs:
+
+- ~put~ / ~get~ — symbol property accessors (= used by `define-error',
+  `nelisp-sqlite' module init, many other low-level Emacs primitives)
+- ~copy-sequence~ / ~copy-tree~ / ~last~ — list helpers
+- ~assoc~ / ~assq~ / ~rassoc~ / ~rassq~ — alist accessors
+- ~delete~ / ~delq~ — list element removal
+- + likely a long tail of other subr.el / fns.c primitives that surface
+  one-by-one as each load step proceeds.
+
+This is the *coverage grind* — each missing primitive is small (= 5-30
+LoC each) but the queue is long (= probably 30+ symbols to reach a
+functional `(memory-list)' dispatch).  Estimate: 1-2 days of focused
+work to completion, with each new symbol surfaced empirically by
+re-running the load chain.
+
+*** Phase 2 architectural conclusion
+
+The Pattern C plumbing is COMPLETE and CORRECT.  Real anvil module
+loading is bottlenecked on raw L2 coverage of standard Emacs builtins
+— not on any architectural gap.  Continuing the grind = pure expansion
+of ~nelisp-emacs/src/emacs-*.el~ until enough surface lands.
+
+* Phase 3 — FFI substrate via skeeto/elisp-ffi fork (2026-05-02)
+
+User directive (2026-05-02 #4): instead of implementing the full
+Emacs Dynamic Module API in NeLisp Rust (= ~500 LoC, 1-2 weeks), fork
+skeeto/elisp-ffi as zawatton/nelisp-ffi and adapt its libffi-based
+subprocess driver for the NeLisp runtime.  This unblocks SQLite + any
+other extern-C library WITHOUT adding to NeLisp itself.
+
+** What shipped
+
+- *zawatton/nelisp-ffi* (= new repo, commit ~b44650c~).  Adapted from
+  skeeto/elisp-ffi (UNLICENSE).  Uses ~nelisp-make-process~ /
+  ~nelisp-process-send-string~ when ~(featurep 'nelisp)~ at load time;
+  host Emacs ~make-process~ otherwise.  String-accumulator output via
+  process filter — no buffer dependencies.  C++ glue (~ffi-glue.cc~)
+  unchanged from upstream.  ~(ffi-call ...)~ alias preserved.
+
+  Verified under host Emacs:
+    ~(nelisp-ffi-call nil "rand" [:sint32])~ → 1804289383
+    ~(nelisp-ffi-call "libnelisp_runtime.so" "nl_sqlite_open"
+                       [:sint64 :pointer] ":memory:")~ → 1
+    ~(nelisp-ffi-call ... "nl_sqlite_alive" [:sint64 :sint64] 1)~ → 1
+
+- *nelisp-emacs/src/emacs-sqlite-ffi.el* (= commit ~d3e1ad5~).
+  ~sqlite-open~ / ~sqlite-close~ / ~sqlite-execute~ / ~sqlitep~ /
+  ~sqlite-available-p~ as polyfills that route through ~nelisp-ffi-call~
+  to ~libnelisp_runtime.so:nl_sqlite_*~.  Naive JSON encoding for
+  args (= nil / strings / integers / floats).  ~sqlite-select~ stub
+  pending Phase 4 (= needs caller-allocated output buffer support in
+  the FFI substrate).
+
+  Verified under host Emacs after fmakunbound override of the C
+  builtins:
+    ~(sqlite-available-p)~ → t
+    ~(sqlite-open ":memory:")~ → integer handle
+    ~CREATE TABLE~ + ~INSERT VALUES (?, ?)~ → both succeed
+
+** Phase 3 BOUNDARY — NeLisp standalone subprocess deadlock
+
+Getting the FFI chain running under ~bin/anvil-runtime mcp serve~
+revealed an *architectural* deadlock distinct from the polyfill grind:
+
+  - ~nelisp-ffi.el~ spawns ~nelisp-ffi-glue~ via ~nelisp-make-process~.
+  - ~nelisp-make-process~ lives in
+    ~nelisp/packages/nelisp-process/src/nelisp-process.el~.
+  - That file ~require~'s ~cl-lib~ + uses ~cl-defstruct~ + ~autoload~
+    + many helpers — none of which are in NeLisp's bootstrap evaluator.
+  - Bootstrap evaluator has 73 builtins covering arithmetic, list, string,
+    regex, file metadata.  Zero process-spawn primitives.
+
+Resulting deadlock: subprocess spawn needs nelisp-process load, which
+needs cl-lib polyfilled, which is ~200 LoC of L2 work.  OR — the FFI
+substrate needs to bypass elisp subprocess entirely.
+
+** Phase 3 escape hatches
+
+Three distinct paths out of the deadlock; pick based on appetite:
+
+  - *3-A: cl-lib polyfill push.*  Add ~cl-defstruct~ + ~cl-loop~ + the
+    rest of cl-lib core to ~nelisp-emacs/src/emacs-cl-*.el~.  Pure L2
+    work, fits the user directive.  Effort 1-2 days.  Unblocks
+    ~nelisp-process~ load → ~nelisp-ffi~ subprocess spawn → SQLite via
+    ffi-glue.
+
+  - *3-B: anvil-runtime owns the FFI subprocess.*  Have the Rust
+    ~anvil-runtime~ binary pre-spawn ~nelisp-ffi-glue~ at startup and
+    expose its stdio file descriptors as NeLisp builtins
+    (~nelisp-ffi--write~ / ~nelisp-ffi--read~).  ~nelisp-ffi.el~ skips
+    the spawn step entirely.  Effort ~half day Rust.  Cleanest
+    decoupling — no cl-lib dependency for FFI.
+
+  - *3-C: in-process FFI via libffi crate in anvil-runtime.*  Add
+    libffi-rs to anvil-runtime's Cargo.toml; implement ~nelisp-ffi-call~
+    as a Rust-side NeLisp builtin that uses libffi directly inside the
+    anvil-runtime process.  No subprocess at all.  Effort 1 day Rust.
+    Best performance, no glue binary to ship, but largest
+    anvil-runtime surface change.
+
+3-B is the smallest delta that preserves the elisp-ffi protocol +
+its crash isolation property.  3-A keeps the work entirely in the
+elisp layer.  3-C is the cleanest long-term but a wider Rust change.
+
+* Phase 3-A' — vendor full Emacs elisp tree (2026-05-02)
+
+User directive (2026-05-02 #5): "Emacs にある elisp の機能を再実装
+する必要はまったくありません。emacs の elisp コードを全て vendor
+してください" — vendor all Emacs elisp instead of reimplementing.
+
+** What shipped
+
+- *nelisp-emacs/vendor/emacs-lisp/* (= commit ~0787c77~).  GNU Emacs
+  30.1 lisp/ tree, 1654 ~*.el~ files, 74MB.  All ~*.el.gz~ Debian
+  ships decompressed, ~*.elc~ stripped.  License: GPL-3.0-or-later,
+  per-file headers preserved.  ~vendor/emacs-lisp/COPYING~ +
+  ~VENDOR.md~ documents bundle origin + modification policy (= none).
+
+- Verified under host Emacs (= where the upstream cl-lib loads from
+  the vendor path):
+    ~(require 'cl-lib)~ → t
+    ~(cl-defstruct foo bar baz)~ + ~(make-foo :bar 42 :baz 7)~ → ok
+    ~(foo-bar (make-foo :bar 42 :baz 7))~ → 42
+
+** Phase 3-A' BOUNDARY — NeLisp reader strictness
+
+Loading the vendored ~cl-lib.el~ under ~bin/anvil-runtime~ surfaces
+a NeLisp reader limitation:
+
+  bridge eval error in <self-host-fallback>:
+    failed to parse cl-lib.el: lex error at 208:2: unknown escape: \(
+
+The offending input is the standard Emacs docstring idiom:
+
+  "Return multiple values, Common Lisp style.
+
+\(fn &rest VALUES)"
+
+Emacs's reader treats `\X' inside a string as literal `\X' for any
+unknown escape character `X'.  NeLisp's lexer
+(`build-tool/src/reader/lexer.rs:262') rejects unknown escapes
+strictly, breaking compatibility with the vendored Emacs source.
+
+This idiom appears across most Emacs source files (= used by
+`help-function-arglist' to override the displayed argument list);
+patching every occurrence in the 74MB vendor tree would defeat the
+"byte-identical to upstream" property the VENDOR.md guarantees.
+
+** Phase 3-A'' resolution paths
+
+  - *3-A''-1: relax NeLisp lexer.*  Change `lexer.rs:262' to fall
+    through unknown `\X' as literal `\X' (= match Emacs reader
+    semantics).  ~5 LoC Rust.  Strictly speaking a *bug-compatibility
+    fix* with Emacs, not a new feature — the change makes NeLisp
+    able to parse the source format it claims to support.
+
+  - *3-A''-2: pre-process vendor at copy time.*  Vendor sync script
+    rewrites `\(' → `\\(' (and similarly for `\)' / `\,' / `\.' /
+    other Emacs literals) before commit.  Source still loads under
+    host Emacs (= the extra escape is idempotent).  Cons: vendor is
+    no longer byte-identical to upstream; updates require rerunning
+    the script.
+
+  - *3-A''-3: dual-source the vendor.*  Keep upstream-identical
+    files as `vendor/emacs-lisp.upstream/' and have the build chain
+    materialize a `vendor/emacs-lisp.processed/' with fixes applied.
+    Most invasive but transparent.
+
+3-A''-1 is the minimum-blast-radius option (= one Rust line, fixes
+the entire vendor tree).  Pending user decision on whether the
+"don't add to NeLisp" directive applies to lexer bug-compatibility
+fixes.
+
+** What works today (= verified end-to-end)
+
+  * Synthetic demo modules without backquote → ✓
+    (~anvil-nelisp-shims-demo.el~ exposes ~nelisp-shims-demo-ping~,
+    Rust dispatches, NeLisp evaluates, MCP returns "pong".)
+  * ~anvil-state.el~ loads under polyfilled shim → ✓
+    (= but does not register MCP tools — it's infrastructure used by
+    anvil-memory; tool registration awaits backquote unblock.)
+  * Any user-side module that avoids backquote → ✓
+    (= user can write custom anvil modules using only `defun' /
+    `let' / `setq' etc. and they will Pattern-C-register correctly
+    today.)
+
+** What is blocked (= waiting on NeLisp Phase 2)
+
+  * ~anvil-memory~ load → blocked by backquote
+  * ~anvil-worklog~ load → blocked by backquote (likely; uses similar
+    macro patterns)
+  * ~anvil-orchestrator~ load → blocked by backquote + needs
+    process / timer / sentinel infra (= NeLisp Phase 4 territory)
+  * ~anvil-org~ — out of scope (org-mode is genuinely Emacs-dependent)
+
+** Phase plan
+
+| Phase | Scope                                                                 | Acceptance                                          |
+|-------+-----------------------------------------------------------------------+-----------------------------------------------------|
+|     1 | shim layer + Rust ~AnvilModuleRegistry~ + ~memory-list~ end-to-end PoC | ~bin/anvil-runtime mcp serve~ exposes ~memory-list~ |
+|     2 | full ~memory-*~ + ~worklog-*~ tools (~10 each)                        | parity with Emacs path for those 2 modules          |
+|     3 | ~file-*~ + ~git-*~ tools                                              | most CLAUDE.md daily-use tools work standalone      |
+|     4 | ~orchestrator-*~ (process / timer-heavy)                              | submit-one + status round-trip                      |
+|     5 | ~org-*~ — out of scope or external shim                               | (see "Genuinely Emacs-only" below)                  |
+
+* Motivation
+
+Per Doc 18 / Doc 44 the NeLisp standalone path (= ~bin/anvil mcp serve~ via
+the Rust ~anvil-runtime~ binary) is meant to remove the Emacs runtime
+dependency for AI MCP clients.  Today it exposes ~30 tools — ~anvil-host-*~,
+~shell-*~, ~data-*~, ~file-*~ — out of the ~120+ that the Emacs path serves.
+The missing 90 (~memory-*~, ~worklog-*~, ~file-batch~, ~git-*~,
+~orchestrator-*~, etc.) are NOT genuinely Emacs-dependent: their Elisp source
+calls SQLite / shell-out / regex / buffer APIs that NeLisp already provides
+via ~nelisp-sqlite-rs~ / ~nelisp-syscall-process~ / ~nelisp-syscall-fileio~.
+
+The actual blocker is architectural:
+
+- The Rust runtime currently uses /per-module Rust registries/ (Pattern A —
+  ~AnvilShellFilterRegistry~, ~AnvilDataRegistry~, ~AnvilFileRegistry~) plus
+  one /static-defun-discovery/ path (Pattern B — ~AnvilHostRegistry~ scans
+  for ~(defun anvil-host-FOO ...)~ at parse time).
+- The standard anvil-module pattern (~anvil-memory~ / ~anvil-worklog~ /
+  ~anvil-orchestrator~ / ...) registers its tools at /runtime/ via
+  ~(anvil-server-register-tools SERVER-ID SPECS)~ — Pattern C.  The Rust
+  runtime has no Pattern C support.
+
+This doc adds Pattern C: a shim that intercepts the runtime registration
+calls into a global accumulator the Rust side can read after module load,
+plus a generic ~AnvilModuleRegistry~ that does load → query → dispatch.
+
+* Design
+
+** Pattern C — shim + accumulator (Elisp side)
+
+New file ~anvil-nelisp-shims.el~ (loaded via the same ~(require 'anvil-config)~
+path that already fires from ~anvil-host.el~, gated on ~(featurep 'nelisp)~):
+
+#+begin_src emacs-lisp
+;; SQLite API: NeLisp has nelisp-sqlite-* (via nelisp-sqlite-rs extension);
+;; Emacs uses sqlite-* (built-in 29+).  The shim aliases the Emacs names
+;; to the NeLisp ones so anvil-state.el etc. work unmodified.
+(defalias 'sqlite-open       'nelisp-sqlite-open)
+(defalias 'sqlite-execute    'nelisp-sqlite-execute)
+(defalias 'sqlite-select     'nelisp-sqlite-select)
+(defalias 'sqlite-close      'nelisp-sqlite-close)
+(defalias 'sqlitep           'nelisp-sqlitep)
+;; ... same for pragma / transaction / commit / rollback
+
+;; anvil-server-register-tool[s]: in standalone mode the Rust runtime
+;; reads the tool registry directly, so the shim just collects specs.
+(defvar anvil-nelisp-shims--collected-specs nil
+  "Reverse-order alist of (SERVER-ID . SPEC-LIST) collected by the
+shim.  Read once by AnvilModuleRegistry::collect after each module
+load.")
+
+(defun anvil-server-register-tools (server-id specs)
+  "Standalone shim — accumulate SPECS for SERVER-ID."
+  (push (cons server-id specs) anvil-nelisp-shims--collected-specs)
+  specs)
+
+(defun anvil-server-register-tool (handler &rest props)
+  "Standalone shim — synthesize a 1-element spec from HANDLER + PROPS
+and route through `anvil-server-register-tools'."
+  (let* ((id (plist-get props :id))
+         (server-id (or (plist-get props :server-id) "default"))
+         (spec (list :id id :handler handler
+                     :description (plist-get props :description)
+                     :title (plist-get props :title)
+                     :read-only (plist-get props :read-only))))
+    (anvil-server-register-tools server-id (list spec))))
+
+(defun anvil-nelisp-shims-drain ()
+  "Return collected specs as a flat list and reset the accumulator."
+  (prog1 (apply #'append
+                (mapcar #'cdr (nreverse anvil-nelisp-shims--collected-specs)))
+    (setq anvil-nelisp-shims--collected-specs nil)))
+#+end_src
+
+Loaded only when ~(featurep 'nelisp)~ — the regular Emacs path
+keeps using the real ~anvil-server~ implementation.
+
+** Pattern C — Rust generic loader
+
+New file ~anvil-runtime/src/anvil_module_registry.rs~:
+
+#+begin_src rust
+pub struct AnvilModuleRegistry {
+    env: Mutex<Env>,
+    tools: Vec<ToolDef>,
+}
+
+impl AnvilModuleRegistry {
+    pub fn new(env: Env, module_paths: &[PathBuf]) -> Result<Self, Error> {
+        // 1. Load each .el via read_all + eval (in order — modules may
+        //    require each other, so the caller orders deps first).
+        // 2. After all loads, eval (anvil-nelisp-shims-drain) to get the
+        //    accumulated tool spec list.
+        // 3. Parse each spec into a ToolDef holding the elisp handler
+        //    symbol name + a ToolSpec (id / description / input_schema).
+    }
+}
+
+impl ToolRegistry for AnvilModuleRegistry {
+    fn list(&self) -> Vec<ToolSpec> { ... }
+    fn call(&self, name: &str, args: Value) -> Result<Value, JsonRpcError> {
+        // 1. Find ToolDef by name.
+        // 2. Build elisp form: (HANDLER ARG1 ARG2 ...) with arg coercion
+        //    via build_call_form (already in anvil_host_registry.rs).
+        // 3. eval_via_self_host(env, form).
+        // 4. sexp_tool_result(out).
+    }
+}
+#+end_src
+
+Wired into ~AnvilToolsRegistry::new~ alongside the existing host /
+shell-filter / data / file registries.  Module path list comes from a
+new env var ~ANVIL_MODULE_FILES~ (colon-separated absolute paths) — the
+~bin/anvil~ wrapper sets it from the resolved ~anvil-lib~ dir + each
+profile's module list.
+
+** Module load order (Phase 1)
+
+#+begin_src
+1. anvil-nelisp-shims.el       (must come first — establishes shim alises)
+2. anvil-state.el              (SQLite KV / TTL — most modules require it)
+3. anvil-memory.el             (Phase 1 PoC target)
+4. (Phase 2:) anvil-worklog.el
+5. (Phase 3:) anvil-file.el / anvil-git.el / anvil-http.el / ...
+#+end_src
+
+** Tool dispatch contract
+
+Each spec in the accumulator must include:
+
+| Key            | Type              | Meaning                          |
+|----------------+-------------------+----------------------------------|
+| ~:id~          | string            | MCP tool name                    |
+| ~:handler~     | symbol / function | elisp callable to invoke         |
+| ~:description~ | string            | MCP tool description             |
+| ~:title~       | string (optional) | display name                     |
+| ~:read-only~   | bool (optional)   | hint                             |
+
+Rust dispatch builds ~(HANDLER ARG1 ARG2 ...)~ where args come from
+JSON-RPC ~params~ deserialized via ~sexp_arg_from_json~ (existing helper
+in ~anvil_host_registry.rs~).  One-arg handlers receive a positional
+arg; multi-arg handlers — TBD.  Phase 1 supports zero / one positional
+arg only; multi-arg expansion deferred to Phase 2.
+
+* Genuinely Emacs-only modules
+
+Out of scope for D-3 (= keep on Emacs path or out of NeLisp standalone):
+
+- ~anvil-org~ — uses Emacs' org-mode parser (~10k LoC of Elisp + heavy
+  buffer / overlay / property semantics).  Porting org-mode to NeLisp
+  is a separate multi-month project.  Workaround = dual-server or
+  fall back to Emacs spawn for ~org-*~ tools only.
+- ~anvil-org-index~ — same dependency.
+- Anything that uses Emacs' ~display-buffer~ / window / overlay APIs
+  (= UI code).  No anvil tools currently in this category.
+
+* Risks
+
+- Shim defalias cycles: if a NeLisp module ~require~'s a feature that
+  itself shims back, we get infinite require.  Mitigate by gating the
+  shim load with ~(unless (fboundp 'sqlite-open) ...)~.
+- Pattern A/B coexistence: ~AnvilShellFilterRegistry~ already provides
+  ~shell-*~ via Rust compat.  If anvil-shell-filter.el is also loaded
+  via Pattern C, we get duplicate tool registration.  Mitigate by
+  a /skip-list/ in the module loader.
+- SQLite path divergence: Emacs uses ~~/.emacs.d/anvil-memory-index.db~,
+  NeLisp standalone may write to a different path.  Use the existing
+  ~anvil-memory-shared-db-roots~ + symlinks to keep both in sync.
+
+* References
+
+- Doc 18 — Stage D standalone launcher
+- Doc 44 — anvil-runtime crate split
+- Doc 50 — anvil-config user config loader (= sibling work, this doc
+  builds on the same `(require 'anvil-config)' bridge in anvil-host.el)

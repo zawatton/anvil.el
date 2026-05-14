@@ -29,7 +29,7 @@
 ;; Dynamic variables owned by `checkdoc'; declared so that the
 ;; byte compiler treats the `let' bindings in
 ;; `anvil-sexp--run-checkdoc' as dynamic (they are read by
-;; `checkdoc-file' internally).  The feature itself is loaded
+;; `checkdoc-current-buffer' internally).  The feature itself is loaded
 ;; lazily inside the function to avoid a top-level recursive
 ;; require when users load anvil-sexp during an active checkdoc
 ;; session.
@@ -37,6 +37,8 @@
 (defvar checkdoc-autofix-flag)
 (defvar checkdoc-spellcheck-documentation-flag)
 (defvar checkdoc-verb-check-experimental-flag)
+(defvar checkdoc--batch-flag)
+(defvar checkdoc-pending-errors)
 
 
 ;;;; --- group + constants ---------------------------------------------------
@@ -1060,9 +1062,21 @@ leak in."
       (when (buffer-live-p log-buf) (kill-buffer log-buf)))))
 
 (defun anvil-sexp--run-checkdoc (file)
-  "Run `checkdoc-file' on FILE, return list of diagnostic plists."
+  "Run `checkdoc-current-buffer' on FILE, return diagnostic plists.
+`checkdoc-file' visits FILE via `find-file-noselect', overrides
+`checkdoc-diagnostic-buffer' with \"*warn*\", and may display
+diagnostic windows.  Drive `checkdoc-current-buffer' directly so
+the MCP tool can collect diagnostics in an internal buffer without
+touching the user's window layout.
+
+Track whether a visiting buffer existed before the call and kill
+only the buffer we create.  Otherwise subsequent apply-path writes
+that use `with-temp-buffer' + `write-region' can leave the visited
+buffer stale and trigger `ask-user-about-supersession-threat' on
+the next interactive edit."
   (require 'checkdoc)
-  (let ((warn-buf (get-buffer-create "*anvil-sexp-cd*"))
+  (let ((pre-buf (find-buffer-visiting file))
+        (warn-buf (get-buffer-create "*anvil-sexp-cd*"))
         (diags '()))
     (unwind-protect
         (progn
@@ -1070,9 +1084,13 @@ leak in."
           (let ((checkdoc-diagnostic-buffer (buffer-name warn-buf))
                 (checkdoc-autofix-flag 'never)
                 (checkdoc-spellcheck-documentation-flag nil)
-                (checkdoc-verb-check-experimental-flag nil))
+                (checkdoc-verb-check-experimental-flag nil)
+                (checkdoc--batch-flag t)
+                (checkdoc-pending-errors nil))
             (condition-case err
-                (checkdoc-file file)
+                (save-window-excursion
+                  (with-current-buffer (find-file-noselect file)
+                    (checkdoc-current-buffer t)))
               (error
                (push (list :kind 'error :source 'checkdoc :line 0
                            :message (error-message-string err))
@@ -1091,7 +1109,13 @@ leak in."
                               :source 'checkdoc
                               :line line :message msg)
                         diags))))))
-      (when (buffer-live-p warn-buf) (kill-buffer warn-buf)))
+      (when (buffer-live-p warn-buf) (kill-buffer warn-buf))
+      (unless pre-buf
+        (let ((post-buf (find-buffer-visiting file)))
+          (when (buffer-live-p post-buf)
+            (with-current-buffer post-buf
+              (set-buffer-modified-p nil))
+            (kill-buffer post-buf)))))
     (nreverse diags)))
 
 (defun anvil-sexp--tool-verify (file &optional byte_compile checkdoc)

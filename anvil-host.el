@@ -34,6 +34,13 @@
 
 (require 'cl-lib)
 (require 'subr-x)
+;; Doc 50 — load the user config loader.  Under regular Emacs this is
+;; a cheap no-op; under the NeLisp standalone path (= `bin/anvil mcp
+;; serve' via the Rust anvil-runtime binary) it resolves
+;; `$ANVIL_CONFIG_DIR/config.el' so defcustom overrides land before
+;; any other anvil module's init code runs.  See anvil-config.el for
+;; the detection contract.
+(require 'anvil-config)
 
 ;;;; --- defaults / constants -----------------------------------------------
 
@@ -42,6 +49,13 @@
 
 (defconst anvil-host--default-max-output 16384
   "Default max output bytes captured per stream by `anvil-shell'.")
+
+(defconst anvil-host--stderr-drain-budget-sec 0.2
+  "Seconds to drain the stderr pipe-proc after the main proc exits.
+Captures late stderr bytes that the kernel pipe still held when
+the shell child died.  Capped so a disowned descendant which
+inherits fd 2 (e.g. `setsid --fork') cannot extend
+`anvil-shell' beyond this budget.")
 
 (defun anvil-host--default-coding ()
   "Return the default coding system for shell I/O on this OS.
@@ -114,15 +128,31 @@ for other reasons should invoke `setsid --fork' explicitly."
           ;; that too.
           (let ((stderr-proc (get-buffer-process stderr-buf)))
             (when (processp stderr-proc)
-              (set-process-sentinel stderr-proc #'ignore)))
-          (let ((deadline (+ (float-time) timeout)))
-            (while (and (process-live-p proc)
-                        (< (float-time) deadline))
-              (accept-process-output proc 0.1))
-            (when (process-live-p proc)
-              (delete-process proc)
-              (error "anvil-host: shell timeout after %ss: %s"
-                     timeout command)))
+              (set-process-sentinel stderr-proc #'ignore))
+            (let ((deadline (+ (float-time) timeout)))
+              (while (and (process-live-p proc)
+                          (< (float-time) deadline))
+                (accept-process-output proc 0.1))
+              (when (process-live-p proc)
+                (delete-process proc)
+                (when (and stderr-proc (process-live-p stderr-proc))
+                  (delete-process stderr-proc))
+                (error "anvil-host: shell timeout after %ss: %s"
+                       timeout command)))
+            ;; Brief bounded drain for late stderr after proc exit.
+            ;; The stderr pipe-proc is independent: when proc dies the
+            ;; kernel pipe may still hold bytes the proc just wrote,
+            ;; and the pipe-proc only goes inactive once we read them.
+            ;; Bound the drain so that a disowned descendant which
+            ;; inherits fd 2 (e.g. `setsid --fork') cannot extend the
+            ;; call past `anvil-host--stderr-drain-budget-sec'.
+            (when (and stderr-proc (process-live-p stderr-proc))
+              (let ((drain-deadline
+                     (+ (float-time)
+                        anvil-host--stderr-drain-budget-sec)))
+                (while (and (process-live-p stderr-proc)
+                            (< (float-time) drain-deadline))
+                  (accept-process-output stderr-proc 0.02)))))
           (let ((exit (process-exit-status proc))
                 (out  (with-current-buffer stdout-buf (buffer-string)))
                 (err  (with-current-buffer stderr-buf (buffer-string))))
