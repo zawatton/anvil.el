@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# anvil-runtime-stdio — MCP-stdio ↔ UNIX-socket bridge for the
+# persistent anvil-runtime daemon.  K2 v2 (2026-05-11) — uses `socat'
+# to relay each MCP client session over the daemon's `~/.anvil-runtime/sock'.
+# Multi-client concurrent: N MCP clients can run at once, each getting
+# their own connection process inside the standalone NeLisp registry.
+#
+# Drop-in for `.mcp.json':
+#   {"mcpServers":{"anvil-standalone":{"command":"<...>/anvil-runtime-stdio"}}}
+#
+# Setup:
+#   1. Start the daemon (cold-load ~5-7 min, one-time):
+#        bin/anvil-runtime-daemon start
+#   2. Wait for `pre-loop registry keys=...' to appear in the log:
+#        bin/anvil-runtime-daemon logs
+#   3. Wire `.mcp.json' as above and start the MCP client.
+
+set -eu -o pipefail
+
+DIR="${ANVIL_RUNTIME_DAEMON_DIR:-$HOME/.anvil-runtime}"
+SOCKET="$DIR/sock"
+PID_FILE="$DIR/daemon.pid"
+
+if [ ! -S "$SOCKET" ] ; then
+    echo "anvil-runtime-stdio: socket missing — start the daemon first:" >&2
+    echo "    $(dirname "$0")/anvil-runtime-daemon start" >&2
+    exit 1
+fi
+
+if [ -f "$PID_FILE" ] && ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null ; then
+    echo "anvil-runtime-stdio: daemon process is dead (pid $(cat "$PID_FILE")). Restart:" >&2
+    echo "    $(dirname "$0")/anvil-runtime-daemon restart" >&2
+    exit 1
+fi
+
+# Prefer socat if available (= more featureful, half-close handling),
+# fall back to OpenBSD `nc -U' (= ships with Debian / Ubuntu / most
+# distros by default and supports UNIX-domain sockets via `-U').
+#
+# Two non-obvious bits we learned during PoC validation (2026-05-11):
+#
+# 1. `nc -N' (= shutdown socket on stdin EOF) is required for one-shot
+#    smoke tests so nc exits cleanly and its stdio buffer flushes.  For
+#    long-lived MCP clients (Claude Code etc.) stdin stays open between
+#    frames, so `-N' is a no-op — but leaving it on is still useful
+#    because the daemon sees "connection broken" promptly when the MCP
+#    client tears down the bridge process.
+#
+# 2. `stdbuf -o0' on the OUTPUT side is critical when the bridge's
+#    stdout is a pipe to another process (= Claude Code's MCP frame
+#    parser) rather than a tty.  Without it nc full-buffers the
+#    response, the parser sees nothing, and "Failed to reconnect"
+#    surfaces because the initialize response never arrives within the
+#    MCP client's handshake timeout.  socat's `-T 0' avoids the same
+#    pitfall via its own scheduling.
+if command -v socat >/dev/null 2>&1 ; then
+    exec socat -T 0 STDIO UNIX-CONNECT:"$SOCKET"
+elif command -v nc >/dev/null 2>&1 ; then
+    # `-N' (= shutdown socket on stdin EOF) is intentionally OFF.  When
+    # Claude Code spawns this bridge and feeds initialize, it sometimes
+    # closes the bridge's stdin before reading the response — `-N' then
+    # tears the socket down before the daemon's process-send-string
+    # call lands, producing EPIPE (errno=32) in the daemon log and
+    # "Failed to reconnect" on the client.  `stdbuf -o0' is what gets
+    # the response bytes to the client promptly; the bridge process
+    # itself exits when the MCP client kills it at session teardown.
+    if command -v stdbuf >/dev/null 2>&1 ; then
+        exec stdbuf -i0 -o0 -e0 nc -U "$SOCKET"
+    else
+        exec nc -U "$SOCKET"
+    fi
+else
+    echo "anvil-runtime-stdio: need \`socat' or OpenBSD \`nc' for UNIX-socket bridge" >&2
+    exit 1
+fi

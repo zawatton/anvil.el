@@ -1,3 +1,28 @@
 *.elc
 .eask/
 dist/
+
+# Claude Code session ephemera — never commit.
+.claude/
+
+# Accidental anvil-memory / anvil-worklog / anvil-org DB drop site.
+# These files appear when a tilde-prefix path expansion fails and the
+# DB sink is created literally inside the worktree as `~/.emacs.d/'.
+# Contains user personal memory entries — must not leak to public.
+~/
+*.db
+*.db-shm
+*.db-wal
+
+# Local git scratch
+.gitcommit
+.worktrees/
+
+# AI assistant project-instruction files — kept local, not published.
+CLAUDE.md
+AGENTS.md
+.cursorrules
+.cursor/
+.aider*
+.codex/
+.windsurfrules
