@@ -89,6 +89,12 @@
   (load init-el nil t)
   (load stub-el nil t)
 
+  ;; Put `anvil-el-dir' on `load-path' so any `(require 'anvil-orchestrator-routing)'
+  ;; / `(require 'anvil-orchestrator-presets)' / etc. inside tool-module
+  ;; files resolve to siblings of `anvil-server.el'.  Without this the
+  ;; load/enable of those modules fails with "Cannot open load file".
+  (add-to-list 'load-path anvil-el-dir)
+
   ;; anvil-server module load chain.  Order: metrics → server → commands
   ;; (= matches anvil-server.el's `(require 'anvil-server-metrics)' and
   ;; anvil-server-commands.el's `(require 'anvil-server)').

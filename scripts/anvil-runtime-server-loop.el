@@ -78,6 +78,14 @@
   ;; --- substrate bootstrap (same as shell-loop.el) ---
   (load init-el nil t)
   (load stub-el nil t)
+
+  ;; Put `anvil-el-dir' on `load-path' so any `(require 'anvil-orchestrator-routing)'
+  ;; / `(require 'anvil-orchestrator-presets)' / etc. inside the
+  ;; tool-module files below resolve to siblings of `anvil-server.el'.
+  ;; Without this `anvil-orchestrator.el' load/enable fails with
+  ;; "Cannot open load file anvil-orchestrator-routing".
+  (add-to-list 'load-path anvil-el-dir)
+
   (load metrics-el nil t)
   (load server-el nil t)
   (load server-commands-el nil t)
