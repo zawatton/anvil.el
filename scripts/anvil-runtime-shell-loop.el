@@ -89,6 +89,33 @@
   (load init-el nil t)
   (load stub-el nil t)
 
+  ;; --- TEMPORARY alist-get override (= Doc 98 §98.2 workaround) ---
+  ;;
+  ;; The fixed `alist-get' lives in `nelisp/lisp/nelisp-stdlib-misc.el'
+  ;; on the source side, but standalone NeLisp's `.image' baker (= Doc 98
+  ;; §98.2) doesn't yet capture elisp-side `defun' / `fset' mutations that
+  ;; route through the env-shim, so the alist-get image baked into the
+  ;; binary is still the pre-fix version.  Direct-load the .el here so
+  ;; the corrected `alist-get' wins over the image-embedded one.
+  ;;
+  ;; Remove this block once Doc 98 §98.2 (= elisp-complete frozen-heap
+  ;; baker) ships and the .image carries the fixed alist-get.
+  (let* ((nelisp-lisp-dir
+          (or (and (boundp 'anvil-runtime-bootstrap-nelisp-lisp-dir)
+                   (> (length anvil-runtime-bootstrap-nelisp-lisp-dir) 0)
+                   anvil-runtime-bootstrap-nelisp-lisp-dir)
+              (concat (file-name-directory (directory-file-name anvil-el-dir))
+                      "nelisp/lisp")))
+         (stdlib-misc (concat nelisp-lisp-dir "/nelisp-stdlib-misc.el")))
+    (when (file-exists-p stdlib-misc)
+      (condition-case err
+          (load stdlib-misc nil t)
+        (error
+         (when (fboundp 'nelisp--write-stderr-line)
+           (nelisp--write-stderr-line
+            (concat "[shell-loop] nelisp-stdlib-misc override load ERR: "
+                    (format "%S" err))))))))
+
   ;; Put `anvil-el-dir' on `load-path' so any `(require 'anvil-orchestrator-routing)'
   ;; / `(require 'anvil-orchestrator-presets)' / etc. inside tool-module
   ;; files resolve to siblings of `anvil-server.el'.  Without this the
