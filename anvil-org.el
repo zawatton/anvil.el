@@ -232,14 +232,18 @@ Check your Emacs hooks (`before-revert-hook', \
 `after-revert-hook', `revert-buffer-function')"
                 file-path (error-message-string err))))))))))
 
-(defun anvil-org--complete-and-save (file-path response-alist)
-  "Create ID if needed, save FILE-PATH, return JSON.
+(defun anvil-org--complete (file-path response-alist &optional no-save)
+  "Create ID if needed, maybe save FILE-PATH, return JSON.
 Creates or gets an Org ID for the current headline and returns it.
 FILE-PATH is the path to save the buffer contents to.
-RESPONSE-ALIST is an alist of response fields."
+RESPONSE-ALIST is an alist of response fields.
+When NO-SAVE is non-nil, the Org ID is created but the buffer is
+neither written to disk nor refreshed — the caller is responsible
+for managing the buffer's saved state."
   (let ((id (org-id-get-create)))
-    (write-region (point-min) (point-max) file-path)
-    (anvil-org--refresh-file-buffers file-path)
+    (unless no-save
+      (write-region (point-min) (point-max) file-path)
+      (anvil-org--refresh-file-buffers file-path))
     (json-encode
      (append
       `((success . t))
@@ -248,15 +252,20 @@ RESPONSE-ALIST is an alist of response fields."
 
 (defun anvil-org--fail-if-modified (file-path operation)
   "Check if FILE-PATH has unsaved change in any buffer.
-OPERATION is a string describing the operation for error messages."
-  (dolist (buf (buffer-list))
-    (with-current-buffer buf
-      (when (and (buffer-file-name)
-                 (string= (buffer-file-name) file-path)
-                 (buffer-modified-p))
-        (anvil-org--tool-validation-error
-         "Cannot %s: file has unsaved changes in buffer"
-         operation)))))
+OPERATION is a string describing the operation for error messages.
+
+When a live buffer's major mode is in `anvil-modes-allow-buffer-modify',
+unsaved changes are permitted — the edit will happen buffer-first and
+only be saved if the buffer was clean beforehand."
+  (unless (anvil--buffer-first-viable-p file-path)
+    (dolist (buf (buffer-list))
+      (with-current-buffer buf
+        (when (and (buffer-file-name)
+                   (string= (buffer-file-name) file-path)
+                   (buffer-modified-p))
+          (anvil-org--tool-validation-error
+           "Cannot %s: file has unsaved changes in buffer"
+           operation))))))
 
 (defmacro anvil-org--with-org-file (file-path &rest body)
   "Execute BODY in a temp Org buffer with file at FILE-PATH."
@@ -267,33 +276,60 @@ OPERATION is a string describing the operation for error messages."
      (goto-char (point-min))
      ,@body))
 
-(defmacro anvil-org--modify-and-save
+(defmacro anvil-org--modify
     (file-path operation response-alist &rest body)
   "Execute BODY to modify Org file at FILE-PATH, then save result.
+
 First validates that FILE-PATH has no unsaved changes (using
-OPERATION for error messages).  Then executes BODY in a temp buffer
-set up for the Org file.  After BODY executes, creates an Org ID if
-needed, saves the buffer, refreshes any visiting buffers, and
-returns the result of `anvil-org--complete-and-save' with FILE-PATH
-and RESPONSE-ALIST.
+OPERATION for error messages), unless the file's major mode
+appears in `anvil-modes-allow-buffer-modify'.
+
+Two execution paths:
+
+1. Buffer-first (when `anvil--buffer-first-viable-p' returns
+   non-nil): edits are made directly in the first live buffer
+   visiting FILE-PATH.  If the buffer had unsaved modifications
+   before the edit, the buffer is NOT saved — preserving any
+   in-progress user edits.  Otherwise the buffer is saved and
+   refreshed as normal.
+
+2. Disk-first (default): reads the file into a temp buffer,
+   executes BODY, then writes the result to disk and refreshes
+   all visiting buffers.  Unsaved changes in any buffer raise an
+   error before the edit proceeds.
+
 BODY can access FILE-PATH, OPERATION, and RESPONSE-ALIST as
 variables."
   (declare (indent 3) (debug (form form form body)))
-  `(progn
-     (anvil-org--fail-if-modified ,file-path ,operation)
-     (with-temp-buffer
-       (unwind-protect
-           (progn
-             (insert-file-contents ,file-path)
-             (set-visited-file-name ,file-path t)
-             (set-buffer-modified-p nil)
-             (org-mode)
-             (goto-char (point-min))
-             ,@body
-             (anvil-org--complete-and-save ,file-path ,response-alist))
-         ;; Do not let failed tool calls prompt about killing the
-         ;; temporary file-visiting buffer.
-         (set-buffer-modified-p nil)))))
+  `(if-let ((viable (anvil--buffer-first-viable-p ,file-path)))
+       ;; Buffer-first path
+       (let ((buf (car viable))
+             (was-modified (cdr viable)))
+         (with-current-buffer buf
+           (save-restriction
+             (widen)
+             (save-excursion
+               ,@body
+               ;; Complete — save only if the buffer was clean.
+               (anvil-org--complete
+                ,file-path ,response-alist was-modified)))))
+     ;; Disk-first path
+     (progn
+       (anvil-org--fail-if-modified ,file-path ,operation)
+       (with-temp-buffer
+         (unwind-protect
+             (progn
+               (insert-file-contents ,file-path)
+               (set-visited-file-name ,file-path t)
+               (set-buffer-modified-p nil)
+               (org-mode)
+               (goto-char (point-min))
+               ,@body
+               (anvil-org--complete
+                ,file-path ,response-alist))
+           ;; Do not let failed tool calls prompt about killing the
+           ;; temporary file-visiting buffer.
+           (set-buffer-modified-p nil))))))
 
 (defun anvil-org--find-allowed-file-with-id
     (id &optional not-found-fn file-access-fn)
@@ -307,10 +343,10 @@ versus resource callers."
         (file-access-fn
          (or file-access-fn #'anvil-org--tool-file-access-error)))
     (if-let* ((id-file (org-id-find-id-file id)))
-      ;; ID found in database, check if file is allowed
-      (if-let* ((allowed-file (anvil-org--find-allowed-file id-file)))
-        allowed-file
-        (funcall file-access-fn id))
+        ;; ID found in database, check if file is allowed
+        (if-let* ((allowed-file (anvil-org--find-allowed-file id-file)))
+            allowed-file
+          (funcall file-access-fn id))
       ;; ID not in database - might not exist or DB is stale
       ;; Fall back to searching allowed files manually (only when restriction is on)
       (if (not anvil-org-allowed-files-enabled)
@@ -338,11 +374,11 @@ Throws an error if neither prefix matches."
   `(if-let* ((id
               (anvil-org--extract-uri-suffix
                ,uri anvil-org--uri-id-prefix)))
-     ,id-body
+       ,id-body
      (if-let* ((headline
                 (anvil-org--extract-uri-suffix
                  ,uri anvil-org--uri-headline-prefix)))
-       ,headline-body
+         ,headline-body
        (anvil-org--tool-validation-error
         "Invalid resource URI format: %s"
         ,uri))))
@@ -353,7 +389,7 @@ FILENAME must be an absolute path.
 Returns the full path if allowed, signals an error otherwise."
   (unless (file-name-absolute-p filename)
     (anvil-org--resource-validation-error "Path must be absolute: %s"
-                                        filename))
+                                          filename))
   (let ((allowed-file (anvil-org--find-allowed-file filename)))
     (unless allowed-file
       (anvil-org--resource-file-access-error filename))
@@ -405,10 +441,10 @@ Returns (FILE . HEADLINE) where FILE is the decoded file path and
 HEADLINE is the part after the fragment separator.
 File paths with # characters should be encoded as %23."
   (if-let* ((hash-pos (string-match "#" path-after-protocol)))
-    (cons
-     (anvil-org--decode-file-path
-      (substring path-after-protocol 0 hash-pos))
-     (substring path-after-protocol (1+ hash-pos)))
+      (cons
+       (anvil-org--decode-file-path
+        (substring path-after-protocol 0 hash-pos))
+       (substring path-after-protocol (1+ hash-pos)))
     (cons (anvil-org--decode-file-path path-after-protocol) nil)))
 
 (defun anvil-org--parse-resource-uri (uri)
@@ -494,7 +530,7 @@ Otherwise, navigates using HEADLINE-PATH as title hierarchy."
   (if is-id
       ;; ID case - headline-path contains single ID
       (if-let* ((pos (org-find-property "ID" (car headline-path))))
-        (goto-char pos)
+          (goto-char pos)
         (anvil-org--id-not-found-error (car headline-path)))
     ;; Path case - headline-path contains title hierarchy
     (unless (anvil-org--navigate-to-headline headline-path)
@@ -711,7 +747,7 @@ Throws error for invalid types or malformed JSON."
       (cond
        ((string-empty-p trimmed)
         nil) ; "" / whitespace -> no tags (kept for MCP callers wanting
-             ; to express "no tags" without inventing a sentinel)
+                                        ; to express "no tags" without inventing a sentinel)
        ((eq (aref trimmed 0) ?\[)
         (condition-case err
             (let ((parsed (json-parse-string trimmed
@@ -956,11 +992,11 @@ MCP Parameters:
          (file-path (car parsed))
          (headline-path (cdr parsed)))
     (anvil-org--validate-todo-state new_state)
-    (anvil-org--modify-and-save file-path "update"
-                              `((previous_state
-                                 .
-                                 ,(or current_state ""))
-                                (new_state . ,new_state))
+    (anvil-org--modify file-path "update"
+                                `((previous_state
+                                   .
+                                   ,(or current_state ""))
+                                  (new_state . ,new_state))
       (anvil-org--goto-headline-from-uri
        headline-path (string-prefix-p anvil-org--uri-id-prefix uri))
 
@@ -1036,11 +1072,11 @@ MCP Parameters:
         (setq parent-id id)))
 
     ;; Add the TODO item
-    (anvil-org--modify-and-save file-path "add TODO"
-                              `((file
-                                 .
-                                 ,(file-name-nondirectory file-path))
-                                (title . ,title))
+    (anvil-org--modify file-path "add TODO"
+                                `((file
+                                   .
+                                   ,(file-name-nondirectory file-path))
+                                  (title . ,title))
       (let ((parent-level
              (anvil-org--navigate-to-parent-or-top
               parent-path parent-id)))
@@ -1168,9 +1204,9 @@ MCP Parameters:
          (headline-path (cdr parsed)))
 
     ;; Rename the headline in the file
-    (anvil-org--modify-and-save file-path "rename"
-                              `((previous_title . ,current_title)
-                                (new_title . ,new_title))
+    (anvil-org--modify file-path "rename"
+                                `((previous_title . ,current_title)
+                                  (new_title . ,new_title))
       ;; Navigate to the headline
       (anvil-org--goto-headline-from-uri
        headline-path (string-prefix-p anvil-org--uri-id-prefix uri))
@@ -1219,7 +1255,7 @@ MCP Parameters:
            (file-path (car parsed))
            (headline-path (cdr parsed)))
 
-      (anvil-org--modify-and-save file-path "edit body" nil
+      (anvil-org--modify file-path "edit body" nil
         (anvil-org--goto-headline-from-uri
          headline-path
          (string-prefix-p anvil-org--uri-id-prefix resource_uri))
