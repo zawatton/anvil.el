@@ -188,6 +188,7 @@ Anvil の default install は *約 40 個の MCP ツール* を提供します (
 | =anvil-worker= | 時間のかかる処理 (OCR、PDF 変換、ファイル一括走査など) を裏の別 Emacs に逃がす。対話中の Emacs はフリーズしない |
 | 大規模 org ファイルの編集 | 1.2 MB 以上の org も末尾欠損なく編集 (Windows ファイルマウント問題を回避) |
 | LLM クライアント非依存 | Claude Code / Claude Desktop / GPT / Ollama 経由のローカル LLM、すべて MCP で繋がる |
+| =anvil-modes-allow-buffer-modify= | Anvil ツールがファイルを訪れるのではなくライブバッファを直接変更するように major mode を設定。未保存の編集を保持します。 |
 
 数値の根拠と詳細なケーススタディは [[https://github.com/zawatton/anvil.el/blob/master/README.ja.org#効率性--anvil-が-ai-トークンを節約する理由][効率性 — Anvil が AI トークンを節約する理由]] にあります。
 全モジュール一覧は [[https://github.com/zawatton/anvil.el/blob/master/README.ja.org#モジュール][モジュール]] を参照。
@@ -622,6 +623,37 @@ user 向けです。
 ;; Anvil を起動
 (anvil-enable)
 (anvil-server-start)
+#+end_src
+
+** バッファ優先編集 — anvil-modes-allow-buffer-modify
+
+デフォルトでは、anvil の org 編集ツール (update-todo-state, add-todo,
+rename-headline, edit-body) は *ディスク優先* ポリシーを採用しています。
+ファイルをテンポラリバッファに読み込み、編集を適用し、結果をディスクに書き出し、
+訪問中のバッファがあればリフレッシュします。いずれかのバッファに未保存の変更がある
+場合は操作が拒否されます — anvil は人間が作業中の編集を上書きしないからです。
+
+=anvil-modes-allow-buffer-modify= に major mode のリストを設定すると、
+オープン中のバッファがその mode にマッチするファイルについて、anvil は
+*バッファ優先* ポリシーに切り替えます:
+
+1. ファイルを訪問している最初のバッファを見つけます
+   (indirect バッファは base バッファを辿ります)。
+2. バッファに既に未保存の変更があるか確認します。
+3. ライブバッファ内で直接編集を行います。
+4. 編集前にバッファがクリーンだった場合 *のみ* 保存します —
+   作業中の編集を保持するため、未保存の変更があった場合は保存しません。
+
+つまり、AI エージェントと人間が同じファイルで共同作業する際、
+エージェントが書きかけの編集を強制保存することはありません。
+
+#+begin_src emacs-lisp
+;; org ファイルのみバッファ優先編集を有効化
+(setq anvil-modes-allow-buffer-modify '(org-mode))
+
+;; または、全オープンバッファで有効化
+;; (fundamental-mode は特別扱いで、あらゆる major mode にマッチします)
+(setq anvil-modes-allow-buffer-modify '(fundamental-mode))
 #+end_src
 
 ** Browser モジュール（オプション）

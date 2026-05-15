@@ -293,6 +293,25 @@ All anvil tools are registered under this server ID."
   :type 'string
   :group 'anvil)
 
+(defcustom anvil-modes-allow-buffer-modify nil
+  "List of major modes where anvil edits should modify the live buffer.
+
+When a file being edited has at least one open buffer whose major mode
+is derived from a mode in this list, anvil's org-modifying tools
+(such as `anvil-org--modify') will:
+
+1. Locate the first buffer visiting that file (following indirect
+   buffers to their base buffer).
+2. Note whether the buffer already has unsaved modifications.
+3. Make the edit directly in the live buffer.
+4. Only save the buffer if it did *not* have unsaved modifications
+   before the edit — preserving any in-progress user edits.
+
+Set this to \='(fundamental-mode) to enable buffer-first editing for
+every file open in Emacs, regardless of its major mode."
+  :type '(repeat symbol)
+  :group 'anvil)
+
 ;;; State
 
 (defvar anvil--enabled nil
@@ -376,6 +395,35 @@ Loads all modules listed in `anvil-modules' and `anvil-optional-modules'."
       (dolist (mod anvil-optional-modules)
         (princ (format "  - %s %s\n" mod
                        (if (memq mod anvil--loaded-modules) "[active]" "[not loaded]")))))))
+
+
+;;; Buffer-first modify helpers
+
+(defun anvil--buffer-first-viable-p (file-path)
+  "Return non-nil if FILE-PATH should be edited in a live buffer.
+
+Returns (BUF . WAS-MODIFIED) where BUF is the base buffer visiting
+FILE-PATH and WAS-MODIFIED is t when that buffer had unsaved edits
+before this check.  Returns nil when:
+- `anvil-modes-allow-buffer-modify' is nil, or
+- no buffer visits FILE-PATH, or
+- the visiting buffer's major mode does not derive from any mode
+  listed in `anvil-modes-allow-buffer-modify'.
+
+When the visiting buffer is an indirect buffer its base buffer is
+used instead.
+
+As a special case, `fundamental-mode' matches any mode — set the
+option to \='(fundamental-mode) for buffer-first editing everywhere."
+  (when anvil-modes-allow-buffer-modify
+    (when-let* ((buf (find-buffer-visiting (expand-file-name file-path))))
+      (let ((base (or (buffer-base-buffer buf) buf)))
+        (when (with-current-buffer base
+                (or (memq 'fundamental-mode anvil-modes-allow-buffer-modify)
+                    (cl-some (lambda (m)
+                               (provided-mode-derived-p major-mode m))
+                             anvil-modes-allow-buffer-modify)))
+          (cons base (buffer-modified-p base)))))))
 
 (provide 'anvil)
 ;;; anvil.el ends here
