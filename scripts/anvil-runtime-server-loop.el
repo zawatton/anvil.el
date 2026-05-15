@@ -260,24 +260,49 @@ response."
 
   (defvar anvil-mcp--state-by-fd (make-hash-table :test #'eql))
 
-  (defun anvil-mcp--find-crlfcrlf (s)
-    "Return index of \\r\\n\\r\\n in S or nil."
+  (defun anvil-mcp--find-headers-end (s)
+    "Return (IDX . LEN) where IDX is the start of the header/body
+separator in S and LEN is its byte length, or nil when no
+separator is present yet.
+
+Accepts both `\\r\\n\\r\\n' (4-byte, MCP spec) and `\\n\\n' (2-byte,
+LF-only).  Claude Code 2.1.122 emits LF-only termination while
+spec-compliant clients (= older Claude Code, Cursor, others) emit
+CRLF; supporting both lets the same daemon serve every MCP host."
     (let ((n (length s))
           (i 0)
           (found nil))
-      (while (and (not found) (< (+ i 3) n))
-        (when (and (eq (aref s i) ?\r)
-                   (eq (aref s (+ i 1)) ?\n)
-                   (eq (aref s (+ i 2)) ?\r)
-                   (eq (aref s (+ i 3)) ?\n))
-          (setq found i))
+      (while (and (not found) (< i n))
+        (cond
+         ;; CRLFCRLF (4-byte, MCP spec).
+         ((and (< (+ i 3) n)
+               (eq (aref s i) ?\r)
+               (eq (aref s (+ i 1)) ?\n)
+               (eq (aref s (+ i 2)) ?\r)
+               (eq (aref s (+ i 3)) ?\n))
+          (setq found (cons i 4)))
+         ;; LFLF (2-byte, Claude Code 2.1.122 dialect).
+         ((and (< (+ i 1) n)
+               (eq (aref s i) ?\n)
+               (eq (aref s (+ i 1)) ?\n))
+          (setq found (cons i 2))))
         (setq i (1+ i)))
       found))
 
+  ;; Backwards-compatible alias for any old caller that still expects
+  ;; the CRLF-only signature (returns plain INDEX).  Reuses the new
+  ;; finder so we only have one separator-scan implementation.
+  (defun anvil-mcp--find-crlfcrlf (s)
+    "Return index of \\r\\n\\r\\n (or \\n\\n) in S, or nil."
+    (let ((hit (anvil-mcp--find-headers-end s)))
+      (and hit (car hit))))
+
   (defun anvil-mcp--parse-content-length (header-block)
     "Walk HEADER-BLOCK line-by-line, return the Content-Length value
-or nil.  Case-insensitive prefix match."
-    (let ((lines (split-string header-block "\r\n"))
+or nil.  Case-insensitive prefix match.  Accepts both CRLF and
+LF-only line endings to match the separator dialects handled by
+`anvil-mcp--find-headers-end'."
+    (let ((lines (split-string header-block "\r?\n"))
           (found nil))
       (while (and lines (not found))
         (let* ((line (anvil-server--strip-trailing-cr (car lines)))
@@ -330,10 +355,12 @@ zero or more complete frames, dispatches each via
           (cond
            ((eq (plist-get state :phase) 'header)
             (let* ((buf (plist-get state :buffer))
-                   (idx (anvil-mcp--find-crlfcrlf buf)))
-              (when idx
-                (let* ((header (substring buf 0 idx))
-                       (rest (substring buf (+ idx 4)))
+                   (hit (anvil-mcp--find-headers-end buf)))
+              (when hit
+                (let* ((idx (car hit))
+                       (sep-len (cdr hit))
+                       (header (substring buf 0 idx))
+                       (rest (substring buf (+ idx sep-len)))
                        (n (anvil-mcp--parse-content-length header)))
                   (cond
                    ((and (integerp n) (>= n 0))
