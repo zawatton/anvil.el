@@ -45,13 +45,19 @@ isolation from any outer daemon state."
   "Return the list of tool names currently advertised by tools/list.
 SERVER-ID defaults to \"default\" and is resolved through
 `anvil-server-id-aliases' by the handler."
-  (let ((response-json nil)
-        (sid (or server-id "default")))
-    (cl-letf (((symbol-function 'anvil-server--jsonrpc-response)
-               (lambda (_id payload) (setq response-json payload))))
-      (anvil-server--handle-tools-list 1 sid))
+  (let* ((sid (or server-id "default"))
+         ;; bc8da89 added a per-server-id JSON cache.  Tests share the
+         ;; top-level cache table (the fixture only lets `anvil-server--tools')
+         ;; and may rebind `anvil-server-tool-filter-function' or
+         ;; `anvil-server-id-aliases' between calls; full clrhash so each
+         ;; call rebuilds from current dynamic state.
+         (_ (anvil-server--tools-list-cache-invalidate))
+         (response-string (anvil-server--handle-tools-list 1 sid))
+         (response (json-read-from-string response-string))
+         (result (alist-get 'result response))
+         (tools (alist-get 'tools result)))
     (mapcar (lambda (entry) (alist-get 'name entry))
-            (append (alist-get 'tools response-json) nil))))
+            (append tools nil))))
 
 ;;;; --- profile-toolset dispatch ------------------------------------------
 
