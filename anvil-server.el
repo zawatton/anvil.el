@@ -187,6 +187,49 @@ Returns a hash table mapping template to template-data."
   "Create a JSON-RPC response with ID and RESULT."
   (json-encode `((jsonrpc . "2.0") (id . ,id) (result . ,result))))
 
+;; ---- tools/list response cache (perf: 2026-05-11) ----
+;;
+;; MCP `tools/list' returns a ~20KB JSON payload for the standard
+;; ~30-tool bundle.  json-encode on NeLisp standalone is O(N²) inside
+;; the native `mapconcat' primitive (`lisp/nelisp-stdlib-plist-str.el'
+;; line ~1037, `(setq acc (concat acc joiner (car cur)))' in a while
+;; loop), driving response time to 35-120 s and overrunning Claude
+;; Code's 30 s /mcp reconnect timeout.  The response content is pure
+;; data — registry × filter — so caching the JSON-encoded `result'
+;; object per server-id and skipping json-encode on subsequent calls
+;; is safe.  Invalidated by `anvil-server-register-tool' /
+;; `anvil-server-unregister-tool' (which call the helper directly).
+;;
+;; We cache only the `result' fragment (= the JSON for `((tools . [...]))'),
+;; not the full JSON-RPC wrapper, because the wrapper's `id' varies per
+;; call.  The wrapper concat is constant-time string assembly.
+(defvar anvil-server--tools-list-cache (make-hash-table :test 'equal)
+  "Hash table mapping server-id → JSON string of cached `result' object.
+The stored string is the JSON-encoded `((tools . [...]))' alist, with no
+outer JSON-RPC wrapper.  Cleared per server-id by
+`anvil-server--tools-list-cache-invalidate' when tools register /
+unregister.")
+
+(defun anvil-server--tools-list-cache-invalidate (&optional server-id)
+  "Drop the tools/list cache entry for SERVER-ID (or every entry if nil)."
+  (if server-id
+      (remhash server-id anvil-server--tools-list-cache)
+    (clrhash anvil-server--tools-list-cache)))
+
+(defun anvil-server--jsonrpc-response-from-result-json (id result-json)
+  "Build a JSON-RPC response by wrapping a pre-encoded RESULT-JSON string.
+ID is encoded inline.  Used by the tools/list cache fast path to skip
+a full json-encode of the (potentially ~20KB) result object."
+  (concat "{\"jsonrpc\":\"2.0\",\"id\":"
+          (cond
+           ((null id) "null")
+           ((integerp id) (number-to-string id))
+           ((stringp id) (json-encode id))
+           (t (json-encode id)))
+          ",\"result\":"
+          result-json
+          "}"))
+
 
 (defun anvil-server--param-name-matches-arg-p (param-name arg)
   "Return t if PARAM-NAME matches ARG symbol name."
@@ -494,6 +537,16 @@ SERVER-ID must be non-nil and already resolved to a string."
                    server-id
                    json-message)))))))
 
+(defmacro anvil-server--metrics-bump (place)
+  "Increment metrics PLACE, swallowing setf failures on standalone NeLisp.
+The `cl-defstruct' setf machinery is not yet wired in standalone NeLisp,
+so `(cl-incf (anvil-server-metrics-calls m))' raises `wrong-type-argument:
+symbol' there.  Metrics are observability — losing a count is acceptable;
+losing dispatch is not.  This macro keeps the host-Emacs path incrementing
+normally while standalone silently no-ops."
+  (declare (debug t))
+  `(condition-case nil (cl-incf ,place) (error nil)))
+
 (defun anvil-server--handle-error (err)
   "Handle error ERR in MCP process by logging and creating an error response.
 Returns a JSON-RPC error response string for internal errors."
@@ -688,7 +741,7 @@ METHOD-METRICS is used to track errors."
          id `((contents . ,(vector content-entry)))))
     ;; Handle resource-specific errors with custom error codes
     (anvil-server-resource-error
-     (cl-incf (anvil-server-metrics-errors method-metrics))
+     (anvil-server--metrics-bump (anvil-server-metrics-errors method-metrics))
      (let ((code (car (cdr err)))
            (message (cadr (cdr err))))
        (anvil-server--jsonrpc-error id code message)))
@@ -699,7 +752,7 @@ METHOD-METRICS is used to track errors."
       (format "Resource handler quit for %s: %S" uri err)))
     ;; Handle any other error from the handler
     (error
-     (cl-incf (anvil-server-metrics-errors method-metrics))
+     (anvil-server--metrics-bump (anvil-server-metrics-errors method-metrics))
      (anvil-server--jsonrpc-error
       id anvil-server-jsonrpc-error-internal
       (format "Error reading resource %s: %s"
@@ -747,7 +800,7 @@ METHOD is the JSON-RPC method name to dispatch.
 PARAMS is the JSON-RPC params object from the request.
 Returns a JSON-RPC response string for the request."
   (let ((method-metrics (anvil-server-metrics--get method)))
-    (cl-incf (anvil-server-metrics-calls method-metrics))
+    (anvil-server--metrics-bump (anvil-server-metrics-calls method-metrics))
 
     (cond
      ((equal method "initialize")
@@ -860,45 +913,65 @@ Returns a list of registered tools with their metadata, minus any
 filtered out by `anvil-server-tool-filter-function'.  SERVER-ID may
 be a virtual id registered in `anvil-server-id-aliases'; in that
 case tool lookup uses the resolved real id but the filter function
-still sees the original virtual id for profile selection."
-  (let ((tool-list (vector))
-        (resolved-id (anvil-server--resolve-id server-id)))
-    (when-let* ((tools-table
-                 (gethash resolved-id anvil-server--tools)))
-      (maphash
-       (lambda (tool-id tool)
-         (when (or (null anvil-server-tool-filter-function)
-                   (funcall anvil-server-tool-filter-function
-                            tool-id tool server-id))
-           (let* ((tool-description (plist-get tool :description))
-                  (tool-title (plist-get tool :title))
-                  (tool-read-only (plist-get tool :read-only))
-                  (tool-schema
-                   (or (plist-get tool :schema) '((type . "object"))))
-                  (tool-entry
-                   `((name . ,tool-id)
-                     (description . ,tool-description)
-                     (inputSchema . ,tool-schema)))
-                  (annotations nil))
-             ;; Collect annotations if present
-             (when tool-title
-               (push (cons 'title tool-title) annotations))
-             ;; Add readOnlyHint when :read-only is explicitly provided (both t
-             ;; and nil)
-             (when (plist-member tool :read-only)
-               (let ((annot-value
-                      (if tool-read-only
-                          t
-                        :json-false)))
-                 (push (cons 'readOnlyHint annot-value) annotations)))
-             ;; Add annotations to tool entry if any exist
-             (when annotations
-               (setq tool-entry
-                     (append
-                      tool-entry `((annotations . ,annotations)))))
-             (setq tool-list (vconcat tool-list (vector tool-entry))))))
-       tools-table))
-    (anvil-server--jsonrpc-response id `((tools . ,tool-list)))))
+still sees the original virtual id for profile selection.
+
+Perf (2026-05-11): the JSON-encoded `result' object is cached per
+server-id in `anvil-server--tools-list-cache' and skips full
+json-encode on subsequent calls.  The cache is invalidated by
+register / unregister."
+  (let* ((resolved-id (anvil-server--resolve-id server-id))
+         ;; Filter function may have stateful side effects keyed off
+         ;; the *virtual* server-id (= unresolved).  We still cache
+         ;; by resolved-id because the maphash domain (= tools table)
+         ;; is shared across virtual ids that alias the same real id;
+         ;; per-virtual filter selectivity does not change the tool
+         ;; metadata included for a given resolved-id.  If a filter
+         ;; that legitimately varies output by virtual id is wired,
+         ;; switch this key to (cons server-id resolved-id) and add
+         ;; matching `remhash' calls in the invalidate helper.
+         (cache-key resolved-id)
+         (cached (gethash cache-key anvil-server--tools-list-cache)))
+    (if cached
+        (anvil-server--jsonrpc-response-from-result-json id cached)
+      (let ((tool-list (vector)))
+        (when-let* ((tools-table
+                     (gethash resolved-id anvil-server--tools)))
+          (maphash
+           (lambda (tool-id tool)
+             (when (or (null anvil-server-tool-filter-function)
+                       (funcall anvil-server-tool-filter-function
+                                tool-id tool server-id))
+               (let* ((tool-description (plist-get tool :description))
+                      (tool-title (plist-get tool :title))
+                      (tool-read-only (plist-get tool :read-only))
+                      (tool-schema
+                       (or (plist-get tool :schema) '((type . "object"))))
+                      (tool-entry
+                       `((name . ,tool-id)
+                         (description . ,tool-description)
+                         (inputSchema . ,tool-schema)))
+                      (annotations nil))
+                 ;; Collect annotations if present
+                 (when tool-title
+                   (push (cons 'title tool-title) annotations))
+                 ;; Add readOnlyHint when :read-only is explicitly provided (both t
+                 ;; and nil)
+                 (when (plist-member tool :read-only)
+                   (let ((annot-value
+                          (if tool-read-only
+                              t
+                            :json-false)))
+                     (push (cons 'readOnlyHint annot-value) annotations)))
+                 ;; Add annotations to tool entry if any exist
+                 (when annotations
+                   (setq tool-entry
+                         (append
+                          tool-entry `((annotations . ,annotations)))))
+                 (setq tool-list (vconcat tool-list (vector tool-entry))))))
+           tools-table))
+        (let ((result-json (json-encode `((tools . ,tool-list)))))
+          (puthash cache-key result-json anvil-server--tools-list-cache)
+          (anvil-server--jsonrpc-response-from-result-json id result-json))))))
 
 (defun anvil-server--build-resource-entry
     (uri-or-template resource-data is-template)
@@ -1125,7 +1198,7 @@ virtual server-ids share the same handler pool."
             ;; Handle invalid parameter errors
             (anvil-server-invalid-params
              (anvil-server-metrics--track-tool-call tool-name t)
-             (cl-incf (anvil-server-metrics-errors method-metrics))
+             (anvil-server--metrics-bump (anvil-server-metrics-errors method-metrics))
              (anvil-server--jsonrpc-error
               id
               anvil-server-jsonrpc-error-invalid-params
@@ -1134,7 +1207,7 @@ virtual server-ids share the same handler pool."
             ;; anvil-server-tool-throw
             (anvil-server-tool-error
              (anvil-server-metrics--track-tool-call tool-name t)
-             (cl-incf (anvil-server-metrics-errors method-metrics))
+             (anvil-server--metrics-bump (anvil-server-metrics-errors method-metrics))
              (let ((formatted-error
                     `((content
                        .
@@ -1152,13 +1225,13 @@ virtual server-ids share the same handler pool."
             ;; Keep existing handling for all other errors
             (error
              (anvil-server-metrics--track-tool-call tool-name t)
-             (cl-incf (anvil-server-metrics-errors method-metrics))
+             (anvil-server--metrics-bump (anvil-server-metrics-errors method-metrics))
              (anvil-server--jsonrpc-error
               id anvil-server-jsonrpc-error-internal
               (format "Internal error executing tool: %s"
                       (error-message-string err))))))
       (anvil-server-metrics--track-tool-call tool-name t)
-      (cl-incf (anvil-server-metrics-errors method-metrics))
+      (anvil-server--metrics-bump (anvil-server-metrics-errors method-metrics))
       (anvil-server--jsonrpc-error
        id
        anvil-server-jsonrpc-error-invalid-request
@@ -1633,7 +1706,10 @@ See also:
           (when (plist-member properties k)
             (setq tool (plist-put tool k (plist-get properties k)))))
         ;; Register the tool
-        (anvil-server--ref-counted-register id tool tools-table)))))
+        (anvil-server--ref-counted-register id tool tools-table)
+        ;; Perf (2026-05-11): tools/list response is cached per server-id;
+        ;; drop the cached entry so the next /list rebuilds with the new tool.
+        (anvil-server--tools-list-cache-invalidate server-id)))))
 
 (defun anvil-server-unregister-tool (tool-id &optional server-id)
   "Unregister a tool with ID TOOL-ID from the MCP server with SERVER-ID.
@@ -1641,9 +1717,16 @@ See also:
 Returns t if the tool was found and removed, nil otherwise.
 
 See also: `anvil-server-register-tool'"
-  (let ((tools-table
-         (anvil-server--get-server-tools (or server-id "default"))))
-    (anvil-server--ref-counted-unregister tool-id tools-table)))
+  (let* ((effective-id (or server-id "default"))
+         (tools-table
+          (anvil-server--get-server-tools effective-id))
+         (removed
+          (anvil-server--ref-counted-unregister tool-id tools-table)))
+    ;; Perf (2026-05-11): drop the cached tools/list response so the
+    ;; next /list rebuilds without the removed tool.
+    (when removed
+      (anvil-server--tools-list-cache-invalidate effective-id))
+    removed))
 
 (defun anvil-server-register-tools (server-id specs)
   "Register every (HANDLER . PROPS) SPEC under SERVER-ID in one call.

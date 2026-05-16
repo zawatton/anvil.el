@@ -209,6 +209,17 @@ response."
       (process-send-string proc header)
       (process-send-string proc body)))
 
+  (defun anvil-server-mcp-ndjson-send (proc body)
+    "Send BODY followed by a newline to PROC (= newline-delimited JSON wire).
+
+Claude Code 2.1.138+ emits bare JSON objects terminated by `\\n'
+rather than the spec-defined `Content-Length:'-prefixed frame.  We
+detect the dialect per connection (= first byte of the first chunk:
+`{' -> ndjson, otherwise framed) and route responses through this
+helper instead of `frame-send' for those clients."
+    (process-send-string proc body)
+    (process-send-string proc "\n"))
+
   ;; --- tool-module load chain (same as shell-loop default) ---
   (let* ((modules-env (anvil-runtime-server--env
                        "ANVIL_TOOL_MODULES"
@@ -260,24 +271,49 @@ response."
 
   (defvar anvil-mcp--state-by-fd (make-hash-table :test #'eql))
 
-  (defun anvil-mcp--find-crlfcrlf (s)
-    "Return index of \\r\\n\\r\\n in S or nil."
+  (defun anvil-mcp--find-headers-end (s)
+    "Return (IDX . LEN) where IDX is the start of the header/body
+separator in S and LEN is its byte length, or nil when no
+separator is present yet.
+
+Accepts both `\\r\\n\\r\\n' (4-byte, MCP spec) and `\\n\\n' (2-byte,
+LF-only).  Claude Code 2.1.122 emits LF-only termination while
+spec-compliant clients (= older Claude Code, Cursor, others) emit
+CRLF; supporting both lets the same daemon serve every MCP host."
     (let ((n (length s))
           (i 0)
           (found nil))
-      (while (and (not found) (< (+ i 3) n))
-        (when (and (eq (aref s i) ?\r)
-                   (eq (aref s (+ i 1)) ?\n)
-                   (eq (aref s (+ i 2)) ?\r)
-                   (eq (aref s (+ i 3)) ?\n))
-          (setq found i))
+      (while (and (not found) (< i n))
+        (cond
+         ;; CRLFCRLF (4-byte, MCP spec).
+         ((and (< (+ i 3) n)
+               (eq (aref s i) ?\r)
+               (eq (aref s (+ i 1)) ?\n)
+               (eq (aref s (+ i 2)) ?\r)
+               (eq (aref s (+ i 3)) ?\n))
+          (setq found (cons i 4)))
+         ;; LFLF (2-byte, Claude Code 2.1.122 dialect).
+         ((and (< (+ i 1) n)
+               (eq (aref s i) ?\n)
+               (eq (aref s (+ i 1)) ?\n))
+          (setq found (cons i 2))))
         (setq i (1+ i)))
       found))
 
+  ;; Backwards-compatible alias for any old caller that still expects
+  ;; the CRLF-only signature (returns plain INDEX).  Reuses the new
+  ;; finder so we only have one separator-scan implementation.
+  (defun anvil-mcp--find-crlfcrlf (s)
+    "Return index of \\r\\n\\r\\n (or \\n\\n) in S, or nil."
+    (let ((hit (anvil-mcp--find-headers-end s)))
+      (and hit (car hit))))
+
   (defun anvil-mcp--parse-content-length (header-block)
     "Walk HEADER-BLOCK line-by-line, return the Content-Length value
-or nil.  Case-insensitive prefix match."
-    (let ((lines (split-string header-block "\r\n"))
+or nil.  Case-insensitive prefix match.  Accepts both CRLF and
+LF-only line endings to match the separator dialects handled by
+`anvil-mcp--find-headers-end'."
+    (let ((lines (split-string header-block "\r?\n"))
           (found nil))
       (while (and lines (not found))
         (let* ((line (anvil-server--strip-trailing-cr (car lines)))
@@ -305,17 +341,45 @@ or nil.  Case-insensitive prefix match."
         (setq lines (cdr lines)))
       found))
 
+  (defun anvil-mcp--find-lf (s)
+    "Return index of the first `\\n' in S, or nil."
+    (let ((n (length s))
+          (i 0)
+          (found nil))
+      (while (and (not found) (< i n))
+        (when (eq (aref s i) ?\n)
+          (setq found i))
+        (setq i (1+ i)))
+      found))
+
+  (defun anvil-mcp--send-response (proc response mode)
+    "Write RESPONSE back to PROC using MODE (`framed' or `ndjson')."
+    (cond
+     ((eq mode 'ndjson)
+      (anvil-server-mcp-ndjson-send proc response))
+     (t
+      (anvil-server-mcp-frame-send proc response))))
+
   (defun anvil-mcp-filter (proc chunk)
     "Per-connection MCP frame parser.  Accumulates CHUNK, extracts
 zero or more complete frames, dispatches each via
 `anvil-server-process-jsonrpc', and writes the response back via
-`process-send-string'."
+`anvil-server-mcp-frame-send' (Content-Length: framed) or
+`anvil-server-mcp-ndjson-send' (bare JSON + `\\n').
+
+Wire-format detection (= per-connection, latched on first chunk):
+- `Content-Length: ...\\r\\n\\r\\nBODY' framed (= LSP-style MCP spec)
+- `{...JSON...}\\n' newline-delimited JSON (= Claude Code 2.1.138+)
+The first non-empty buffer's leading byte picks the dialect:
+`{' -> `:mode ndjson', anything else -> `:mode framed'.
+Responses go back in the matching wire format."
     (let* ((fd (process-id-fd proc))
            (state (or (gethash fd anvil-mcp--state-by-fd)
                       (puthash fd
                                (list :buffer ""
                                      :phase 'header
-                                     :body-len 0)
+                                     :body-len 0
+                                     :mode nil)
                                anvil-mcp--state-by-fd))))
       (when (fboundp 'nelisp--write-stderr-line)
         (nelisp--write-stderr-line
@@ -324,16 +388,65 @@ zero or more complete frames, dispatches each via
                  (length (plist-get state :buffer)))))
       (plist-put state :buffer
                  (concat (plist-get state :buffer) chunk))
+      ;; Latch the wire dialect on the first non-empty buffer.
+      (when (and (null (plist-get state :mode))
+                 (> (length (plist-get state :buffer)) 0))
+        (let ((leader (aref (plist-get state :buffer) 0)))
+          (cond
+           ((eq leader ?{)
+            (plist-put state :mode 'ndjson)
+            (when (fboundp 'nelisp--write-stderr-line)
+              (nelisp--write-stderr-line
+               (format "[mcp-filter] fd=%d wire-format=ndjson" fd))))
+           (t
+            (plist-put state :mode 'framed)
+            (when (fboundp 'nelisp--write-stderr-line)
+              (nelisp--write-stderr-line
+               (format "[mcp-filter] fd=%d wire-format=framed" fd)))))))
       (let ((keep-draining t))
         (while keep-draining
           (setq keep-draining nil)
           (cond
+           ;; ── NDJSON path ─────────────────────────────────────────
+           ((eq (plist-get state :mode) 'ndjson)
+            (let* ((buf (plist-get state :buffer))
+                   (lf  (anvil-mcp--find-lf buf)))
+              (when lf
+                (let ((body (substring buf 0 lf))
+                      (rest (substring buf (1+ lf))))
+                  (plist-put state :buffer rest)
+                  (when (and (> (length body) 0))
+                    (when (fboundp 'nelisp--write-stderr-line)
+                      (nelisp--write-stderr-line
+                       (format "[mcp-filter] fd=%d dispatch body[%d]: %S"
+                               fd (length body)
+                               (substring body 0 (min 120 (length body))))))
+                    (let ((response
+                           (condition-case err
+                               (anvil-server-process-jsonrpc body server-id)
+                             (error
+                              (format
+                               "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32603,\"message\":\"Internal error: %s\"}}"
+                               (replace-regexp-in-string
+                                "\"" "\\\\\""
+                                (format "%S" err)))))))
+                      (when (fboundp 'nelisp--write-stderr-line)
+                        (nelisp--write-stderr-line
+                         (format "[mcp-filter] fd=%d response stringp=%S len=%d"
+                                 fd (stringp response)
+                                 (if (stringp response) (length response) -1))))
+                      (when (and (stringp response) (> (length response) 0))
+                        (anvil-mcp--send-response proc response 'ndjson))))
+                  (setq keep-draining t)))))
+           ;; ── Framed path ─────────────────────────────────────────
            ((eq (plist-get state :phase) 'header)
             (let* ((buf (plist-get state :buffer))
-                   (idx (anvil-mcp--find-crlfcrlf buf)))
-              (when idx
-                (let* ((header (substring buf 0 idx))
-                       (rest (substring buf (+ idx 4)))
+                   (hit (anvil-mcp--find-headers-end buf)))
+              (when hit
+                (let* ((idx (car hit))
+                       (sep-len (cdr hit))
+                       (header (substring buf 0 idx))
+                       (rest (substring buf (+ idx sep-len)))
                        (n (anvil-mcp--parse-content-length header)))
                   (cond
                    ((and (integerp n) (>= n 0))
@@ -377,7 +490,7 @@ zero or more complete frames, dispatches each via
                                fd (stringp response)
                                (if (stringp response) (length response) -1))))
                     (when (and (stringp response) (> (length response) 0))
-                      (anvil-server-mcp-frame-send proc response)))
+                      (anvil-mcp--send-response proc response 'framed)))
                   (setq keep-draining t)))))
            (t nil))))))
 
