@@ -1634,12 +1634,21 @@ stream-json NDJSON survives round-trip."
              (final    (cond
                         ((eq status 'cancelled) 'cancelled)
                         ((eq status 'timeout)   'failed)
+                        ;; Reaped = sentinel never fired but the OS
+                        ;; says the proc is gone.  Trust the exit code.
+                        ((eq status 'reaped)
+                         (if (and (integerp exit) (zerop exit)) 'done 'failed))
                         ((and (integerp exit) (zerop exit)) 'done)
                         (t 'failed)))
              (error-msg
               (cond
                ((eq status 'timeout) "anvil-orchestrator: wall-clock timeout")
                ((eq status 'cancelled) "anvil-orchestrator: cancelled by user")
+               ;; Reaped + failed: sentinel was missed AND exit was non-zero.
+               ;; Reaped + done: leave :error nil — the work succeeded, the
+               ;; orchestrator just lost track briefly.
+               ((and (eq status 'reaped) (eq final 'failed))
+                (format "anvil-orchestrator: exit %s (reaped — sentinel missed)" exit))
                ((eq final 'failed)
                 (format "anvil-orchestrator: exit %s" exit))
                (t nil))))
@@ -1670,8 +1679,51 @@ stream-json NDJSON survives round-trip."
 
 ;;;; --- timeout + pump -----------------------------------------------------
 
+(defun anvil-orchestrator--reap-dead-running ()
+  "Force-finalize tasks whose process is dead but never finalized.
+
+Self-healing for the rare case where a sentinel never fires (codex
+CLI fork-exec with parent SIGPIPE, daemon process-table corruption,
+etc.).  Without this, the task is stuck at `:status running' forever
+and `anvil-orchestrator-cancel' falls through because every recovery
+path is gated on `process-live-p'.
+
+For each dead proc in `--running', sets `anvil-cancel-reason = reaped'
+on the proc and calls `--finalize' via the normal flow so exit code
+still drives the verdict (done on 0, failed otherwise).  When
+`--finalize' itself errors, removes the proc from `--running' and
+hard-marks the task failed so it never wedges again.  Returns the
+count of reaped tasks."
+  (let ((dead nil))
+    (maphash
+     (lambda (id proc)
+       (unless (process-live-p proc)
+         (push (cons id proc) dead)))
+     anvil-orchestrator--running)
+    (dolist (cell dead)
+      (let ((id (car cell))
+            (proc (cdr cell)))
+        (process-put proc 'anvil-cancel-reason 'reaped)
+        (condition-case err
+            (anvil-orchestrator--finalize proc 'reaped)
+          (error
+           (remhash id anvil-orchestrator--running)
+           (anvil-orchestrator--task-update
+            id
+            :status      'failed
+            :finished-at (float-time)
+            :error
+            (format "anvil-orchestrator: reaper finalize failed: %s"
+                    (error-message-string err)))))))
+    (length dead)))
+
 (defun anvil-orchestrator--check-timeouts ()
-  "SIGTERM (then SIGKILL) processes exceeding their wall-clock cap."
+  "SIGTERM (then SIGKILL) processes exceeding their wall-clock cap.
+
+Also reaps any dead procs lingering in `--running' (sentinel missed)
+so stale `:status running' tasks recover on the next pump tick."
+  ;; Reap first so the timeout scan only sees live procs.
+  (anvil-orchestrator--reap-dead-running)
   (let ((now (float-time)))
     (maphash
      (lambda (id proc)
@@ -2171,6 +2223,27 @@ loop so the Emacs UI stays responsive."
                    (lambda ()
                      (when (process-live-p proc)
                        (ignore-errors (signal-process proc 'SIGKILL)))))
+      t)
+     ;; Self-heal: status says `running' but the proc is missing
+     ;; (never registered) or dead (sentinel missed).  Force-finalize
+     ;; so cancel never falls through to nil for a stuck task.
+     ((eq (plist-get task :status) 'running)
+      (when proc
+        (process-put proc 'anvil-cancel-reason 'cancelled)
+        (condition-case _err
+            (anvil-orchestrator--finalize proc 'cancelled)
+          (error nil)))
+      (remhash task-id anvil-orchestrator--running)
+      ;; Re-check status — finalize may have set it to done/failed
+      ;; based on exit code; only force `cancelled' when finalize
+      ;; could not run or did not move the state.
+      (let ((cur (anvil-orchestrator--task-get task-id)))
+        (when (eq (plist-get cur :status) 'running)
+          (anvil-orchestrator--task-update
+           task-id
+           :status       'cancelled
+           :finished-at  (float-time)
+           :error        "anvil-orchestrator: cancelled (process was dead)")))
       t)
      (t nil))))
 

@@ -1,7 +1,7 @@
 #+title: Persistent State — SQLite-backed KV with Namespaces and TTL
 #+date: 2026-04-18
 #+author: zawatton
-#+property: status DRAFT
+#+property: status PHASE-1-2-SHIPPED
 #+property: scope GENERIC
 
 * STATUS

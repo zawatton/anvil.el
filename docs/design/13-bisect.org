@@ -1,7 +1,7 @@
 #+title: anvil-bisect — Test-Driven Regression Localizer
 #+date: 2026-04-19
 #+author: zawatton
-#+property: status DRAFT
+#+property: status PHASE-1-SHIPPED
 #+property: scope GENERIC
 
 * STATUS

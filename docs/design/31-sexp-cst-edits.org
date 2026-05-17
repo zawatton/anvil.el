@@ -1,7 +1,7 @@
 #+title: anvil-sexp-cst — CST-level Lisp Editing + Object Drilling
 #+date: 2026-04-21
 #+author: zawatton
-#+property: status DRAFT
+#+property: status SHIPPED
 #+property: scope GENERIC
 
 * STATUS

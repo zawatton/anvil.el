@@ -1,15 +1,18 @@
 #+title: anvil-memory-bridge — HTTP API + cross-AI extensions + mobile
 #+date: 2026-04-29
 #+author: zawatton
-#+property: status DRAFT
+#+property: status DEFERRED
 #+property: scope GENERIC
 
 * STATUS
   :PROPERTIES:
   :ID:       4f1b9c8a-2e3d-4a5b-9c6e-1a2b3c4d5e6f
   :END:
-~Phase 0 DRAFT~ (2026-04-29、Phase 2C of the memory cross-PC sharing
-roadmap that started with Phases 1 / 2A / 2B).
+~DEFERRED~ (2026-05-17)。元 ~Phase 0 DRAFT~ (2026-04-29、Phase 2C of
+the memory cross-PC sharing roadmap that started with Phases 1 / 2A /
+2B)。develop → master 統合 gate を通すため一旦 DEFERRED に移送。
+mobile / cross-AI bridge の roadmap (本文 Phase 1-4) は実需が固まる
+まで保留。git-tracked SQLite (Phase 2A) で当面は十分動く。
 
 This document describes a network bridge in front of =anvil-memory= so
 that:

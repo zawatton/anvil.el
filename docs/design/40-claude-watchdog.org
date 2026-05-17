@@ -1,14 +1,18 @@
 #+title: anvil-claude-watchdog — Detect Claude Code TUI deadlock
 #+date: 2026-04-29
 #+author: zawatton
-#+property: status DRAFT
+#+property: status DEFERRED
 #+property: scope GENERIC
 
 * STATUS
   :PROPERTIES:
   :ID:       3a4d1ec0-7b5f-4e6a-9b21-9c4d40b6d8c1
   :END:
-~Phase 1 DRAFT~ (2026-04-29、feat/doc-40-claude-watchdog-phase1)。
+~DEFERRED~ (2026-05-17)。元 ~Phase 1 DRAFT~ (2026-04-29、
+feat/doc-40-claude-watchdog-phase1)。develop → master 統合 gate を
+通すため一旦 DEFERRED 扱いに移送。実需 (deadlock 再発 + 検知漏れ
+シナリオの蓄積) を待ってから着手再開する。Phase 1 MVP 仕様自体は
+本文に保存済。
 
 *Phase 1 MVP:* Linux procfs + jsonl mtime での Claude Code (Anthropic
 CLI) deadlock 検知 + desktop 通知 + anvil-state event ログ。
