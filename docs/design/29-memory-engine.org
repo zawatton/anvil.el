@@ -1,7 +1,7 @@
 #+title: anvil-memory-engine — Bayesian Validity + TTL + ROI + Contradiction
 #+date: 2026-04-20
 #+author: zawatton
-#+property: status DRAFT
+#+property: status PHASE-1-4A-SHIPPED
 #+property: scope CONVENTION-COUPLED
 
 * STATUS

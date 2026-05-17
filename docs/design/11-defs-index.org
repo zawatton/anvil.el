@@ -1,7 +1,7 @@
 #+title: anvil-defs — Elisp Symbol Index for Cross-File Navigation
 #+date: 2026-04-19
 #+author: zawatton
-#+property: status DRAFT
+#+property: status PHASE-1-2-SHIPPED
 #+property: scope GENERIC
 
 * STATUS

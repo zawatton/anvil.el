@@ -1,7 +1,7 @@
 #+title: anvil-lisp-reader — Reader-Based Structural Edits for the Lisp Family
 #+date: 2026-04-20
 #+author: zawatton
-#+property: status DRAFT
+#+property: status DEFERRED
 #+property: scope GENERIC
 
 * STATUS

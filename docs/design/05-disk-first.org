@@ -1,6 +1,6 @@
 #+title: Disk-First Policy — Buffer Divergence Guard
 #+date: 2026-04-15
-#+property: status DRAFT
+#+property: status SHIPPED
 #+property: scope CONVENTION-COUPLED
 
 * STATUS

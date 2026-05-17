@@ -1,7 +1,7 @@
 #+title: anvil-shell-filter — Per-Command Output Compression + Tee
 #+date: 2026-04-20
 #+author: zawatton
-#+property: status DRAFT
+#+property: status PHASE-1-2-3-SHIPPED
 #+property: scope GENERIC
 
 * STATUS
