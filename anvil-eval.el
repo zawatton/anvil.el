@@ -76,7 +76,12 @@ Set automatically for the duration of each MCP tool call.")
 (defun anvil-eval--org-mode-fast-advice (orig-fn &rest args)
   "Make `org-mode' setup minimal when called inside an MCP tool."
   (if (and anvil-eval-org-fast-mode anvil-eval--in-org-fast-mode)
-      (let ((delay-mode-hooks t))
+      (progn
+        ;; setq-local, not let: Emacs 30's define-derived-mode calls
+        ;; (make-local-variable 'delay-mode-hooks) inside org-mode, which
+        ;; errors if the variable is already let-bound.  Making it
+        ;; buffer-local first turns that call into a harmless no-op.
+        (setq-local delay-mode-hooks t)
         (apply orig-fn args)
         (when (fboundp 'font-lock-mode)
           (font-lock-mode -1))
