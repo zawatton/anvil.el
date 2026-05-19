@@ -373,6 +373,33 @@
               (plist-get r :diagnostics)))))
       (when (file-exists-p tmp) (delete-file tmp)))))
 
+(ert-deftest anvil-sexp-test-verify-byte-compile-does-not-display-windows ()
+  "Byte-compile warnings must not alter the user's window layout."
+  (let ((tmp (make-temp-file "anvil-sexp-bytecomp-ui-" nil ".el"))
+        (window-config (current-window-configuration)))
+    (unwind-protect
+        (progn
+          (with-temp-file tmp
+            (insert ";;; anvil-sexp-bytecomp-ui.el --- missing cookie\n"
+                    ";;; Commentary:\n;; Warning fixture.\n;;; Code:\n"
+                    "(defun anvil-sexp-test-bytecomp-ui-warning () 1)\n"
+                    "(provide 'anvil-sexp-bytecomp-ui)\n"
+                    ";;; anvil-sexp-bytecomp-ui.el ends here\n"))
+          (let ((windows-before (mapcar (lambda (w)
+                                          (window-buffer w))
+                                        (window-list (selected-frame)
+                                                     'no-minibuf))))
+            (anvil-sexp--tool-verify tmp nil "nil")
+            (should (equal (mapcar (lambda (w)
+                                     (window-buffer w))
+                                   (window-list (selected-frame)
+                                                'no-minibuf))
+                           windows-before))))
+      (set-window-configuration window-config)
+      (when (file-exists-p tmp) (delete-file tmp))
+      (let ((elc (concat tmp "c")))
+        (when (file-exists-p elc) (delete-file elc))))))
+
 (ert-deftest anvil-sexp-test-verify-checkdoc-does-not-display-windows ()
   "checkdoc verification must not alter windows or warning buffers."
   (let ((tmp (make-temp-file "anvil-sexp-checkdoc-ui-" nil ".el")))
