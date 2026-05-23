@@ -44,6 +44,18 @@ definitions below do NOT gate on this constant; they use per-symbol
 `unless (fboundp ...)' guards instead so they remain inert under
 regular Emacs but install unconditionally under NeLisp standalone.")
 
+;; Under regular Emacs, ensure the real `anvil-server' loads BEFORE the
+;; per-symbol `unless (fboundp ...)' guards below run, so the guards see
+;; the real functions and become inert.  Without this, transitive load
+;; paths that arrive here before anvil-server (e.g.
+;; `anvil-git' → `anvil-host' → `anvil-config' → this file) would install
+;; the standalone stubs and then `(provide 'anvil-server)' below would
+;; short-circuit the eventual `(require 'anvil-server)' in anvil-git,
+;; leaving `anvil-server--tools' unbound and tool registration broken.
+;; Under NeLisp standalone, anvil-server.el is not on load-path so the
+;; NOERROR require silently returns nil and the stubs install as designed.
+(require 'anvil-server nil t)
+
 (defvar anvil-nelisp-shims--collected-specs nil
   "Reverse-order alist of (SERVER-ID . SPEC-LIST) collected by the shim.
 Populated by every `anvil-server-register-tool[s]' call during module
