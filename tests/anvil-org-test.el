@@ -9,6 +9,7 @@
 (require 'ert)
 (require 'cl-lib)
 (require 'json)
+(require 'anvil)
 (require 'anvil-org)
 
 (defun anvil-org-test--with-temp-org (content fn)
@@ -198,7 +199,116 @@
             (content (anvil-org-test--read path)))
        (should (eq t (alist-get 'success response)))
        (should (string-match-p
-                "^\\*\\* TODO Child[ \t]+:work:urgent:$"
+                "^\\*\\* TODO Child[ \\t]+:work:urgent:$"
                 content))))))
+
+;;; Buffer-first modify tests
+
+(ert-deftest anvil-org-test-buffer-first-viable-returns-nil-by-default ()
+  "`anvil--buffer-first-viable-p' returns nil when the mode list is nil."
+  (anvil-org-test--with-temp-org "* Test\nBody."
+    (lambda (path)
+      (find-file-noselect path)
+      (unwind-protect
+          (should-not (anvil--buffer-first-viable-p path))
+        (kill-buffer (find-buffer-visiting path))))))
+
+(ert-deftest anvil-org-test-buffer-first-viable-returns-cons-when-matching ()
+  "`anvil--buffer-first-viable-p' returns a cons when the mode matches."
+  (let ((anvil-modes-allow-buffer-modify '(org-mode)))
+    (anvil-org-test--with-temp-org "* Test\nBody."
+      (lambda (path)
+        (find-file-noselect path)
+        (unwind-protect
+            (let ((result (anvil--buffer-first-viable-p path)))
+              (should result)
+              (should (bufferp (car result)))
+              (should-not (cdr result)))
+          (kill-buffer (find-buffer-visiting path)))))))
+
+(ert-deftest anvil-org-test-buffer-first-viable-detects-modified ()
+  "`anvil--buffer-first-viable-p' correctly reports modified state."
+  (let ((anvil-modes-allow-buffer-modify '(org-mode)))
+    (anvil-org-test--with-temp-org "* Test\nBody."
+      (lambda (path)
+        (let ((buf (find-file-noselect path)))
+          (unwind-protect
+              (progn
+                (with-current-buffer buf
+                  (insert "unsaved change")
+                  (let ((result (anvil--buffer-first-viable-p path)))
+                    (should result)
+                    (should (eq buf (car result)))
+                    (should (cdr result))))
+                (with-current-buffer buf
+                  (set-buffer-modified-p nil)))
+            (kill-buffer buf)))))))
+
+(ert-deftest anvil-org-test-buffer-first-preserves-unsaved-modifications ()
+  "Buffer-first editing does NOT save when the buffer was already modified."
+  (let ((anvil-modes-allow-buffer-modify '(org-mode)))
+    (anvil-org-test--with-temp-org
+     "* Before\nOriginal content.\n"
+     (lambda (path)
+       (let ((buf (find-file-noselect path)))
+         (unwind-protect
+             (let ((anvil-org-allowed-files (list path))
+                   (anvil-org-allowed-files-enabled t))
+               (with-current-buffer buf
+                 (goto-char (point-max))
+                 (insert "User's unsaved work."))
+               (anvil-org--modify path "update"
+                   '((previous_state . "") (new_state . "DONE"))
+                 (goto-char (point-min))
+                 (org-todo "DONE"))
+               (with-current-buffer buf
+                 (should (buffer-modified-p))
+                 (goto-char (point-min))
+                 (should (search-forward "User's unsaved work" nil t))
+                 (goto-char (point-min))
+                 (should (search-forward "DONE" nil t)))
+               (let ((disk-content (anvil-org-test--read path)))
+                 (should-not (string-match-p "DONE" disk-content))
+                 (should (string-match-p "Before" disk-content))))
+           (when (buffer-live-p buf)
+             (with-current-buffer buf
+               (set-buffer-modified-p nil))
+             (kill-buffer buf))))))))
+
+(ert-deftest anvil-org-test-buffer-first-saves-when-clean ()
+  "Buffer-first editing DOES save when the buffer was clean."
+  (let ((anvil-modes-allow-buffer-modify '(org-mode)))
+    (anvil-org-test--with-temp-org
+     "* Before\nOriginal content.\n"
+     (lambda (path)
+       (let ((buf (find-file-noselect path)))
+         (unwind-protect
+             (let ((anvil-org-allowed-files (list path))
+                   (anvil-org-allowed-files-enabled t))
+               (anvil-org--modify path "update"
+                   '((previous_state . "") (new_state . "DONE"))
+                 (goto-char (point-min))
+                 (org-todo "DONE"))
+               (with-current-buffer buf
+                 (should-not (buffer-modified-p)))
+               (let ((disk-content (anvil-org-test--read path)))
+                 (should (string-match-p "DONE" disk-content))
+                 (should (string-match-p "Before" disk-content))))
+           (when (buffer-live-p buf)
+             (with-current-buffer buf
+               (set-buffer-modified-p nil))
+             (kill-buffer buf))))))))
+
+(ert-deftest anvil-org-test-fundamental-mode-matches-everything ()
+  "`fundamental-mode' in the mode list matches org-mode buffers."
+  (let ((anvil-modes-allow-buffer-modify '(fundamental-mode)))
+    (anvil-org-test--with-temp-org "* Test\nBody."
+      (lambda (path)
+        (find-file-noselect path)
+        (unwind-protect
+            (let ((result (anvil--buffer-first-viable-p path)))
+              (should result)
+              (should (bufferp (car result))))
+          (kill-buffer (find-buffer-visiting path)))))))
 
 ;;; anvil-org-test.el ends here

@@ -271,6 +271,7 @@ sister package).  Highlights:
 | =anvil-worker= | Dispatch long-running tasks (OCR, PDF conversion, batch file scans) to a separate background Emacs. The interactive Emacs never freezes |
 | Large org file editing | Edit org files of 1.2 MB or more without truncation (avoids the Windows file-mount issue) |
 | LLM client agnostic | Claude Code / Claude Desktop / GPT / local LLMs via Ollama — all speak through MCP |
+| =anvil-modes-allow-buffer-modify= | Configure major modes where Anvil tools modify live buffers directly rather than visiting files, preserving unsaved changes. |
 
 For numerical evidence and detailed case studies, see [[https://github.com/zawatton/anvil.el#efficiency--why-anvil-saves-ai-tokens][Efficiency — why Anvil saves AI tokens]].
 For the full module list, see [[https://github.com/zawatton/anvil.el#modules][Modules]].
@@ -676,6 +677,39 @@ budget goes to reasoning about your code, not re-reading it.
 ;; Start anvil
 (anvil-enable)
 (anvil-server-start)
+#+end_src
+
+** Buffer-first editing — anvil-modes-allow-buffer-modify
+
+By default, anvil's org-modifying tools (update-todo-state, add-todo,
+rename-headline, edit-body) use a *disk-first* policy: they read
+the file into a temporary buffer, apply the edit, write the result
+to disk, and refresh any visiting buffers.  If any buffer has unsaved
+modifications, the operation is refused — anvil will not clobber
+your in-progress edits.
+
+When =anvil-modes-allow-buffer-modify= is set to a list of major
+modes, anvil switches to a *buffer-first* policy for files whose
+open buffers match one of those modes:
+
+1. Locate the first buffer visiting the file (following indirect
+   buffers to their base buffer).
+2. Note whether the buffer already has unsaved modifications.
+3. Make the edit directly in the live buffer.
+4. Only save the buffer if it did *not* have unsaved modifications
+   before the edit — preserving any in-progress user work.
+
+This means an AI agent and a human can collaborate on the same
+file without the agent forcing a save that would commit half-finished
+edits.
+
+#+begin_src emacs-lisp
+;; Enable buffer-first editing for org files only
+(setq anvil-modes-allow-buffer-modify '(org-mode))
+
+;; Or enable it for every open buffer (fundamental-mode is a
+;; special case that matches any major mode)
+(setq anvil-modes-allow-buffer-modify '(fundamental-mode))
 #+end_src
 
 ** User config — Emacs vs NeLisp standalone
