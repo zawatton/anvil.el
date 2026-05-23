@@ -224,7 +224,7 @@ no-ops in that case; the tool must detect the no-op and throw."
             (content (anvil-org-test--read path)))
        (should (eq t (alist-get 'success response)))
        (should (string-match-p
-                "^\\*\\* TODO Child[ \\t]+:work:urgent:$"
+                "^\\*\\* TODO Child[ \t]+:work:urgent:$"
                 content))))))
 
 ;;; Buffer-first modify tests
