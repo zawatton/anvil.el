@@ -140,6 +140,31 @@
        (should (eq t (alist-get 'success response)))
        (should (string-match-p "^\\* TODO Plain" content))))))
 
+(ert-deftest anvil-org-test-update-todo-state-errors-when-blocked ()
+  "Blocked transitions (org-enforce-todo-dependencies) must surface as errors.
+
+A parent with an unfinished child TODO cannot be marked DONE while
+`org-enforce-todo-dependencies' is non-nil.  `org-todo' silently
+no-ops in that case; the tool must detect the no-op and throw."
+  (anvil-org-test--with-temp-org
+   "* TODO Parent\n** TODO Child\n"
+   (lambda (path)
+     (let* ((anvil-org-allowed-files (list path))
+            (anvil-org-allowed-files-enabled t)
+            (org-enforce-todo-dependencies t)
+            (uri (concat "org-headline://" path "#Parent"))
+            (err (should-error
+                  (anvil-org--tool-update-todo-state uri "TODO" "DONE")
+                  :type 'error))
+            (content (anvil-org-test--read path)))
+       ;; Error message names the blocked transition.
+       (should (string-match-p "blocked" (error-message-string err)))
+       (should (string-match-p "DONE" (error-message-string err)))
+       ;; Disk must still show the parent as TODO, not DONE.
+       (should (string-match-p "^\\* TODO Parent" content))
+       (should-not (string-match-p "^\\* DONE Parent" content))))))
+
+
 (ert-deftest anvil-org-test-add-todo-empty-tags-string ()
   "Empty `tags' string must mean no tags, not a single empty tag."
   (anvil-org-test--with-temp-org

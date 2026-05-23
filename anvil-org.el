@@ -1016,8 +1016,23 @@ MCP Parameters:
            (or current_state "(no state)")
            (or actual-state "(no state)") "State")))
 
-      ;; Update the state
-      (org-todo new_state))))
+      ;; Update the state.  `org-todo' silently no-ops when the
+      ;; transition is blocked (e.g. `org-enforce-todo-dependencies'
+      ;; with unfinished children, or a custom `org-blocker-hook' that
+      ;; vetoes the change).  Re-read the state from the buffer to
+      ;; detect such a no-op and surface it as an error instead of
+      ;; lying about success.
+      (org-todo new_state)
+      (save-excursion
+        (beginning-of-line)
+        (let ((post-state (org-get-todo-state)))
+          (unless (equal post-state new_state)
+            (anvil-org--tool-validation-error
+             (concat "TODO state change blocked: expected '%s', "
+                     "headline is still '%s' "
+                     "(likely `org-enforce-todo-dependencies' or "
+                     "`org-blocker-hook' rejected the transition)")
+             new_state (or post-state "(no state)"))))))))
 
 ;; PHASE-C-IDE-SPLIT-CANDIDATE: inserts heading + ID + tags + body in real buffer
 (defun anvil-org--tool-add-todo
