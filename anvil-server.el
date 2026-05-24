@@ -1127,6 +1127,47 @@ Errors raised by hook functions are caught and logged; they do not
 mask or modify the handler's result.  Keep hook functions cheap —
 they run on every successful dispatch.")
 
+(defvar anvil-server-tool-error-hook nil
+  "Abnormal hook run when a tool handler error is observed.
+Functions are called with (ERR TOOL-NAME SOURCE):
+  ERR        — the raw error condition cell from `condition-case'.
+  TOOL-NAME  — the active tool id, or nil when the hook fires from
+               `anvil-server-with-error-handling' without a tool
+               name in scope.
+  SOURCE     — call-site hint symbol:
+                 `tool-body'             from inside the macro or
+                                         the dispatcher's generic
+                                         `error' arm,
+                 `dispatcher-validation' from the dispatcher's
+                                         `anvil-server-invalid-params'
+                                         arm.
+
+Used by `anvil-harness-telemetry' (Doc 46) to classify failures into
+the 4 runtime-harness classes (no-exec / contract-violation / stall /
+reasoning) and persist them for measurement of Doc 43-47 effects.
+
+Errors raised by hook functions are caught and logged; they do not
+mask the original error.")
+
+(defvar anvil-server--current-tool-name nil
+  "Dynamically bound to the active tool name during dispatch.
+Lets `anvil-server-tool-error-hook' callbacks attribute errors to
+the correct tool even when fired from inside
+`anvil-server-with-error-handling', which has no lexical access to
+the dispatcher-level name.")
+
+(defun anvil-server--run-tool-error-hook (err tool-name source)
+  "Run `anvil-server-tool-error-hook' with ERR / TOOL-NAME / SOURCE.
+Hook errors are caught and logged so telemetry never breaks the
+main dispatch flow."
+  (when anvil-server-tool-error-hook
+    (condition-case hook-err
+        (run-hook-with-args 'anvil-server-tool-error-hook
+                            err tool-name source)
+      (error
+       (message "anvil-server: tool-error-hook failed: %s"
+                (error-message-string hook-err))))))
+
 (defvar anvil-server-id-aliases nil
   "Alist mapping virtual server-ids to real server-ids.
 Entries are (VIRTUAL . REAL) string pairs.  Used to advertise the
@@ -1355,7 +1396,8 @@ virtual server-ids share the same handler pool."
                                      (alist-get
                                       (intern param-name) tool-args))))
                               (push value arg-values)))))
-                      (let ((final-args (nreverse arg-values)))
+                      (let ((final-args (nreverse arg-values))
+                            (anvil-server--current-tool-name tool-name))
                         (if (plist-get tool :offload)
                             (anvil-server--offload-apply
                              tool handler final-args)
@@ -1426,6 +1468,8 @@ virtual server-ids share the same handler pool."
             (anvil-server-invalid-params
              (anvil-server-metrics--track-tool-call tool-name t)
              (anvil-server--metrics-bump (anvil-server-metrics-errors method-metrics))
+             (anvil-server--run-tool-error-hook
+              err tool-name 'dispatcher-validation)
              (anvil-server--jsonrpc-error
               id
               anvil-server-jsonrpc-error-invalid-params
@@ -1453,6 +1497,8 @@ virtual server-ids share the same handler pool."
             (error
              (anvil-server-metrics--track-tool-call tool-name t)
              (anvil-server--metrics-bump (anvil-server-metrics-errors method-metrics))
+             (anvil-server--run-tool-error-hook
+              err tool-name 'tool-body)
              (anvil-server--jsonrpc-error
               id anvil-server-jsonrpc-error-internal
               (format "Internal error executing tool: %s"
@@ -1577,6 +1623,8 @@ See also: `anvil-server-tool-throw'"
      (quit
       (anvil-server-tool-throw (format "Quit: %S" err)))
      (error
+      (anvil-server--run-tool-error-hook
+       err anvil-server--current-tool-name 'tool-body)
       (anvil-server-tool-throw (format "Error: %S" err)))))
 
 ;;; Tool helpers

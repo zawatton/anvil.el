@@ -115,6 +115,21 @@ These are not loaded by default.  Available modules:
                 `session' (Stop event).  Five MCP tools: compact-
                 estimate / -should-trigger / -snapshot / -restore /
                 -hook.
+- `harness-telemetry' — Doc 46 Phase 1 runtime-harness failure
+                classifier + 4-class SQLite telemetry (no-exec /
+                contract-violation / stall / reasoning).  Hooks
+                into `anvil-server-tool-error-hook' (raised from
+                inside `anvil-server-with-error-handling' and the
+                tools/call dispatcher) to classify every failure
+                with a static rule table and persist the event
+                into a `harness_failures' table inside the
+                anvil-worklog DB file.  Three MCP tools —
+                harness-telemetry-record / -stats / -recent —
+                expose the recorder + aggregator queries so
+                later modules (Doc 43-47) can measure their
+                effect against a 1-2 week baseline.  Requires
+                Emacs 29+ for SQLite; soft-deps on
+                `anvil-worklog' for the DB path resolver.
 - `claude-watchdog' — Detect Claude Code (Anthropic CLI) TUI deadlock
                 via /proc + jsonl mtime polling.  When wchar stops
                 advancing while State=R and the session jsonl goes
