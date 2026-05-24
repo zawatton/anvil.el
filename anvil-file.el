@@ -2170,7 +2170,7 @@ MCP Parameters:
                     (req  (or (alist-get 'required f)
                               (alist-get "required" f nil nil #'equal))))
                 (append (list :name name :regexp re)
-                        (when (and req (not (eq req :null)))
+                        (when (eq req t)
                           (list :required t)))))
             fields-raw))
           (max-blocks (funcall get "max-blocks"))

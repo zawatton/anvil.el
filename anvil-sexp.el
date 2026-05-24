@@ -1044,7 +1044,8 @@ leak in."
                 (byte-compile-dest-file-function (lambda (_) tmp-elc))
                 (byte-compile-verbose nil))
             (condition-case err
-                (setq ok (byte-compile-file file))
+                (save-window-excursion
+                  (setq ok (byte-compile-file file)))
               (error
                (with-current-buffer log-buf
                  (goto-char (point-max))
