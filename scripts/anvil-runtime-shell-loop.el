@@ -35,6 +35,15 @@
 
 ;;; Code:
 
+;; Pre-declare so `[STEP]' diagnostic trace lines below can gate on it
+;; before `anvil-server.el' is loaded.  `defvar' is a no-op when the
+;; variable is already bound, so `anvil-server.el's own `defvar' just
+;; documents the same name later in the chain.
+(defvar anvil-server--debug-trace nil
+  "When non-nil, emit `[STDIO]/[PJ]/[VAD]/[JR]/[TL]/[REG-*]/[STEP]'
+diagnostic trace lines via `nelisp--write-stderr-line'.  Default
+nil for production (silent).")
+
 (defun anvil-runtime-shell--env (name default)
   (let ((val (and (fboundp 'getenv) (getenv name))))
     (if (and val (> (length val) 0)) val default)))
@@ -86,8 +95,42 @@
        (server-commands-el (concat anvil-el-dir "/anvil-server-commands.el")))
 
   ;; Bootstrap layer 2 + json / backquote fixes.
+  ;; emacs-init.el gates its vendor load-path setup on
+  ;; `nelisp-emacs-vendor-root'.  Without this the subr-x / nelisp-coding
+  ;; chain fails with "feature was not provided".  (Same regression as
+  ;; server-loop.el; both code paths need this setq.)
+  (setq nelisp-emacs-vendor-root (concat nelisp-emacs-dir "/vendor"))
+  ;; Pre-provide `nelisp-coding-jis-tables' so its 460 KB defconst is
+  ;; never loaded under the post-2026-05-17 nelisp (Doc 49 Wave 7-13
+  ;; Phase 47 native swap), which aborts with glibc "double free or
+  ;; corruption (!prev)" on that file.  MCP / JSON-RPC is UTF-8 only,
+  ;; so the JIS tables are deadweight here.
+  (provide 'nelisp-coding-jis-tables)
+  ;; Pre-provide the 6 vendor libs that `anvil-runtime-polyfills.el'
+  ;; tries to `(load ...)' below.  Under the post-2026-05-17 nelisp the
+  ;; pure-elisp interpreter allocates ~1 MB/s while walking those files
+  ;; and never reclaims the cons cells, so even the FAILED loads (e.g.
+  ;; `seq' / `cl-extra' / `profiler') burn substrate memory unboundedly.
+  ;; NeLisp's permissive `require' silently succeeds for already-provided
+  ;; features, so downstream `(require 'subr-x)' etc are satisfied
+  ;; without ever touching the vendor files.
+  (dolist (lib '(subr-x seq cl-extra cl-seq benchmark profiler))
+    (provide lib))
+  ;; Prefer .el over .elc — post-2026-05-17 nelisp's stdlib-misc swaps
+  ;; the elisp Reader to a pure-elisp form that cannot parse `#[..]'
+  ;; byte-compiled lambdas or `#s(..)' record syntax that .elc files
+  ;; contain.  Without this, stale .elc files in nelisp-emacs/src/ and
+  ;; anvil.el/ silently override their .el siblings and explode after
+  ;; stdlib-misc loads.
+  (setq load-prefer-newer t)
+  (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+    (nelisp--write-stderr-line "[STEP] pre-init"))
   (load init-el nil t)
+  (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+    (nelisp--write-stderr-line "[STEP] init-el done"))
   (load stub-el nil t)
+  (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+    (nelisp--write-stderr-line "[STEP] stub-el done"))
 
   ;; --- TEMPORARY alist-get override (= Doc 98 §98.2 workaround) ---
   ;;
@@ -100,21 +143,30 @@
   ;;
   ;; Remove this block once Doc 98 §98.2 (= elisp-complete frozen-heap
   ;; baker) ships and the .image carries the fixed alist-get.
-  (let* ((nelisp-lisp-dir
-          (or (and (boundp 'anvil-runtime-bootstrap-nelisp-lisp-dir)
-                   (> (length anvil-runtime-bootstrap-nelisp-lisp-dir) 0)
-                   anvil-runtime-bootstrap-nelisp-lisp-dir)
-              (concat (file-name-directory (directory-file-name anvil-el-dir))
-                      "nelisp/lisp")))
-         (stdlib-misc (concat nelisp-lisp-dir "/nelisp-stdlib-misc.el")))
-    (when (file-exists-p stdlib-misc)
-      (condition-case err
-          (load stdlib-misc nil t)
-        (error
-         (when (fboundp 'nelisp--write-stderr-line)
-           (nelisp--write-stderr-line
-            (concat "[shell-loop] nelisp-stdlib-misc override load ERR: "
-                    (format "%S" err))))))))
+  ;; Inline the alist-get fix from nelisp-stdlib-misc.el (= the only
+  ;; piece anvil-server actually needs from that file).  Loading the
+  ;; full stdlib-misc redefines `princ' / `error' / `list' / `provide' /
+  ;; etc to pure-elisp versions that cause json-read-from-string to
+  ;; degrade ~300x on strings > 75 bytes (bisected 2026-05-24).  By
+  ;; inlining just this one defun we get the alist-get fix without
+  ;; clobbering the Rust-fast primitives the rest of anvil needs.
+  (defun alist-get (key alist &optional default _remove testfn)
+    (let ((cur alist) (found nil) (result default))
+      (while (and cur (not found))
+        (let ((pair (car cur)))
+          (cond
+           ((not (consp pair)) (setq cur (cdr cur)))
+           ((cond
+             ((null testfn) (equal (car pair) key))
+             ((eq testfn 'eq) (eq (car pair) key))
+             ((eq testfn 'equal) (equal (car pair) key))
+             ((or (eq testfn 'string=) (eq testfn 'string-equal))
+              (and (stringp (car pair)) (stringp key) (equal (car pair) key)))
+             (t (funcall testfn (car pair) key)))
+            (setq result (cdr pair))
+            (setq found t))
+           (t (setq cur (cdr cur))))))
+      result))
 
   ;; Put `anvil-el-dir' on `load-path' so any `(require 'anvil-orchestrator-routing)'
   ;; / `(require 'anvil-orchestrator-presets)' / etc. inside tool-module
@@ -126,13 +178,21 @@
   ;; (= matches anvil-server.el's `(require 'anvil-server-metrics)' and
   ;; anvil-server-commands.el's `(require 'anvil-server)').
   (load metrics-el nil t)
+  (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+    (nelisp--write-stderr-line "[STEP] metrics-el done"))
   (load server-el nil t)
+  (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+    (nelisp--write-stderr-line "[STEP] server-el done"))
   (load server-commands-el nil t)
+  (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+    (nelisp--write-stderr-line "[STEP] server-commands-el done"))
 
   ;; stdin shim — anvil-server-run-batch-stdio reads frames via
   ;; `read-from-minibuffer'; emacs-stdio.el's installer overrides the
   ;; bulk-stub nil binding with a chunked reader backed by libc.read.
   (load stdio-el nil t)
+  (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+    (nelisp--write-stderr-line "[STEP] stdio-el done"))
   (when (fboundp 'emacs-stdio-install-stdin-shim)
     (emacs-stdio-install-stdin-shim))
 
@@ -144,16 +204,18 @@
   ;; audit (= migrated from `nelisp-emacs/scripts/' 2026-05-14).
   (let ((polyfills-el (concat anvil-el-dir
                               "/scripts/anvil-runtime-polyfills.el")))
-    (when (fboundp 'nelisp--write-stderr-line)
+    (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
       (nelisp--write-stderr-line
        (concat "[shell-loop] loading polyfills " polyfills-el)))
     (condition-case err
         (load polyfills-el nil t)
       (error
-       (when (fboundp 'nelisp--write-stderr-line)
+       (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
          (nelisp--write-stderr-line
           (concat "[shell-loop] polyfills load ERR: "
-                  (format "%S" err)))))))
+                  (format "%S" err))))))
+    (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+      (nelisp--write-stderr-line "[STEP] polyfills done")))
 
   ;; `help-function-arglist' polyfill — emacs-stub-bulk.el ships a
   ;; nil-returning placeholder, but anvil-server.el's tool dispatcher
@@ -317,11 +379,19 @@ Uses CR-strip to recognise lines that are CRLF artefacts as blank."
   ;; default carries the actual list.
   (let* ((modules-env (anvil-runtime-shell--env
                        "ANVIL_TOOL_MODULES"
-                       (concat
-                        "anvil-discovery,anvil-sqlite,anvil-bench,"
-                        "anvil-state,anvil-memory,anvil-worklog,"
-                        "anvil-org-index"))))
-    (when (fboundp 'nelisp--write-stderr-line)
+                       ;; Default trimmed 2026-05-24 from 7 → 3 modules.
+                       ;; Under post-2026-05-17 nelisp without built-in
+                       ;; sqlite, `anvil-state' / `anvil-memory' /
+                       ;; `anvil-worklog' / `anvil-org-index' all fail
+                       ;; at their *-enable step with "sqlite not
+                       ;; available", registering zero tools.  Loading
+                       ;; them anyway burned 63 % of cold-load time
+                       ;; (~13 of ~20 min) on the pure-elisp interpreter
+                       ;; before failing.  Set ANVIL_TOOL_MODULES
+                       ;; explicitly to re-enable any of them once nelisp
+                       ;; ships a sqlite primitive.
+                       "anvil-discovery,anvil-sqlite,anvil-bench")))
+    (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
       (nelisp--write-stderr-line
        (concat "[shell-loop] ANVIL_TOOL_MODULES="
                (if (> (length modules-env) 0) modules-env "<empty>"))))
@@ -330,7 +400,7 @@ Uses CR-strip to recognise lines that are CRLF artefacts as blank."
         (let* ((trimmed (if (fboundp 'string-trim) (string-trim name) name))
                (file (concat anvil-el-dir "/" trimmed ".el"))
                (enable-sym (intern (concat trimmed "-enable"))))
-          (when (fboundp 'nelisp--write-stderr-line)
+          (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
             (nelisp--write-stderr-line
              (concat "[shell-loop] loading " file)))
           ;; Wrap each module's load + enable so a single bad module
@@ -339,14 +409,14 @@ Uses CR-strip to recognise lines that are CRLF artefacts as blank."
           (condition-case err
               (progn
                 (load file nil t)
-                (when (fboundp 'nelisp--write-stderr-line)
+                (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
                   (nelisp--write-stderr-line
                    (concat "[shell-loop] " (symbol-name enable-sym)
                            " fboundp=" (if (fboundp enable-sym) "t" "nil"))))
                 (when (fboundp enable-sym)
                   (funcall enable-sym)))
             (error
-             (when (fboundp 'nelisp--write-stderr-line)
+             (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
                (nelisp--write-stderr-line
                 (concat "[shell-loop] " trimmed
                         " load/enable ERR: " (format "%S" err))))))))))
@@ -357,12 +427,12 @@ Uses CR-strip to recognise lines that are CRLF artefacts as blank."
     (condition-case err
         (anvil-runtime-polyfills-apply-post-load-patches)
       (error
-       (when (fboundp 'nelisp--write-stderr-line)
+       (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
          (nelisp--write-stderr-line
           (concat "[shell-loop] post-load patches ERR: "
                   (format "%S" err)))))))
 
-  (when (fboundp 'nelisp--write-stderr-line)
+  (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
     (let ((bucket (and (boundp 'anvil-server--tools)
                        (gethash server-id anvil-server--tools))))
       (nelisp--write-stderr-line
@@ -374,6 +444,8 @@ Uses CR-strip to recognise lines that are CRLF artefacts as blank."
   ;; `anvil-server-run-batch-stdio' itself calls `anvil-server-start'
   ;; on entry, so we MUST NOT call it here (= duplicate call signals
   ;; `MCP server is already running').  Just enter the loop.
+  (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+    (nelisp--write-stderr-line "[STEP] entering MCP stdin loop"))
   (anvil-server-run-batch-stdio server-id))
 
 ;;; anvil-runtime-shell-loop.el ends here

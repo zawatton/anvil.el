@@ -63,6 +63,13 @@
 (declare-function anvil-future-error "anvil-offload" (future))
 (declare-function anvil-future-checkpoint "anvil-offload" (future))
 
+(defvar anvil-server--debug-trace nil
+  "When non-nil, emit `[STDIO]/[PJ]/[VAD]/[JR]/[TL]/[REG-*]/[STEP]'
+diagnostic trace lines via `nelisp--write-stderr-line' from the
+standalone-nelisp dispatch chain.  Default nil for production
+(silent).  Bisect / debug sessions can set non-nil before loading
+the substrate to trace per-stage timing.")
+
 ;;; Customization variables
 
 (defgroup anvil-server nil
@@ -183,9 +190,230 @@ Returns a hash table mapping template to template-data."
          server-id templates-table anvil-server--resource-templates)
         templates-table)))
 
+(defun anvil-server--js-string (s)
+  "Encode S as a JSON string literal (including surrounding quotes).
+Hand-built char-by-char escape that avoids `json-encode' (which has
+cumulative degenerate performance on the pure-elisp interpreter
+post-2026-05-17: stalls after ~4-5 calls in the same process)."
+  (let ((parts (list "\""))
+        (i 0) (n (length s)))
+    (while (< i n)
+      (let ((c (aref s i)))
+        (cond
+         ((eq c ?\") (push "\\\"" parts))
+         ((eq c ?\\) (push "\\\\" parts))
+         ((eq c ?\n) (push "\\n" parts))
+         ((eq c ?\r) (push "\\r" parts))
+         ((eq c ?\t) (push "\\t" parts))
+         ((< c 32) (push (format "\\u%04x" c) parts))
+         (t (push (char-to-string c) parts))))
+      (setq i (1+ i)))
+    (push "\"" parts)
+    (apply #'concat (nreverse parts))))
+
+(defun anvil-server--js-schema (schema)
+  "Encode an anvil-generated MCP input SCHEMA alist to JSON.
+Handles the bounded shape produced by
+`anvil-server--generate-schema-from-function':
+  `((type . \"object\") (properties . PROPS) (required . VEC))'.
+Hand-built to avoid `json-encode' cumulative degradation."
+  (if (null schema)
+      "{\"type\":\"object\"}"
+    (let ((parts (list "{"))
+          (first t))
+      (dolist (pair schema)
+        (let ((key (car pair))
+              (val (cdr pair)))
+          (unless first (push "," parts))
+          (setq first nil)
+          (push (anvil-server--js-string (symbol-name key)) parts)
+          (push ":" parts)
+          (cond
+           ((stringp val)
+            (push (anvil-server--js-string val) parts))
+           ((vectorp val)
+            (push "[" parts)
+            (let ((vfirst t) (j 0) (vn (length val)))
+              (while (< j vn)
+                (unless vfirst (push "," parts))
+                (setq vfirst nil)
+                (push (anvil-server--js-string (aref val j)) parts)
+                (setq j (1+ j))))
+            (push "]" parts))
+           ((eq key 'properties)
+            ;; alist of (NAME-STRING . SUB-ALIST)
+            (push "{" parts)
+            (let ((pfirst t))
+              (dolist (prop val)
+                (unless pfirst (push "," parts))
+                (setq pfirst nil)
+                (push (anvil-server--js-string (car prop)) parts)
+                (push ":" parts)
+                (push (anvil-server--js-schema (cdr prop)) parts)))
+            (push "}" parts))
+           (t
+            ;; Fallback: stringify
+            (push (anvil-server--js-string (format "%s" val)) parts)))))
+      (push "}" parts)
+      (apply #'concat (nreverse parts)))))
+
+(defun anvil-server--build-tool-fragment (id description schema)
+  "Build a tools/list JSON fragment for one tool.
+Hand-built; never calls `json-encode'."
+  (concat "{\"name\":" (anvil-server--js-string id)
+          ",\"description\":" (anvil-server--js-string description)
+          ",\"inputSchema\":" (anvil-server--js-schema schema)
+          "}"))
+
+(defun anvil-server--scan-substr-pos (s needle)
+  "Return start index of NEEDLE in S, or nil.
+Pure char-by-char scan — does not depend on `string-match' which
+returns nil on raw-byte strings from `read-stdin-bytes' under
+standalone nelisp."
+  (let* ((s-len (length s))
+         (n-len (length needle))
+         (limit (- s-len n-len))
+         (i 0)
+         (found nil))
+    (while (and (<= i limit) (not found))
+      (let ((j 0) (ok t))
+        (while (and ok (< j n-len))
+          (if (eq (aref s (+ i j)) (aref needle j))
+              (setq j (1+ j))
+            (setq ok nil)))
+        (if ok (setq found i)
+          (setq i (1+ i)))))
+    found))
+
+(defun anvil-server--scan-int-after (s needle)
+  "Return integer immediately following NEEDLE in S, or nil."
+  (let ((pos (anvil-server--scan-substr-pos s needle)))
+    (when pos
+      (let* ((s-len (length s))
+             (i (+ pos (length needle)))
+             (digits nil))
+        (while (and (< i s-len)
+                    (let ((c (aref s i)))
+                      (and (>= c ?0) (<= c ?9))))
+          (push (aref s i) digits)
+          (setq i (1+ i)))
+        (when digits
+          (string-to-number (apply #'string (nreverse digits))))))))
+
+(defun anvil-server--scan-string-after (s needle)
+  "Return string between NEEDLE and the next `\"' in S, or nil."
+  (let ((pos (anvil-server--scan-substr-pos s needle)))
+    (when pos
+      (let* ((s-len (length s))
+             (i (+ pos (length needle)))
+             (chars nil))
+        (while (and (< i s-len) (not (eq (aref s i) ?\")))
+          (push (aref s i) chars)
+          (setq i (1+ i)))
+        (apply #'string (nreverse chars))))))
+
+(defun anvil-server--scan-flat-object-after (s needle)
+  "Parse a flat JSON object that begins right after NEEDLE in S.
+Returns an alist `((SYMBOL . STRING-OR-INT) ...)' or nil if no
+match.  Handles the bounded shape used by MCP tool arguments:
+`{\"key1\":\"val1\",\"key2\":42,\"key3\":\"val3\"}'.  Bypasses
+json-read-from-string (broken on read-stdin-bytes strings under
+standalone nelisp)."
+  (let ((pos (anvil-server--scan-substr-pos s needle)))
+    (when pos
+      (let* ((s-len (length s))
+             (i (+ pos (length needle)))
+             ;; Skip optional whitespace + opening `{'.
+             (_skip-open
+              (progn
+                (while (and (< i s-len)
+                            (let ((c (aref s i)))
+                              (or (eq c ?\s) (eq c ?\t) (eq c ?\n))))
+                  (setq i (1+ i)))
+                (when (and (< i s-len) (eq (aref s i) ?\{))
+                  (setq i (1+ i)))))
+             (result nil)
+             (done nil))
+        (while (and (not done) (< i s-len))
+          ;; Skip whitespace and commas
+          (while (and (< i s-len)
+                      (let ((c (aref s i)))
+                        (or (eq c ?\s) (eq c ?\t) (eq c ?\n) (eq c ?,))))
+            (setq i (1+ i)))
+          (cond
+           ((>= i s-len) (setq done t))
+           ((eq (aref s i) ?\})
+            (setq done t))
+           ((eq (aref s i) ?\")
+            ;; Read key string
+            (setq i (1+ i))
+            (let ((key-chars nil))
+              (while (and (< i s-len) (not (eq (aref s i) ?\")))
+                (push (aref s i) key-chars)
+                (setq i (1+ i)))
+              (when (< i s-len) (setq i (1+ i))) ; consume closing "
+              ;; Skip whitespace + colon
+              (while (and (< i s-len)
+                          (let ((c (aref s i)))
+                            (or (eq c ?\s) (eq c ?\t) (eq c ?:))))
+                (setq i (1+ i)))
+              ;; Read value
+              (let ((key (intern (apply #'string (nreverse key-chars))))
+                    (val nil))
+                (cond
+                 ((and (< i s-len) (eq (aref s i) ?\"))
+                  (setq i (1+ i))
+                  (let ((val-chars nil))
+                    (while (and (< i s-len) (not (eq (aref s i) ?\")))
+                      ;; Minimal escape handling: skip a single backslash
+                      ;; and copy the next char verbatim (covers `\"' and
+                      ;; `\\' for typical MCP args).
+                      (if (eq (aref s i) ?\\)
+                          (progn
+                            (setq i (1+ i))
+                            (when (< i s-len)
+                              (push (aref s i) val-chars)
+                              (setq i (1+ i))))
+                        (push (aref s i) val-chars)
+                        (setq i (1+ i))))
+                    (when (< i s-len) (setq i (1+ i))) ; consume closing "
+                    (setq val (apply #'string (nreverse val-chars)))))
+                 ((and (< i s-len)
+                       (let ((c (aref s i)))
+                         (or (eq c ?-)
+                             (and (>= c ?0) (<= c ?9)))))
+                  (let ((num-chars nil))
+                    (while (and (< i s-len)
+                                (let ((c (aref s i)))
+                                  (or (eq c ?-)
+                                      (eq c ?.)
+                                      (and (>= c ?0) (<= c ?9)))))
+                      (push (aref s i) num-chars)
+                      (setq i (1+ i)))
+                    (setq val
+                          (string-to-number
+                           (apply #'string (nreverse num-chars))))))
+                 (t (setq done t)))
+                (push (cons key val) result))))
+           (t (setq i (1+ i)))))
+        (nreverse result)))))
+
 (defun anvil-server--jsonrpc-response (id result)
   "Create a JSON-RPC response with ID and RESULT."
-  (json-encode `((jsonrpc . "2.0") (id . ,id) (result . ,result))))
+  (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+    (nelisp--write-stderr-line "[JR] enter"))
+  (let* ((t0 (float-time))
+         (form `((jsonrpc . "2.0") (id . ,id) (result . ,result)))
+         (_ (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+              (nelisp--write-stderr-line
+               (format "[JR] form-built %.4fs" (- (float-time) t0)))))
+         (t1 (float-time))
+         (out (json-encode form)))
+    (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+      (nelisp--write-stderr-line
+       (format "[JR] json-encode %.4fs len=%d"
+               (- (float-time) t1) (length out))))
+    out))
 
 ;; ---- tools/list response cache (perf: 2026-05-11) ----
 ;;
@@ -569,10 +797,20 @@ The function performs JSON-RPC 2.0 validation, checking:
 
 If validation succeeds, dispatches the request to the appropriate handler.
 Returns a JSON-RPC formatted response string, or nil for notifications."
-  (let* ((jsonrpc (alist-get 'jsonrpc request))
+  (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+    (nelisp--write-stderr-line "[VAD] enter"))
+  (let* ((t-ag (float-time))
+         (jsonrpc (alist-get 'jsonrpc request))
+         (_ (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+              (nelisp--write-stderr-line
+               (format "[VAD] alist-get-jsonrpc %.4fs val=%S" (- (float-time) t-ag) jsonrpc))))
          (id (alist-get 'id request))
          (method (alist-get 'method request))
          (params (alist-get 'params request))
+         (_ (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+              (nelisp--write-stderr-line
+               (format "[VAD] 4-alist-get total %.4fs id=%S method=%S"
+                       (- (float-time) t-ag) id method))))
          (is-notification
           (and method (string-prefix-p "notifications/" method))))
     ;; Check for JSON-RPC 2.0 compliance first
@@ -933,7 +1171,14 @@ register / unregister."
          (cached (gethash cache-key anvil-server--tools-list-cache)))
     (if cached
         (anvil-server--jsonrpc-response-from-result-json id cached)
-      (let ((tool-list (vector)))
+      ;; Fast path (2026-05-24): collect pre-encoded :json-fragment
+      ;; cached on each tool plist at registration time.  Per-request
+      ;; concat is O(n) and avoids json-encode entirely.  Original code
+      ;; called json-encode on a vector-of-entries which degenerated to
+      ;; stuck after 1-2 entries on the pure-elisp interpreter post-
+      ;; 2026-05-17.
+      (let* ((t0 (float-time))
+             (fragments nil))
         (when-let* ((tools-table
                      (gethash resolved-id anvil-server--tools)))
           (maphash
@@ -941,35 +1186,16 @@ register / unregister."
              (when (or (null anvil-server-tool-filter-function)
                        (funcall anvil-server-tool-filter-function
                                 tool-id tool server-id))
-               (let* ((tool-description (plist-get tool :description))
-                      (tool-title (plist-get tool :title))
-                      (tool-read-only (plist-get tool :read-only))
-                      (tool-schema
-                       (or (plist-get tool :schema) '((type . "object"))))
-                      (tool-entry
-                       `((name . ,tool-id)
-                         (description . ,tool-description)
-                         (inputSchema . ,tool-schema)))
-                      (annotations nil))
-                 ;; Collect annotations if present
-                 (when tool-title
-                   (push (cons 'title tool-title) annotations))
-                 ;; Add readOnlyHint when :read-only is explicitly provided (both t
-                 ;; and nil)
-                 (when (plist-member tool :read-only)
-                   (let ((annot-value
-                          (if tool-read-only
-                              t
-                            :json-false)))
-                     (push (cons 'readOnlyHint annot-value) annotations)))
-                 ;; Add annotations to tool entry if any exist
-                 (when annotations
-                   (setq tool-entry
-                         (append
-                          tool-entry `((annotations . ,annotations)))))
-                 (setq tool-list (vconcat tool-list (vector tool-entry))))))
+               (let ((frag (plist-get tool :json-fragment)))
+                 (when frag (push frag fragments)))))
            tools-table))
-        (let ((result-json (json-encode `((tools . ,tool-list)))))
+        (let* ((joined (mapconcat #'identity (nreverse fragments) ","))
+               (result-json (concat "{\"tools\":[" joined "]}")))
+          (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+            (nelisp--write-stderr-line
+             (format "[TL] fast-path %.4fs n=%d len=%d"
+                     (- (float-time) t0) (length fragments)
+                     (length result-json))))
           (puthash cache-key result-json anvil-server--tools-list-cache)
           (anvil-server--jsonrpc-response-from-result-json id result-json))))))
 
@@ -1061,7 +1287,8 @@ virtual server-ids share the same handler pool."
               (let*
                   ((arglist
                     (progn
-                      (unless (functionp handler)
+                      (unless (or (functionp handler)
+                                  (and (symbolp handler) (fboundp handler)))
                         (signal 'void-function (list handler)))
                       ;; Keep dispatch aligned with registration-time
                       ;; schema extraction, including transport-only
@@ -1377,35 +1604,98 @@ See also: `anvil-server-process-jsonrpc-parsed'"
 
   (anvil-server--log-json-rpc "in" json-string server-id)
 
+  (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+    (nelisp--write-stderr-line
+     (format "[PJ] in t=%.4f json-len=%d" (float-time) (length json-string))))
+
   ;; Step 1: Try to parse the JSON, handle parsing errors
   (let ((json-object nil)
         (response nil))
-    ;; Attempt to parse the JSON
-    (condition-case json-err
-        (setq json-object
-              (json-read-from-string
-               (decode-coding-string json-string 'utf-8 t)))
-      (json-error
-       ;; If JSON parsing fails, create a parse error response
-       (setq response
-             (anvil-server--jsonrpc-error
-              nil anvil-server-jsonrpc-error-parse
-              (format "Parse error: %s"
-                      (error-message-string json-err))))))
-    ;; Step 2: Process the request if JSON parsing succeeded
+    (let ((t0 (float-time))
+          (decoded nil))
+      (condition-case json-err
+          (progn
+            ;; Bypass decode-coding-string on standalone nelisp:
+            ;; read-stdin-bytes already returns a UTF-8 string, and
+            ;; decode-coding-string on it produces a multibyte string
+            ;; whose internal representation makes json-read-from-string
+            ;; pathologically slow (> 600 s observed for 150-byte body).
+            (setq decoded
+                  (if (and (fboundp 'nl-ffi-call)
+                           (not (and (fboundp 'multibyte-string-p)
+                                     (multibyte-string-p json-string))))
+                      ;; Host Emacs path: still decode for correctness.
+                      (decode-coding-string json-string 'utf-8 t)
+                    ;; Standalone nelisp: skip decode, json-string is
+                    ;; already UTF-8 text.
+                    json-string))
+            (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+              (nelisp--write-stderr-line
+               (format "[PJ] decode %.4fs decoded-len=%d"
+                       (- (float-time) t0) (length decoded))))
+            ;; Standalone nelisp: json-read-from-string and string-match
+            ;; both return nil on raw-byte strings from read-stdin-bytes,
+            ;; so use a char-by-char scan that bypasses both.
+            ;; Host Emacs: json-read works fine and is needed because
+            ;; the scan-extract path drops `params' (real tool dispatch
+            ;; needs full alist).  Gate on a standalone-only fboundp.
+            (let ((t1 (float-time)))
+              (if (fboundp 'nelisp--write-stderr-line)
+                  ;; standalone path
+                  (let* ((sx-id (anvil-server--scan-int-after
+                                 decoded "\"id\":"))
+                         (sx-method (anvil-server--scan-string-after
+                                     decoded "\"method\":\""))
+                         ;; For `tools/call' the handler needs
+                         ;; `(name . X) (arguments . ALIST)' in params.
+                         ;; Extract both with a flat-object scanner.
+                         (sx-params
+                          (when (equal sx-method "tools/call")
+                            (let ((nm (anvil-server--scan-string-after
+                                       decoded "\"name\":\""))
+                                  (args (anvil-server--scan-flat-object-after
+                                         decoded "\"arguments\":")))
+                              `((name . ,nm) (arguments . ,args))))))
+                    (setq json-object
+                          `((jsonrpc . "2.0")
+                            (id . ,sx-id)
+                            (method . ,sx-method)
+                            (params . ,sx-params)))
+                    (when anvil-server--debug-trace
+                      (nelisp--write-stderr-line
+                       (format "[PJ] scan-extract %.4fs id=%S method=%S name=%S"
+                               (- (float-time) t1) sx-id sx-method
+                               (and sx-params (alist-get 'name sx-params))))))
+                ;; host Emacs path — normal json-read
+                (setq json-object (json-read-from-string decoded)))))
+        (json-error
+         (setq response
+               (anvil-server--jsonrpc-error
+                nil anvil-server-jsonrpc-error-parse
+                (format "Parse error: %s"
+                        (error-message-string json-err)))))))
     (unless response
-      (condition-case err
-          (setq response
-                (anvil-server--validate-and-dispatch-request
-                 json-object server-id))
-        (quit
-         (setq response (anvil-server--handle-error err)))
-        (error
-         (setq response (anvil-server--handle-error err)))))
-
-    ;; Only log and return responses when they exist (not for notifications)
+      (let ((t0 (float-time)))
+        (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+          (nelisp--write-stderr-line "[PJ] dispatch-start"))
+        (condition-case err
+            (setq response
+                  (anvil-server--validate-and-dispatch-request
+                   json-object server-id))
+          (quit
+           (setq response (anvil-server--handle-error err)))
+          (error
+           (setq response (anvil-server--handle-error err))))
+        (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+          (nelisp--write-stderr-line
+           (format "[PJ] validate+dispatch %.4fs resp-len=%d"
+                   (- (float-time) t0)
+                   (if response (length response) -1))))))
     (when response
       (anvil-server--log-json-rpc "out" response server-id))
+    (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+      (nelisp--write-stderr-line
+       (format "[PJ] out t=%.4f" (float-time))))
     response))
 
 (defun anvil-server-process-jsonrpc-parsed (request server-id)
@@ -1651,23 +1941,38 @@ See also:
          (read-only (plist-get properties :read-only))
          (server-id (or (plist-get properties :server-id) "default"))
          (tools-table (anvil-server--get-server-tools server-id)))
-    ;; Error checking for required properties
-    (unless (functionp handler)
+    ;; Error checking for required properties.
+    ;; Standalone nelisp's `functionp' returns nil for symbols whose
+    ;; function cell was installed via `fset' (= encoded handler
+    ;; wrappers from `anvil-server-encode-handler').  Accept any
+    ;; symbol whose function cell is bound as a fallback.
+    (unless (or (functionp handler)
+                (and (symbolp handler) (fboundp handler)))
       (error "Tool registration requires handler function"))
     (unless id
       (error "Tool registration requires :id property"))
     (unless description
       (error "Tool registration requires :description property"))
     ;; Check for existing registration
+    (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+      (nelisp--write-stderr-line (concat "[REG-IN] " id)))
     (if-let* ((existing (gethash id tools-table)))
       (anvil-server--ref-counted-register id existing tools-table)
-      (let* ((handler-meta
+      (let* ((_p1 (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+                    (nelisp--write-stderr-line (concat "[REG-1 normalize] " id))))
+             (handler-meta
               (anvil-server--normalize-tool-handler handler))
+             (_p2 (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+                    (nelisp--write-stderr-line (concat "[REG-2 normalize-done] " id))))
              (raw-handler (plist-get handler-meta :handler))
              (arglist (plist-get handler-meta :arglist))
              (encode-result (plist-get handler-meta :encode-result))
+             (_p3 (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+                    (nelisp--write-stderr-line (concat "[REG-3 schema-start] " id))))
              (schema
               (anvil-server--generate-schema-from-function raw-handler))
+             (_p4 (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+                    (nelisp--write-stderr-line (concat "[REG-4 schema-done] " id))))
              (tool
               (list
                :id id
@@ -1705,6 +2010,15 @@ See also:
                               :intent :layer :stability))
           (when (plist-member properties k)
             (setq tool (plist-put tool k (plist-get properties k)))))
+        ;; Pre-build the tools/list JSON fragment with a hand-rolled
+        ;; encoder that avoids `json-encode' entirely.  On post-2026-
+        ;; 05-17 nelisp the pure-elisp `json-encode' degrades after
+        ;; 4-5 calls — calling it 6 times during substrate registration
+        ;; was hitting the wall and stalling cold-load.  The hand-built
+        ;; encoder uses only `concat' + `format' and stays O(N) regardless.
+        (let ((fragment (anvil-server--build-tool-fragment
+                         id description (plist-get tool :schema))))
+          (setq tool (plist-put tool :json-fragment fragment)))
         ;; Register the tool
         (anvil-server--ref-counted-register id tool tools-table)
         ;; Perf (2026-05-11): tools/list response is cached per server-id;

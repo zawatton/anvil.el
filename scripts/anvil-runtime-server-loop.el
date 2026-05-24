@@ -26,6 +26,13 @@
 
 ;;; Code:
 
+;; Pre-declare so diagnostic trace lines can gate on it before
+;; `anvil-server.el' loads.  See shell-loop.el for the same pattern.
+(defvar anvil-server--debug-trace nil
+  "When non-nil, emit `[STDIO]/[PJ]/[VAD]/[JR]/[TL]/[REG-*]/[STEP]'
+diagnostic trace lines via `nelisp--write-stderr-line'.  Default
+nil for production (silent).")
+
 (defun anvil-runtime-server--env (name default)
   (let ((val (and (fboundp 'getenv) (getenv name))))
     (if (and val (> (length val) 0)) val default)))
@@ -76,6 +83,19 @@
        (server-commands-el (concat anvil-el-dir "/anvil-server-commands.el")))
 
   ;; --- substrate bootstrap (same as shell-loop.el) ---
+  ;; emacs-init.el gates its vendor load-path setup on
+  ;; `nelisp-emacs-vendor-root'.  Without this, `(require 'subr-x)' and
+  ;; the chain `nelisp-coding' → `nelisp-emacs-compat-fileio' →
+  ;; `emacs-fileio-builtins' all fail with "feature was not provided".
+  (setq nelisp-emacs-vendor-root (concat nelisp-emacs-dir "/vendor"))
+  ;; Pre-provide `nelisp-coding-jis-tables' to bypass its 460KB defconst
+  ;; load — under the post-2026-05-17 nelisp (Doc 49 Wave 7–13 Phase 47
+  ;; native swap), loading that file aborts the process with glibc
+  ;; "double free or corruption (!prev)".  MCP / JSON-RPC traffic is
+  ;; UTF-8 only and never exercises JIS codec paths, so the tables are
+  ;; deadweight for the server-loop.  Remove once the nelisp regression
+  ;; is fixed upstream.
+  (provide 'nelisp-coding-jis-tables)
   (load init-el nil t)
   (load stub-el nil t)
 
@@ -94,7 +114,7 @@
       (condition-case err
           (load stdlib-misc nil t)
         (error
-         (when (fboundp 'nelisp--write-stderr-line)
+         (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
            (nelisp--write-stderr-line
             (concat "[server-loop] nelisp-stdlib-misc override load ERR: "
                     (format "%S" err))))))))
@@ -119,13 +139,13 @@
   ;; (migrated from nelisp-emacs/scripts/ to anvil.el/scripts/ 2026-05-14)
   (let ((polyfills-el (concat anvil-el-dir
                               "/scripts/anvil-runtime-polyfills.el")))
-    (when (fboundp 'nelisp--write-stderr-line)
+    (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
       (nelisp--write-stderr-line
        (concat "[server-loop] loading polyfills " polyfills-el)))
     (condition-case err
         (load polyfills-el nil t)
       (error
-       (when (fboundp 'nelisp--write-stderr-line)
+       (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
          (nelisp--write-stderr-line
           (concat "[server-loop] polyfills load ERR: "
                   (format "%S" err)))))))
@@ -223,11 +243,16 @@ helper instead of `frame-send' for those clients."
   ;; --- tool-module load chain (same as shell-loop default) ---
   (let* ((modules-env (anvil-runtime-server--env
                        "ANVIL_TOOL_MODULES"
-                       (concat
-                        "anvil-discovery,anvil-sqlite,anvil-bench,"
-                        "anvil-state,anvil-memory,anvil-worklog,"
-                        "anvil-org-index,anvil-orchestrator"))))
-    (when (fboundp 'nelisp--write-stderr-line)
+                       ;; Default trimmed 2026-05-24 from 8 → 3 modules.
+                       ;; anvil-{state,memory,worklog,org-index,
+                       ;; orchestrator} all fail at *-enable with
+                       ;; "sqlite not available" under post-2026-05-17
+                       ;; nelisp standalone (no sqlite primitive yet),
+                       ;; burning 63 % of cold-load time before failing.
+                       ;; Set ANVIL_TOOL_MODULES explicitly to re-enable
+                       ;; any of them once nelisp ships sqlite.
+                       "anvil-discovery,anvil-sqlite,anvil-bench")))
+    (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
       (nelisp--write-stderr-line
        (concat "[server-loop] ANVIL_TOOL_MODULES=" modules-env)))
     (when (> (length modules-env) 0)
@@ -235,14 +260,14 @@ helper instead of `frame-send' for those clients."
         (let* ((trimmed (if (fboundp 'string-trim) (string-trim name) name))
                (file (concat anvil-el-dir "/" trimmed ".el"))
                (enable-sym (intern (concat trimmed "-enable"))))
-          (when (fboundp 'nelisp--write-stderr-line)
+          (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
             (nelisp--write-stderr-line (concat "[server-loop] loading " file)))
           (condition-case err
               (progn
                 (load file nil t)
                 (when (fboundp enable-sym) (funcall enable-sym)))
             (error
-             (when (fboundp 'nelisp--write-stderr-line)
+             (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
                (nelisp--write-stderr-line
                 (concat "[server-loop] " trimmed " load/enable ERR: "
                         (format "%S" err))))))))))
@@ -252,7 +277,7 @@ helper instead of `frame-send' for those clients."
     (condition-case err
         (anvil-runtime-polyfills-apply-post-load-patches)
       (error
-       (when (fboundp 'nelisp--write-stderr-line)
+       (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
          (nelisp--write-stderr-line
           (concat "[server-loop] post-load patches ERR: "
                   (format "%S" err)))))))
@@ -381,7 +406,7 @@ Responses go back in the matching wire format."
                                      :body-len 0
                                      :mode nil)
                                anvil-mcp--state-by-fd))))
-      (when (fboundp 'nelisp--write-stderr-line)
+      (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
         (nelisp--write-stderr-line
          (format "[mcp-filter] fd=%d chunk=%d bytes phase=%S buflen-before=%d"
                  fd (length chunk) (plist-get state :phase)
@@ -395,12 +420,12 @@ Responses go back in the matching wire format."
           (cond
            ((eq leader ?{)
             (plist-put state :mode 'ndjson)
-            (when (fboundp 'nelisp--write-stderr-line)
+            (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
               (nelisp--write-stderr-line
                (format "[mcp-filter] fd=%d wire-format=ndjson" fd))))
            (t
             (plist-put state :mode 'framed)
-            (when (fboundp 'nelisp--write-stderr-line)
+            (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
               (nelisp--write-stderr-line
                (format "[mcp-filter] fd=%d wire-format=framed" fd)))))))
       (let ((keep-draining t))
@@ -416,7 +441,7 @@ Responses go back in the matching wire format."
                       (rest (substring buf (1+ lf))))
                   (plist-put state :buffer rest)
                   (when (and (> (length body) 0))
-                    (when (fboundp 'nelisp--write-stderr-line)
+                    (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
                       (nelisp--write-stderr-line
                        (format "[mcp-filter] fd=%d dispatch body[%d]: %S"
                                fd (length body)
@@ -430,7 +455,7 @@ Responses go back in the matching wire format."
                                (replace-regexp-in-string
                                 "\"" "\\\\\""
                                 (format "%S" err)))))))
-                      (when (fboundp 'nelisp--write-stderr-line)
+                      (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
                         (nelisp--write-stderr-line
                          (format "[mcp-filter] fd=%d response stringp=%S len=%d"
                                  fd (stringp response)
@@ -457,7 +482,7 @@ Responses go back in the matching wire format."
                    (t
                     ;; Malformed header — drop everything, hope to resync
                     (plist-put state :buffer "")
-                    (when (fboundp 'nelisp--write-stderr-line)
+                    (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
                       (nelisp--write-stderr-line
                        (format "[server-loop] bad header on fd=%d, dropping buffer"
                                fd)))))))))
@@ -470,7 +495,7 @@ Responses go back in the matching wire format."
                   (plist-put state :phase 'header)
                   (plist-put state :body-len 0)
                   (plist-put state :buffer rest)
-                  (when (fboundp 'nelisp--write-stderr-line)
+                  (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
                     (nelisp--write-stderr-line
                      (format "[mcp-filter] fd=%d dispatch body[%d]: %S"
                              fd n
@@ -484,7 +509,7 @@ Responses go back in the matching wire format."
                              (replace-regexp-in-string
                               "\"" "\\\\\""
                               (format "%S" err)))))))
-                    (when (fboundp 'nelisp--write-stderr-line)
+                    (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
                       (nelisp--write-stderr-line
                        (format "[mcp-filter] fd=%d response stringp=%S len=%d"
                                fd (stringp response)
@@ -496,7 +521,7 @@ Responses go back in the matching wire format."
 
   (defun anvil-mcp-sentinel (proc msg)
     "Clean up per-connection state when a child closes."
-    (when (fboundp 'nelisp--write-stderr-line)
+    (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
       (nelisp--write-stderr-line
        (format "[server-loop] sentinel %s: %s"
                (process-name proc)
@@ -515,13 +540,13 @@ Responses go back in the matching wire format."
     (condition-case err
         (anvil-server-start)
       (error
-       (when (fboundp 'nelisp--write-stderr-line)
+       (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
          (nelisp--write-stderr-line
           (concat "[server-loop] anvil-server-start ERR: "
                   (format "%S" err)))))))
 
   ;; --- bind listener + enter event loop ---
-  (when (fboundp 'nelisp--write-stderr-line)
+  (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
     (let ((bucket (and (boundp 'anvil-server--tools)
                        (gethash server-id anvil-server--tools))))
       (nelisp--write-stderr-line
@@ -536,27 +561,35 @@ Responses go back in the matching wire format."
   ;; has a 30 s timeout — a cold tools/list would blow past it).  The
   ;; cache lives in `anvil-server--tools-list-cache' (added in
   ;; anvil-server.el alongside `anvil-server--handle-tools-list').
-  (when (and (fboundp 'anvil-server--handle-tools-list)
+  ;; tools/list pre-warm is intentionally disabled under the
+  ;; post-2026-05-17 nelisp runtime — the pure-elisp `json-encode'
+  ;; from Doc 49 Wave 7-13 burns ~9.5 GB RSS and 100 % CPU for many
+  ;; minutes without producing output, blocking socket bind.  Allow
+  ;; opt-in via ANVIL_TOOLS_LIST_PREWARM=1 once the regression is
+  ;; addressed upstream.  First incoming `tools/list' pays the cold
+  ;; encode cost; MCP clients with > 60 s handshake timeout cope.
+  (when (and (anvil-runtime-server--env "ANVIL_TOOLS_LIST_PREWARM" nil)
+             (fboundp 'anvil-server--handle-tools-list)
              (boundp 'anvil-server--tools-list-cache))
-    (when (fboundp 'nelisp--write-stderr-line)
+    (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
       (nelisp--write-stderr-line
        "[server-loop] pre-warming tools/list cache"))
     (condition-case err
         (let ((unused (anvil-server--handle-tools-list 0 server-id)))
           (ignore unused)
-          (when (fboundp 'nelisp--write-stderr-line)
+          (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
             (nelisp--write-stderr-line
              (format "[server-loop] tools/list cache pre-warmed (%d bytes)"
                      (length (or (gethash server-id
                                           anvil-server--tools-list-cache)
                                  ""))))))
       (error
-       (when (fboundp 'nelisp--write-stderr-line)
+       (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
          (nelisp--write-stderr-line
           (concat "[server-loop] tools/list pre-warm ERR: "
                   (format "%S" err)))))))
 
-  (when (fboundp 'nelisp--write-stderr-line)
+  (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
     (nelisp--write-stderr-line
      (concat "[server-loop] binding socket " socket-path)))
 
@@ -573,7 +606,7 @@ Responses go back in the matching wire format."
           :server t
           :filter #'anvil-mcp-filter
           :sentinel #'anvil-mcp-sentinel)))
-    (when (fboundp 'nelisp--write-stderr-line)
+    (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
       (nelisp--write-stderr-line
        (format "[server-loop] listening on %s fd=%d"
                socket-path (process-id-fd server)))))

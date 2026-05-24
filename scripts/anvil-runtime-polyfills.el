@@ -81,13 +81,22 @@
       (add-to-list 'load-path dir))))
 
 (dolist (lib '("subr-x" "seq" "cl-extra" "cl-seq" "benchmark" "profiler"))
-  (condition-case anvil-runtime-polyfills--vendor-err
-      (load lib nil t)
-    (error
-     (when (fboundp 'nelisp--write-stderr-line)
-       (nelisp--write-stderr-line
-        (concat "[anvil-runtime-polyfills] vendor load `" lib "' failed: "
-                (format "%S" anvil-runtime-polyfills--vendor-err)))))))
+  ;; Under post-2026-05-17 nelisp the pure-elisp interpreter allocates
+  ;; ~1 MB/s walking each of these vendor files and never reclaims it,
+  ;; so unconditional `load' burns substrate memory unboundedly.  The
+  ;; caller (= shell-loop.el / server-loop.el) pre-provides the 6
+  ;; feature names before loading us; skip the load when the feature is
+  ;; already provided so the burn does not happen.  In host Emacs the
+  ;; vendor files load fast and the pre-provide isn't done, so the
+  ;; original path is preserved there.
+  (unless (featurep (intern lib))
+    (condition-case anvil-runtime-polyfills--vendor-err
+        (load lib nil t)
+      (error
+       (when (fboundp 'nelisp--write-stderr-line)
+         (nelisp--write-stderr-line
+          (concat "[anvil-runtime-polyfills] vendor load `" lib "' failed: "
+                  (format "%S" anvil-runtime-polyfills--vendor-err))))))))
 
 ;; emacs-stub-bulk binds many subr-x bits unconditionally even when
 ;; vendor subr-x didn't load — `provide' ensures `(require 'subr-x)'
