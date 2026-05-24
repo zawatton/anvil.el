@@ -1,0 +1,261 @@
+#+title: anvil-orchestrator budget + heartbeat (Paperclip-style hard stops)
+#+date: 2026-05-24
+#+author: zawatton
+#+property: status DRAFT
+#+property: scope GENERIC
+
+* STATUS
+  :PROPERTIES:
+  :ID:       d1c4e0f2-8f44-4f7c-bc1a-paperclip-47
+  :END:
+~DRAFT~ (2026-05-24) — Paperclip (動画 yt_20260524_paperclip_multi_agent_
+management) の二重安全装置 (ハートビート + 予算ハードストップ) を
+anvil-orchestrator + anvil-worker-probe に取り込む設計案。動画の
+「月 30 万円超え暴走事故」を防ぐ実用機能。
+
+Paperclip 採用要素 (anvil 既存と比較):
+
+| 機能                          | Paperclip | anvil 既存                        |
+|-------------------------------+-----------+-----------------------------------|
+| ハートビート (生存信号)        | あり      | anvil-worker-probe quick-alive-p  |
+| タスク単位予算上限            | あり      | **未実装**                        |
+| エージェント単位予算上限      | あり      | **未実装**                        |
+| 90% 警告 → 100% 強制停止       | あり      | **未実装**                        |
+| ゴールアラインメント 4 層     | あり      | scope 外 (Doc 17 session で議論)  |
+| マルチカンパニー分離          | あり      | 当面不要 (1 人事業主)             |
+
+→ anvil で取り込む価値があるのは **予算ハードストップ** が最大。
+   ハートビートは既存 quick-alive-p の延長で軽く拡張。
+
+* Motivation
+
+anvil-orchestrator は codex / claude / gemini 等を dispatch するが:
+
+- per-task cost 上限なし → 暴走で高額請求リスク
+- per-provider cost 上限なし → 1 provider に偏る
+- 90%/100% 警告 → 強制停止のフローなし
+- ハートビート機構はあるが orchestrator 側で能動的に使っていない
+
+動画の実例:
+- 月 30 万円超えの暴走請求
+- 「実行中のまま 1 時間放置」問題
+
+memory `feedback_codex_chatgpt_usage_limit` でも触れた通り、codex 経路
+は ChatGPT 課金で per-token cost が見えにくいが、API 経路は直接効く。
+budget hard stop は **API 経路で必須**。
+
+* Existing anvil との接続マップ
+
+| anvil module            | 役割                                              |
+|-------------------------+--------------------------------------------------|
+| anvil-orchestrator      | submit / submit-one に :budget / :timeout 追加  |
+| anvil-worker-probe      | ハートビート機構の拡張                            |
+| anvil-state             | budget remaining の永続化、cross-session 集計    |
+| anvil-claude-watchdog   | stale detect → 自動停止トリガ                    |
+| anvil-cron              | 日次/月次 budget reset の schedule               |
+| anvil-worklog (Doc 42)  | budget 消費履歴                                   |
+
+→ 新規 module 不要。既存への拡張のみで実装可能。
+
+* Open Questions (要議論)
+
+** Q1. 予算単位の階層
+
+Paperclip は 4 層 (会社/チーム/エージェント/タスク)。1 人事業主の anvil
+では:
+
+- (a) per-task のみ (シンプル、Paperclip 最小単位)
+- (b) per-task + per-provider 2 層 (provider 別月額上限)
+- (c) per-task + per-provider + per-day 累計 (運用しやすい)
+- (d) 4 層フル (over-engineering)
+
+→ **推奨**: (c)。task ハードストップ + provider 月額上限 + 日次累計
+   ガード。3 層で運用負荷低く、99% の事故を防げる。
+
+** Q2. cost 計測の精度
+
+provider 別に cost 取得方法が異なる:
+
+| Provider     | cost 取得方法                                    |
+|--------------+-------------------------------------------------|
+| Claude API   | response.usage の input/output tokens × 単価    |
+| codex CLI    | =/cost= command output (現在は per-session のみ) |
+| gemini API   | response.usageMetadata                          |
+| ChatGPT Plus | 取れない (Pro plan)                              |
+| Codex Plus   | 取れない (Plus plan)                             |
+
+ChatGPT/Codex Plus 経路は per-token cost が 0 (= サブスク内) なので、
+budget は **API key 経路のみ実効**。Plus 経路は wall-clock + 回数だけ
+で管理する。
+
+→ budget 機能の defcustom で「API only / both」を選べる。default は
+   API only (Plus 経路は無効化、wall-clock で別管理)。
+
+** Q3. ハートビート interval と timeout
+
+論文 (Paperclip 動画) では「N 秒ごとの生存信号」「無応答で自動強制停止」。
+anvil-worker-probe quick-alive-p は既に存在するが orchestrator 側で
+能動的にポーリングしていない。
+
+選択肢:
+
+- (a) anvil-orchestrator が 30s ごとに probe 呼び出し、timeout 90s
+- (b) worker 側が能動的に anvil-state に "alive at <ts>" を書く、
+      orchestrator が読み取り
+- (c) 両方 (冗長だが安全)
+
+→ **推奨**: (a)。既存 probe を再利用、orchestrator 内で interval/timeout
+   を defcustom 化。
+
+** Q4. 強制停止後の cleanup
+
+stop trigger 発火後:
+
+- worktree の uncommitted changes をどうするか
+- 中途 commit を残すか revert するか
+- worklog にどう記録するか
+- next session で resume できるよう snapshot するか (anvil-session 連携)
+
+→ **推奨**: snapshot は anvil-session に委譲、worktree は **そのまま残す**
+   (uncommitted changes は user judgment)、worklog に "stopped by budget"
+   タグで記録。
+
+** Q5. 90% 警告の通知経路
+
+Paperclip では「90% 警告」を出す。anvil 文脈:
+
+- (a) emacsclient で minibuffer message
+- (b) anvil-session-events に emit、Claude が次ターンに気づく
+- (c) Stop hook で additionalContext 注入 (anvil-compact 流儀)
+- (d) システムレベル通知 (notify-send / Windows toast)
+
+→ **推奨**: (b) + (c)。Claude 自身が「あと 10% 残ってる、ペース落とそう」
+   と判断できる経路と、emergency 用の external 通知。
+
+** Q6. budget reset cycle
+
+- per-task: タスク終了で reset (自明)
+- per-provider 月額: 月初 reset (anvil-cron で 1 日 0:00 に)
+- per-day: 日次 reset (anvil-cron で 0:00)
+
+reset event を anvil-worklog に "budget rollover" として記録、トレース
+可能に。
+
+** Q7. Paperclip 全体取り込み vs 部分
+
+Paperclip 動画の取り込み対象:
+
+| 機能                              | 採用 | 理由                              |
+|-----------------------------------+------+-----------------------------------|
+| ハートビート                      | ✓    | 既存 probe を能動利用に拡張       |
+| 予算ハードストップ                | ✓    | 暴走防止に必須                    |
+| 90% 警告 → 100% 停止              | ✓    | budget の一部                    |
+| ゴールアラインメント 4 層         | -    | 1 人事業主の運用には over-eng    |
+| BYOA アダプター                   | -    | orchestrator が既に 3 provider   |
+|                                   |      | 対応 (claude/codex/gemini)        |
+| マルチカンパニー分離              | -    | 1 人事業主                       |
+| プラグインの hot-swap             | -    | anvil の anvil-modules で代替可  |
+| ポータビリティ (export/import)    | -    | git で十分                       |
+
+* Architecture (案)
+
+** 主要 component
+
+#+begin_example
+[anvil-orchestrator 拡張]
+   ├─ submit / submit-one に新引数:
+   │    :budget       (USD)
+   │    :timeout      (seconds)
+   │    :heartbeat-interval (seconds, default 30)
+   │    :heartbeat-timeout  (seconds, default 90)
+   ├─ budget-tracker
+   │    ├─ task-budget   (task 単位)
+   │    ├─ provider-budget (月額)
+   │    └─ daily-budget  (日次)
+   ├─ cost-meter
+   │    ├─ Claude API   usage parse
+   │    ├─ codex CLI    /cost output parse
+   │    ├─ gemini API   usageMetadata parse
+   │    └─ Plus plans   skip (wall-clock + count のみ)
+   ├─ heartbeat-monitor
+   │    ├─ interval ポーリング (anvil-worker-probe)
+   │    ├─ timeout 検出
+   │    └─ stop-trigger
+   ├─ stop-trigger
+   │    ├─ kill subprocess
+   │    ├─ worklog "stopped by <reason>" 記録
+   │    ├─ anvil-session snapshot 保存
+   │    └─ notify (90%/100% paths)
+   └─ MCP surface
+        ├─ orchestrator-budget-set / -get / -reset
+        ├─ orchestrator-cost-stats
+        └─ orchestrator-stop (manual emergency stop)
+#+end_example
+
+** state schema (anvil-state)
+
+#+begin_example
+orchestrator.budget.task.<id>.limit
+orchestrator.budget.task.<id>.consumed
+orchestrator.budget.provider.<name>.month.limit
+orchestrator.budget.provider.<name>.month.consumed
+orchestrator.budget.daily.<yyyymmdd>.limit
+orchestrator.budget.daily.<yyyymmdd>.consumed
+orchestrator.heartbeat.<task-id>.last-seen
+#+end_example
+
+* Phase 分割案
+
+| Phase | scope                                                     | 工数 |
+|-------+-----------------------------------------------------------+------|
+| 1     | :budget / :timeout / cost-meter (Claude+gemini API のみ)  | 中   |
+|       | + stop-trigger + worklog "stopped" tag + 20 ERT           |      |
+| 2     | heartbeat-monitor (anvil-worker-probe 拡張) +             | 小   |
+|       | :heartbeat-interval / -timeout                             |      |
+| 3     | per-provider 月額 + per-day 累計 (Q1-c 完成)               | 小   |
+| 4     | 90% 警告経路 (anvil-session-events + additionalContext)   | 小   |
+| 5     | codex CLI /cost 統合 + Plus plan の wall-clock 管理        | 中   |
+
+* 評価メトリクス
+
+- 暴走防止: budget 超過時の停止までの latency (target ≤ 5s)
+- 誤検知: 正常タスクが budget 内で停止される false positive (target 0)
+- ハートビート: stale detect から stop までの latency (target ≤ 120s)
+- per-task cost 精度: cost-meter と provider 請求書の乖離 (target ≤ 5%)
+
+* 安全策
+
+- budget 0 設定で全停止 (kill switch)
+- stop-trigger 失敗時の二重 kill (SIGTERM → SIGKILL)
+- emergency stop MCP tool は authentication 不要 (最速で止める)
+- budget reset は monotonic clock で計測 (clock skew 防止)
+- Plus plan 経路の budget は wall-clock based、誤って 0 になっても停止
+  しない (= 課金されないので無害)
+
+* 取り込み見送り判断材料
+
+- Phase 1 で API 経路の cost-meter 精度が 5% 以内に収まる
+- Phase 2 で stale detect の false positive rate が < 1%
+- 1 回の暴走を実証的に防ぐ (synthetic 暴走テスト)
+
+* 既存 doc との関係
+
+- Doc 10 (orchestrator) — :budget / :timeout 引数を追加
+- Doc 17 (session) — stop 時の snapshot で resume
+- Doc 36 (auto-compact) — 90% 警告経路 (additionalContext) の流儀を継承
+- Doc 40 (claude-watchdog) — stale detect と統合
+- Doc 42 (worklog-index) — stopped tag、cost rollover 記録
+- Doc 46 (harness-telemetry) — budget timeout は「実行不能」分類
+
+* References
+
+- 元動画: [[file:~/Cowork/Notes/capture/yt/yt_20260524_paperclip_multi_agent_management.org][yt_20260524_paperclip_multi_agent_management.org]]
+  (さとるチャンネル、約 12 分)
+- Paperclip GitHub (要確認、動画では URL 未明示)
+
+* Decision Log
+
+- 2026-05-24 — DRAFT 起票。Q1 (予算階層) と Q2 (Plus plan の cost 取れ
+  ない問題) が要議論。Plus plan 経路を主用途とする運用形態では budget
+  機能の効用が薄いため、Q7 で「Paperclip 全体でなく予算+ハートビートに
+  絞る」スコープ判断を明示。
