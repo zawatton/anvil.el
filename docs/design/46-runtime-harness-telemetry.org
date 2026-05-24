@@ -1,0 +1,393 @@
+#+title: anvil-harness-telemetry — Runtime Harness 4-class failure classification
+#+date: 2026-05-24
+#+author: zawatton
+#+property: status PHASE-1-SHIPPED
+#+property: scope GENERIC
+#+property: target dual-target-deferred-nelisp
+
+* STATUS
+  :PROPERTIES:
+  :ID:       d1c4e0f2-8f44-4f7c-bc1a-harness-telemetry-46
+  :END:
+~PHASE-1-SHIPPED~ (2026-05-24) — 論文「Runtime Harness」(動画
+yt_20260524_runtime_harness_88pct) の 失敗分析 4 分類を anvil の telemetry
+層に取り込む。基盤 doc — 単独効果は小さいが、後続改善 (Doc 43/44/45/47)
+の効果測定に必要なため **最優先で着地** する。
+
+Phase 1 設計は 2026-05-24 に user との議論で freeze (D1-D8、後述
+=Phase 1 Frozen Decisions= 節)。実装は別セッションで着手。
+
+論文の核心:
+
+- LLM の重みを変えず成功率 +88.5%、126 通り中 92% で改善
+- 失敗分析 393 件を手作業で 4 分類:
+  - *実行不能* 33.3%
+  - *ツール契約違反* 23.3%
+  - *反復停滞* 13.2%
+  - *推論ミス* 残り (~30%)
+- 失敗の約 7 割は推論力ではなくモデルと環境の「接点」問題
+- アブレーション: アクション検証層除去 -61.7pt、停滞監視層除去 -36.2pt
+  → 全層必須
+
+→ anvil ではまず **失敗ログを 4 分類で記録する telemetry** を整備する。
+4 層ハーネス本体は別 doc (将来) で。
+
+* Phase 1 Frozen Decisions (2026-05-24)
+
+以下の 8 決定で Phase 1 設計を freeze。実装着手前の最終 reference。
+
+** D1. classifier rule の初版
+
+dispatcher 内 static 同期分類、LLM fallback なし。90%+ は regex + error
+type で判定可能との前提。LLM 分類は Phase 4 で opt-in。
+
+#+begin_src elisp
+(defconst anvil-harness-telemetry-classifier-rules
+  '(;; no-exec (実行不能 ~ 33.3%)
+    (no-exec
+     :error-symbols (void-function
+                     error-process-exited-abnormally
+                     file-missing
+                     file-error)
+     :regex ("not callable"
+             "Connection refused"
+             "No such file or directory"
+             "Permission denied"
+             "process exited [1-9]"))
+
+    ;; contract-violation (契約違反 ~ 23.3%)
+    (contract-violation
+     :error-symbols (wrong-type-argument
+                     wrong-number-of-arguments)
+     :regex ("Missing required parameter"
+             "json-schema validation"
+             "Invalid argument"
+             "InputValidationError"))
+
+    ;; stall (反復停滞 ~ 13.2%) — repetition-detector emit のみ
+    (stall :emit-only-from-repetition-detector t)
+
+    ;; reasoning (推論ミス ~ 30%) — fallback
+    (reasoning :fallback t)))
+#+end_src
+
+注意: =wrong-type-argument= は call stack depth で意味が変わる
+(dispatcher 入口 = contract-violation、内部 = no-exec)。Phase 1
+classifier は **stack depth で分岐** する。
+
+** D2. event 書込み先 = 同 DB 新 table =harness_failures=
+
+anvil-worklog 本体は人間の作業ログ、failure event は機械生成で性格が違う。
+DB file は共有 (=Notes/.anvil-worklog/anvil-worklog-index.db=) するが
+table は独立、FTS5 も別 index。
+
+#+begin_src sql
+CREATE TABLE harness_failures (
+  id INTEGER PRIMARY KEY,
+  timestamp TEXT NOT NULL,        -- ISO datetime
+  class TEXT NOT NULL,            -- no-exec/contract-violation/stall/reasoning
+  confidence REAL NOT NULL,       -- 0.0-1.0 (D4)
+  tool TEXT,
+  args_digest TEXT,               -- sxhash for repetition-detector
+  error_message TEXT,
+  provider TEXT,                  -- claude/codex/gemini/etc
+  session_id TEXT,
+  machine TEXT,
+  raw_context TEXT                -- 短縮された原文
+);
+
+CREATE VIRTUAL TABLE harness_failures_fts USING fts5(
+  error_message, raw_context,
+  content='harness_failures', content_rowid='id',
+  tokenize='trigram'
+);
+#+end_src
+
+** D3. dispatcher hook の配線箇所
+
+=anvil-server-with-error-handling= macro 周辺。既存 macro の =condition-case=
+ハンドラに 1 行 =anvil-harness-telemetry-record-from-error= を追加する。
+macro 利用箇所では =(require 'anvil-server)= 必須 (memory:
+=feedback_anvil_macro_require=)。
+
+** D4. confidence flag
+
+classifier は =:match-count= (= hit したルール数) を返す:
+- 1+ ルール hit: =confidence=1.0=
+- 0 hit (= fallback reasoning): =confidence=0.3= で low-confidence flag
+- =harness-telemetry-stats= で low-confidence bucket を別途集計、後で
+  manual review で classifier rule に feedback
+
+precision 測定は operational data から後付け labeling で行う
+(golden test set を最初に作らない)。
+
+** D5. Phase 1 scope (concrete)
+
+- =anvil-harness-telemetry.el= 新規 (=anvil-optional-modules= 入り)
+- =;;; anvil-audit: tools-wrapped-at-registration= header 必須 (memory:
+  =feedback_anvil_audit_header_required=)
+- classifier (D1) + sqlite schema (D2) + dispatcher hook (D3)
+- 3 MCP tool:
+  - =harness-telemetry-record= (内部 API、host module から呼ぶ)
+  - =harness-telemetry-stats= (per-day / per-class / per-tool / per-provider
+    集計、low-confidence 別 bucket)
+  - =harness-telemetry-recent= (直近 N 件、:class フィルタ可)
+- 20 ERT (classifier rules ごと 1 件 + stats aggregation + low-confidence
+  flagging + dispatcher hook integration)
+
+** D6. ship 後の観測期間
+
+Phase 1 ship → **1-2 週間 baseline 観測**。Doc 43-47 着手はその後。
+baseline 期間中の per-class daily count を anvil-worklog にも =MEMO AI:
+telemetry baseline= で記録、後で比較可能に。
+
+** D7. golden test set
+
+Phase 1 ship 時点では作らない。operational data 50-100 件を 1 週間で
+蓄積 → manual labeling → classifier rule update のループで運用。
+
+** D8. dual-target 化
+
+portable 機能系 (memory: =feedback_anvil_module_dual_target_categorization=)
+に分類。**Phase 1 は Emacs only で ship**、NeLisp 対応は Phase 5+
+(NeLisp runtime 側に anvil-server / anvil-worklog 相当が揃ってから)。
+
+* Motivation
+
+anvil-orchestrator / anvil-worker / anvil-claude-watchdog 等で
+失敗 event は発生しているが、現状は:
+
+- error message を raw string で worklog に書く
+- recovery ロジックは module ごとに ad-hoc
+- 改善 PR の効果を **何が減ったか** で測れない
+
+論文の 4 分類で telemetry を分類すれば:
+
+1. **改善 PR の効果が定量化できる** (例: Tool Attention は契約違反を
+   減らすはず、TACO は反復停滞を減らすはず)
+2. ボトルネック特定: 自分の運用では実行不能 33% が正しいのか?
+3. 後続 doc (43/44/45/47) の取り込み効果を逆算で評価可能
+4. anvil の外部公開時に「論文準拠の telemetry」として差別化
+
+これは「単独で効果薄、後続改善の基盤」という性格上、**最優先で着地**
+させる価値がある。
+
+* 4 分類の anvil 文脈での定義
+
+| 分類           | 論文での定義          | anvil 検出シグナル                   |
+|----------------+-----------------------+--------------------------------------|
+| 実行不能       | tool call が API 呼出 | tool dispatcher が =error '... not  |
+|                | 段階で失敗            | callable= / =wrong-type-argument=    |
+|                |                       | / process exit non-zero / network err|
+|------------------------+----------------------------------------|
+| ツール契約違反 | schema 違反、必須引数 | json-schema validation fail /        |
+|                | 不足、型不一致        | =Missing required parameter= /       |
+|                |                       | dispatcher pre-call check fail       |
+|------------------------+----------------------------------------|
+| 反復停滞       | 同一思考の反復、状態  | 同一 tool + 同一引数の 3 回以上 /    |
+|                | が変わらない、進行    | session-events に 5 連続 review /    |
+|                | なし、トライ飽和      | watchdog stale detect                |
+|------------------------+----------------------------------------|
+| 推論ミス       | 上記以外、ロジック    | 上記いずれにも該当しないエラー /     |
+|                | 的に間違った tool 選択| user feedback "this is wrong"        |
+
+* Existing anvil との接続マップ
+
+| anvil module           | telemetry での役割                           |
+|------------------------+---------------------------------------------|
+| anvil-worklog (Doc 42) | 4 分類タグ付きで failure event を永続化     |
+| anvil-session-events   | 反復停滞 / 連続 review の検出元              |
+| anvil-claude-watchdog  | stale 検出 (= 反復停滞 の一種)               |
+| anvil-server (dispatcher) | 契約違反 / 実行不能の判定原点              |
+| anvil-orchestrator     | provider 別失敗統計                          |
+
+→ 新規 module = =anvil-harness-telemetry.el= 1 個。dispatcher にフック
+   を 1 箇所差し込むのみ。
+
+* Open Questions (要議論)
+
+** Q1. 分類器をどこに置くか
+
+選択肢:
+
+- (a) dispatcher の error handler 内で同期分類 (低レイテンシ、低精度)
+- (b) anvil-worklog 書込み時に post-process で分類 (中レイテンシ、中精度)
+- (c) LLM を使って分類 (高精度、cost あり)
+
+→ **推奨**: (a) static rules を default、(c) を opt-in。論文の 4 分類は
+   regex + error type で 90%+ 判定可能。LLM 分類は曖昧ケースのみ。
+
+** Q2. 後続 doc 効果測定の baseline をどう取るか
+
+各 doc を ship する前に baseline 計測が要る:
+
+- Tool Attention (Doc 44) ship 前後で「契約違反」が減るか
+- TACO (Doc 45) ship 前後で「反復停滞」が減るか
+- autoresearch (Doc 43) ship 前後で「推論ミス」が減るか
+- Paperclip (Doc 47) ship 前後で「実行不能」 (= stale 含む) が減るか
+
+→ telemetry MUST ship 最初に。それまで Doc 43-47 の効果は逸話的にしか
+   語れない。
+
+** Q3. プライバシー / 漏洩リスク
+
+failure event の中に user data (file path, prompt 抜粋) が含まれる:
+
+- ローカルにのみ保存 (= anvil-worklog の既存挙動と同じ)
+- 集計値のみ外部公開可能 (count by class, per-day)
+- raw event は disk only、export には opt-in
+
+→ 既存 worklog ポリシーで十分。
+
+** Q4. 統計 dashboard をどう見せるか
+
+- (a) MCP tool =harness-telemetry-stats= で JSON 返す (Claude 用)
+- (b) Emacs tabulated-list-mode で見る (人間用)
+- (c) HTML 生成 (anthropic_markdown_to_html 流儀、外部共有用)
+
+→ (a) を Phase 1、(b) は anvil-compact Phase 3b のパターン流用。
+   (c) は marginal。
+
+** Q5. 反復停滞の閾値設定
+
+論文では 4 パターン (同一思考反復 / 状態変化なし / 進行なし / トライ飽和)。
+anvil での閾値:
+
+- 同一 tool+args 3 回連続 → 停滞警告
+- 5 回連続 → 停滞分類 + 段階介入トリガ
+- session-events 連続 review 5 件 → 停滞分類
+
+defcustom で調整可能に。default は論文寄りの保守的値。
+
+* Architecture (案)
+
+** 主要 component
+
+#+begin_example
+[anvil-harness-telemetry]
+   ├─ classifier
+   │    ├─ static rules (regex + error type)
+   │    └─ fallback: 推論ミス
+   ├─ event-recorder
+   │    └─ anvil-worklog に 4 分類タグ付きで write
+   ├─ repetition-detector
+   │    ├─ ring buffer of recent (tool, args) tuples
+   │    └─ N 回連続検出で event emit
+   ├─ stats-aggregator
+   │    └─ per-day / per-class / per-tool counts
+   └─ MCP surface
+        ├─ harness-telemetry-record (内部 API)
+        ├─ harness-telemetry-stats  (集計取得)
+        └─ harness-telemetry-recent (直近 N 件)
+#+end_example
+
+** event schema (anvil-worklog 拡張)
+
+#+begin_example
+title:    "harness failure: <class>"
+body:     plist
+          - :class      one of (no-exec, contract-violation,
+                                stall, reasoning)
+          - :tool       tool name (or nil)
+          - :error      error message (string)
+          - :provider   claude/codex/gemini/etc
+          - :session    session-id
+          - :timestamp  ISO datetime
+machine:  既存
+date:     既存
+#+end_example
+
+** classifier rules (初版)
+
+| class              | regex / signal                                   |
+|--------------------+--------------------------------------------------|
+| no-exec            | "not callable" / "process exited [1-9]" /        |
+|                    | "network error" / "ENOENT"                       |
+| contract-violation | "Missing required parameter" / "wrong-type" /    |
+|                    | "json-schema validation"                         |
+| stall              | repetition-detector emit / watchdog stale /      |
+|                    | session-events 5x review                         |
+| reasoning          | 上記いずれにも該当しない (fallback)               |
+
+* Phase 分割案
+
+| Phase | scope                                                     | 工数 |
+|-------+-----------------------------------------------------------+------|
+| 1     | classifier (static rules) + event-recorder +              | 小   |
+|       | dispatcher hook + harness-telemetry-record/stats/recent   |      |
+|       | MCP tool + 20 ERT                                         |      |
+| 2     | repetition-detector + stall classification 自動化         | 小   |
+| 3     | tabulated-list dashboard (Emacs UI)                       | 小   |
+| 4     | LLM 分類 fallback (Q1-c)                                   | 中   |
+
+→ Phase 1 のみで「baseline 計測」目的は達成。Doc 43-47 の効果測定が
+   可能になる。
+
+* 評価メトリクス
+
+(これ自身が「メトリクスを取る doc」なので、評価メトリクス = 自分の出力)
+
+- classifier の precision/recall (manual labeling と照合)
+- per-day failure count by class
+- top-3 failing tool by class
+
+* 安全策
+
+- classifier 失敗時は raw error をそのまま記録 (フォールバック)
+- worklog 書込みエラーは silent fail (telemetry が main flow を止めない)
+- repetition-detector の ring buffer overflow 防止 (default size 100)
+
+* 取り込み見送り判断材料
+
+- Phase 1 classifier precision ≥ 80% (4 分類 × 50 件 ラベル付き)
+- 1 失敗 event 記録コストが orchestrator 通常使用の 1% 以内
+- Doc 43-47 のいずれか ship 後、対応分類の減少が確認できる
+
+* 既存 doc との関係
+
+- Doc 42 (worklog-index) — event 永続化先
+- Doc 10 (orchestrator) — provider 別 telemetry の source
+- Doc 17 (session) — session-events で停滞検出
+- Doc 40 (claude-watchdog) — stale 検出を停滞 class に統合
+- Doc 43 (autoresearch) — 推論ミス減少の効果測定
+- Doc 44 (tool-attention) — 契約違反減少の効果測定
+- Doc 45 (taco) — 反復停滞減少の効果測定
+- Doc 47 (paperclip-budget) — 実行不能減少の効果測定
+
+* References
+
+- 元動画: [[file:~/Cowork/Notes/capture/yt/yt_20260524_runtime_harness_88pct.org][yt_20260524_runtime_harness_88pct.org]]
+  (さとるチャンネル、約 15 分)
+- 論文「Runtime Harness」(動画内で言及、原典要確認)
+
+* Decision Log
+
+- 2026-05-24 — DRAFT 起票。**最優先で着地** すべき基盤 doc であることを
+  明示。Doc 43-47 の効果測定が telemetry に依存するため、これが無いと
+  後続が evidence-based に進まない。
+- Q1 (静的分類 vs LLM 分類) と Q5 (停滞閾値) が技術論点。
+
+** Decision freeze
+
+- 2026-05-24 — Phase 1 設計 freeze (D1-D8)。User 承認済、実装は別セッションで
+  着手。Open Questions Q1-Q5 はすべて =Phase 1 Frozen Decisions= 節で
+  resolved (regex 表は D1、DB schema は D2、dashboard 経路は D5 で MCP
+  tool only、stall 閾値は D5 内 ERT で sealing)。
+
+** Phase 1 ship
+
+- 2026-05-24 — Phase 1 SHIPPED (=anvil-harness-telemetry.el= +
+  20 ERT pass).  Files:
+  - =anvil-harness-telemetry.el= new module, 28.5 KB
+  - =anvil-server.el= +49 LOC (defvar =anvil-server-tool-error-hook=,
+    dynamic =anvil-server--current-tool-name=, helper
+    =anvil-server--run-tool-error-hook=, macro / dispatcher hook
+    call sites)
+  - =tests/anvil-harness-telemetry-test.el= 20 ERT (classifier 8 /
+    schema+record 4 / stats 4 / recent 2 / dispatcher hook 2)
+  - =anvil.el= +16 LOC docstring entry for the new optional module
+  - byte-compile clean on all 4 files, end-to-end smoke verified
+    (void-function inside `anvil-server-with-error-handling' lands
+    one row in =harness_failures= with class=no-exec).
+  Phase 1 D6 1-2 週 baseline 観測期間 開始。Doc 43-47 着手は telemetry
+  data 蓄積後。

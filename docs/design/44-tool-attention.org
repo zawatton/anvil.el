@@ -1,0 +1,230 @@
+#+title: anvil-manifest Phase 2 — Tool Attention (intent search + state filter + lazy load)
+#+date: 2026-05-24
+#+author: zawatton
+#+property: status DRAFT
+#+property: scope GENERIC
+
+* STATUS
+  :PROPERTIES:
+  :ID:       d1c4e0f2-8f44-4f7c-bc1a-tool-attention-44
+  :END:
+~DRAFT~ (2026-05-24) — Doc 26 anvil-manifest (Phase 1 + 1a + 1b SHIPPED)
+の Phase 2 拡張。論文「Tool Attention is All You Need」(2026 解説動画
+yt_20260524_tool_attention_mcp_tax) の 3 部品を anvil 層に取り込む。
+
+論文の核心:
+
+- MCP はステートレス設計 → 毎ターン全ツールスキーマ再注入 → N×t 形 (2 乗
+  的) に膨張
+- 典型構成 (MCP サーバー 5 個) で 1 ターン 15-20K 固定消費、N=100, t=30
+  で累積 1.42M トークン (ユーザー入力前に消費)
+- コンテキスト長 70% 超で認知劣化 (70% 崩壊ライン)、1M でも同じ
+- 解決策: =量* でなく *選別*
+
+論文の 3 部品をすべて anvil で実装する設計。
+
+* Motivation
+
+Doc 26 Phase 1 で実装した manifest-profile は **静的 subset** だった:
+
+- env =ANVIL_PROFILE= で起動時に 1 つ選び、session 中は固定
+- profile 定義は手で書く (full / core / nav / lean / ultra の 5 種)
+
+これでも 30-50% 削減できたが、Tool Attention の主張は **動的選別** が
+本質的:
+
+1. *意図ベース検索 (IsO)* — ユーザー入力 embedding × ツール要約 embedding
+   で Top-K 抽出
+2. *状態フィルタ* — 現在の対話状態 (workspace state, prev tool calls 等)
+   から「今実行可能なツール」を絞る
+3. *2 段階遅延ロード* — まりプール (Top-K 要約のみ) を前頭に、フル定義は
+   オンデマンド展開、LRU で温存
+
+→ Doc 26 の static profile を **dynamic profile** に進化させる。
+
+* Existing anvil との接続マップ
+
+| anvil module           | Tool Attention での役割                       |
+|------------------------+----------------------------------------------|
+| anvil-manifest (Doc 26)| profile definition + tools/list filter (既存) |
+| anvil-defs-index       | ツール docstring の機械可読化 (既に SHIPPED) |
+| anvil-state            | LRU キャッシュ + recent tool calls 履歴     |
+| anvil-session-events   | dialog state machine の signal               |
+| anvil-orchestrator     | embedding 計算の dispatch (codex/claude経由) |
+| anvil-discovery        | tool intent metadata の supply 元           |
+
+→ **新規追加は anvil-manifest.el への拡張**、新 module 不要。
+
+* Open Questions (要議論)
+
+** Q1. Embedding model を何で動かすか
+
+論文推奨は =all-MiniLM-L6-V2= (384 次元、CPU 動作、レイテンシ 60ms 以下)。
+anvil 文脈での選択肢:
+
+| 選択肢                          | pros                        | cons                  |
+|---------------------------------+-----------------------------+-----------------------|
+| (A) Python subprocess           | 既存 ML エコ全部使える      | subprocess overhead   |
+|     (sentence-transformers)     |                             | + Python依存          |
+| (B) ONNX Runtime + emacs-module | embed in-process、低 latency| build 複雑度          |
+| (C) ローカル LLM の embedding   | NeLisp/codex の future API  | API 不安定/未確定     |
+|     endpoint (e.g. ollama)      |                             |                       |
+| (D) 第三者 API (OpenAI/Cohere)  | 最も簡単                    | network + cost + 規約 |
+
+→ **推奨初手**: (A) Python subprocess。anvil-orchestrator が既に Python
+   subprocess 経路を持つので追加コスト最小。レイテンシは ~200ms 以内で
+   会話 UX には問題なし (会話 1 ターンが秒オーダーなので)。
+
+** Q2. dialog state の取り方
+
+「状態フィルタ」で「今実行可能なツール」を判定するには dialog state が
+必要:
+
+- (a) Claude session の transcript_path から最終 N 件を読む
+- (b) anvil-session-events の recent event を state として使う (既存)
+- (c) Tool 定義に =:preconditions= を declarative に持たせ評価する
+
+→ **推奨**: (b) + (c) のハイブリッド。state は anvil-session-events から
+   読み (低コスト)、preconditions は tool ごとに =anvil-register-tools=
+   マクロで宣言する (既存 =:profiles= タグの隣)。
+
+** Q3. 2 段階遅延ロードの実装方式
+
+論文では「まりプール (Top-K 要約のみ)」をプロンプト前頭に、フル定義は
+オンデマンド。MCP プロトコル上どう実現するか:
+
+- MCP =tools/list= は session 1 回しか発火しないクライアント実装が多い
+- 「フル定義をオンデマンド」= ツールが呼ばれた時に MCP 再 list を要求
+  する方法がない
+
+→ **回避策**: =anvil-manifest= の dynamic dispatcher 側で、初期 list 時に
+   全要約 + フル定義を返すが、フル定義は **trimmed schema** (param名
+   + 1 行 description のみ) に圧縮。Top-K 外のツールは IsO で hit した
+   ターンだけ詳細展開。
+
+   これは「2 段階」というより「常時 trimmed、IsO hit で詳細注入」と呼ぶ
+   方が正確。論文と完全一致ではないが MCP プロトコル制約下の現実解。
+
+** Q4. 「ツール要約を操作視点の自然文に書き直す」を誰がやるか
+
+論文の重要指摘: docstring が「実装視点の説明文」だと IsO 精度が下がる。
+ユーザーの自然言語クエリと埋め込み空間で近づきにくいため。
+
+選択肢:
+
+- (a) 全 docstring を手で書き直す (~90 tool、~数日工数)
+- (b) anvil-autoresearch (Doc 43) の最適化対象 (A) として走らせる
+- (c) 一度限り orchestrator (codex) でバルク書き直し → review
+
+→ **推奨**: (c) で初版作成 → (b) で continuous 改善。Doc 43 Phase 1 の
+   候補 (A) と一直線。
+
+** Q5. ユーザーから見た opt-in/out
+
+Doc 26 の Phase 1 は env =ANVIL_PROFILE= で profile 指定。Phase 2 は:
+
+- =ANVIL_PROFILE=dynamic= で Tool Attention 経路を有効化
+- 既存 profile (=core= / =nav= 等) は完全互換、何もしなければ静的のまま
+- =manifest-cost= MCP tool に「現在の dynamic profile が advertise して
+  いるツール」を返す機能を追加
+
+* Architecture (案)
+
+** 主要 component
+
+#+begin_example
+[anvil-manifest Phase 2 拡張]
+   ├─ embedding-service (Python subprocess via anvil-orchestrator)
+   │    └─ sentence-transformers/all-MiniLM-L6-V2
+   ├─ tool-summary-index
+   │    └─ build at session start (cache to anvil-state)
+   ├─ intent-search (IsO)
+   │    ├─ embed user input
+   │    ├─ top-K cosine similarity
+   │    └─ K=10, θ=0.28 default (論文値)
+   ├─ state-filter
+   │    ├─ read anvil-session-events recent
+   │    ├─ evaluate per-tool :preconditions
+   │    └─ remove not-executable tools
+   ├─ schema-trimmer
+   │    └─ Top-K → full, others → trimmed
+   ├─ lru-cache (anvil-state)
+   │    └─ keep last 20 hit tools "warm"
+   └─ recovery-suggest (論文 5 点目)
+        └─ blocked tool 検出時 "代替として X が呼べる" 提示
+#+end_example
+
+** ループ
+
+#+begin_example
+[user prompt arrives via Stop/UserPromptSubmit hook]
+   ↓
+[intent-search]   embed prompt, top-K
+   ↓
+[state-filter]    apply :preconditions
+   ↓
+[schema-trimmer]  Top-K full + others trimmed
+   ↓
+[manifest output] additionalContext or tools/list response
+   ↓
+[lru-cache]       update on tool call
+#+end_example
+
+* Phase 分割案
+
+| Phase | scope                                                     | 工数 |
+|-------+-----------------------------------------------------------+------|
+| 2a    | embedding service + tool-summary-index + IsO Top-K のみ  | 中   |
+|       | (state-filter / lazy-load なし、まず IsO 精度を測る)     |      |
+| 2b    | state-filter 追加 (:preconditions タグ + evaluator)       | 小   |
+| 2c    | schema-trimmer + LRU + recovery-suggest                   | 小   |
+| 2d    | docstring 一括書き直し (Q4 (c) → Doc 43 連携)             | 小   |
+
+→ Phase 2a 単体で論文ベース効果の大半が出るはず (IsO が支配的)。
+   2b/2c は marginal gain で gating する。
+
+* 評価メトリクス
+
+論文と同じく:
+
+- IsO Top-K recall (関連ツールが Top-K に含まれる率)
+- per-ターン平均 advertised tokens
+- per-session cumulative tokens
+- 70% 崩壊ライン到達までのターン数
+
+→ Doc 26 既存の =manifest-cost= MCP tool に Phase 2 メトリクスを追加。
+
+* 安全策
+
+- Top-K で目的のツールが落ちると Claude が「使えるはずのツールが見えない」
+  状態になる。recovery-suggest で代替提示が必須。
+- IsO 失敗時 (embedding service 落ち等) は static profile に fallback。
+- 全 dialog state を読むため transcript_path の path traversal を防ぐ
+  whitelist。
+
+* 取り込み見送り判断材料
+
+- Phase 2a で IsO Top-K recall (K=10) がベースライン (static =core=
+  profile) を超える relevance を出すか
+- per-session cumulative tokens が static profile より 30%+ 削減
+- 70% 崩壊ラインまでのターン数が 1.5x 以上に伸びる
+
+* 既存 doc との関係
+
+- Doc 26 (manifest-profile) — Phase 1 の static dispatcher を活用
+- Doc 27 (shell-filter) — Tool 出力削減と組み合わせて累乗的効果
+- Doc 28 (progressive-disclosure) — schema-trimmer の思想的元
+- Doc 29 (memory-engine) — embedding service を共有可能 (FAISS / FTS5)
+- Doc 34 (tool-discovery) — tool intent metadata の supply 元
+- Doc 43 (autoresearch) — docstring 最適化を委譲 (Q4)
+
+* References
+
+- 元動画: [[file:~/Cowork/Notes/capture/yt/yt_20260524_tool_attention_mcp_tax.org][yt_20260524_tool_attention_mcp_tax.org]]
+  (さとるチャンネル、約 27 分)
+- 論文 "Tool Attention is All You Need" (動画内で言及、原典要確認)
+
+* Decision Log
+
+- 2026-05-24 — DRAFT 起票。Q1 (embedding model 選定) と Q3 (MCP プロトコル
+  制約下の lazy-load 実装方式) が技術的最重要論点。

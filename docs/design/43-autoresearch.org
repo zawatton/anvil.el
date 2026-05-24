@@ -1,0 +1,297 @@
+#+title: anvil-autoresearch — self-improving experiment loop
+#+date: 2026-05-24
+#+author: zawatton
+#+property: status DRAFT
+#+property: scope GENERIC
+
+* STATUS
+  :PROPERTIES:
+  :ID:       d1c4e0f2-8f44-4f7c-bc1a-autoresearch-43
+  :END:
+~DRAFT~ (2026-05-24) — Karpathy 提唱の autoresearch (AI エージェントが
+学習プログラムを書き換え → 評価 → keep/discard を無限に回す枠組み) を
+anvil 層に取り込む設計案。実装着手前の議論用 DRAFT で、最適化対象の候補・
+安全策・既存 anvil との重複範囲・規約問題を整理する。
+
+実証データ (動画投稿者 2000 試行):
+
+- Karpathy 原典: 2 日 × 700 試行 → 採用率 3% (20 件)、GPT-2 性能到達
+  時間 -11%
+- PaperLantern MCP 接続で TRM が 5 分で UltraExtremeBenchmark 92.2%
+  (元論文 18 時間 87%) 超え、非対称 Dropout 等 AI 独自発見あり
+- 実践者経験: ~CLAUDE.MD~ 命名必須 / 硬いルールは外側 shell / Docker
+  +branch 分離必須 / メタオーバーフィット対策にホールドアウト必須
+
+* Motivation
+
+anvil ecosystem には改善対象が散在している:
+
+- elisp byte-compile の hot path / inline 判定境界
+- NeLisp Phase 47 codegen の SSA pass 順序 / レジスタ割付ヒューリスティック
+- MCP tool docstring の品質 (Tool Attention IsO 精度に直結 — Doc 43
+  併走候補)
+- CLAUDE.md content の構造 (token cost と参照精度のトレードオフ)
+- anvil-orchestrator routing rule (provider × task 最適マッピング)
+- test-suite ordering (fail-fast 性能)
+
+これらは現状すべて *人が観察 → 仮説 → 1 変更 → 検証* で改善している。
+autoresearch の核心は **次の試行を AI が判断する** 点で、従来の AutoML/
+Hyperopt が「探索空間を人が設計」していたのに対し、探索対象が *コード
+構造そのもの* に拡張される。
+
+anvil で autoresearch を持つと:
+
+1. ベンチマーク駆動の自己改善が 24h 走り続ける (cron + orchestrator
+   + worktree の組み合わせで実現可能性は既に揃っている)
+2. anvil-bisect の 1 次元探索を多次元化した上位 primitive
+3. NeLisp Phase 47 codegen 改善のような *人間の感性が効きにくい*
+   領域で AI 独自発見が起きる可能性 (動画事例の非対称 Dropout 同様)
+
+* Existing anvil との接続マップ
+
+| anvil module           | autoresearch における役割              |
+|------------------------+----------------------------------------|
+| anvil-orchestrator     | 試行 dispatch + provider routing       |
+| anvil-bench            | 評価メトリクス収集 (BPB 相当)          |
+| anvil-bisect           | 1 次元探索 — autoresearch の特殊例     |
+| anvil-state            | 試行履歴 (TSV 相当) 永続化             |
+| anvil-worklog          | 試行ログの長期保存 + FTS5 検索         |
+| anvil-memory           | 採用された変更 (≒ "skill") の蓄積      |
+| anvil-cron             | 24h ループの schedule                  |
+| anvil-git (worktree)   | branch + worktree 分離 (動画推奨形)    |
+| anvil-session          | snapshot + restore で resume           |
+| anvil-compact          | long loop で context が溢れた時の救済  |
+| anvil-claude-watchdog  | 試行 stale 検知                        |
+
+→ **新規 module は anvil-autoresearch.el のみ**。残りは既存 primitive の
+合成で立つ。これが autoresearch を anvil に乗せる最大の利点。
+
+* Open Questions (要議論)
+
+** Q1. 最適化対象 (= train.py 相当) を何にするか
+
+原典は ~train.py~ (ML 学習スクリプト)。anvil 用の候補:
+
+| 候補                            | 評価関数         | 探索次元     | 危険度 |
+|---------------------------------+------------------+--------------+--------|
+| (A) MCP tool docstring          | Tool Attention   | 文字列       | 低     |
+|                                 | IsO 精度 (Top-K  |              |        |
+|                                 | recall)          |              |        |
+| (B) anvil-orchestrator routing  | task success     | rule weights | 低     |
+|                                 | × cost           |              |        |
+| (C) elisp byte-compile flags    | bench-compare    | flag combo   | 中     |
+|                                 | (anvil-bench)    |              |        |
+| (D) NeLisp Phase 47 codegen     | byte-identity    | pass order + | 高     |
+|     pass orderings              | + perf bench     | heuristic    |        |
+| (E) test-suite ordering         | mean-time-to-    | ordering     | 低     |
+|                                 | failure          |              |        |
+| (F) CLAUDE.md sections          | token cost ×     | 文字列構造   | 中     |
+|                                 | reference recall |              |        |
+
+→ **推奨初手**: (A) MCP tool docstring。理由:
+- Tool Attention 取り込み候補 (前回深掘り) と直接連動
+- 評価関数が定量化容易 (IsO Top-K recall)
+- 失敗しても被害が文字列差し戻しのみ
+- anvil-defs-index で全 docstring を機械可読化済
+
+** Q2. ループランナーをどこに置くか (規約問題)
+
+動画の実証パターン: 外側 shell が ~claude -p <prompt> --resume~ を
+呼ぶ。ただし:
+
+#+begin_quote
+Anthropic 個人向け利用規約: APIキーを使用した場合を除き、人間の関与
+なしに自動で Claude Code を呼び出すことは禁止
+#+end_quote
+
+→ anvil 公式機能として ship する場合、**API key 経路でしか実装できない**。
+sub に既存 Pro plan 課金で済ませる運用は規約違反。これは Doc を
+DRAFT で議論すべき重大論点。
+
+選択肢:
+
+1. anvil-autoresearch は API key 経路のみ公式サポート。cost 上限を
+   anvil-state に持たせる
+2. orchestrator codex 経路 ([[file:10-orchestrator.org]]) で逃げる —
+   ChatGPT account auth (memory: feedback_anvil_orchestrator_codex_sandbox)
+   なら per-token 課金なし、ただし sandbox=workspace-write 必須
+3. nelisp-runtime 配下のローカル LLM 経路を待つ (将来)
+
+→ **推奨初手**: 2 (codex orchestrator 経路)。ChatGPT Plus サブスクで
+回せる、anvil 既存 primitive で配線済、規約問題なし。
+
+** Q3. 評価関数の独立性 (メタオーバーフィット対策)
+
+原典の最大の罠: ループ内バリデーション集合への過適合。
+対策はホールドアウト集合を **ループ外** に持つこと。
+
+anvil 文脈での具体策:
+
+- 評価データを 2 分割: =eval-inner= (ループ内) + =eval-holdout=
+  (週 1 回のみ実行)
+- =eval-holdout= の score が下がっていたら採用変更を retroactive に
+  revert する gate を anvil-autoresearch-finalize に持つ
+- holdout は git で snapshot 化して時系列で差分追跡
+
+** Q4. 安全策 (worktree + sandbox + budget)
+
+動画推奨は Docker 分離 + branch 分離。anvil 既存は:
+
+- =anvil-git worktree-list= で worktree 分離は primitive 化済
+  (memory: project_anvil_git_extension)
+- sandbox は orchestrator codex 経路で =:sandbox "workspace-write"=
+- Docker 分離は anvil に primitive なし — 新規追加かパススルー
+
+→ 初手は worktree + codex sandbox で十分、Docker は Phase 2 以降。
+
+ただし以下 4 つの hard gate は MVP 必須:
+
+1. cost budget hard stop ([[file:10-orchestrator.org]] 既存 :budget
+   流用)
+2. wall-clock timeout (loop 全体 + 1 試行ごと)
+3. file scope whitelist (autoresearch が touch できる path を allowlist)
+4. eval-holdout 劣化検知時の auto-revert
+
+** Q5. anvil-bisect (1 次元探索) との関係
+
+既存の =anvil-bisect= は test-driven の 1 次元 git bisect。
+autoresearch は多次元 + AI 判断 + 永続ループという拡張。
+
+選択肢:
+
+- (a) anvil-bisect を内部で autoresearch が呼ぶ (1 次元探索のサブルーチン)
+- (b) 完全独立、bisect は触らない
+- (c) bisect の API を拡張して autoresearch も同じ MCP tool 表面に出す
+
+→ **推奨**: (b) 独立。bisect の単純さを壊さない、autoresearch は別 module。
+
+** Q6. orchestrator preset として実装するか、新 module として実装するか
+
+選択肢:
+
+- (a) =orchestrator-submit= の preset =:autoresearch= として実装
+- (b) 新規 =anvil-autoresearch= module、内部で orchestrator を呼ぶ
+
+→ **推奨**: (b)。loop state machine + snapshot + holdout gate が
+複雑で、preset 1 個に押し込むのは無理。orchestrator は試行 dispatch
+だけ担当させる。
+
+* Architecture (案、議論前提)
+
+** 主要 component
+
+#+begin_example
+[anvil-autoresearch]
+   ├─ run-loop (cron-friendly entry point)
+   │    ├─ propose-change       → orchestrator-submit
+   │    │    (codex, :sandbox workspace-write)
+   │    ├─ apply-change         → worktree commit
+   │    ├─ eval-inner           → anvil-bench / make test
+   │    ├─ decide (keep/discard)→ score vs baseline
+   │    ├─ commit-or-revert     → git worktree
+   │    └─ record               → anvil-state + anvil-worklog
+   ├─ eval-holdout              (週 1, 別 cron entry)
+   │    └─ retroactive-revert   失敗時
+   ├─ snapshot / restore        anvil-session 連動
+   └─ MCP surface (tools)
+        ├─ autoresearch-start  / stop / status
+        ├─ autoresearch-log    (試行履歴)
+        └─ autoresearch-skills (採用変更を anvil-memory 形式で export)
+#+end_example
+
+** ループの状態機械
+
+#+begin_example
+[idle]
+  ↓ autoresearch-start
+[propose]   orchestrator dispatch
+  ↓
+[apply]     worktree commit
+  ↓
+[eval]      anvil-bench / make test
+  ↓
+[decide]    keep / discard / abort
+  ↓
+[record]    state + worklog 永続化
+  ↓
+[cooldown]  rate limit per provider
+  ↓ (loop) or [idle] (budget/timeout/error)
+#+end_example
+
+** state schema (anvil-state)
+
+- =autoresearch.<run-id>.baseline-score=
+- =autoresearch.<run-id>.trials.<n>= = plist (change, score, decision,
+  cost)
+- =autoresearch.<run-id>.skills= = 採用された変更のリスト (final
+  promote 時に anvil-memory に export)
+- =autoresearch.<run-id>.budget.remaining=
+- =autoresearch.<run-id>.holdout.last-score=
+
+* Phase 分割案
+
+| Phase | scope                                                   | 工数 |
+|-------+---------------------------------------------------------+------|
+| 1     | MCP tool docstring autoresearch (Q1-A) を MVP として     | 中   |
+|       | 実装. orchestrator codex 経路 + worktree + bench         |      |
+|       | + budget hard stop. holdout は手動運用.                  |      |
+| 2     | eval-holdout 自動化 + retroactive-revert gate            | 小   |
+| 3     | 探索対象を anvil-orchestrator routing (Q1-B) に拡張      | 小   |
+| 4     | anvil-memory への skill promote pipeline                 | 小   |
+| 5     | NeLisp codegen (Q1-D) への適用 (要 NeLisp 側 API 整備)   | 大   |
+| 6     | tabulated-list UI (進捗観察、anvil-compact Phase 3b 流儀) | 小   |
+
+* 取り込み見送り判断材料
+
+以下のいずれかが満たされない場合、Phase 1 完了時点で見送り決定する:
+
+1. Phase 1 MVP で MCP tool docstring の IsO Top-K recall が
+   ベースライン (人手作成) を超える
+2. 1 run あたりの cost が anvil-orchestrator 通常使用の 10x 以内
+3. holdout score が inner score と無関係に振る舞う (= メタオーバー
+   フィット制御可能)
+
+逆に上記すべて満たせば Phase 2 以降に進む。
+
+* Primitive vs Convention 分離
+
+scope GENERIC として ship する場合:
+
+- *Primitive (一般化可能)*:
+  - loop state machine
+  - propose → apply → eval → decide サイクル
+  - holdout gate
+  - budget hard stop
+  - snapshot/restore via anvil-session
+
+- *Convention (運用者固有)*:
+  - 最適化対象の選定 (MCP docstring / CLAUDE.md / ...)
+  - 評価関数の定義 (make test / anvil-bench / custom)
+  - skill promote 時の anvil-memory schema
+
+→ primitive 層は anvil-autoresearch.el に閉じ、convention 層は
+=anvil-autoresearch-target-spec= 構造体で declarative に与える形に
+すれば外部公開可能。
+
+* 既存 doc との関係
+
+- Doc 10 (orchestrator) — 試行 dispatch を委譲
+- Doc 13 (bisect) — 1 次元探索の特殊例として位置付け、独立保持
+- Doc 14 (bench-profile) — 評価メトリクス収集に依存
+- Doc 17 (session) — snapshot/restore で resume
+- Doc 26 (manifest-profile) — Q1-A (MCP docstring 最適化) で密結合
+- Doc 29 (memory-engine) — skill promote の export 先
+- Doc 36 (auto-compact) — long loop で context 救済
+- Doc 42 (worklog-index) — 試行履歴の long-term storage
+
+* References
+
+- 元動画: [[file:~/Cowork/Notes/capture/yt/yt_20260524_autoresearch_ai_agent_loop.org][yt_20260524_autoresearch_ai_agent_loop.org]]
+  (数理の弾丸 / Karpathy autoresearch 解説、約 56 分)
+- Karpathy autoresearch GitHub (動画内で言及、要確認)
+- PaperLantern MCP (autoresearch に論文参照を追加する MCP)
+
+* Decision Log
+
+- 2026-05-24 — DRAFT 起票。Phase 1 着手前にユーザー議論を待つ。
+  Q1 (最適化対象選定) と Q2 (規約問題) が最重要論点。
