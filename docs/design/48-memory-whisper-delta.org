@@ -1,0 +1,319 @@
+#+title: anvil-memory Phase 6 — WHISPER delta injection (session-start delta over full MEMORY.md)
+#+date: 2026-05-25
+#+author: zawatton
+#+property: status PHASE-6A-6B-SHIPPED
+#+property: scope CONVENTION-COUPLED
+
+* STATUS
+  :PROPERTIES:
+  :ID:       d1c4e0f2-8f44-4f7c-bc1a-whisper-48
+  :END:
+~Phase 6a + 6b SHIPPED~ (2026-05-25) — Doc 29 (memory-engine, Phase
+1-4a SHIPPED) + Doc 37 (observation layer, Phase 1-6 SHIPPED) の上に
+「差分注入 (WHISPER)」を乗せる。OSS「Subconscious」(解説動画
+yt_20260524_claude_code_subconscious) の WHISPER モードから
+メカニズムのみ取り込む。
+
+実装状況 (2026-05-25):
+
+- *SHIPPED* — Phase 6a engine (=anvil-memory--whisper-entries= /
+  =--whisper-digest= / =--whisper-diff= / =--whisper-format= /
+  snapshot load+store) + 公開 API =anvil-memory-session-delta= +
+  Phase 6b fallback-gate (forced / no-state / no-snapshot /
+  bad-snapshot / stale-snapshot / empty-current-guard /
+  delta-exceeds-threshold の 7 分岐) + 3 defcustom
+  (=anvil-memory-whisper-full-threshold= 既定 0.4 /
+  =-snapshot-max-age-days= 既定 7 / =-state-ns=)。MCP tool
+  =memory-session-delta=。ERT 8 件 + 既存 142 件 = 150/150 green、
+  byte-compile 0 warning。
+- *SHIPPED* — Phase 6a の SessionStart hook 配線。新規 *同期* フック
+  =bin/claude-memory-whisper-delta.sh= が =anvil-memory-session-delta= を
+  emacsclient 経由で呼び、=additionalContext= JSON envelope (=json-encode=
+  で合成) を temp file 経由で stdout へ emit。=.claude/settings.json= の
+  SessionStart に PRELOAD フック直後・同期 (非 =&=) で登録。MEMORY.md
+  再生成スクリプト (=regenerate-claude-memory-index.sh=) は MEMORY.md /
+  人間閲覧 / cross-AI 用にそのまま背景並走。fail-open (daemon down /
+  timeout / 空 delta は無出力で exit 0 → harness の MEMORY.md が
+  ベースライン)。=ANVIL_WHISPER_NO_COMMIT= でドライラン可。dry-run 実測:
+  full mode 31200 字 envelope, 79ms。
+- *未着手* — Phase 6c (MEMORY.md 1 行短縮 lint) / 6d (Stop hook 非同期
+  snapshot 確定) は未着手。
+
+外部 OSS の核心 (取り込む部分):
+
+- セッション間で全メモリブロックを毎回送らず、*前回からの変更行だけ*
+  「この行が追加/削除されました」形式で注入 → トークン節約
+- Stop hook で session 終了時にバックグラウンド (=child.unref=) で記憶
+  整理 (Sleep-time agent)
+
+取り込まない部分:
+
+- Letta クラウド API 依存 (= cloud lock-in)。anvil は local-first
+  ([[file:29-memory-engine.org]] / [[file:42-worklog-index.org]] と同じ SQLite 単一基盤) を維持
+- 8 ブロック固定スキーマ → anvil の type (user/feedback/project/
+  reference/memo) を流用、新スキーマは作らない
+
+* Motivation
+
+** 現に起きている問題 (active bug)
+
+SessionStart の system reminder が現在こう警告している:
+
+#+begin_quote
+WARNING: MEMORY.md is 34.5KB (limit: 24.4KB) — index entries are too
+long. Only part of it was loaded. Lines after 200 will be truncated.
+#+end_quote
+
+Doc 29 の =memory-regenerate-index= は MEMORY.md を **decay-score 降順の
+pointer list 全量** で生成し、SessionStart で全 load する設計
+([[file:29-memory-engine.org]] 本文 L133)。memory 件数が増えるほど
+MEMORY.md が肥大し、ある時点で **末尾エントリが切り捨てられて
+load されなくなる**。つまり古い・低 decay の memory は事実上
+SessionStart の文脈から消える。
+
+Doc 37 の auto-inject は別経路で =max 1000 tokens=・優先度
+=recency × importance × project_match= の capped 注入を既に持つ
+([[file:37-claude-mem-bridge.org]] L184)。が、これは observation memo
+(claude-mem 由来 capture) 向けであって、Doc 29 の MEMORY.md pointer
+index 全量 load 問題そのものは解消していない。
+
+** WHISPER が効く理由
+
+毎セッション MEMORY.md を全量 load する代わりに:
+
+1. SessionStart は「前回セッション終了時点の index snapshot」と
+   現在の index を比較し、*差分 (added / changed / removed)* だけを
+   注入
+2. 変化が無ければ何も注入しない (= 大半のセッションはほぼ 0 トークン)
+3. 全量が要るとき (新規 PC / snapshot 不在 / 明示要求) だけ full load
+   に fallback
+
+これで MEMORY.md の物理肥大と SessionStart の token 負荷を恒久的に
+切り離す。truncation bug も「全量を毎回送らない」ことで自然に解消。
+
+* Existing anvil との接続マップ
+
+| anvil module            | WHISPER delta での役割                          |
+|-------------------------+-------------------------------------------------|
+| anvil-memory (Doc 29)   | index / decay-score / =memory-regenerate-index= |
+| anvil-memory-obs (D37)  | importance =:delta= rule、auto-inject capped 注入 |
+| anvil-state             | last-session index snapshot (digest) の保存先   |
+| anvil-session (Doc 17)  | last session 終了 timestamp / session id        |
+| anvil-worklog (Doc 42)  | consolidation 実績の長期記録 (任意)             |
+
+→ 新規 module 不要。=anvil-memory.el= への関数追加 +
+  SessionStart hook の差し替えで成立。
+
+* Open Questions (要議論)
+
+** Q1. 「差分」の単位と粒度
+
+候補:
+
+- (a) MEMORY.md の *行* 単位 diff (= Subconscious WHISPER 素朴版)
+- (b) memory *エントリ* 単位 (name 単位で added/changed/removed)
+- (c) エントリ単位 + 本文 hash で「説明文だけ変わった」も検出
+
+→ *推奨*: (b) エントリ単位。MEMORY.md は 1 entry = 1 行なので行 diff
+   と近いが、entry の =name= を安定キーにすれば decay-score の並び替え
+   だけで「changed」誤検出しない。本文 (description) hash も持てば
+   (c) に拡張可。
+
+** Q2. snapshot をどこに持つか
+
+last-session の index 状態を保存する場所:
+
+- (a) =anvil-state= に =(:memory-index-digest <sha1> :entries [...])=
+- (b) memory DB に専用テーブル =memory_session_snapshot=
+- (c) =~/.claude/.../memory/.last-index.json=
+
+→ *推奨*: (a) anvil-state。session スコープ管理は anvil-state の責務
+   ([[file:08-state.org]] 系)。cross-PC は Doc 29 と同じ git-tracked DB の
+   仕組みに乗らないので、snapshot は **PC ローカル** で良い (差分が
+   取れない PC では full fallback すればよい)。
+
+** Q3. full-load fallback の発火条件
+
+差分注入が成立しないケース:
+
+- snapshot が存在しない (初回 / 新規 PC / state クリア後)
+- snapshot が古すぎる (N セッション以上前 / TTL 超過)
+- 差分が index の X% を超える (= 実質作り直し、差分の方が高コスト)
+- ユーザーが明示 (=ANVIL_MEMORY_INJECT=full=)
+
+→ *推奨*: 上記 4 条件のいずれかで full load。閾値は
+   defcustom (=anvil-memory-whisper-full-threshold= 既定 0.4)。
+
+** Q4. Doc 37 auto-inject との責務分担
+
+Doc 37 は既に capped/prioritized 注入を持つ。二重注入を避ける:
+
+- Doc 29 MEMORY.md = *構造化 memory* (user/feedback/project/...) の
+  index → WHISPER delta はこちらを担当
+- Doc 37 observation memo = *作業 capture* (claude-mem 由来) → 既存
+  capped 注入のまま
+
+→ *推奨*: 経路を分離。WHISPER は Doc 29 系 index 専用。Doc 37 経路は
+   無改変。両者の合計 token を =memory-cost= 的 MCP tool で可視化。
+
+** Q5. Sleep-time consolidation (Stop hook 非同期) を入れるか
+
+Subconscious は Stop hook で transcript を送って記憶整理。anvil 文脈:
+
+- (a) 入れない。memory-add は明示 tool 呼び出しのまま (現状維持)
+- (b) Stop hook で worktree の memory dir を =memory-scan= + index
+  snapshot 更新だけ非同期実行 (記憶「生成」はしない、snapshot を
+  次回 delta の基準に固定するため)
+- (c) (b) + orchestrator で「今回 session の学びを memory 候補に」要約
+
+→ *推奨*: まず (b)。WHISPER の差分基準 snapshot を Stop 時に確定させる
+   のが主目的。(c) の自動 memory 生成は誤検出リスクが高く、既存の
+   =memory-save-check= 重複検出を通さず増殖する恐れがあるので Phase を
+   分ける。=child.unref= 相当は Doc 36 (auto-compact) の非同期 snapshot
+   パターンを流用。
+
+** Q6. 切り捨てられている既存 entry の救済
+
+現状 MEMORY.md は 200 行で切れ、末尾 entry が load されていない。
+WHISPER 化しても「過去に一度も注入されていない低 decay entry」は
+依然 cold のまま。
+
+→ *推奨*: 初回 full load 時に **全 entry を 1 度は注入**して snapshot
+   を確定。以降は delta。これで「切り捨てゾーンの entry」も最低 1 回は
+   文脈に入る。あわせて MEMORY.md index 自体の 1 行長を縮める
+   (description を短縮、Doc 29 の警告どおり ~150 字以内) lint も同時に
+   回す。
+
+* Architecture (案)
+
+** 主要 component
+
+#+begin_example
+[anvil-memory WHISPER 拡張]
+   ├─ index-snapshot
+   │    ├─ build: (name . body-hash) の sorted リスト + 全体 digest
+   │    └─ store: anvil-state (PC ローカル)
+   ├─ delta-compute
+   │    ├─ prev snapshot vs current index
+   │    ├─ added   : prev に無い name
+   │    ├─ changed : name 同一・body-hash 差異
+   │    └─ removed : prev に有り current に無い name
+   ├─ inject-formatter
+   │    ├─ "memory 追加: [name] desc" / "更新: ..." / "削除: ..."
+   │    └─ full fallback 時は Doc 29 の regenerate-index 全量
+   ├─ fallback-gate (Q3)
+   │    └─ snapshot 不在 / 古い / 差分>閾値 / 明示 → full
+   └─ stop-consolidate (Q5, Phase 後半)
+        └─ Stop hook: memory-scan + snapshot 確定 (非同期)
+#+end_example
+
+** ループ
+
+#+begin_example
+[SessionStart hook]
+   ↓
+[load prev snapshot from anvil-state]
+   ↓
+[fallback-gate]  不成立 → full load (Doc 29 regenerate) → snapshot 確定 → 終了
+   ↓ 成立
+[delta-compute]  prev vs current
+   ↓
+[inject-formatter]  added/changed/removed のみ注入 (空なら何もしない)
+   ↓
+[update snapshot]  current を次回基準に保存
+
+[Stop hook] (Phase 後半)
+   ↓
+[memory-scan (非同期, unref)]  他 AI 編集 .md を吸収
+   ↓
+[snapshot 再確定]
+#+end_example
+
+* Phase 分割案
+
+| Phase | scope                                                      | 工数 |
+|-------+------------------------------------------------------------+------|
+| 6a    | index-snapshot + delta-compute + inject-formatter         | 中   |
+|       | (SessionStart を delta 注入に差し替え、Stop 連携なし)      |      |
+| 6b    | fallback-gate の 4 条件 + defcustom 閾値                    | 小   |
+| 6c    | MEMORY.md 1 行長 lint (description 短縮、~150 字 gate)      | 小   |
+| 6d    | Stop hook consolidation (Q5 (b)、非同期 snapshot 確定)     | 小   |
+| 6e    | (任意) orchestrator 要約で memory 候補生成 (Q5 (c))        | 中   |
+
+→ Phase 6a + 6b で truncation bug は解消し、SessionStart token も
+   恒久削減。6c は index 自体の健全化。6d/6e は marginal で gating。
+
+* 評価メトリクス
+
+- SessionStart で注入される memory token (target: 変化なしセッションで ≈ 0)
+- full-load 発火率 (target: 定常運用で < 10% のセッション)
+- 切り捨てゾーン entry が「最低 1 回は注入された」率 (target: 100%)
+- delta 誤検出率 (decay 並び替えだけで changed と誤判定する率、target: 0)
+
+* 安全策
+
+- snapshot 破損 / 不整合時は **必ず full load に fallback** (memory が
+  見えなくなる事故を最優先で防ぐ)。
+- delta が「全 entry removed」を示したら異常とみなし full load
+  (state クリア誤爆対策)。
+- Stop hook の非同期処理は session 終了をブロックしない
+  (=child.unref= 相当)。失敗しても次回 full fallback で復旧。
+- snapshot は PC ローカル。cross-PC では差分が無いので full から開始
+  (正しい挙動)。
+
+* 取り込み見送り判断材料
+
+- Phase 6a で「変化なしセッションの注入 token ≈ 0」かつ memory の
+  実利用 (memory-access 経由参照) が full load 時と同等以上を保つか
+- full-load 発火率が定常で < 10% に収まるか (毎回 full なら無意味)
+- 切り捨てゾーン entry の cold 化が解消するか
+
+いずれも未達なら Doc 29 の「MEMORY.md 1 行短縮 + 件数 prune」
+([[file:29-memory-engine.org]] decay GC) だけで足り、WHISPER は過剰と判断。
+
+* 既存 doc との関係
+
+- Doc 29 (memory-engine) — index / decay-score / regenerate-index を
+  full-load fallback としてそのまま活用
+- Doc 37 (claude-mem-bridge) — observation memo の capped 注入は無改変、
+  WHISPER は Doc 29 index 専用で経路分離
+- Doc 36 (auto-compact) — Stop hook の非同期 snapshot パターンを流用
+- Doc 42 (worklog-index) — consolidation 実績の長期記録 (任意)
+- Doc 44 (tool-attention) — 入口 (tool schema) の選別、本 doc は memory
+  入口の選別。両者で SessionStart token を二重に削減
+
+* References
+
+- 元動画: [[file:~/Cowork/Notes/capture/yt/yt_20260524_claude_code_subconscious.org][yt_20260524_claude_code_subconscious.org]]
+  (さとるチャンネル、約 15 分)
+- OSS "Subconscious" (Letta Sleep-time Agent based、WHISPER mode)
+  — メカニズムのみ参照、Letta cloud 依存は不採用
+- 関連 X 投稿: Agentmemory / Acontext (編集可能 Markdown + Git 管理)
+  [[file:~/Cowork/Notes/capture/web/web_20260525_x_ai_claudecode_digest.org]]
+
+* Decision Log
+
+- 2026-05-25 — DRAFT 起票。active bug (MEMORY.md 34.5KB truncation) を
+  直接の motivation とする。Letta cloud は不採用、local-first を維持
+  (Q なし、設計前提)。最重要論点は Q1 (差分粒度) と Q4 (Doc 37
+  auto-inject との責務分担、二重注入回避)。
+- 2026-05-25 — Phase 6a engine + 6b fallback-gate を実装・SHIPPED。
+  Q1 は推奨どおり *エントリ単位 + body sha1 hash* (decay 並び替えで
+  changed 誤検出しない) を採用。snapshot は anvil-state に PC ローカル
+  保存 (Q2 推奨 (a))。fallback は 7 分岐 (Q3 の 4 条件 + forced /
+  no-state / bad-snapshot)。Q4 (Doc 37 との責務分担) は session-delta が
+  Doc 29 index 専用で経路分離する設計を踏襲、Doc 37 auto-inject は無改変。
+  SessionStart hook の live 差し替え (Q5 / 6d 含む) は未着手で別 step。
+- 2026-05-25 — Phase 6a の SessionStart hook 配線を SHIPPED。当初想定の
+  「=regenerate-claude-memory-index.sh= を delta 注入に差し替え」ではなく
+  *別の同期フック* =claude-memory-whisper-delta.sh= を新設し、既存の
+  backgrounded 再生成スクリプトは MEMORY.md 用に温存する分離方式を採用
+  (理由: 再生成は startup をブロックしないよう =&= 背景実行、delta は
+  =additionalContext= 注入のため同期必須で責務が異なる)。JSON envelope
+  は daemon 内 =json-encode= で合成し temp file 経由で出力
+  (=emacsclient -e= の prin1 引用を回避)。full mode の reason =no-state= /
+  =bad-snapshot= は harness の MEMORY.md load と二重になり価値が無いため
+  emit 抑止。実 snapshot は未確定で残し、ユーザーの次回実セッションが
+  初回 full 注入 (Q6 = 切り捨てゾーン entry の 1 回注入) を担う。
+  daemon の =anvil-state.db= で snapshot plist の prin1/read round-trip を
+  実証済。

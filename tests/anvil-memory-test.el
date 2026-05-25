@@ -2233,6 +2233,152 @@ and returns the body verbatim."
       (should (plist-get after :last-accessed)))))
 
 
+;;;; --- Phase 6: WHISPER session delta (Doc 48) ---------------------------
+
+(require 'anvil-state nil t)
+
+(defmacro anvil-memory-test--with-state (&rest body)
+  "Run BODY with `anvil-state' isolated to a fresh temp DB."
+  (declare (indent 0))
+  `(let ((anvil-state-db-path (make-temp-file "anvil-state-memtest-" nil ".db"))
+         (anvil-state--db nil))
+     (unwind-protect
+         (progn ,@body)
+       (when (boundp 'anvil-state--db)
+         (when (and anvil-state--db (sqlitep anvil-state--db))
+           (ignore-errors (sqlite-close anvil-state--db)))
+         (setq anvil-state--db nil))
+       (ignore-errors (delete-file anvil-state-db-path)))))
+
+(defun anvil-memory-test--seed-md (root name type desc)
+  "Write a memory fixture NAME (no extension) under ROOT with TYPE / DESC."
+  (anvil-memory-test--write
+   (expand-file-name (concat name ".md") root)
+   (format "---\nname: %s\ndescription: %s\ntype: %s\n---\nbody of %s\n"
+           name desc type name)))
+
+(ert-deftest anvil-memory-test/whisper-diff-detects-add-change-remove ()
+  "`anvil-memory--whisper-diff' keys by :name and flags hash changes."
+  (skip-unless (fboundp 'anvil-memory--whisper-diff))
+  (let* ((prev (list (list :name "a" :base "a.md" :desc "" :hash "h1")
+                     (list :name "b" :base "b.md" :desc "" :hash "h2")
+                     (list :name "z" :base "z.md" :desc "" :hash "h9")))
+         (cur (list (list :name "a" :base "a.md" :desc "" :hash "h1")
+                    (list :name "b" :base "b.md" :desc "" :hash "h2x")
+                    (list :name "c" :base "c.md" :desc "" :hash "h3")))
+         (d (anvil-memory--whisper-diff prev cur))
+         (names (lambda (k) (mapcar (lambda (e) (plist-get e :name))
+                                    (plist-get d k)))))
+    (should (equal '("c") (funcall names :added)))
+    (should (equal '("b") (funcall names :changed)))
+    (should (equal '("z") (funcall names :removed)))))
+
+(ert-deftest anvil-memory-test/whisper-format-empty-is-empty-string ()
+  "An all-empty delta renders as the empty string (nothing to inject)."
+  (skip-unless (fboundp 'anvil-memory--whisper-format))
+  (should (equal "" (anvil-memory--whisper-format nil nil nil))))
+
+(ert-deftest anvil-memory-test/whisper-format-renders-only-present-sections ()
+  "Only non-empty sections render; descriptions appear for add/change."
+  (skip-unless (fboundp 'anvil-memory--whisper-format))
+  (let ((txt (anvil-memory--whisper-format
+              (list (list :name "n1" :base "n1.md" :desc "d1"))
+              nil
+              (list (list :name "old" :base "old.md" :desc "x")))))
+    (should (string-match-p "メモリ差分" txt))
+    (should (string-match-p "### 追加" txt))
+    (should (string-match-p "\\[n1\\](n1.md) — d1" txt))
+    (should (string-match-p "### 削除" txt))
+    (should (string-match-p "^- old$" txt))
+    (should-not (string-match-p "### 更新" txt))))
+
+(ert-deftest anvil-memory-test/whisper-first-call-full-then-no-change-delta ()
+  "First call has no snapshot → full; after commit an unchanged index
+yields a delta with reason `no-change' and empty text."
+  (skip-unless (and (anvil-memory-test--supported-p 'session-delta)
+                    (anvil-memory-test--supported-p 'scan)
+                    (fboundp 'anvil-state-set)))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--with-state
+      (anvil-memory-test--seed-md root "user_role" "user" "a dev")
+      (anvil-memory-scan)
+      (let ((r1 (anvil-memory-session-delta root)))
+        (should (eq 'full (plist-get r1 :mode)))
+        (should (equal "no-snapshot" (plist-get r1 :reason))))
+      (let ((r2 (anvil-memory-session-delta root)))
+        (should (eq 'delta (plist-get r2 :mode)))
+        (should (equal "no-change" (plist-get r2 :reason)))
+        (should (equal "" (plist-get r2 :text)))))))
+
+(ert-deftest anvil-memory-test/whisper-detects-added-memory ()
+  "A memory added after the baseline shows up in the delta's :added."
+  (skip-unless (and (anvil-memory-test--supported-p 'session-delta)
+                    (anvil-memory-test--supported-p 'scan)
+                    (fboundp 'anvil-state-set)))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--with-state
+      (let ((anvil-memory-whisper-full-threshold 1.0))
+        (anvil-memory-test--seed-md root "user_role" "user" "a dev")
+        (anvil-memory-scan)
+        (anvil-memory-session-delta root) ; baseline
+        (anvil-memory-test--seed-md root "feedback_new_rule" "feedback" "do x")
+        (anvil-memory-scan)
+        (let* ((r (anvil-memory-session-delta root))
+               (added (mapcar (lambda (e) (plist-get e :name))
+                              (plist-get r :added))))
+          (should (eq 'delta (plist-get r :mode)))
+          (should (member "feedback_new_rule" added))
+          (should (string-match-p "feedback_new_rule" (plist-get r :text))))))))
+
+(ert-deftest anvil-memory-test/whisper-threshold-falls-back-to-full ()
+  "A delta ratio above the threshold falls back to a full body."
+  (skip-unless (and (anvil-memory-test--supported-p 'session-delta)
+                    (anvil-memory-test--supported-p 'scan)
+                    (fboundp 'anvil-state-set)))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--with-state
+      (let ((anvil-memory-whisper-full-threshold 0.1))
+        (anvil-memory-test--seed-md root "user_role" "user" "a dev")
+        (anvil-memory-scan)
+        (anvil-memory-session-delta root) ; baseline (1 entry)
+        (anvil-memory-test--seed-md root "feedback_new_rule" "feedback" "do x")
+        (anvil-memory-scan)               ; now 2 entries, delta 1/2 = 0.5 > 0.1
+        (let ((r (anvil-memory-session-delta root)))
+          (should (eq 'full (plist-get r :mode)))
+          (should (equal "delta-exceeds-threshold" (plist-get r :reason))))))))
+
+(ert-deftest anvil-memory-test/whisper-force-full ()
+  "FORCE-FULL bypasses the snapshot and returns a full body."
+  (skip-unless (and (anvil-memory-test--supported-p 'session-delta)
+                    (anvil-memory-test--supported-p 'scan)
+                    (fboundp 'anvil-state-set)))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--with-state
+      (anvil-memory-test--seed-md root "user_role" "user" "a dev")
+      (anvil-memory-scan)
+      (anvil-memory-session-delta root) ; baseline committed
+      (let ((r (anvil-memory-session-delta root :force-full t)))
+        (should (eq 'full (plist-get r :mode)))
+        (should (equal "forced" (plist-get r :reason)))))))
+
+(ert-deftest anvil-memory-test/whisper-empty-current-guard ()
+  "An index emptied after a non-empty snapshot forces a full body."
+  (skip-unless (and (anvil-memory-test--supported-p 'session-delta)
+                    (anvil-memory-test--supported-p 'scan)
+                    (anvil-memory-test--supported-p 'prune)
+                    (fboundp 'anvil-state-set)))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--with-state
+      (anvil-memory-test--seed-md root "user_role" "user" "a dev")
+      (anvil-memory-scan)
+      (anvil-memory-session-delta root) ; baseline (1 entry)
+      (delete-file (expand-file-name "user_role.md" root))
+      (anvil-memory-prune (list root))
+      (let ((r (anvil-memory-session-delta root)))
+        (should (eq 'full (plist-get r :mode)))
+        (should (equal "empty-current-guard" (plist-get r :reason)))))))
+
+
 (provide 'anvil-memory-test)
 
 ;;; anvil-memory-test.el ends here
