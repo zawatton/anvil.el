@@ -1,14 +1,14 @@
 #+title: anvil-memory Phase 6 — WHISPER delta injection (session-start delta over full MEMORY.md)
 #+date: 2026-05-25
 #+author: zawatton
-#+property: status PHASE-6A-6B-SHIPPED
+#+property: status PHASE-6A-6D-SHIPPED
 #+property: scope CONVENTION-COUPLED
 
 * STATUS
   :PROPERTIES:
   :ID:       d1c4e0f2-8f44-4f7c-bc1a-whisper-48
   :END:
-~Phase 6a + 6b SHIPPED~ (2026-05-25) — Doc 29 (memory-engine, Phase
+~Phase 6a–6d SHIPPED~ (2026-05-25) — Doc 29 (memory-engine, Phase
 1-4a SHIPPED) + Doc 37 (observation layer, Phase 1-6 SHIPPED) の上に
 「差分注入 (WHISPER)」を乗せる。OSS「Subconscious」(解説動画
 yt_20260524_claude_code_subconscious) の WHISPER モードから
@@ -36,8 +36,29 @@ yt_20260524_claude_code_subconscious) の WHISPER モードから
   timeout / 空 delta は無出力で exit 0 → harness の MEMORY.md が
   ベースライン)。=ANVIL_WHISPER_NO_COMMIT= でドライラン可。dry-run 実測:
   full mode 31200 字 envelope, 79ms。
-- *未着手* — Phase 6c (MEMORY.md 1 行短縮 lint) / 6d (Stop hook 非同期
-  snapshot 確定) は未着手。
+- *SHIPPED* — Phase 6c (MEMORY.md index line lint + clip)。defcustom
+  =anvil-memory-index-line-max-chars= 既定 200 で =regenerate-index= が
+  =- [NAME](BASE) — DESC= の DESC 末尾を clip + =…= 付与 (link prefix 保持)。
+  read-only audit =anvil-memory-lint-index= が char/byte 長・budget
+  (=anvil-memory-index-budget-bytes= 既定 24400) 超過量・over エントリを報告。
+  MCP tool =memory-lint-index=。実測: 実 index 133 entries 中 82 が 200 字超、
+  raw 40321 byte (budget 15921 byte 超)、clip 後 max 行 200 字。CJK は
+  200 字=最大 600 byte のため char clip だけでは byte budget に完全には
+  収まらず lint がその実態を可視化 (truncation bug 自体は 6a/6b が解消済、
+  6c は index 健全化 + 可視化が役割)。
+- *SHIPPED* — Phase 6d (session 終了時 snapshot 確定)。公開 API
+  =anvil-memory-commit-snapshot= (delta 計算せず baseline を現在 index に
+  進める) + =anvil-memory-session-stop-sync= (=memory-scan= で他 AI 編集
+  .md 吸収 → commit)。MCP tool =memory-stop-sync=。新規スクリプト
+  =bin/claude-memory-stop-snapshot.sh= を =.claude/settings.json= の
+  *SessionEnd* フックに detached (=nohup ... &=) で登録 — Claude Code の
+  literal =Stop= は毎ターン発火し scan が無駄なので once-per-session の
+  =SessionEnd= で設計の「Stop hook consolidation」を実現。実測 scan 172
+  files + commit = 2.5s (detached で session 終了をブロックしない)。
+  ERT +8 件 = 158/158 green、byte-compile 0 warning。
+- *未着手* — Phase 6e (任意): orchestrator 要約で memory 候補生成 (Q5 (c))。
+  誤検出リスクが高く =memory-save-check= 重複検出を通さず増殖する恐れが
+  あるため gating。
 
 外部 OSS の核心 (取り込む部分):
 
@@ -317,3 +338,13 @@ WHISPER 化しても「過去に一度も注入されていない低 decay entry
   初回 full 注入 (Q6 = 切り捨てゾーン entry の 1 回注入) を担う。
   daemon の =anvil-state.db= で snapshot plist の prin1/read round-trip を
   実証済。
+- 2026-05-25 — Phase 6c + 6d を実装・SHIPPED。6c は char ベース clip
+  (既定 200 字) + char/byte 両報告の lint。実 index は raw 40KB / clip 後も
+  31.5KB で 24.4KB budget には収まらない (CJK 3byte/字) が、truncation bug は
+  6a/6b の delta 注入が解消済なので 6c は健全化 + 可視化に留める判断。6d は
+  当初の literal =Stop= ではなく =SessionEnd= フックに配線 (Stop は毎ターン
+  発火し 172-file scan を毎回走らせ無駄なため、設計の「session 終了時」意図に
+  忠実な once-per-session イベントを採用)。baseline 確定の二重化 (SessionStart
+  commit = crash fallback / SessionEnd commit = 正常終了時の "while away"
+  基準) を許容。snapshot は anvil-state round-trip 実証済、テスト後 delete で
+  pristine に戻し初回 full 注入を温存。

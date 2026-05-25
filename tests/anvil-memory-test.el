@@ -2379,6 +2379,113 @@ yields a delta with reason `no-change' and empty text."
         (should (equal "empty-current-guard" (plist-get r :reason)))))))
 
 
+;;;; --- Phase 6c: index line lint (Doc 48) --------------------------------
+
+(ert-deftest anvil-memory-test/truncate-index-line-fits-unchanged ()
+  "A line within the limit is returned unchanged."
+  (skip-unless (fboundp 'anvil-memory--truncate-index-line))
+  (should (equal "- [a](b.md) — c"
+                 (anvil-memory--truncate-index-line "- [a](b.md) — c" 200))))
+
+(ert-deftest anvil-memory-test/truncate-index-line-clips ()
+  "An over-long line is clipped to exactly MAX chars with an ellipsis."
+  (skip-unless (fboundp 'anvil-memory--truncate-index-line))
+  (let ((out (anvil-memory--truncate-index-line
+              (concat "- [n](f.md) — " (make-string 300 ?x)) 100)))
+    (should (= 100 (length out)))
+    (should (string-suffix-p "…" out))))
+
+(ert-deftest anvil-memory-test/truncate-index-line-disabled ()
+  "nil / non-positive MAX leaves the line untouched."
+  (skip-unless (fboundp 'anvil-memory--truncate-index-line))
+  (let ((line (concat "- [n](f.md) — " (make-string 300 ?x))))
+    (should (equal line (anvil-memory--truncate-index-line line nil)))
+    (should (equal line (anvil-memory--truncate-index-line line 0)))))
+
+(ert-deftest anvil-memory-test/lint-index-flags-over-long-lines ()
+  "lint-index flags only entries whose rendered line exceeds the limit."
+  (skip-unless (anvil-memory-test--supported-p 'scan))
+  (anvil-memory-test--with-env
+    (let ((anvil-memory-index-line-max-chars 80))
+      (anvil-memory-test--seed-md root "short_one" "user" "tiny")
+      (anvil-memory-test--seed-md root "long_one" "feedback"
+                                  (make-string 200 ?z))
+      (anvil-memory-scan)
+      (let* ((r (anvil-memory-lint-index root))
+             (over-names (mapcar (lambda (e) (plist-get e :name))
+                                 (plist-get r :over))))
+        (should (= 2 (plist-get r :total)))
+        (should (= 1 (plist-get r :over-count)))
+        (should (member "long_one" over-names))
+        (should-not (member "short_one" over-names))
+        (should (> (plist-get r :total-bytes) 0))))))
+
+(ert-deftest anvil-memory-test/regenerate-clips-long-lines ()
+  "regenerate-index clips lines to anvil-memory-index-line-max-chars."
+  (skip-unless (anvil-memory-test--supported-p 'scan))
+  (anvil-memory-test--with-env
+    (let ((anvil-memory-index-line-max-chars 60))
+      (anvil-memory-test--seed-md root "long_one" "feedback"
+                                  (make-string 200 ?z))
+      (anvil-memory-scan)
+      (let* ((body (anvil-memory-regenerate-index root))
+             (maxlen (apply #'max (mapcar #'length
+                                          (split-string body "\n")))))
+        (should (<= maxlen 60))
+        (should (string-match-p "…" body))))))
+
+;;;; --- Phase 6d: Stop-hook snapshot consolidation (Doc 48) ---------------
+
+(ert-deftest anvil-memory-test/commit-snapshot-then-no-change-delta ()
+  "commit-snapshot sets a baseline so an unchanged index yields no-change."
+  (skip-unless (and (fboundp 'anvil-memory-commit-snapshot)
+                    (anvil-memory-test--supported-p 'session-delta)
+                    (anvil-memory-test--supported-p 'scan)
+                    (fboundp 'anvil-state-set)))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--with-state
+      (anvil-memory-test--seed-md root "user_role" "user" "a dev")
+      (anvil-memory-scan)
+      (let ((c (anvil-memory-commit-snapshot root)))
+        (should (= 1 (plist-get c :total)))
+        (should (plist-get c :stored)))
+      (let ((r (anvil-memory-session-delta root)))
+        (should (eq 'delta (plist-get r :mode)))
+        (should (equal "no-change" (plist-get r :reason)))))))
+
+(ert-deftest anvil-memory-test/stop-sync-scans-and-commits ()
+  "stop-sync scans the dir and advances the snapshot baseline."
+  (skip-unless (and (fboundp 'anvil-memory-session-stop-sync)
+                    (anvil-memory-test--supported-p 'session-delta)
+                    (anvil-memory-test--supported-p 'scan)
+                    (fboundp 'anvil-state-set)))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--with-state
+      (anvil-memory-test--seed-md root "user_role" "user" "a dev")
+      (anvil-memory-test--seed-md root "feedback_x" "feedback" "do x")
+      (let ((s (anvil-memory-session-stop-sync root)))
+        (should (>= (plist-get s :scanned) 2))
+        (should (= 2 (plist-get s :total)))
+        (should (plist-get s :stored)))
+      (let ((r (anvil-memory-session-delta root)))
+        (should (eq 'delta (plist-get r :mode)))
+        (should (equal "no-change" (plist-get r :reason)))))))
+
+(ert-deftest anvil-memory-test/stop-sync-no-scan-still-commits ()
+  "stop-sync with NO-SCAN skips scanning but still commits the snapshot."
+  (skip-unless (and (fboundp 'anvil-memory-session-stop-sync)
+                    (anvil-memory-test--supported-p 'scan)
+                    (fboundp 'anvil-state-set)))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--with-state
+      (anvil-memory-test--seed-md root "user_role" "user" "a dev")
+      (anvil-memory-scan)
+      (let ((s (anvil-memory-session-stop-sync root t)))
+        (should (null (plist-get s :scanned)))
+        (should (= 1 (plist-get s :total)))
+        (should (plist-get s :stored))))))
+
+
 (provide 'anvil-memory-test)
 
 ;;; anvil-memory-test.el ends here

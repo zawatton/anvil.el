@@ -282,6 +282,25 @@ re-baselines cleanly instead of emitting a giant catch-up delta."
   :type 'string
   :group 'anvil-memory)
 
+(defcustom anvil-memory-index-line-max-chars 200
+  "Maximum characters per `MEMORY.md' index line (Doc 48 Phase 6c).
+`anvil-memory-regenerate-index' clips a line's DESCRIPTION tail and
+appends an ellipsis when the rendered `- [NAME](BASE) — DESC' line
+exceeds this many characters, so the index stays inside the harness
+auto-load budget instead of being silently truncated.  nil or a
+non-positive value disables clipping (full descriptions are kept)."
+  :type '(choice (const :tag "Disabled" nil) integer)
+  :group 'anvil-memory)
+
+(defcustom anvil-memory-index-budget-bytes 24400
+  "Byte budget `anvil-memory-lint-index' compares the index against.
+The Claude Code harness only loads roughly the first 24.4KB / 200
+lines of `MEMORY.md'; entries beyond that are dropped.  The lint
+reports total UTF-8 bytes against this budget so over-long (often
+CJK, 3 bytes/char) descriptions can be shortened at the source."
+  :type 'integer
+  :group 'anvil-memory)
+
 (defconst anvil-memory-ttl-policies
   '((user      . (:hard nil      :soft nil))
     (feedback  . (:hard nil      :soft 15552000))   ; soft 180d
@@ -1375,11 +1394,82 @@ writes it to disk (the memory-pruner skill owns that step)."
               (name (or (and fm (plist-get fm :name))
                         (anvil-memory--fallback-display-name path)))
               (desc (or (and fm (plist-get fm :description)) "")))
-         (if (string-empty-p desc)
-             (format "- [%s](%s)" name base)
-           (format "- [%s](%s) — %s" name base desc))))
+         (anvil-memory--truncate-index-line
+          (if (string-empty-p desc)
+              (format "- [%s](%s)" name base)
+            (format "- [%s](%s) — %s" name base desc))
+          anvil-memory-index-line-max-chars)))
      scoped
      "\n")))
+
+
+;;;; --- Phase 6c: MEMORY.md index line lint (Doc 48) ----------------------
+
+(defun anvil-memory--truncate-index-line (line max)
+  "Return LINE clipped to MAX characters with a trailing ellipsis.
+LINE is a rendered `MEMORY.md' index line.  When MAX is nil, a
+non-positive integer, or LINE already fits, LINE is returned
+unchanged.  Otherwise the tail (the description) is dropped so the
+result is exactly MAX characters including the appended ellipsis."
+  (if (or (null max) (not (integerp max)) (<= max 0)
+          (<= (length line) max))
+      line
+    (concat (substring line 0 (max 1 (1- max))) "…")))
+
+(defun anvil-memory-lint-index (&optional root)
+  "Audit `MEMORY.md' index line lengths under ROOT for length health.
+ROOT defaults to the first effective root.  Read-only: measures the
+raw (un-clipped) `- [NAME](BASE) — DESC' line each memory would emit
+and reports which exceed `anvil-memory-index-line-max-chars'.
+
+Returns a plist:
+
+  (:total N :over-count M :limit-chars L :budget-bytes B
+   :total-bytes TB :over-budget OB
+   :over ((:name NAME :base BASE :chars C :bytes BY) ...))
+
+:total-bytes is the raw UTF-8 size the full index would occupy (one
+newline counted per line); :over-budget is how far that exceeds
+`anvil-memory-index-budget-bytes' (0 when it fits).  :over lists the
+entries longer than the per-line limit, longest first."
+  (let* ((root (or root (car (anvil-memory--effective-roots)))))
+    (unless (and root (stringp root))
+      (user-error "anvil-memory-lint-index: no ROOT"))
+    (let* ((abs-root (file-name-as-directory (expand-file-name root)))
+           (rows (anvil-memory-list nil :with-decay t :sort 'decay))
+           (scoped (cl-remove-if-not
+                    (lambda (r)
+                      (string-prefix-p abs-root (plist-get r :file)))
+                    rows))
+           (limit anvil-memory-index-line-max-chars)
+           (total 0) (total-bytes 0) (over nil))
+      (dolist (row scoped)
+        (let* ((path (plist-get row :file))
+               (base (file-name-nondirectory path))
+               (body (or (anvil-memory--get-body path) ""))
+               (fm (anvil-memory--parse-frontmatter body))
+               (name (or (and fm (plist-get fm :name))
+                         (anvil-memory--fallback-display-name path)))
+               (desc (or (and fm (plist-get fm :description)) ""))
+               (line (if (string-empty-p desc)
+                         (format "- [%s](%s)" name base)
+                       (format "- [%s](%s) — %s" name base desc)))
+               (chars (length line))
+               (bytes (length (encode-coding-string line 'utf-8))))
+          (cl-incf total)
+          (setq total-bytes (+ total-bytes bytes 1))
+          (when (and (integerp limit) (> limit 0) (> chars limit))
+            (push (list :name name :base base :chars chars :bytes bytes)
+                  over))))
+      (setq over (cl-sort over #'> :key (lambda (e) (plist-get e :chars))))
+      (list :total total
+            :over-count (length over)
+            :limit-chars limit
+            :budget-bytes anvil-memory-index-budget-bytes
+            :total-bytes total-bytes
+            :over-budget (max 0 (- total-bytes
+                                   anvil-memory-index-budget-bytes))
+            :over over))))
 
 
 ;;;; --- Phase 6: WHISPER session delta (Doc 48) ---------------------------
@@ -1566,6 +1656,34 @@ current index as a side effect, so the next call diffs from now."
     (unless no-commit
       (anvil-memory--whisper-store-snapshot root entries digest))
     result))
+
+;;;###autoload
+(defun anvil-memory-commit-snapshot (root)
+  "Advance ROOT's WHISPER snapshot baseline to the current index.
+Builds the current entry set + digest and stores it via `anvil-state'
+without computing or injecting a delta.  Used by the Stop hook (Doc
+48 Phase 6d) so the next session's delta is measured from this
+session's end.  Returns (:total N :digest DIGEST :stored S) where
+STORED is non-nil when anvil-state accepted the write."
+  (unless (and root (stringp root))
+    (user-error "anvil-memory-commit-snapshot: ROOT must be a string"))
+  (let* ((entries (anvil-memory--whisper-entries root))
+         (digest (anvil-memory--whisper-digest entries))
+         (stored (anvil-memory--whisper-store-snapshot root entries digest)))
+    (list :total (length entries) :digest digest :stored (and stored t))))
+
+;;;###autoload
+(defun anvil-memory-session-stop-sync (root &optional no-scan)
+  "Stop-hook consolidation for ROOT (Doc 48 Phase 6d).
+Re-scans ROOT (absorbing memory .md files edited by other agents)
+unless NO-SCAN is non-nil, then advances the WHISPER snapshot baseline
+via `anvil-memory-commit-snapshot'.  Generates or alters no memories.
+Returns (:scanned N-OR-nil :total M :digest D :stored S)."
+  (unless (and root (stringp root))
+    (user-error "anvil-memory-session-stop-sync: ROOT must be a string"))
+  (let ((scanned (unless no-scan (anvil-memory-scan (list root))))
+        (committed (anvil-memory-commit-snapshot root)))
+    (append (list :scanned scanned) committed)))
 
 
 ;;;; --- Phase 2b-i: FTS tokenizer reindex ---------------------------------
@@ -2562,6 +2680,33 @@ Advances the snapshot baseline as a side effect."
    (anvil-memory-session-delta
     root :force-full (anvil-memory--coerce-bool full))))
 
+(defun anvil-memory--tool-lint-index (&optional root)
+  "Audit MEMORY.md index line lengths under ROOT (Doc 48 Phase 6c).
+
+MCP Parameters:
+  root - Optional directory whose index lines are measured.  Omit to
+         use the first effective memory root.
+
+Returns (:total N :over-count M :limit-chars L :budget-bytes B
+         :total-bytes TB :over-budget OB :over [...]).  Read-only."
+  (anvil-server-with-error-handling
+   (anvil-memory-lint-index
+    (and root (not (string-empty-p root)) root))))
+
+(defun anvil-memory--tool-stop-sync (root &optional no-scan)
+  "Advance ROOT's WHISPER snapshot at session end (Doc 48 Phase 6d).
+
+MCP Parameters:
+  root    - Directory whose memory index snapshot is re-baselined.
+  no-scan - Optional truthy flag.  When set, skips the .md re-scan and
+            only commits the snapshot from the current index.
+
+Returns (:scanned N :total M :digest D :stored S).  Intended for the
+Stop hook; advances the next session's delta baseline."
+  (anvil-server-with-error-handling
+   (anvil-memory-session-stop-sync
+    root (anvil-memory--coerce-bool no-scan))))
+
 (defun anvil-memory--tool-reindex-fts (&optional tokenizer)
   "Rebuild memory_body_fts with TOKENIZER (trigram / unicode61).
 
@@ -2923,6 +3068,31 @@ removed entries (mode `delta'), or the full MEMORY.md body (mode
 index was cleared, or the delta exceeds
 `anvil-memory-whisper-full-threshold'.  Advances the snapshot baseline
 as a side effect; pass full=true to force a full body.")
+
+    (,(anvil-server-encode-handler #'anvil-memory--tool-lint-index)
+     :id "memory-lint-index"
+     :intent '(memory admin)
+     :layer 'workflow
+     :description
+     "Audit MEMORY.md index line lengths under ROOT (Doc 48 Phase 6c).
+Reports how many `- [NAME](FILE) — DESC' lines exceed
+`anvil-memory-index-line-max-chars', the raw UTF-8 byte total of the
+index, and how far that total overruns the harness auto-load budget
+(`anvil-memory-index-budget-bytes', ~24.4KB).  Use it to find the
+descriptions to shorten so the full index loads without truncation.
+Read-only."
+     :read-only t)
+
+    (,(anvil-server-encode-handler #'anvil-memory--tool-stop-sync)
+     :id "memory-stop-sync"
+     :intent '(memory)
+     :layer 'workflow
+     :description
+     "Advance ROOT's WHISPER snapshot baseline at session end (Doc 48
+Phase 6d).  Re-scans the memory directory (absorbing .md files edited
+by other agents) unless no-scan is set, then commits the current
+index as the snapshot so the next session's delta is measured from
+this session's end.  Generates or alters no memories.")
 
     (,(anvil-server-encode-handler #'anvil-memory--tool-reindex-fts)
      :id "memory-reindex-fts"
