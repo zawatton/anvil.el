@@ -398,6 +398,43 @@ empty), so the cache round-trips purely through string ops + `load'
                anvil-server--schema-cache)))
   (anvil-server--schema-cache-write))
 
+(defun anvil-server-register-cached-tool-fragments
+    (server-id lazy-loaders)
+  "Register cached tool-list fragments for SERVER-ID.
+LAZY-LOADERS is an alist mapping tool id strings to loader functions.
+Each cached entry becomes a placeholder tool that can advertise itself
+in `tools/list' immediately.  The real module is loaded on first
+`tools/call' through its loader."
+  (let ((tools-table (anvil-server--get-server-tools server-id))
+        (fragments nil)
+        (count 0))
+    (anvil-server--schema-cache-load)
+    (dolist (entry anvil-server--schema-cache)
+      (let* ((id (plist-get entry :id))
+             (fragment (plist-get entry :fragment))
+             (loader (cdr (assoc id lazy-loaders))))
+        (when (and (stringp id)
+                   (stringp fragment)
+                   loader
+                   (not (gethash id tools-table)))
+          (puthash id
+                   (list :id id
+                         :description ""
+                         :schema (plist-get entry :schema)
+                         :json-fragment fragment
+                         :lazy-placeholder t
+                         :lazy-loader loader)
+                   tools-table)
+          (push fragment fragments)
+          (setq count (1+ count)))))
+    (when (> count 0)
+      (puthash server-id
+               (concat "{\"tools\":["
+                       (mapconcat #'identity (nreverse fragments) ",")
+                       "]}")
+               anvil-server--tools-list-cache))
+    count))
+
 (defun anvil-server--scan-substr-pos (s needle)
   "Return start index of NEEDLE in S, or nil.
 Pure char-by-char scan — does not depend on `string-match' which
@@ -1283,14 +1320,39 @@ is resolved through `anvil-server-id-aliases' for capability lookup."
                 (and templates-table
                      (> (hash-table-count templates-table) 0)))
         (push `(resources . ,(make-hash-table)) capabilities))
-      (anvil-server--jsonrpc-response
-       id
-       `((protocolVersion . ,anvil-server-protocol-version)
-         (serverInfo
-          .
-          ((name . ,anvil-server-name)
-           (version . ,anvil-server-protocol-version)))
-         (capabilities . ,capabilities))))))
+      (if (fboundp 'nelisp--write-stderr-line)
+          ;; Standalone NeLisp can spend tens of seconds in `json-encode'
+          ;; even for this tiny fixed response.  Build the result JSON
+          ;; directly and wrap it with the existing pre-encoded helper.
+          (let ((cap-json
+                 (concat "{"
+                         (mapconcat
+                          #'identity
+                          (delq nil
+                                (list
+                                 (when (assoc 'tools capabilities)
+                                   "\"tools\":{}")
+                                 (when (assoc 'resources capabilities)
+                                   "\"resources\":{}")))
+                          ",")
+                         "}")))
+            (anvil-server--jsonrpc-response-from-result-json
+             id
+             (concat "{\"protocolVersion\":"
+                     (anvil-server--js-string anvil-server-protocol-version)
+                     ",\"serverInfo\":{\"name\":"
+                     (anvil-server--js-string anvil-server-name)
+                     ",\"version\":"
+                     (anvil-server--js-string anvil-server-protocol-version)
+                     "},\"capabilities\":" cap-json "}")))
+        (anvil-server--jsonrpc-response
+         id
+         `((protocolVersion . ,anvil-server-protocol-version)
+           (serverInfo
+            .
+            ((name . ,anvil-server-name)
+             (version . ,anvil-server-protocol-version)))
+           (capabilities . ,capabilities)))))))
 
 (defun anvil-server--handle-initialized ()
   "Handle initialized notification from client.
@@ -1522,6 +1584,14 @@ virtual server-ids share the same handler pool."
           (when tools-table
             (gethash tool-name tools-table)))
          (tool-args (alist-get 'arguments params)))
+    (when (and tool
+               (plist-get tool :lazy-placeholder)
+               (functionp (plist-get tool :lazy-loader)))
+      (funcall (plist-get tool :lazy-loader) tool-name resolved-id)
+      (setq tools-table (gethash resolved-id anvil-server--tools))
+      (setq tool
+            (when tools-table
+              (gethash tool-name tools-table))))
     (if tool
         (let ((handler (plist-get tool :handler))
               (context (list :id id)))
@@ -2217,7 +2287,11 @@ See also:
     (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
       (nelisp--write-stderr-line (concat "[REG-IN] " id)))
     (if-let* ((existing (gethash id tools-table)))
-      (anvil-server--ref-counted-register id existing tools-table)
+      (if (plist-get existing :lazy-placeholder)
+          (progn
+            (remhash id tools-table)
+            (apply #'anvil-server-register-tool handler properties))
+        (anvil-server--ref-counted-register id existing tools-table))
       (let* ((_p1 (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
                     (nelisp--write-stderr-line (concat "[REG-1 normalize] " id))))
              (handler-meta

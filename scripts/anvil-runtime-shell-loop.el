@@ -215,24 +215,27 @@ nil for production (silent).")
 
   ;; Substrate polyfills (cl-* gaps + sqlite cursor protocol +
   ;; benchmark/profiler stubs) for anvil-* GREEN-bucket modules.
-  ;; Loaded BEFORE the tool-module chain so registrations and call
-  ;; handlers see a healthy substrate.  See
-  ;; `<anvil.el>/scripts/anvil-runtime-polyfills.el' for the surface
-  ;; audit (= migrated from `nelisp-emacs/scripts/' 2026-05-14).
-  (let ((polyfills-el (concat anvil-el-dir
-                              "/scripts/anvil-runtime-polyfills.el")))
-    (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
-      (nelisp--write-stderr-line
-       (concat "[shell-loop] loading polyfills " polyfills-el)))
-    (condition-case err
-        (load polyfills-el nil t)
-      (error
-       (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
-         (nelisp--write-stderr-line
-          (concat "[shell-loop] polyfills load ERR: "
-                  (format "%S" err))))))
-    (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
-      (nelisp--write-stderr-line "[STEP] polyfills done")))
+  ;; Defer this until a real tool module is loaded.  Cached lazy tool
+  ;; fragments can advertise tools/list without it, saving cold-connect
+  ;; time on the common schema-cache-hit path.
+  (defvar anvil-runtime-shell--polyfills-loaded nil)
+  (defun anvil-runtime-shell--ensure-polyfills-loaded ()
+    (unless anvil-runtime-shell--polyfills-loaded
+      (setq anvil-runtime-shell--polyfills-loaded t)
+      (let ((polyfills-el (concat anvil-el-dir
+                                  "/scripts/anvil-runtime-polyfills.el")))
+        (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+          (nelisp--write-stderr-line
+           (concat "[shell-loop] loading polyfills " polyfills-el)))
+        (condition-case err
+            (load polyfills-el nil t)
+          (error
+           (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+             (nelisp--write-stderr-line
+              (concat "[shell-loop] polyfills load ERR: "
+                      (format "%S" err))))))
+        (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+          (nelisp--write-stderr-line "[STEP] polyfills done")))))
 
   ;; `help-function-arglist' polyfill — emacs-stub-bulk.el ships a
   ;; nil-returning placeholder, but anvil-server.el's tool dispatcher
@@ -378,6 +381,44 @@ Uses CR-strip to recognise lines that are CRLF artefacts as blank."
         (setq line (ignore-errors (read-from-minibuffer ""))))
       line))
 
+  (defun anvil-runtime-shell--module-tool-ids (module-name)
+    "Return the default MCP tool ids registered by MODULE-NAME."
+    (cond
+     ((string= module-name "anvil-discovery")
+      '("anvil-tools-by-intent" "anvil-tools-usage-report"))
+     ((string= module-name "anvil-sqlite")
+      '("sqlite-query"))
+     ((string= module-name "anvil-bench")
+      '("bench-compare" "bench-profile-expr" "bench-last"))
+     (t nil)))
+
+  (defun anvil-runtime-shell--load-tool-module (module-name)
+    "Load MODULE-NAME from `anvil-el-dir' and call its enable function."
+    (anvil-runtime-shell--ensure-polyfills-loaded)
+    (let* ((file (concat anvil-el-dir "/" module-name ".el"))
+           (enable-sym (intern (concat module-name "-enable"))))
+      (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+        (nelisp--write-stderr-line
+         (concat "[shell-loop] loading " file)))
+      (load file nil t)
+      (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+        (nelisp--write-stderr-line
+         (concat "[shell-loop] " (symbol-name enable-sym)
+                 " fboundp=" (if (fboundp enable-sym) "t" "nil"))))
+      (when (fboundp enable-sym)
+        (funcall enable-sym))
+      ;; Post-load substrate patches (= anvil-sqlite regex compat etc).
+      ;; In lazy mode modules load one at a time, so run the patches after
+      ;; each successful module load instead of once after an eager chain.
+      (when (fboundp 'anvil-runtime-polyfills-apply-post-load-patches)
+        (condition-case err
+            (anvil-runtime-polyfills-apply-post-load-patches)
+          (error
+           (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+             (nelisp--write-stderr-line
+              (concat "[shell-loop] post-load patches ERR: "
+                      (format "%S" err)))))))))
+
   ;; Optional tool-module load+enable chain.  `ANVIL_TOOL_MODULES' is a
   ;; comma-separated list of anvil-* module basenames (e.g.
   ;; "anvil-discovery,anvil-sqlite,anvil-bench") that the driver should
@@ -413,41 +454,43 @@ Uses CR-strip to recognise lines that are CRLF artefacts as blank."
        (concat "[shell-loop] ANVIL_TOOL_MODULES="
                (if (> (length modules-env) 0) modules-env "<empty>"))))
     (when (> (length modules-env) 0)
-      (dolist (name (split-string modules-env "," t))
-        (let* ((trimmed (if (fboundp 'string-trim) (string-trim name) name))
-               (file (concat anvil-el-dir "/" trimmed ".el"))
-               (enable-sym (intern (concat trimmed "-enable"))))
-          (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
-            (nelisp--write-stderr-line
-             (concat "[shell-loop] loading " file)))
-          ;; Wrap each module's load + enable so a single bad module
-          ;; (= unmet substrate dep, missing helper) skips instead of
-          ;; aborting the whole driver before run-batch-stdio is reached.
-          (condition-case err
-              (progn
-                (load file nil t)
-                (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
-                  (nelisp--write-stderr-line
-                   (concat "[shell-loop] " (symbol-name enable-sym)
-                           " fboundp=" (if (fboundp enable-sym) "t" "nil"))))
-                (when (fboundp enable-sym)
-                  (funcall enable-sym)))
-            (error
-             (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
-               (nelisp--write-stderr-line
-                (concat "[shell-loop] " trimmed
-                        " load/enable ERR: " (format "%S" err))))))))))
-  ;; Post-load substrate patches (= anvil-sqlite regex compat etc).
-  ;; Must run AFTER the tool-module load+enable chain because the
-  ;; patches override functions that the modules define.
-  (when (fboundp 'anvil-runtime-polyfills-apply-post-load-patches)
-    (condition-case err
-        (anvil-runtime-polyfills-apply-post-load-patches)
-      (error
-       (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
-         (nelisp--write-stderr-line
-          (concat "[shell-loop] post-load patches ERR: "
-                  (format "%S" err)))))))
+      (let ((module-names nil)
+            (lazy-loaders nil))
+        (dolist (name (split-string modules-env "," t))
+          (let ((trimmed (if (fboundp 'string-trim) (string-trim name) name)))
+            (push trimmed module-names)
+            (dolist (tool-id (anvil-runtime-shell--module-tool-ids trimmed))
+              (let ((module-name trimmed))
+                (push
+                 (cons tool-id
+                       (lambda (_tool-name _server-id)
+                         (anvil-runtime-shell--load-tool-module module-name)))
+                 lazy-loaders)))))
+        (setq module-names (nreverse module-names))
+        (let ((lazy-count
+               (and (fboundp 'anvil-server-register-cached-tool-fragments)
+                    (anvil-server-register-cached-tool-fragments
+                     server-id lazy-loaders))))
+          (cond
+           ((and lazy-count (> lazy-count 0))
+            (when (and anvil-server--debug-trace
+                       (fboundp 'nelisp--write-stderr-line))
+              (nelisp--write-stderr-line
+               (format "[shell-loop] lazy cached tool fragments=%d"
+                       lazy-count))))
+           (t
+            ;; Cache missing or empty: fall back to the old eager path so a
+            ;; first-ever run can still generate and persist schema cache.
+            (dolist (trimmed module-names)
+              (condition-case err
+                  (anvil-runtime-shell--load-tool-module trimmed)
+                (error
+                 (when (and anvil-server--debug-trace
+                            (fboundp 'nelisp--write-stderr-line))
+                   (nelisp--write-stderr-line
+                    (concat "[shell-loop] " trimmed
+                            " load/enable ERR: "
+                            (format "%S" err)))))))))))))
 
   (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
     (let ((bucket (and (boundp 'anvil-server--tools)

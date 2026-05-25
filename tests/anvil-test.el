@@ -191,6 +191,108 @@ MCP Parameters:
               "Read a file for schema cache testing"
               nil)))))
 
+(ert-deftest anvil-test-schema-cache-registers-lazy-tool-fragments ()
+  "Cached fragments can advertise tools before their modules are loaded."
+  (let* ((server-id "anvil-test-lazy-fragments")
+         (cache-file (make-temp-file "anvil-lazy-fragments-"))
+         (fragment "{\"name\":\"lazy-tool\",\"description\":\"Lazy\",\"inputSchema\":{\"type\":\"object\"}}")
+         (loader-called nil))
+    (unwind-protect
+        (progn
+          (write-region
+           (concat
+            "(setq anvil-server--schema-cache-file-data '"
+            (prin1-to-string
+             (list :version anvil-server--schema-cache-version
+                   :entries
+                   (list
+                    (list :id "lazy-tool"
+                          :signature "sig"
+                          :schema '((type . "object"))
+                          :fragment fragment))))
+            ")\n")
+           nil cache-file)
+          (let ((anvil-server-schema-cache-file cache-file)
+                (anvil-server--schema-cache nil)
+                (anvil-server--schema-cache-loaded nil))
+            (should
+             (= 1
+                (anvil-server-register-cached-tool-fragments
+                 server-id
+                 `(("lazy-tool" .
+                    ,(lambda (&rest _)
+                       (setq loader-called t)))))))
+            (let* ((tools-table (anvil-server--get-server-tools server-id))
+                   (tool (gethash "lazy-tool" tools-table)))
+              (should (plist-get tool :lazy-placeholder))
+              (should (equal fragment (plist-get tool :json-fragment)))
+              (should-not loader-called))))
+      (remhash server-id anvil-server--tools)
+      (when (file-exists-p cache-file)
+        (delete-file cache-file)))))
+
+(ert-deftest anvil-test-lazy-placeholder-is-replaced-by-real-registration ()
+  "Loading a module may replace its cached placeholder with a real tool."
+  (defun anvil-test--lazy-real-tool ()
+    "Return ok."
+    "ok")
+  (let* ((server-id "anvil-test-lazy-replace")
+         (tools-table (anvil-server--get-server-tools server-id)))
+    (unwind-protect
+        (progn
+          (puthash "lazy-real"
+                   (list :id "lazy-real"
+                         :json-fragment "{}"
+                         :lazy-placeholder t)
+                   tools-table)
+          (anvil-server-register-tool
+           #'anvil-test--lazy-real-tool
+           :id "lazy-real"
+           :description "Real lazy tool"
+           :server-id server-id)
+          (let ((tool (gethash "lazy-real" tools-table)))
+            (should-not (plist-get tool :lazy-placeholder))
+            (should (eq 'anvil-test--lazy-real-tool
+                        (plist-get tool :handler)))))
+      (remhash server-id anvil-server--tools))))
+
+(ert-deftest anvil-test-tools-call-loads-lazy-placeholder ()
+  "tools/call loads a lazy placeholder before dispatching."
+  (defun anvil-test--lazy-call-tool ()
+    "Return ok."
+    "ok")
+  (let* ((server-id "anvil-test-lazy-call")
+         (tools-table (anvil-server--get-server-tools server-id))
+         (loader-called nil))
+    (unwind-protect
+        (progn
+          (puthash "lazy-call"
+                   (list :id "lazy-call"
+                         :json-fragment "{}"
+                         :lazy-placeholder t
+                         :lazy-loader
+                         (lambda (&rest _)
+                           (setq loader-called t)
+                           (anvil-server-register-tool
+                            #'anvil-test--lazy-call-tool
+                            :id "lazy-call"
+                            :description "Lazy call tool"
+                            :server-id server-id)))
+                   tools-table)
+          (let* ((resp
+                  (anvil-server--handle-tools-call
+                   "lazy-call-id"
+                   '((name . "lazy-call") (arguments . ()))
+                   (make-anvil-server-metrics)
+                   server-id))
+                 (decoded (json-read-from-string resp))
+                 (result (alist-get 'result decoded))
+                 (content (alist-get 'content result))
+                 (text (alist-get 'text (aref content 0))))
+            (should loader-called)
+            (should (equal "ok" text))))
+      (remhash server-id anvil-server--tools))))
+
 (ert-deftest anvil-test-scan-int-after-tolerates-whitespace ()
   "Standalone scanner must accept normal JSON whitespace before numbers."
   (should (equal 42 (anvil-server--scan-int-after "{\"id\": 42,}" "\"id\":")))
