@@ -2486,6 +2486,91 @@ yields a delta with reason `no-change' and empty text."
         (should (plist-get s :stored))))))
 
 
+;;;; --- Phase 6e: orchestrator memory-candidate harvest (Doc 48) ----------
+
+(ert-deftest anvil-memory-test/harvest-parse-extracts-blocks ()
+  "harvest-parse pulls multiple well-formed @@CANDIDATE blocks."
+  (skip-unless (fboundp 'anvil-memory--harvest-parse))
+  (let* ((raw (concat "preamble\n@@CANDIDATE\ntype: user\nname: role\n"
+                      "description: a dev\nbody: works in electrical\n@@END\n"
+                      "@@CANDIDATE\ntype: feedback\nname: rule-x\n"
+                      "description: do x\nbody: always do x\n@@END\ntrailer"))
+         (cs (anvil-memory--harvest-parse raw)))
+    (should (= 2 (length cs)))
+    (should (equal "role" (plist-get (car cs) :name)))
+    (should (equal "user" (plist-get (car cs) :type)))
+    (should (equal "rule-x" (plist-get (cadr cs) :name)))))
+
+(ert-deftest anvil-memory-test/harvest-parse-none-is-empty ()
+  "`@@NONE' and nil both parse to no candidates."
+  (skip-unless (fboundp 'anvil-memory--harvest-parse))
+  (should (null (anvil-memory--harvest-parse "@@NONE")))
+  (should (null (anvil-memory--harvest-parse nil))))
+
+(ert-deftest anvil-memory-test/harvest-parse-skips-incomplete ()
+  "A block missing a body is skipped."
+  (skip-unless (fboundp 'anvil-memory--harvest-parse))
+  (should (null (anvil-memory--harvest-parse
+                 "@@CANDIDATE\ntype: memo\nname: only-name\n@@END"))))
+
+(ert-deftest anvil-memory-test/harvest-transcript-text-extracts ()
+  "Transcript extraction pulls string and structured content text."
+  (skip-unless (fboundp 'anvil-memory--harvest-transcript-text))
+  (let ((f (make-temp-file "anvil-transcript-" nil ".jsonl")))
+    (unwind-protect
+        (progn
+          (with-temp-file f
+            (insert "{\"message\":{\"content\":\"hello world\"}}\n")
+            (insert (concat "{\"message\":{\"content\":"
+                            "[{\"type\":\"text\",\"text\":\"second msg\"}]}}\n")))
+          (let ((txt (anvil-memory--harvest-transcript-text f)))
+            (should (string-match-p "hello world" txt))
+            (should (string-match-p "second msg" txt))))
+      (delete-file f))))
+
+(ert-deftest anvil-memory-test/harvest-no-material-errors ()
+  "No text and no transcript-path yields an error status."
+  (skip-unless (fboundp 'anvil-memory-harvest-candidates))
+  (should (eq 'error (plist-get (anvil-memory-harvest-candidates :text "")
+                                :status))))
+
+(ert-deftest anvil-memory-test/harvest-candidates-mocked ()
+  "With a mocked orchestrator + save-check, candidates parse and annotate."
+  (skip-unless (fboundp 'anvil-memory-harvest-candidates))
+  (cl-letf (((symbol-function 'anvil-orchestrator-submit-and-collect)
+             (lambda (&rest _)
+               (list :status 'done
+                     :summary (concat "@@CANDIDATE\ntype: feedback\n"
+                                      "name: use-tabs\ndescription: prefer tabs\n"
+                                      "body: user prefers tabs\n@@END\n"))))
+            ((symbol-function 'anvil-memory-save-check)
+             (lambda (&rest _) nil)))
+    (let* ((r (anvil-memory-harvest-candidates :text "session text"))
+           (c (car (plist-get r :candidates))))
+      (should (eq 'ok (plist-get r :status)))
+      (should (= 1 (plist-get r :candidate-count)))
+      (should (equal "use-tabs" (plist-get c :name)))
+      (should (equal "feedback" (plist-get c :type)))
+      (should-not (plist-get c :likely-duplicate)))))
+
+(ert-deftest anvil-memory-test/harvest-flags-duplicate ()
+  "A high save-check similarity sets :likely-duplicate."
+  (skip-unless (fboundp 'anvil-memory-harvest-candidates))
+  (cl-letf (((symbol-function 'anvil-orchestrator-submit-and-collect)
+             (lambda (&rest _)
+               (list :status 'done
+                     :summary (concat "@@CANDIDATE\ntype: memo\nname: x\n"
+                                      "description: d\nbody: b\n@@END"))))
+            ((symbol-function 'anvil-memory-save-check)
+             (lambda (&rest _)
+               (list (list :file "/m/x.md" :type "memo" :similarity 0.8)))))
+    (let ((c (car (plist-get (anvil-memory-harvest-candidates
+                              :text "t" :dup-threshold 0.5)
+                             :candidates))))
+      (should (plist-get c :likely-duplicate))
+      (should (= 0.8 (plist-get c :top-similarity))))))
+
+
 (provide 'anvil-memory-test)
 
 ;;; anvil-memory-test.el ends here

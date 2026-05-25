@@ -1,14 +1,14 @@
 #+title: anvil-memory Phase 6 — WHISPER delta injection (session-start delta over full MEMORY.md)
 #+date: 2026-05-25
 #+author: zawatton
-#+property: status PHASE-6A-6D-SHIPPED
+#+property: status PHASE-6A-6E-SHIPPED
 #+property: scope CONVENTION-COUPLED
 
 * STATUS
   :PROPERTIES:
   :ID:       d1c4e0f2-8f44-4f7c-bc1a-whisper-48
   :END:
-~Phase 6a–6d SHIPPED~ (2026-05-25) — Doc 29 (memory-engine, Phase
+~Phase 6a–6e SHIPPED (Phase 6 complete)~ (2026-05-25) — Doc 29 (memory-engine, Phase
 1-4a SHIPPED) + Doc 37 (observation layer, Phase 1-6 SHIPPED) の上に
 「差分注入 (WHISPER)」を乗せる。OSS「Subconscious」(解説動画
 yt_20260524_claude_code_subconscious) の WHISPER モードから
@@ -56,9 +56,16 @@ yt_20260524_claude_code_subconscious) の WHISPER モードから
   =SessionEnd= で設計の「Stop hook consolidation」を実現。実測 scan 172
   files + commit = 2.5s (detached で session 終了をブロックしない)。
   ERT +8 件 = 158/158 green、byte-compile 0 warning。
-- *未着手* — Phase 6e (任意): orchestrator 要約で memory 候補生成 (Q5 (c))。
-  誤検出リスクが高く =memory-save-check= 重複検出を通さず増殖する恐れが
-  あるため gating。
+- *SHIPPED* — Phase 6e (orchestrator memory-candidate harvest、review-only)。
+  =anvil-memory-harvest-candidates= が session material (=:text= か
+  =:transcript-path= の JSONL tail) を orchestrator (既定 claude) に投げ、
+  返答の =@@CANDIDATE= ブロックを parse → 各候補を =memory-save-check= に
+  通して最類似 memory + =:likely-duplicate= を annotate。**永続化も自動追加
+  もしない (review-only)**、=memory-add= は人間/次セッションが判断。MCP tool
+  =memory-harvest-candidates=、hook 非配線 (on-demand only、orchestrator
+  cost あり)。defcustom =-harvest-provider= / =-harvest-timeout-sec= /
+  =-harvest-dup-threshold=。ERT +7 件 = 165/165 green、byte-compile 0
+  warning。Q5 (c) を「自動追加せず候補返却」の最小・安全形で実装。
 
 外部 OSS の核心 (取り込む部分):
 
@@ -348,3 +355,12 @@ WHISPER 化しても「過去に一度も注入されていない低 decay entry
   commit = crash fallback / SessionEnd commit = 正常終了時の "while away"
   基準) を許容。snapshot は anvil-state round-trip 実証済、テスト後 delete で
   pristine に戻し初回 full 注入を温存。
+- 2026-05-25 — Phase 6e を実装・SHIPPED (Phase 6 完結)。user 合意で
+  *review-only + on-demand* の最小・安全形を採用 (auto-add / SessionEnd
+  自動起動は見送り — 誤増殖リスクと orchestrator cost のため)。実装中に
+  =anvil-memory--harvest-parse= で *match-data clobber* バグ (field 抽出の
+  =string-match= が外側 =@@CANDIDATE= マッチを破壊し =match-end= が誤値 →
+  同一ブロック無限再マッチ) を ERT が複数ブロック入力で検出、=match-end= を
+  field 抽出前に確定して修正。単一ブロックは偶然抜けていたため、複数ブロックの
+  ERT が無いと見逃した好例 (memory =feedback_elisp_match_data_clobber= の
+  パターン)。

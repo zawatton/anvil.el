@@ -1686,6 +1686,202 @@ Returns (:scanned N-OR-nil :total M :digest D :stored S)."
     (append (list :scanned scanned) committed)))
 
 
+;;;; --- Phase 6e: orchestrator memory-candidate harvest (Doc 48) ----------
+
+(defcustom anvil-memory-harvest-provider 'claude
+  "Orchestrator provider used by `anvil-memory-harvest-candidates'.
+Extraction is an analysis / judgement task, so the default is `claude'
+per the orchestrator role split.  Override per call if desired."
+  :type 'symbol
+  :group 'anvil-memory)
+
+(defcustom anvil-memory-harvest-timeout-sec 120
+  "Wall-clock cap in seconds for the harvest orchestrator call."
+  :type 'integer
+  :group 'anvil-memory)
+
+(defcustom anvil-memory-harvest-dup-threshold 0.5
+  "Jaccard similarity at/above which a harvested candidate is flagged dup.
+`anvil-memory-harvest-candidates' runs each candidate through
+`anvil-memory-save-check' and marks `:likely-duplicate' when the most
+similar existing memory scores at least this much.  A float in (0 1]."
+  :type 'float
+  :group 'anvil-memory)
+
+(defconst anvil-memory--harvest-prompt-template
+  "You extract DURABLE cross-session memory candidates from a Claude Code
+work session.  Only keep facts worth remembering in future sessions:
+stable user preferences, confirmed working agreements / corrections,
+ongoing project goals or constraints not derivable from the repo, and
+pointers to external resources.  Skip anything transient, anything the
+repo or git history already records, and anything you are unsure about.
+
+For EACH candidate output exactly one block and nothing else around it:
+
+@@CANDIDATE
+type: one of user|feedback|project|reference|memo
+name: short kebab-case slug (type prefix optional)
+description: one line under 150 characters
+body: the fact; for feedback / project add a why and a how-to-apply
+@@END
+
+If nothing is worth saving, output exactly:
+@@NONE
+
+=== SESSION MATERIAL ===
+%s"
+  "Prompt template for `anvil-memory-harvest-candidates' (one %s slot).")
+
+(defun anvil-memory--harvest-transcript-text (path &optional max-chars)
+  "Best-effort plain-text tail of a Claude JSONL transcript at PATH.
+Concatenates user / assistant message text and returns the last
+MAX-CHARS characters (default 12000), or nil when PATH is unreadable.
+Tolerant of malformed lines."
+  (when (and path (file-readable-p path))
+    (let ((max-chars (or max-chars 12000))
+          (chunks nil))
+      (with-temp-buffer
+        (insert-file-contents path)
+        (goto-char (point-min))
+        (while (not (eobp))
+          (let* ((line (buffer-substring-no-properties
+                        (line-beginning-position) (line-end-position)))
+                 (obj (ignore-errors
+                        (let ((json-object-type 'plist)
+                              (json-array-type 'list))
+                          (json-read-from-string line))))
+                 (msg (and obj (or (plist-get obj :message) obj)))
+                 (content (and msg (plist-get msg :content))))
+            (cond
+             ((stringp content) (push content chunks))
+             ((listp content)
+              (dolist (part content)
+                (when (and (listp part)
+                           (equal (plist-get part :type) "text"))
+                  (push (plist-get part :text) chunks))))))
+          (forward-line 1)))
+      (let ((text (mapconcat #'identity (nreverse (delq nil chunks)) "\n")))
+        (if (> (length text) max-chars)
+            (substring text (- (length text) max-chars))
+          text)))))
+
+(defun anvil-memory--harvest-parse (raw)
+  "Parse @@CANDIDATE blocks out of RAW model text into candidate plists.
+Returns a list of (:type :name :description :body); empty when RAW is
+nil, signals `@@NONE', or has no well-formed blocks (a block needs at
+least a name and a body)."
+  (when (and raw (not (string-match-p "@@NONE" raw)))
+    (let ((case-fold-search t)
+          (start 0) (out nil))
+      (while (string-match "@@CANDIDATE\\(\\(?:.\\|\n\\)*?\\)@@END" raw start)
+        ;; Capture the block text + advance START *before* the field
+        ;; regexes below clobber the match data (else `match-end' would
+        ;; point inside BLOCK and the same block re-matches forever).
+        (let ((block (match-string 1 raw))
+              (next (match-end 0)))
+          (setq start next)
+          (let* ((field (lambda (key)
+                          (when (string-match
+                                 (concat "^[ \t]*" key
+                                         ":[ \t]*\\(.*\\(?:\n[ \t].*\\)*\\)")
+                                 block)
+                            (string-trim (match-string 1 block)))))
+                 (type (funcall field "type"))
+                 (name (funcall field "name"))
+                 (desc (funcall field "description"))
+                 (body (funcall field "body")))
+            (when (and name body)
+              (push (list :type (or type "memo")
+                          :name name
+                          :description (or desc "")
+                          :body body)
+                    out)))))
+      (nreverse out))))
+
+;;;###autoload
+(cl-defun anvil-memory-harvest-candidates
+    (&key text transcript-path provider dup-threshold)
+  "Extract durable memory CANDIDATES from session material (Doc 48 Phase 6e).
+
+Submits TEXT (or, when TEXT is empty, the extracted tail of the JSONL
+transcript at TRANSCRIPT-PATH) to orchestrator PROVIDER (default
+`anvil-memory-harvest-provider') and parses @@CANDIDATE blocks out of
+the reply.  Each candidate is run through `anvil-memory-save-check' and
+annotated with its most similar existing memory plus a
+`:likely-duplicate' flag (DUP-THRESHOLD, default
+`anvil-memory-harvest-dup-threshold').
+
+Review-only: nothing is persisted and no memory is added — the caller
+decides what to `memory-add'.  Returns a plist:
+
+  (:status ok|empty|error :provider P :reason R
+   :candidate-count N :candidates (...) :raw RAW)"
+  (let* ((provider (or provider anvil-memory-harvest-provider))
+         (dup-threshold (or dup-threshold anvil-memory-harvest-dup-threshold))
+         (material (or (and text (not (string-empty-p (string-trim text))) text)
+                       (and transcript-path
+                            (anvil-memory--harvest-transcript-text
+                             transcript-path)))))
+    (cond
+     ((or (null material) (string-empty-p (string-trim material)))
+      (list :status 'error :provider provider
+            :reason "no material (pass :text or a readable :transcript-path)"
+            :candidate-count 0 :candidates nil :raw nil))
+     ((not (fboundp 'anvil-orchestrator-submit-and-collect))
+      (list :status 'error :provider provider
+            :reason "anvil-orchestrator unavailable"
+            :candidate-count 0 :candidates nil :raw nil))
+     (t
+      (let* ((prompt (format anvil-memory--harvest-prompt-template material))
+             (res (ignore-errors
+                    (anvil-orchestrator-submit-and-collect
+                     :provider provider
+                     :prompt prompt
+                     :name "memory-harvest"
+                     :collect-timeout-sec anvil-memory-harvest-timeout-sec)))
+             (status (and res (plist-get res :status)))
+             (raw (and res (plist-get res :summary))))
+        (if (not (eq status 'done))
+            (list :status 'error :provider provider
+                  :reason (format "orchestrator %s"
+                                  (or (and res (plist-get res :error))
+                                      status "no-response"))
+                  :candidate-count 0 :candidates nil :raw raw)
+          (let* ((parsed (anvil-memory--harvest-parse raw))
+                 (annotated
+                  (mapcar
+                   (lambda (c)
+                     (let* ((similar
+                             (ignore-errors
+                               (anvil-memory-save-check
+                                (plist-get c :name) (plist-get c :body) 3)))
+                            (top (when similar
+                                   (apply #'max
+                                          (mapcar
+                                           (lambda (s)
+                                             (or (plist-get s :similarity) 0.0))
+                                           similar)))))
+                       (append
+                        c
+                        (list :similar
+                              (mapcar
+                               (lambda (s)
+                                 (list :file (plist-get s :file)
+                                       :type (plist-get s :type)
+                                       :similarity (plist-get s :similarity)))
+                               similar)
+                              :top-similarity (or top 0.0)
+                              :likely-duplicate
+                              (and top (>= top dup-threshold))))))
+                   parsed)))
+            (list :status (if annotated 'ok 'empty)
+                  :provider provider
+                  :reason (if annotated "ok" "no candidates")
+                  :candidate-count (length annotated)
+                  :candidates annotated
+                  :raw raw))))))))
+
+
 ;;;; --- Phase 2b-i: FTS tokenizer reindex ---------------------------------
 
 (defun anvil-memory-reindex-fts (&optional tokenizer)
@@ -2707,6 +2903,28 @@ Stop hook; advances the next session's delta baseline."
    (anvil-memory-session-stop-sync
     root (anvil-memory--coerce-bool no-scan))))
 
+(defun anvil-memory--tool-harvest-candidates (&optional text transcript-path
+                                                        provider)
+  "Extract durable memory candidates from session material (Doc 48 Phase 6e).
+
+MCP Parameters:
+  text            - Session material to harvest (a summary / pasted
+                    excerpts).  Either this or transcript-path is required.
+  transcript-path - Optional path to a Claude JSONL transcript; its text
+                    tail is harvested when text is empty.
+  provider        - Optional orchestrator provider id (default claude).
+
+Review-only: returns candidates + save-check duplicate hints.  Nothing is
+persisted and no memory is added — you decide what to memory-add."
+  (anvil-server-with-error-handling
+   (anvil-memory-harvest-candidates
+    :text (and text (not (string-empty-p text)) text)
+    :transcript-path (and transcript-path
+                          (not (string-empty-p transcript-path))
+                          transcript-path)
+    :provider (and provider (not (string-empty-p provider))
+                   (intern provider)))))
+
 (defun anvil-memory--tool-reindex-fts (&optional tokenizer)
   "Rebuild memory_body_fts with TOKENIZER (trigram / unicode61).
 
@@ -3093,6 +3311,19 @@ Phase 6d).  Re-scans the memory directory (absorbing .md files edited
 by other agents) unless no-scan is set, then commits the current
 index as the snapshot so the next session's delta is measured from
 this session's end.  Generates or alters no memories.")
+
+    (,(anvil-server-encode-handler #'anvil-memory--tool-harvest-candidates)
+     :id "memory-harvest-candidates"
+     :intent '(memory)
+     :layer 'workflow
+     :description
+     "Extract durable cross-session memory CANDIDATES from session material
+via the orchestrator (Doc 48 Phase 6e).  Pass text (a summary / excerpts)
+or a transcript-path.  Each candidate is run through save-check and tagged
+with its most similar existing memory + a likely-duplicate flag.
+Review-only: nothing is persisted and no memory is added — you decide what
+to memory-add.  On-demand only (no hook); the orchestrator call has a
+latency / usage cost.")
 
     (,(anvil-server-encode-handler #'anvil-memory--tool-reindex-fts)
      :id "memory-reindex-fts"
