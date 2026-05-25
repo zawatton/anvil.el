@@ -116,6 +116,23 @@ nil for production (silent).")
   ;; without ever touching the vendor files.
   (dolist (lib '(subr-x seq cl-extra cl-seq benchmark profiler))
     (provide lib))
+  ;; HEADLESS editor/UI skip (standalone NeLisp cold-load ~76s -> ~36s).
+  ;; `bin/anvil-runtime mcp serve' is always headless JSON-RPC over stdio: it
+  ;; never opens a frame, syntax table, font-lock buffer or TUI event loop.
+  ;; Pre-providing these editor/UI substrate features turns emacs-init.el's
+  ;; `(require ...)' calls into silent no-ops (NeLisp's permissive `require'
+  ;; succeeds for already-provided features), so the pure-elisp interpreter
+  ;; never walks ~50s worth of unused defuns.  KEEP loaded: emacs-buffer /
+  ;; minibuffer / string / hash / fns / eval / callproc / sqlite — anvil-server
+  ;; depends on those.  If a tool handler ever needs one of the skipped
+  ;; features, drop it from this list (it will then load on demand).
+  (dolist (f '(emacs-syntax-table emacs-elisp-mode emacs-mode emacs-mode-builtins
+               emacs-font-lock-builtins emacs-faces-builtins emacs-textmodes-stub
+               emacs-redisplay-builtins emacs-tui-event emacs-tui-backend
+               emacs-frame-builtins emacs-window-builtins emacs-keymap-builtins
+               emacs-command-loop-builtins
+               emacs-frame emacs-window keymap emacs-faces emacs-font-lock))
+    (provide f))
   ;; Prefer .el over .elc — post-2026-05-17 nelisp's stdlib-misc swaps
   ;; the elisp Reader to a pure-elisp form that cannot parse `#[..]'
   ;; byte-compiled lambdas or `#s(..)' record syntax that .elc files
