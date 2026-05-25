@@ -111,6 +111,73 @@ MCP Parameters:
     (should-not (assoc "_args" props))
     (should (equal ["task_id"] required))))
 
+(ert-deftest anvil-test-schema-cache-reuses-identical-schema-and-fragment ()
+  "A warm schema cache must skip schema and fragment generation."
+  (defun anvil-test--schema-cache-tool (path &optional mode)
+    "Read PATH using MODE.
+
+MCP Parameters:
+  path - File path to read
+  mode - Optional read mode"
+    (list path mode))
+  (let* ((id "anvil-test-schema-cache")
+         (description "Read a file for schema cache testing")
+         (server-id "anvil-test-schema-cache-server")
+         (cache-file (make-temp-file "anvil-schema-cache-test-"))
+         (arglist (help-function-arglist
+                   'anvil-test--schema-cache-tool t))
+         (fresh-schema
+          (anvil-server--generate-schema-from-function
+           'anvil-test--schema-cache-tool arglist))
+         (fresh-fragment
+          (anvil-server--build-tool-fragment
+           id description fresh-schema)))
+    (unwind-protect
+        (let ((anvil-server-schema-cache-file cache-file)
+              (anvil-server--schema-cache nil)
+              (anvil-server--schema-cache-loaded nil))
+          (anvil-server-unregister-tool id server-id)
+          (anvil-server-register-tool
+           #'anvil-test--schema-cache-tool
+           :id id
+           :description description
+           :server-id server-id)
+          (let* ((tools-table (anvil-server--get-server-tools server-id))
+                 (tool (gethash id tools-table)))
+            (should (equal fresh-schema (plist-get tool :schema)))
+            (should (equal fresh-fragment (plist-get tool :json-fragment))))
+          (anvil-server-unregister-tool id server-id)
+          ;; Force the next registration to reload the on-disk cache.
+          (setq anvil-server--schema-cache nil)
+          (setq anvil-server--schema-cache-loaded nil)
+          (let ((schema-calls 0)
+                (fragment-calls 0))
+            (cl-letf (((symbol-function
+                        'anvil-server--generate-schema-from-function)
+                       (lambda (&rest _args)
+                         (setq schema-calls (1+ schema-calls))
+                         (error "schema generation was not skipped")))
+                      ((symbol-function
+                        'anvil-server--build-tool-fragment)
+                       (lambda (&rest _args)
+                         (setq fragment-calls (1+ fragment-calls))
+                         (error "fragment generation was not skipped"))))
+              (anvil-server-register-tool
+               #'anvil-test--schema-cache-tool
+               :id id
+               :description description
+               :server-id server-id))
+            (let* ((tools-table (anvil-server--get-server-tools server-id))
+                   (tool (gethash id tools-table)))
+              (should (= 0 schema-calls))
+              (should (= 0 fragment-calls))
+              (should (equal fresh-schema (plist-get tool :schema)))
+              (should (equal fresh-fragment
+                             (plist-get tool :json-fragment))))))
+      (anvil-server-unregister-tool id server-id)
+      (when (file-exists-p cache-file)
+        (delete-file cache-file)))))
+
 (ert-deftest anvil-test-dispatch-tolerates-stale-underscore-args ()
   "A client with a stale schema that still sends `_args' must not error.
 The dispatcher silently drops `_'-prefixed provided params so a mid-flight

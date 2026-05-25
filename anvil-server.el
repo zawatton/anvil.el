@@ -88,6 +88,14 @@ Defaults to `user-emacs-directory' but can be customized."
   :type 'directory
   :group 'anvil-server)
 
+(defcustom anvil-server-schema-cache-file
+  (expand-file-name
+   "anvil-schema-cache.el"
+   (expand-file-name "anvil-runtime" temporary-file-directory))
+  "File used to persist precomputed MCP tool schemas and JSON fragments."
+  :type 'file
+  :group 'anvil-server)
+
 ;;; Public Constants
 
 (defconst anvil-server-name "anvil"
@@ -162,6 +170,15 @@ Keys are server-id strings, values are hash tables of URI to resource-data.")
   (make-hash-table :test 'equal)
   "Hash table of registered MCP resource templates by server.
 Keys are server-id strings, values are hash tables of template to template-data.")
+
+(defvar anvil-server--schema-cache-version 1
+  "Version marker for `anvil-server-schema-cache-file'.")
+
+(defvar anvil-server--schema-cache nil
+  "In-memory list of persisted schema cache entries.")
+
+(defvar anvil-server--schema-cache-loaded nil
+  "Non-nil once `anvil-server-schema-cache-file' has been read.")
 
 ;;; Core helpers
 
@@ -264,6 +281,118 @@ Hand-built; never calls `json-encode'."
           ",\"description\":" (anvil-server--js-string description)
           ",\"inputSchema\":" (anvil-server--js-schema schema)
           "}"))
+
+(defun anvil-server--prin1-to-string (object)
+  "Return the `prin1' representation of OBJECT as a string.
+Uses the builtin `prin1-to-string' (a pure string operation) rather
+than `prin1' into a temp buffer: standalone NeLisp ignores a buffer
+stream argument to `prin1' and writes to stdout instead, which both
+corrupts the MCP framing channel and leaves the buffer empty."
+  (let ((print-length nil)
+        (print-level nil))
+    (prin1-to-string object)))
+
+(defun anvil-server--schema-cache-signature
+    (raw-handler arglist description provided-schema)
+  "Return a persistent cache signature for one tool registration.
+Keys on exactly the inputs the generated schema depends on: the
+handler's ARGLIST, its docstring (parsed for the `MCP Parameters:'
+section by `anvil-server--function-param-descriptions'), the tool
+DESCRIPTION, and any explicitly-PROVIDED-SCHEMA.
+
+Deliberately does NOT serialize the live function object.  On
+standalone NeLisp the handler is a `(closure ENV ARGS BODY)' whose
+captured ENV (a) overflows `prin1' into a stack-exhaustion SIGSEGV
+\(observed: hard crash on the first tool registration) and (b) is
+re-consed every session, so a definition-keyed signature could never
+hit the cache there anyway.  The docstring + arglist already change
+whenever an edit alters the generated schema, which is the only
+invalidation this cache needs."
+  (let ((doc (ignore-errors (documentation raw-handler t)))
+        (handler-name (and (symbolp raw-handler) raw-handler)))
+    (anvil-server--prin1-to-string
+     (list :handler handler-name
+           :arglist arglist
+           :description description
+           :doc doc
+           :schema provided-schema))))
+
+(defvar anvil-server--schema-cache-file-data nil
+  "Scratch binding set by loading `anvil-server-schema-cache-file'.
+The cache file is a self-loading `(setq ...)' form; see
+`anvil-server--schema-cache-write'.")
+
+(defun anvil-server--schema-cache-load ()
+  "Read `anvil-server-schema-cache-file' once into memory via `load'.
+Standalone NeLisp cannot `read' from a buffer (`insert-file-contents'
+yields an empty buffer and `(read (current-buffer))' signals \"no
+STREAM\"), so the cache file is a self-loading `(setq ...)' form that we
+`load' and then validate.  `load' behaves identically on host Emacs, so
+this is a single portable path."
+  (unless anvil-server--schema-cache-loaded
+    (setq anvil-server--schema-cache-loaded t)
+    (setq anvil-server--schema-cache
+          (condition-case nil
+              (progn
+                (setq anvil-server--schema-cache-file-data nil)
+                ;; NOERROR + NOMESSAGE: a missing cache file just yields nil.
+                (load anvil-server-schema-cache-file t t)
+                (let ((data anvil-server--schema-cache-file-data))
+                  (if (and (listp data)
+                           (eq (plist-get data :version)
+                               anvil-server--schema-cache-version)
+                           (listp (plist-get data :entries)))
+                      (plist-get data :entries)
+                    nil)))
+            (error nil)))))
+
+(defun anvil-server--schema-cache-write ()
+  "Persist `anvil-server--schema-cache' to disk as a self-loading form.
+Writes `(setq anvil-server--schema-cache-file-data (quote DATA))' via
+`write-region' on a STRING.  Standalone NeLisp does not honour a buffer
+stream argument to `prin1' (it leaks to stdout and leaves the buffer
+empty), so the cache round-trips purely through string ops + `load'
+\(see `anvil-server--schema-cache-load')."
+  (condition-case nil
+      (let ((dir (file-name-directory anvil-server-schema-cache-file)))
+        (when (and dir (not (file-directory-p dir)))
+          (make-directory dir t))
+        (write-region
+         (concat
+          "(setq anvil-server--schema-cache-file-data '"
+          (anvil-server--prin1-to-string
+           (list :version anvil-server--schema-cache-version
+                 :entries anvil-server--schema-cache))
+          ")\n")
+         nil anvil-server-schema-cache-file))
+    (error nil)))
+
+(defun anvil-server--schema-cache-get (id signature)
+  "Return cached schema entry for ID and SIGNATURE, or nil."
+  (anvil-server--schema-cache-load)
+  (catch 'found
+    (dolist (entry anvil-server--schema-cache)
+      (when (and (equal id (plist-get entry :id))
+                 (equal signature (plist-get entry :signature))
+                 (plist-member entry :schema)
+                 (stringp (plist-get entry :fragment)))
+        (throw 'found entry)))
+    nil))
+
+(defun anvil-server--schema-cache-put (id signature schema fragment)
+  "Persist SCHEMA and FRAGMENT for ID and SIGNATURE."
+  (anvil-server--schema-cache-load)
+  (setq anvil-server--schema-cache
+        (cons (list :id id
+                    :signature signature
+                    :schema schema
+                    :fragment fragment)
+              (cl-remove-if
+               (lambda (entry)
+                 (and (equal id (plist-get entry :id))
+                      (equal signature (plist-get entry :signature))))
+               anvil-server--schema-cache)))
+  (anvil-server--schema-cache-write))
 
 (defun anvil-server--scan-substr-pos (s needle)
   "Return start index of NEEDLE in S, or nil.
@@ -582,23 +711,47 @@ doesn't match function arguments, or if any parameter is not documented."
              arg-name)))))
     descriptions))
 
-(defun anvil-server--generate-schema-from-function (func)
+(defun anvil-server--function-param-descriptions (func arglist)
+  "Return MCP parameter descriptions for FUNC using ARGLIST.
+For symbol handlers, cache the parsed descriptions on the symbol so repeated
+registrations do not re-fetch and re-parse the same docstring."
+  (if (symbolp func)
+      (let ((cached (get func 'anvil-server-param-descriptions))
+            (definition (symbol-function func)))
+        (if (and cached
+                 (eq definition (plist-get cached :definition))
+                 (equal arglist (plist-get cached :arglist)))
+            (plist-get cached :descriptions)
+          (let* (;; Use RAW=t to prevent substitute-command-keys from
+                 ;; converting apostrophes to fancy quotes, preserving exact
+                 ;; documentation text.
+                 (docstring (documentation func t))
+                 (descriptions
+                  (anvil-server--extract-param-descriptions
+                   docstring arglist)))
+            (put func 'anvil-server-param-descriptions
+                 (list :arglist arglist
+                       :definition definition
+                       :descriptions descriptions))
+            descriptions)))
+    (anvil-server--extract-param-descriptions (documentation func t) arglist)))
+
+(defun anvil-server--generate-schema-from-function (func &optional arglist)
   "Generate JSON schema by analyzing FUNC's signature.
 Returns a schema object suitable for tool registration.
 Extracts parameter descriptions from the docstring if available.
 Parameters prefixed with `_' (the Elisp unused-arg convention) are
 hidden from the client-facing schema — `anvil-server--handle-tools-call'
-fills them with nil at dispatch time."
-  (let ((arglist (help-function-arglist func t)))
+fills them with nil at dispatch time.
+If ARGLIST is provided, reuse it instead of calling
+`help-function-arglist'."
+  (let ((arglist (or arglist (help-function-arglist func t))))
     (when (memq '&rest arglist)
       (error "MCP tool handlers do not support &rest parameters"))
     (let*
-        ( ;; Use RAW=t to prevent substitute-command-keys from converting
-         ;; apostrophes to fancy quotes, preserving exact documentation text
-         (docstring (documentation func t))
-         (param-descriptions
-          (anvil-server--extract-param-descriptions
-           docstring arglist))
+        ((param-descriptions
+          (anvil-server--function-param-descriptions
+           func arglist))
          ;; Filter out `_'-prefixed args for the user-visible schema.
          (visible-arglist
           (cl-remove-if
@@ -1950,6 +2103,8 @@ Required properties:
 
 Optional properties:
   :title           User-friendly display name for the tool
+  :schema          Precomputed MCP input schema; skips handler introspection
+                   for schema generation when provided
   :read-only       If true, indicates tool doesn't modify its environment
   :server-id       Server identifier (defaults to \"default\")
 
@@ -1994,6 +2149,7 @@ See also:
   (let* ((id (plist-get properties :id))
          (description (plist-get properties :description))
          (title (plist-get properties :title))
+         (provided-schema (plist-get properties :schema))
          (read-only (plist-get properties :read-only))
          (server-id (or (plist-get properties :server-id) "default"))
          (tools-table (anvil-server--get-server-tools server-id)))
@@ -2023,10 +2179,19 @@ See also:
              (raw-handler (plist-get handler-meta :handler))
              (arglist (plist-get handler-meta :arglist))
              (encode-result (plist-get handler-meta :encode-result))
+             (schema-cache-signature
+              (anvil-server--schema-cache-signature
+               raw-handler arglist description provided-schema))
+             (schema-cache-entry
+              (anvil-server--schema-cache-get id schema-cache-signature))
              (_p3 (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
                     (nelisp--write-stderr-line (concat "[REG-3 schema-start] " id))))
              (schema
-              (anvil-server--generate-schema-from-function raw-handler))
+              (if schema-cache-entry
+                  (plist-get schema-cache-entry :schema)
+                (or provided-schema
+                    (anvil-server--generate-schema-from-function
+                     raw-handler arglist))))
              (_p4 (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
                     (nelisp--write-stderr-line (concat "[REG-4 schema-done] " id))))
              (tool
@@ -2072,9 +2237,17 @@ See also:
         ;; 4-5 calls — calling it 6 times during substrate registration
         ;; was hitting the wall and stalling cold-load.  The hand-built
         ;; encoder uses only `concat' + `format' and stays O(N) regardless.
-        (let ((fragment (anvil-server--build-tool-fragment
-                         id description (plist-get tool :schema))))
+        (let ((fragment
+               (or (and schema-cache-entry
+                        (plist-get schema-cache-entry :fragment))
+                   (anvil-server--build-tool-fragment
+                    id description (plist-get tool :schema)))))
           (setq tool (plist-put tool :json-fragment fragment)))
+        (unless schema-cache-entry
+          (anvil-server--schema-cache-put
+           id schema-cache-signature
+           (plist-get tool :schema)
+           (plist-get tool :json-fragment)))
         ;; Register the tool
         (anvil-server--ref-counted-register id tool tools-table)
         ;; Perf (2026-05-11): tools/list response is cached per server-id;
