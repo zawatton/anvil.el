@@ -48,6 +48,226 @@ nil for production (silent).")
   (let ((val (and (fboundp 'getenv) (getenv name))))
     (if (and val (> (length val) 0)) val default)))
 
+(defvar anvil-runtime-shell--fast-stdin-buffer ""
+  "Unread stdin bytes captured by the fast MCP handshake path.")
+
+(defvar anvil-runtime-shell--fast-pending-body nil
+  "JSON-RPC body already read by the fast path but not handled there.")
+
+(defvar anvil-runtime-shell--fast-trace nil
+  "When non-nil, trace the pre-init fast MCP handshake path.")
+
+(defun anvil-runtime-shell--fast-log (s)
+  "Write fast handshake trace S to stderr when tracing is enabled."
+  (when (and anvil-runtime-shell--fast-trace
+             (fboundp 'nelisp--write-stderr-line))
+    (nelisp--write-stderr-line s)))
+
+(defun anvil-runtime-shell--plist-get (plist prop)
+  "Small `plist-get' replacement available before `emacs-init.el'."
+  (let ((cur plist)
+        (found nil)
+        (value nil))
+    (while (and cur (not found))
+      (if (eq (car cur) prop)
+          (progn
+            (setq found t)
+            (setq value (car (cdr cur))))
+        (setq cur (cdr (cdr cur)))))
+    value))
+
+(defun anvil-runtime-shell--substr-pos (s needle)
+  "Return the first position of NEEDLE in S, or nil."
+  (let* ((s-len (length s))
+         (n-len (length needle))
+         (limit (- s-len n-len))
+         (i 0)
+         (found nil))
+    (while (and (<= i limit) (not found))
+      (let ((j 0)
+            (ok t))
+        (while (and ok (< j n-len))
+          (if (eq (aref s (+ i j)) (aref needle j))
+              (setq j (1+ j))
+            (setq ok nil)))
+        (if ok
+            (setq found i)
+          (setq i (1+ i)))))
+    found))
+
+(defun anvil-runtime-shell--scan-json-string (s needle)
+  "Return a JSON string value after NEEDLE in S, or nil."
+  (let ((pos (anvil-runtime-shell--substr-pos s needle)))
+    (when pos
+      (let ((i (+ pos (length needle)))
+            (n (length s))
+            (chars nil))
+        (while (and (< i n)
+                    (let ((c (aref s i)))
+                      (or (eq c ?\s) (eq c ?\t) (eq c ?\n) (eq c ?\r))))
+          (setq i (1+ i)))
+        (when (and (< i n) (eq (aref s i) ?\"))
+          (setq i (1+ i))
+          (while (and (< i n) (not (eq (aref s i) ?\")))
+            (if (eq (aref s i) ?\\)
+                (progn
+                  (setq i (1+ i))
+                  (when (< i n)
+                    (push (aref s i) chars)
+                    (setq i (1+ i))))
+              (push (aref s i) chars)
+              (setq i (1+ i))))
+          (apply #'string (nreverse chars)))))))
+
+(defun anvil-runtime-shell--scan-json-id (s)
+  "Return a simple JSON-RPC id literal from S, as already encoded JSON."
+  (let ((pos (anvil-runtime-shell--substr-pos s "\"id\":")))
+    (if (not pos)
+        "null"
+      (let ((i (+ pos 5))
+            (n (length s))
+            (chars nil))
+        (while (and (< i n)
+                    (let ((c (aref s i)))
+                      (or (eq c ?\s) (eq c ?\t) (eq c ?\n) (eq c ?\r))))
+          (setq i (1+ i)))
+        (cond
+         ((and (< i n) (eq (aref s i) ?\"))
+          (let ((start i))
+            (setq i (1+ i))
+            (while (and (< i n)
+                        (or (not (eq (aref s i) ?\"))
+                            (and (> i start)
+                                 (eq (aref s (1- i)) ?\\))))
+              (setq i (1+ i)))
+            (if (< i n) (substring s start (1+ i)) "null")))
+         (t
+          (while (and (< i n)
+                      (let ((c (aref s i)))
+                        (or (eq c ?-) (and (>= c ?0) (<= c ?9)))))
+            (push (aref s i) chars)
+            (setq i (1+ i)))
+          (if chars (apply #'string (nreverse chars)) "null")))))))
+
+(defun anvil-runtime-shell--frame (body)
+  "Return BODY as a Content-Length MCP frame."
+  (let ((n (if (fboundp 'string-bytes) (string-bytes body) (length body))))
+    (concat "Content-Length: " (number-to-string n) "\r\n\r\n" body)))
+
+(defun anvil-runtime-shell--stdout (s)
+  "Write S to stdout using the standalone byte writer when present."
+  (if (and (fboundp 'nelisp--write-stdout-bytes) (stringp s))
+      (nelisp--write-stdout-bytes s)
+    (princ s)))
+
+(defun anvil-runtime-shell--fast-refill ()
+  "Read more stdin into `anvil-runtime-shell--fast-stdin-buffer'."
+  (let ((chunk (and (fboundp 'read-stdin-bytes)
+                    (read-stdin-bytes 4096))))
+    (when (and (stringp chunk) (> (length chunk) 0))
+      (setq anvil-runtime-shell--fast-stdin-buffer
+            (concat anvil-runtime-shell--fast-stdin-buffer chunk))
+      t)))
+
+(defun anvil-runtime-shell--fast-read-frame ()
+  "Read one MCP frame body using only standalone primitives."
+  (let ((sep-pos nil)
+        (done nil))
+    (while (and (not done)
+                (not (setq sep-pos
+                           (anvil-runtime-shell--substr-pos
+                            anvil-runtime-shell--fast-stdin-buffer
+                            "\r\n\r\n"))))
+      (setq done (not (anvil-runtime-shell--fast-refill))))
+    (when sep-pos
+      (let* ((header (substring anvil-runtime-shell--fast-stdin-buffer
+                                0 sep-pos))
+             (body-start (+ sep-pos 4))
+             (cl-pos (anvil-runtime-shell--substr-pos header "Content-Length:"))
+             (n nil))
+        (when cl-pos
+          (let ((i (+ cl-pos 15))
+                (h-len (length header))
+                (digits nil))
+            (while (and (< i h-len)
+                        (let ((c (aref header i)))
+                          (or (eq c ?\s) (eq c ?\t))))
+              (setq i (1+ i)))
+            (while (and (< i h-len)
+                        (let ((c (aref header i)))
+                          (and (>= c ?0) (<= c ?9))))
+              (push (aref header i) digits)
+              (setq i (1+ i)))
+            (when digits
+              (setq n (string-to-number
+                       (apply #'string (nreverse digits)))))))
+        (when n
+          (while (and (< (length anvil-runtime-shell--fast-stdin-buffer)
+                         (+ body-start n))
+                      (anvil-runtime-shell--fast-refill)))
+          (when (>= (length anvil-runtime-shell--fast-stdin-buffer)
+                    (+ body-start n))
+            (let ((body (substring anvil-runtime-shell--fast-stdin-buffer
+                                   body-start (+ body-start n))))
+              (setq anvil-runtime-shell--fast-stdin-buffer
+                    (substring anvil-runtime-shell--fast-stdin-buffer
+                               (+ body-start n)))
+              body)))))))
+
+(defun anvil-runtime-shell--fast-tools-result (fast-file)
+  "Return a precomputed `tools/list' result JSON from FAST-FILE, or nil."
+  (let ((anvil-runtime-shell--fast-tools-json nil))
+    (condition-case nil
+        (progn
+          (anvil-runtime-shell--fast-log "[FAST] load fast tools")
+          (load fast-file t t)
+          (when (stringp anvil-runtime-shell--fast-tools-json)
+            (anvil-runtime-shell--fast-log "[FAST] fast tools loaded")
+            anvil-runtime-shell--fast-tools-json))
+      (error
+       (anvil-runtime-shell--fast-log "[FAST] fast tools unavailable")
+       nil))))
+
+(defun anvil-runtime-shell--fast-handshake (fast-file)
+  "Serve initialize/tools-list directly from FAST-FILE before full load."
+  (let ((tools-json (anvil-runtime-shell--fast-tools-result fast-file))
+        (keep-going t)
+        (served nil))
+    (when tools-json
+      (anvil-runtime-shell--fast-log "[FAST] enter loop")
+      (while keep-going
+        (let ((body (anvil-runtime-shell--fast-read-frame)))
+          (if (not body)
+              (setq keep-going nil)
+            (let ((method
+                   (anvil-runtime-shell--scan-json-string body "\"method\":"))
+                  (id (anvil-runtime-shell--scan-json-id body)))
+              (anvil-runtime-shell--fast-log
+               (concat "[FAST] method=" (or method "nil")))
+              (cond
+               ((equal method "initialize")
+                (anvil-runtime-shell--stdout
+                 (anvil-runtime-shell--frame
+                  (concat "{\"jsonrpc\":\"2.0\",\"id\":" id
+                          ",\"result\":{\"protocolVersion\":\"2025-03-26\","
+                          "\"serverInfo\":{\"name\":\"anvil\","
+                          "\"version\":\"2025-03-26\"},"
+                          "\"capabilities\":{\"tools\":{}}}}")))
+                (setq served t))
+               ((equal method "notifications/initialized")
+                (setq served t))
+               ((equal method "tools/list")
+                (anvil-runtime-shell--stdout
+                 (anvil-runtime-shell--frame
+                  (concat "{\"jsonrpc\":\"2.0\",\"id\":" id
+                          ",\"result\":" tools-json "}")))
+                (setq served t)
+                (setq keep-going nil))
+               (t
+                (setq anvil-runtime-shell--fast-pending-body body)
+                (setq keep-going nil))))))))
+    served))
+
 ;; Path resolution.  Priority order:
 ;;
 ;;   1. `anvil-runtime-bootstrap-{anvil-el,nelisp-emacs}-dir' set by
@@ -92,7 +312,13 @@ nil for production (silent).")
        (stdio-el (concat nelisp-emacs-dir "/src/emacs-stdio.el"))
        (metrics-el (concat anvil-el-dir "/anvil-server-metrics.el"))
        (server-el (concat anvil-el-dir "/anvil-server.el"))
-       (server-commands-el (concat anvil-el-dir "/anvil-server-commands.el")))
+       (server-commands-el (concat anvil-el-dir "/anvil-server-commands.el"))
+       (fast-tools-file "/tmp/anvil-runtime/anvil-fast-tools.el"))
+
+  (when (and (not anvil-server--debug-trace)
+             (fboundp 'read-stdin-bytes)
+             (fboundp 'nelisp--write-stdout-bytes))
+    (anvil-runtime-shell--fast-handshake fast-tools-file))
 
   ;; Bootstrap layer 2 + json / backquote fixes.
   ;; emacs-init.el gates its vendor load-path setup on
@@ -210,6 +436,11 @@ nil for production (silent).")
   (load stdio-el nil t)
   (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
     (nelisp--write-stderr-line "[STEP] stdio-el done"))
+  (when (boundp 'emacs-stdio--buffer)
+    (setq emacs-stdio--buffer
+          (concat anvil-runtime-shell--fast-stdin-buffer
+                  emacs-stdio--buffer))
+    (setq anvil-runtime-shell--fast-stdin-buffer ""))
   (when (fboundp 'emacs-stdio-install-stdin-shim)
     (emacs-stdio-install-stdin-shim))
 
@@ -473,6 +704,19 @@ Uses CR-strip to recognise lines that are CRLF artefacts as blank."
                      server-id lazy-loaders))))
           (cond
            ((and lazy-count (> lazy-count 0))
+            (let ((tools-json
+                   (and (boundp 'anvil-server--tools-list-cache)
+                        (gethash server-id anvil-server--tools-list-cache))))
+              (when (and (stringp tools-json)
+                         (fboundp 'write-region))
+                (condition-case nil
+                    (write-region
+                     (concat
+                      "(setq anvil-runtime-shell--fast-tools-json '"
+                      (prin1-to-string tools-json)
+                      ")\n")
+                     nil fast-tools-file)
+                  (error nil))))
             (when (and anvil-server--debug-trace
                        (fboundp 'nelisp--write-stderr-line))
               (nelisp--write-stderr-line
@@ -506,6 +750,14 @@ Uses CR-strip to recognise lines that are CRLF artefacts as blank."
   ;; `MCP server is already running').  Just enter the loop.
   (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
     (nelisp--write-stderr-line "[STEP] entering MCP stdin loop"))
+  (when anvil-runtime-shell--fast-pending-body
+    (anvil-server-start)
+    (let ((resp
+           (anvil-server-process-jsonrpc
+            anvil-runtime-shell--fast-pending-body server-id)))
+      (anvil-server--batch-emit-response resp t))
+    (anvil-server-stop)
+    (setq anvil-runtime-shell--fast-pending-body nil))
   (anvil-server-run-batch-stdio server-id))
 
 ;;; anvil-runtime-shell-loop.el ends here
