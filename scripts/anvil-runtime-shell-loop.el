@@ -318,13 +318,13 @@ case-insensitively, returns the integer value or nil."
 
   (defun anvil-server-mcp-frame-encode (body)
     "Phase B5 Stage 1b override — emit `Content-Length: N\r\n\r\nBODY'.
-N is the UTF-8 byte length of BODY.  Standalone NeLisp strings are
-already UTF-8, so `length' is byte-count for ASCII bodies and
-`encode-coding-string' is a no-op identity per Phase B5 stub."
+N is the UTF-8 byte length of BODY."
     (let* ((bytes (if (fboundp 'encode-coding-string)
                       (encode-coding-string body 'utf-8 t)
                     body))
-           (n (length bytes)))
+           (n (if (fboundp 'string-bytes)
+                  (string-bytes bytes)
+                (length bytes))))
       (concat "Content-Length: " (number-to-string n) "\r\n\r\n" body)))
 
   ;; Override the framed-with-prefix reader entirely.  The original uses

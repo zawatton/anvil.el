@@ -296,25 +296,29 @@ corrupts the MCP framing channel and leaves the buffer empty."
     (raw-handler arglist description provided-schema)
   "Return a persistent cache signature for one tool registration.
 Keys on exactly the inputs the generated schema depends on: the
-handler's ARGLIST, its docstring (parsed for the `MCP Parameters:'
-section by `anvil-server--function-param-descriptions'), the tool
-DESCRIPTION, and any explicitly-PROVIDED-SCHEMA.
+handler's ARGLIST, the tool DESCRIPTION, and any
+explicitly-PROVIDED-SCHEMA.
 
 Deliberately does NOT serialize the live function object.  On
 standalone NeLisp the handler is a `(closure ENV ARGS BODY)' whose
 captured ENV (a) overflows `prin1' into a stack-exhaustion SIGSEGV
 \(observed: hard crash on the first tool registration) and (b) is
 re-consed every session, so a definition-keyed signature could never
-hit the cache there anyway.  The docstring + arglist already change
-whenever an edit alters the generated schema, which is the only
-invalidation this cache needs."
-  (let ((doc (ignore-errors (documentation raw-handler t)))
-        (handler-name (and (symbolp raw-handler) raw-handler)))
+hit the cache there anyway.
+
+Also deliberately avoids `(documentation RAW-HANDLER t)'.  Standalone
+NeLisp can return unstable values or hang while resolving docstrings for
+some handlers, and this function runs before cache lookup.  Cache misses
+still parse docstrings during schema generation when user-visible
+parameters exist."
+  (let ((handler-name (and (symbolp raw-handler) raw-handler)))
     (anvil-server--prin1-to-string
      (list :handler handler-name
            :arglist arglist
            :description description
-           :doc doc
+           ;; Preserve the old standalone cache signature shape.  Earlier
+           ;; standalone-generated cache files already stored `:doc nil'.
+           :doc nil
            :schema provided-schema))))
 
 (defvar anvil-server--schema-cache-file-data nil
@@ -415,31 +419,72 @@ standalone nelisp."
     found))
 
 (defun anvil-server--scan-int-after (s needle)
-  "Return integer immediately following NEEDLE in S, or nil."
+  "Return integer after NEEDLE in S, tolerating whitespace, or nil."
   (let ((pos (anvil-server--scan-substr-pos s needle)))
     (when pos
       (let* ((s-len (length s))
              (i (+ pos (length needle)))
-             (digits nil))
+             (digits nil)
+             (saw-digit nil))
+        (while (and (< i s-len)
+                    (let ((c (aref s i)))
+                      (or (eq c ?\s) (eq c ?\t) (eq c ?\n) (eq c ?\r))))
+          (setq i (1+ i)))
+        (when (and (< i s-len) (eq (aref s i) ?-))
+          (push (aref s i) digits)
+          (setq i (1+ i)))
         (while (and (< i s-len)
                     (let ((c (aref s i)))
                       (and (>= c ?0) (<= c ?9))))
           (push (aref s i) digits)
+          (setq saw-digit t)
           (setq i (1+ i)))
-        (when digits
+        (when saw-digit
           (string-to-number (apply #'string (nreverse digits))))))))
 
 (defun anvil-server--scan-string-after (s needle)
-  "Return string between NEEDLE and the next `\"' in S, or nil."
+  "Return JSON string after NEEDLE in S, tolerating whitespace, or nil.
+NEEDLE should end at the colon before the value."
   (let ((pos (anvil-server--scan-substr-pos s needle)))
     (when pos
       (let* ((s-len (length s))
              (i (+ pos (length needle)))
              (chars nil))
-        (while (and (< i s-len) (not (eq (aref s i) ?\")))
-          (push (aref s i) chars)
+        (while (and (< i s-len)
+                    (let ((c (aref s i)))
+                      (or (eq c ?\s) (eq c ?\t) (eq c ?\n) (eq c ?\r))))
           (setq i (1+ i)))
-        (apply #'string (nreverse chars))))))
+        (when (and (< i s-len) (eq (aref s i) ?\"))
+          (setq i (1+ i))
+          (while (and (< i s-len) (not (eq (aref s i) ?\")))
+            (if (eq (aref s i) ?\\)
+                (progn
+                  (setq i (1+ i))
+                  (when (< i s-len)
+                    (push (aref s i) chars)
+                    (setq i (1+ i))))
+              (push (aref s i) chars)
+              (setq i (1+ i))))
+          (apply #'string (nreverse chars)))))))
+
+(defun anvil-server--scan-json-value-after (s needle)
+  "Return a string or integer JSON value after NEEDLE in S, or nil."
+  (let ((pos (anvil-server--scan-substr-pos s needle)))
+    (when pos
+      (let* ((s-len (length s))
+             (i (+ pos (length needle))))
+        (while (and (< i s-len)
+                    (let ((c (aref s i)))
+                      (or (eq c ?\s) (eq c ?\t) (eq c ?\n) (eq c ?\r))))
+          (setq i (1+ i)))
+        (cond
+         ((and (< i s-len) (eq (aref s i) ?\"))
+          (anvil-server--scan-string-after s needle))
+         ((and (< i s-len)
+               (let ((c (aref s i)))
+                 (or (eq c ?-) (and (>= c ?0) (<= c ?9)))))
+          (anvil-server--scan-int-after s needle))
+         (t nil))))))
 
 (defun anvil-server--scan-flat-object-after (s needle)
   "Parse a flat JSON object that begins right after NEEDLE in S.
@@ -748,19 +793,17 @@ If ARGLIST is provided, reuse it instead of calling
   (let ((arglist (or arglist (help-function-arglist func t))))
     (when (memq '&rest arglist)
       (error "MCP tool handlers do not support &rest parameters"))
-    (let*
-        ((param-descriptions
-          (anvil-server--function-param-descriptions
-           func arglist))
-         ;; Filter out `_'-prefixed args for the user-visible schema.
-         (visible-arglist
-          (cl-remove-if
-           (lambda (a)
-             (string-prefix-p "_" (symbol-name a)))
-           arglist)))
+    (let ((visible-arglist
+           (cl-remove-if
+            (lambda (a)
+              (string-prefix-p "_" (symbol-name a)))
+            arglist)))
       (if visible-arglist
           ;; One or more user-visible arguments case
-          (let ((properties '())
+          (let ((param-descriptions
+                 (anvil-server--function-param-descriptions
+                  func arglist))
+                (properties '())
                 (required '())
                 (seen-optional nil))
             (dolist (arg visible-arglist)
@@ -1390,7 +1433,12 @@ register / unregister."
              (format "[TL] fast-path %.4fs n=%d len=%d"
                      (- (float-time) t0) (length fragments)
                      (length result-json))))
-          (puthash cache-key result-json anvil-server--tools-list-cache)
+          ;; Standalone already stores per-tool JSON fragments; rebuilding
+          ;; this small wrapper is cheap.  Avoid mutating this request cache
+          ;; there because post-2026-05-17 NeLisp can stall in hash-table
+          ;; mutation after the large tools/list string is built.
+          (unless (fboundp 'nelisp--write-stderr-line)
+            (puthash cache-key result-json anvil-server--tools-list-cache))
           (anvil-server--jsonrpc-response-from-result-json id result-json))))))
 
 (defun anvil-server--build-resource-entry
@@ -1851,17 +1899,17 @@ See also: `anvil-server-process-jsonrpc-parsed'"
             (let ((t1 (float-time)))
               (if (fboundp 'nelisp--write-stderr-line)
                   ;; standalone path
-                  (let* ((sx-id (anvil-server--scan-int-after
+                  (let* ((sx-id (anvil-server--scan-json-value-after
                                  decoded "\"id\":"))
                          (sx-method (anvil-server--scan-string-after
-                                     decoded "\"method\":\""))
+                                     decoded "\"method\":"))
                          ;; For `tools/call' the handler needs
                          ;; `(name . X) (arguments . ALIST)' in params.
                          ;; Extract both with a flat-object scanner.
                          (sx-params
                           (when (equal sx-method "tools/call")
                             (let ((nm (anvil-server--scan-string-after
-                                       decoded "\"name\":\""))
+                                       decoded "\"name\":"))
                                   (args (anvil-server--scan-flat-object-after
                                          decoded "\"arguments\":")))
                               `((name . ,nm) (arguments . ,args))))))
@@ -2184,6 +2232,13 @@ See also:
                raw-handler arglist description provided-schema))
              (schema-cache-entry
               (anvil-server--schema-cache-get id schema-cache-signature))
+             (_cache-log
+              (when (and anvil-server--debug-trace
+                         (fboundp 'nelisp--write-stderr-line))
+                (nelisp--write-stderr-line
+                 (concat "[REG-2 cache-"
+                         (if schema-cache-entry "hit] " "miss] ")
+                         id))))
              (_p3 (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
                     (nelisp--write-stderr-line (concat "[REG-3 schema-start] " id))))
              (schema

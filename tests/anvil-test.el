@@ -178,6 +178,47 @@ MCP Parameters:
       (when (file-exists-p cache-file)
         (delete-file cache-file)))))
 
+(ert-deftest anvil-test-schema-cache-signature-does-not-read-docstring ()
+  "Signature construction must be stable before cache lookup."
+  (cl-letf (((symbol-function 'documentation)
+             (lambda (&rest _args)
+               (error "documentation must not be called"))))
+    (should (string-match-p
+             ":doc nil"
+             (anvil-server--schema-cache-signature
+              'anvil-test--schema-cache-tool
+              '(path &optional mode)
+              "Read a file for schema cache testing"
+              nil)))))
+
+(ert-deftest anvil-test-scan-int-after-tolerates-whitespace ()
+  "Standalone scanner must accept normal JSON whitespace before numbers."
+  (should (equal 42 (anvil-server--scan-int-after "{\"id\": 42,}" "\"id\":")))
+  (should (equal 42 (anvil-server--scan-int-after "{\"id\":42,}" "\"id\":")))
+  (should (equal 7 (anvil-server--scan-int-after "{\"id\":\t7 }" "\"id\":")))
+  (should (equal -3 (anvil-server--scan-int-after "{\"id\": -3 }" "\"id\":"))))
+
+(ert-deftest anvil-test-scan-string-after-tolerates-whitespace ()
+  "Standalone scanner must accept normal JSON whitespace before strings."
+  (should (equal "tools/list"
+                 (anvil-server--scan-string-after
+                  "{\"method\": \"tools/list\"}" "\"method\":")))
+  (should (equal "tools/list"
+                 (anvil-server--scan-string-after
+                  "{\"method\":\"tools/list\"}" "\"method\":")))
+  (should (equal "a\"b\\c"
+                 (anvil-server--scan-string-after
+                  "{\"name\": \"a\\\"b\\\\c\"}" "\"name\":"))))
+
+(ert-deftest anvil-test-scan-json-value-after-tolerates-string-id ()
+  "JSON-RPC ids may be strings as well as numbers."
+  (should (equal "abc"
+                 (anvil-server--scan-json-value-after
+                  "{\"id\": \"abc\"}" "\"id\":")))
+  (should (equal 17
+                 (anvil-server--scan-json-value-after
+                  "{\"id\": 17}" "\"id\":"))))
+
 (ert-deftest anvil-test-dispatch-tolerates-stale-underscore-args ()
   "A client with a stale schema that still sends `_args' must not error.
 The dispatcher silently drops `_'-prefixed provided params so a mid-flight
