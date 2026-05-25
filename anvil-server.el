@@ -1669,14 +1669,22 @@ See also: `anvil-server-process-jsonrpc-parsed'"
             ;; whose internal representation makes json-read-from-string
             ;; pathologically slow (> 600 s observed for 150-byte body).
             (setq decoded
-                  (if (and (fboundp 'nl-ffi-call)
-                           (not (and (fboundp 'multibyte-string-p)
-                                     (multibyte-string-p json-string))))
-                      ;; Host Emacs path: still decode for correctness.
-                      (decode-coding-string json-string 'utf-8 t)
-                    ;; Standalone nelisp: skip decode, json-string is
-                    ;; already UTF-8 text.
-                    json-string))
+                  (if (fboundp 'nelisp--write-stderr-line)
+                      ;; Standalone nelisp: read-stdin-bytes already returns
+                      ;; UTF-8 text; decode-coding-string would make json-read
+                      ;; pathologically slow, so pass through unchanged.
+                      json-string
+                    ;; Host Emacs: the JSON-RPC line arrives as a unibyte
+                    ;; (raw UTF-8 byte) string, so decode to multibyte before
+                    ;; json-read.  Otherwise CJK argument values come back
+                    ;; unibyte and `search-forward' / `re-search-forward'
+                    ;; never match the multibyte file buffer (manifested as
+                    ;; file-replace-string "string not found" on Japanese
+                    ;; while pure-ASCII args were unaffected).
+                    (if (and (fboundp 'multibyte-string-p)
+                             (multibyte-string-p json-string))
+                        json-string
+                      (decode-coding-string json-string 'utf-8 t))))
             (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
               (nelisp--write-stderr-line
                (format "[PJ] decode %.4fs decoded-len=%d"
