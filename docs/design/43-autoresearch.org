@@ -1,13 +1,157 @@
 #+title: anvil-autoresearch — self-improving experiment loop
 #+date: 2026-05-24
 #+author: zawatton
-#+property: status DRAFT
+#+property: status PHASE-5-6-SHIPPED
 #+property: scope GENERIC
 
 * STATUS
   :PROPERTIES:
   :ID:       d1c4e0f2-8f44-4f7c-bc1a-autoresearch-43
   :END:
+~PHASE-6-SHIPPED~ (2026-05-26) —
+=M-x anvil-autoresearch-dashboard= を追加。orchestrator の task table から
+=autoresearch-*= task だけを抽出し、tabulated-list で stage / target / status /
+provider / model / elapsed / cost / batch / summary を表示する。=g= で refresh、
+=RET= で task plist 詳細を開く。Doc43 自体は proposal / harvest / review /
+promote を MCP primitive として持ち、UI は進捗観察に限定して source 編集や
+harvest 実行はしない。
+
+~PHASE-5-SHIPPED~ (2026-05-26) —
+NeLisp Phase 47 codegen 向けの bounded implementation / harvest scaffold を追加。
+=autoresearch-nelisp-codegen-plan= は NeLisp root、target files、
+byte-compile eval command、ERT holdout command、implementation prompt を返す。
+=autoresearch-nelisp-codegen-implement= はその prompt を orchestrator task として
+submit し、=autoresearch-nelisp-codegen-harvest= が successful summary を
+codegen heuristic で ranking して manual review checklist を返す。Doc43 tool
+自体は NeLisp source を編集しない。
+
+~PHASE-3F-SHIPPED~ (2026-05-26) —
+=autoresearch-routing-implementation-promote-memory= を追加。
+=autoresearch-routing-implementation-harvest= の selected summary JSON、または
+selected candidate object を DB-direct anvil-memory row として保存する。
+=name= / =type= / =memory_description= / =tags_json= を指定できる。source 編集や
+routing 設定変更は行わない。
+
+~PHASE-3E-SHIPPED~ (2026-05-26) — =autoresearch-routing-implementation-harvest=
+を追加。=autoresearch-routing-implement= の batch id から successful task
+summary を回収し、routing implementation report として候補化・score 順
+ranking する。selected summary と manual review checklist を返す。patch 適用、
+source 編集、routing 設定変更は行わない。
+
+~PHASE-3D-SHIPPED~ (2026-05-26) — =autoresearch-routing-implement= を追加。
+=autoresearch-routing-patch-plan= と同じ dry-run plan を作り、その
+implementation prompt を bounded async orchestrator task として submit する。
+provider / model / budget / timeout / heartbeat / cwd / sandbox / no_worktree /
+worktree_name を指定可能。tool 自体は source を編集せず、batch id / task /
+plan を返す。
+
+~PHASE-3C-SHIPPED~ (2026-05-26) — =autoresearch-routing-patch-plan= を追加。
+=autoresearch-routing-harvest= の selected proposal JSON、または batch id から
+harvest した selected proposal を、target-file hints / implementation prompt /
+byte-compile command / ERT holdout command に変換する dry-run helper。source や
+routing 設定は変更せず、review 後の実装 patch step に渡す artifact を返す。
+
+~PHASE-3B-SHIPPED~ (2026-05-26) — =autoresearch-routing-harvest= を追加。
+=autoresearch-routing-propose= の batch id から successful task summary を
+回収し、routing 改善 proposal として候補化・score 順 ranking する。戻り値は
+selected review candidate / candidates / raw results。routing 設定、source、
+provider registry は変更しない read-only decision helper。
+
+~PHASE-3A-SHIPPED~ (2026-05-26) — =autoresearch-routing-propose= を追加。
+=autoresearch-routing-plan= の prompt を bounded async orchestrator task として
+submit し、batch id / task plist / plan を返す。provider / model / budget /
+timeout / heartbeat / cwd / sandbox / no_worktree / worktree_name を指定可能。
+routing 設定や proposal 採用は行わない。
+
+~PHASE-3-SHIPPED~ (2026-05-26) — 探索対象を Q1-B orchestrator routing へ
+拡張。=autoresearch-routing-evaluate= は
+=anvil-orchestrator-select-provider= を複数 policy に対して dry-run し、
+provider choice、cold-start/no-provider/no-sampled-candidates、
+policy disagreement を score 化する。=autoresearch-routing-plan= はその評価を
+future proposal 用 prompt に整形する。read-only で routing 設定や task
+queue は変更しない。
+
+~PHASE-2E-SHIPPED~ (2026-05-26) — =autoresearch-docstring-promote-memory=
+を追加。=autoresearch-docstring-run= または
+=autoresearch-docstring-harvest= の JSON 結果から selected candidate の
+description を取り出し、=anvil-memory-add= で DB-direct memory に保存する。
+=name= / =type= / =memory_description= / =tags_json= を指定できる。採用候補が
+無い run は保存せず error にする。
+
+~PHASE-2D-SHIPPED~ (2026-05-26) — proposal submit 系に worktree 明示制御を
+追加。=autoresearch-docstring-propose= と
+=autoresearch-docstring-propose-batch= が =no_worktree= / =worktree_name= を
+受け取り、orchestrator task の =:no-worktree= / =:worktree-name= に渡す。
+batch propose では =worktree_name-NN-of-MM= に展開する。これで
+orchestrator の auto worktree に任せる、明示名を使う、または opt-out する
+経路を Doc43 側から制御できる。
+
+~PHASE-2C-SHIPPED~ (2026-05-26) — =autoresearch-docstring-propose-batch=
+を追加。1 tool の rewrite plan から count 本の bounded orchestrator tasks を
+同一 batch に submit し、各 prompt に candidate 番号を入れて variation を
+促す。各 task には既存 single propose と同じ =budget_usd= / =timeout_sec= /
+=heartbeat_timeout_sec= / =cwd= / =sandbox= を載せる。戻り値の =:batch-id=
+を =autoresearch-docstring-harvest= に渡すことで、fan-out → harvest →
+multi-candidate eval/holdout まで一続きで運用できる。
+
+~PHASE-2B-SHIPPED~ (2026-05-26) — =autoresearch-docstring-harvest= を追加。
+orchestrator proposal batch の successful task summary を description 候補に
+変換し、=autoresearch-docstring-run= に接続する。=wait= 指定時は batch
+terminal まで待ち、done + summary の候補だけを eval / holdout / issue-score
+選抜に渡す。候補が無い場合は source file を触らず =:kept nil= を返す。
+これで propose → collect/harvest → multi-candidate run の回収経路まで接続。
+
+~PHASE-2A-SHIPPED~ (2026-05-26) — =autoresearch-docstring-run= を追加。
+=candidates_json= の複数 description 候補を同じ original snapshot に順次
+適用し、各候補ごとに =eval_command= / =holdout_command= gate を走らせる。
+通過候補は docstring issue score で採点し、最良候補だけを最後に source へ
+残す。全候補が失敗した場合は元ファイルへ復元する。LLM 呼び出しと worktree
+分離はまだ行わないが、単発 apply/eval から多候補探索 loop へ進んだ。
+
+~PHASE-2-SHIPPED~ (2026-05-26) — =autoresearch-docstring-apply= に
+=holdout_command= を追加し、inner =eval_command= が通った後でも holdout が
+non-zero exit の場合は元ファイルへ retroactive revert する gate を実装。
+戻り値に =:holdout= / =:revert-reason= を含め、MCP wrapper からも指定できる。
+worktree 横断の探索 loop は後続 Phase に残す。
+
+~PHASE-1E-SHIPPED~ (2026-05-26) — =autoresearch-docstring-propose= を追加。
+Phase 1b の rewrite plan から Codex/orchestrator 向け prompt を生成し、
+1 task を =anvil-orchestrator-submit= に async 投入する proposal 入口。
+=budget_usd= / =timeout_sec= / =heartbeat_timeout_sec= / =cwd= /
+=sandbox= を task plist に載せるため、Doc 47 の budget/heartbeat guard と
+codex sandbox を利用できる。patch 適用・worktree 作成・eval/decide はまだ
+行わず、戻り値は batch id と実際に submit した task。
+
+~PHASE-1D-SHIPPED~ (2026-05-26) — =autoresearch-docstring-apply= を追加。
+review 済みの docstring patch を 1 件だけ source に適用し、任意の
+=eval_command= を実行する local deterministic apply/eval loop。eval が
+non-zero exit の場合は元ファイルを復元し、=keep_on_eval_failure= が truthy
+の時だけ失敗変更を残す。LLM 呼び出し・worktree 分離はまだ行わない。
+
+~PHASE-1C-SHIPPED~ (2026-05-25) — =autoresearch-docstring-patch= を追加。
+=tool_id= / =server_id= / =new_description= を受け取り、対象 tool の
+=:description= string literal を source から特定し、replacement bounds、
+old/new Elisp string literal、unified-diff style patch candidate を返す。
+dry-run のみで、ファイル変更・LLM 呼び出し・test 実行はしない。
+
+~PHASE-1B-SHIPPED~ (2026-05-25) — =autoresearch-docstring-plan= を追加。
+対象 tool-id を指定するか、省略時は =autoresearch-docstrings= の最高 score
+候補を選び、current description / issues / parameter docs /
+registration-site hint / deterministic draft / rewrite prompt を返す。
+read-only planner であり、LLM 呼び出し・patch 適用・ファイル変更はしない。
+
+~PHASE-1A-SHIPPED~ (2026-05-25) — Q1-A (MCP tool docstring
+autoresearch) の読み取り専用 evaluator として =autoresearch-docstrings=
+を追加済み。登録済み MCP manifest を走査し、短すぎる description、
+generic phrase、usage guidance 不足、id-token coverage 不足、parameter
+description 不足/短すぎを score 化して rewrite 候補を返す。
+
+~PHASE-0-SHIPPED~ (2026-05-25) — 読み取り専用の
+=autoresearch-scan= MCP tool を実装済み。ローカルの Web / X / YouTube
+要約 archive と =docs/design= を走査し、anvil 実装に繋がりそうな行を
+file/line/evidence/kind/score/suggested-action 付きでランキングする。
+LLM 呼び出し・ファイル変更・自動 loop 実行はまだ行わない。
+
 ~DRAFT~ (2026-05-24) — Karpathy 提唱の autoresearch (AI エージェントが
 学習プログラムを書き換え → 評価 → keep/discard を無限に回す枠組み) を
 anvil 層に取り込む設計案。実装着手前の議論用 DRAFT で、最適化対象の候補・
@@ -230,16 +374,474 @@ autoresearch は多次元 + AI 判断 + 永続ループという拡張。
 
 * Phase 分割案
 
+** Phase 0 — local candidate scanner (shipped)
+
+- =anvil-autoresearch.el= を optional module として追加
+- =autoresearch-scan= MCP tool を追加
+- 既定 root:
+  - =~/Cowork/Notes/capture/web=
+  - =~/Cowork/Notes/capture/yt=
+  - =docs/design=
+- =query= / =roots_json= / =limit= で対象を絞り込み可能
+- read-only。LLM 呼び出し、ファイル変更、自動採否判断はしない
+
+Phase 0 の目的は、記事・X 投稿・YouTube 要約から「次に実装するなら何か」
+を機械的に拾えるようにすること。Phase 1 以降の自動実験 loop は、この候補
+リストを seed として使う。
+
+** Phase 1a — MCP docstring evaluator (shipped)
+
+- =autoresearch-docstrings= MCP tool を追加
+- 登録済み MCP tool manifest を read-only に評価
+- score 対象:
+  - description が短すぎる
+  - generic phrase だけで用途が曖昧
+  - usage guidance (=use/when/filter/optional/required/returns 等) が薄い
+  - tool id の有意味 token が description に出ていない
+  - input schema parameter description が無い/短すぎる
+- 返却項目:
+  - server-id / id / handler / score / issues
+  - description-length / param-count / description
+  - suggested-action = rewrite-mcp-description
+
+この段階は evaluator のみ。LLM rewrite、patch 生成、評価データ分割、
+holdout gate、keep/discard は Phase 1b 以降。
+
+** Phase 1b — MCP docstring rewrite planner (shipped)
+
+- =autoresearch-docstring-plan= MCP tool を追加
+- =tool_id= / =server_id= 指定時は対象 tool の plan を返す
+- =tool_id= 省略時は =autoresearch-docstrings= の最高 score 候補を選ぶ
+- read-only 返却項目:
+  - current description
+  - score / issues
+  - schema parameter docs
+  - registration-site hint (= :id 検索による file/line/snippet)
+  - deterministic draft description
+  - future rewrite 用 prompt
+
+この段階では patch を作らない。次段は planner の prompt を orchestrator に
+渡す、または deterministic draft を使って dry-run patch を生成する。
+
+** Phase 1c — MCP docstring dry-run patch candidate (shipped)
+
+- =autoresearch-docstring-patch= MCP tool を追加
+- =tool_id= / =server_id= 指定時は対象 tool の patch candidate を返す
+- =tool_id= 省略時は planner と同じく最高 score 候補を使う
+- =new_description= 省略時は deterministic draft を replacement に使う
+- read-only 返却項目:
+  - dry-run marker
+  - file / start-line / end-line
+  - old/new description
+  - old/new Elisp string literal
+  - unified-diff style patch candidate
+  - 元 planner 結果
+
+ここまでで Q1-A は「候補抽出 → plan → dry-run patch」まで到達。次段は
+patch candidate を apply する前の validation gate、または orchestrator 経由
+の LLM rewrite を dry-run に接続する。
+
+** Phase 1d — MCP docstring local apply/eval loop (shipped)
+
+- =autoresearch-docstring-apply= MCP tool を追加
+- Phase 1c の patch candidate を土台に、対象 =:description= string literal
+  の stale bounds を検証して 1 箇所だけ書き換える
+- =eval_command= が指定されていれば shell command を実行し、exit 0 なら keep
+- =eval_command= が non-zero exit の時は、元ファイル content を復元して
+  =:reverted t= を返す
+- =keep_on_eval_failure= が truthy の時だけ、失敗した変更を残す
+- LLM 呼び出し・worktree 分離・budget 管理はまだ行わない
+
+これで Q1-A は「候補抽出 → plan → dry-run patch → apply → eval →
+keep/revert」まで到達。ただし deterministic draft / user-provided rewrite
+専用で、orchestrator codex 経由の proposal generation は Phase 1e へ送る。
+
+** Phase 1e — MCP docstring orchestrator proposal submit (shipped)
+
+- =autoresearch-docstring-propose= MCP tool を追加
+- Phase 1b の plan から、replacement description だけを返すよう指示した
+  Codex/orchestrator 向け prompt を生成する
+- =anvil-orchestrator-submit= に 1 task を async 投入する
+- task には以下を明示的に載せる:
+  - =:budget-usd=
+  - =:timeout-sec=
+  - =:heartbeat-timeout-sec=
+  - =:cwd= (repo/worktree directory)
+  - =:sandbox= (Codex sandbox override)
+- 戻り値:
+  - =:batch-id=
+  - 実際に submit した =:task=
+  - 元 plan
+
+この段階でも patch は適用しない。proposal 結果を review し、採用する場合は
+=autoresearch-docstring-patch= / =autoresearch-docstring-apply= に渡す。
+Phase 2b で proposal batch の harvest 接続を追加した。worktree 作成、
+bench 実行、採用 commit 化は後続 Phase に残す。
+
+** Phase 2 — eval-holdout + retroactive-revert gate (shipped)
+
+- =autoresearch-docstring-apply= に =holdout_command= を追加
+- 通常の =eval_command= は inner gate として扱う
+- inner gate が keep した変更だけ holdout を実行する
+- holdout が non-zero exit の場合は =keep_on_eval_failure= に関係なく
+  元ファイル content を復元する
+- 戻り値:
+  - =:eval= inner eval 結果
+  - =:holdout= holdout eval 結果
+  - =:kept=
+  - =:reverted=
+  - =:revert-reason= (=eval-failed= / =holdout-failed= / nil)
+
+** Phase 2a — docstring multi-candidate local loop (shipped)
+
+- =autoresearch-docstring-run= MCP tool を追加
+- =candidates_json= は JSON array:
+  - string entry: そのまま replacement description
+  - object entry: =description= / =new_description= と optional =label=
+- 各候補は同じ original snapshot に適用してから =eval_command= を実行
+- inner eval が通った候補だけ =holdout_command= を実行
+- holdout まで通った候補は、仮の description に対する docstring issue score
+  (=short-description= / =generic-description= / usage guidance 等) で採点
+- 全試行後に source を original へ戻し、最良候補だけを final apply する
+- 全候補が gate を通らなければ original を維持し、=:kept nil= を返す
+- 戻り値:
+  - =:attempts= candidate ごとの eval / holdout / reject reason / post-score
+  - =:selected= 採用候補
+  - =:kept= / =:reverted=
+
+この Phase は worktree を作らない。既存 apply/eval/holdout primitive の上に
+安全な多候補 local 探索を載せる段階で、worktree 横断・orchestrator batch
+polling・採用 commit 化は次段に残す。
+
+** Phase 2b — proposal harvest bridge (shipped)
+
+- =autoresearch-docstring-harvest= MCP tool を追加
+- =batch_id= の orchestrator batch を =anvil-orchestrator-collect= で回収
+- optional =wait= が truthy なら batch terminal まで待ってから collect
+- =status= が =done= で =summary= が non-empty の task だけを candidate 化
+- fenced block や quoted string だけの summary は description text へ正規化
+- 候補が無い場合は source file を編集しない
+- 候補がある場合は JSON array にして =autoresearch-docstring-run= へ渡し、
+  eval / holdout / issue-score で最良 proposal だけを残す
+- 戻り値:
+  - =:results= collect した slim task list
+  - =:candidates= harvested description candidates
+  - =:run= =autoresearch-docstring-run= の結果
+  - =:kept= / =:reverted=
+
+これで Q1-A の docstring autoresearch は、提案生成を orchestrator に出し、
+batch 結果を回収して local eval/holdout gate に流す基本 loop まで接続済み。
+Phase 2c で proposal batch の N 本生成 helper も追加済み。Phase 2d で
+worktree 分離の明示制御を proposal task metadata に接続済み。Phase 2e で
+採用結果の memory promotion も追加済み。次段は採用変更の commit 化または
+Q1-B への拡張。
+
+** Phase 2c — proposal batch fan-out helper (shipped)
+
+- =autoresearch-docstring-propose-batch= MCP tool を追加
+- =tool_id= / =server_id= から single propose と同じ rewrite plan を作る
+- =count= 本の orchestrator task を同一 batch に submit
+- task name は =autoresearch-docstring-<tool>-NN-of-MM= で一意化
+- prompt には =candidate N of M= を入れて、候補間の variation を促す
+- 各 task に以下を per-task metadata として載せる:
+  - =:budget-usd=
+  - =:timeout-sec=
+  - =:heartbeat-timeout-sec=
+  - =:cwd=
+  - =:sandbox=
+- 戻り値:
+  - =:batch-id=
+  - =:count=
+  - =:tasks= 実際に submit した task list
+  - =:plan=
+
+運用 sequence は:
+
+1. =autoresearch-docstring-propose-batch= で N 候補を async submit
+2. =orchestrator-status= で batch を観察
+3. =autoresearch-docstring-harvest= で done summaries を回収
+4. =autoresearch-docstring-run= が eval / holdout / issue-score で採用判断
+
+** Phase 2d — explicit worktree controls (shipped)
+
+- =autoresearch-docstring-propose= に =no_worktree= / =worktree_name= を追加
+- =autoresearch-docstring-propose-batch= に =no_worktree= / =worktree_name= を追加
+- =no_worktree= truthy の時は task plist に =:no-worktree t= を載せる
+- =worktree_name= 指定時は task plist に =:worktree-name= を載せる
+- =no_worktree= が truthy の場合は =worktree_name= を抑制する
+- batch propose の =worktree_name= は =<base>-NN-of-MM= へ展開する
+- 既存の orchestrator worktree policy:
+  - =:no-worktree t= で opt-out
+  - =:worktree-name= で native/provider worktree name hint
+  - 未指定なら =anvil-orchestrator-worktree-auto= に従う
+
+これで Doc43 は proposal fan-out 時点で worktree isolation を明示できる。
+実際の worktree 作成・cleanup は orchestrator が担当し、Doc43 は task
+metadata を渡すだけに留める。
+
+** Phase 2e — memory promotion bridge (shipped)
+
+- =autoresearch-docstring-promote-memory= MCP tool を追加
+- =run_json= は以下どちらも受け付ける:
+  - =autoresearch-docstring-run= の JSON object
+  - =autoresearch-docstring-harvest= の JSON object (=run= field を自動使用)
+- =selected.description= が存在する run だけを promote
+- =anvil-memory-add= は実行時に lazy require し、anvil-memory 未ロード環境では
+  tool 実行時 error にする
+- default memory:
+  - =type= は =memo=
+  - =name= は =autoresearch_docstring_<tool>_<timestamp>=
+  - tags は =doc43, autoresearch, docstring=
+- memory body は org-ish に以下を記録:
+  - server id
+  - tool id
+  - source file
+  - selected label
+  - post score
+  - accepted description
+
+これで Q1-A の採用結果は source 変更だけでなく、後続セッションが参照できる
+memory row として残せる。
+
+** Phase 3 — orchestrator routing target expansion (shipped)
+
+- =autoresearch-routing-evaluate= MCP tool を追加
+- =autoresearch-routing-plan= MCP tool を追加
+- =anvil-orchestrator-routing= は lazy require
+- evaluation input:
+  - representative =prompt=
+  - comma-separated =policies= (=balanced,speed,cost,quality= 等)
+  - comma-separated =candidates= (=claude,codex,ollama= 等)
+  - =since_sec=
+  - =min_samples=
+- 各 policy で =anvil-orchestrator-select-provider= を dry-run
+- issue scoring:
+  - =no-provider=
+  - =cold-start=
+  - =no-sampled-candidates=
+  - =single-sampled-provider=
+  - policy 間の selected provider 不一致
+- =autoresearch-routing-plan= は evaluation を元に、routing default /
+  candidate set / min-samples / cold-start / stats interpretation 改善用 prompt
+  を返す
+- read-only。routing defcustom / task queue / provider registry は変更しない
+
+これで Doc43 は Q1-A docstring 改善だけでなく、Q1-B provider × task
+mapping の改善候補も同じ autoresearch surface に載せた。
+
+** Phase 3a — routing proposal submit (shipped)
+
+- =autoresearch-routing-propose= MCP tool を追加
+- =autoresearch-routing-plan= の =:rewrite-prompt= を 1 本の async
+  orchestrator task に変換する
+- task metadata:
+  - =:name= は =autoresearch-routing-improvement=
+  - =:provider= / =:model=
+  - =:budget-usd= / =:timeout-sec= / =:heartbeat-timeout-sec=
+  - =:cwd= / =:sandbox=
+  - =:no-worktree= / =:worktree-name=
+- =autoresearch-docstring-propose= と同じ proposal default / coerce helper を使う
+- 戻り値は =:submitted= / =:batch-id= / =:task= / =:plan= /
+  =:suggested-action=
+- routing defcustom / provider registry / proposal apply は変更しない
+
+これで Q1-B routing は dry-run evaluation → plan → bounded proposal submit まで
+Doc43 surface から辿れる。
+
+** Phase 3b — routing proposal harvest/decision (shipped)
+
+- =autoresearch-routing-harvest= MCP tool を追加
+- =batch_id= の orchestrator batch を =anvil-orchestrator-collect= で回収
+- optional =wait= が truthy なら batch terminal まで待ってから collect
+- =status= が =done= で =summary= が non-empty の task だけを proposal 候補化
+- score 対象:
+  - 十分な本文長
+  - routing / provider / policy / candidate / min-samples / cold-start /
+    stats / test / defcustom / anvil-orchestrator への言及
+  - balanced / speed / cost / quality policy への言及
+  - ERT / byte-compile など検証語への言及
+- 戻り値:
+  - =:results= collect した raw task summaries
+  - =:candidates= score 順 proposal candidates
+  - =:selected= review 候補
+  - =:suggested-action=
+- read-only。routing defcustom / provider registry / source file / proposal apply は
+  変更しない
+
+これで Q1-B routing は evaluation → plan → proposal submit → harvest /
+decision まで Doc43 surface に載った。次段は selected proposal を人間 review
+後に routing 実装 patch へ変換する dry-run patch helper、または採用変更の
+commit 化。
+
+** Phase 3c — routing dry-run patch planner (shipped)
+
+- =autoresearch-routing-patch-plan= MCP tool を追加
+- input は以下のどちらか:
+  - =proposal_json=: =autoresearch-routing-harvest= result、または selected
+    candidate object
+  - =batch_id=: proposal JSON が空の時に harvest して selected を使う
+- 出力:
+  - =:dry-run t=
+  - =:proposal=
+  - =:selected=
+  - =:source=
+  - =:target-files= (=anvil-orchestrator-routing.el= /
+    =tests/anvil-orchestrator-test.el= / =anvil-orchestrator.el=)
+  - =:implementation-prompt=
+  - =:eval-command= byte-compile command
+  - =:holdout-command= orchestrator ERT command
+- read-only。source file、routing defcustom、provider registry は変更しない
+
+これで Q1-B routing は評価・提案・回収だけでなく、review 済み proposal を
+実装 task に渡せる deterministic artifact へ変換できる。
+
+** Phase 3d — routing implementation submit (shipped)
+
+- =autoresearch-routing-implement= MCP tool を追加
+- input は =autoresearch-routing-patch-plan= と同じ:
+  - =proposal_json=
+  - または =batch_id= + optional =wait= / =max_candidates=
+- =autoresearch-routing-patch-plan= で implementation prompt を作り、
+  =anvil-orchestrator-submit= に 1 task を async submit
+- task metadata:
+  - =:name= は =autoresearch-routing-implementation=
+  - =:provider= / =:model=
+  - =:budget-usd= / =:timeout-sec= / =:heartbeat-timeout-sec=
+  - =:cwd= / =:sandbox=
+  - =:no-worktree= / =:worktree-name=
+- 戻り値:
+  - =:submitted=
+  - =:batch-id=
+  - =:task=
+  - =:plan=
+  - =:suggested-action=
+- tool 自体は source file を編集しない。実装変更は orchestrator task の作業結果を
+  review して採用する
+
+これで Q1-B routing は evaluation → proposal generation → harvest/decision →
+dry-run implementation plan → bounded implementation task submit まで接続済み。
+
+** Phase 3e — routing implementation harvest/review (shipped)
+
+- =autoresearch-routing-implementation-harvest= MCP tool を追加
+- =batch_id= の orchestrator implementation batch を
+  =anvil-orchestrator-collect= で回収
+- optional =wait= が truthy なら batch terminal まで待ってから collect
+- =status= が =done= で =summary= が non-empty の task だけを implementation
+  candidate 化
+- score 対象:
+  - 十分な本文長
+  - =anvil-orchestrator-routing.el=
+  - =tests/anvil-orchestrator-test.el=
+  - routing / provider / policy / candidate / min-samples / cold-start /
+    stats / defcustom
+  - ERT / byte-compile / passed / failed など検証・失敗 signal
+- 戻り値:
+  - =:results=
+  - =:candidates=
+  - =:selected=
+  - =:review-checklist=
+  - =:suggested-action=
+- read-only。patch 適用、source file 編集、routing defcustom / provider registry
+  の変更はしない
+
+これで Q1-B routing は implementation task の submit だけでなく、その結果の
+回収・review 候補選定まで Doc43 surface で扱える。
+
+** Phase 3f — routing implementation memory promotion (shipped)
+
+- =autoresearch-routing-implementation-promote-memory= MCP tool を追加
+- input:
+  - =autoresearch-routing-implementation-harvest= result JSON
+  - または selected candidate object (=summary= field 必須)
+- =anvil-memory-add= は実行時に lazy require し、anvil-memory 未ロード環境では
+  tool 実行時 error にする
+- default memory:
+  - =type= は =memo=
+  - =name= は =autoresearch_routing_impl_<label>_<timestamp>=
+  - tags は =doc43, autoresearch, routing, implementation=
+- memory body は org-ish に以下を記録:
+  - batch id
+  - selected label
+  - task id
+  - provider
+  - score
+  - accepted implementation summary
+- source file / routing defcustom / provider registry は変更しない
+
+これで Q1-B routing の採用 review 結果を、後続セッションが参照できる memory
+row として保存できる。
+
+** Phase 5 — NeLisp codegen application scaffold (shipped)
+
+- =autoresearch-nelisp-codegen-plan= MCP tool を追加
+- =autoresearch-nelisp-codegen-implement= MCP tool を追加
+- =autoresearch-nelisp-codegen-harvest= MCP tool を追加
+- default root は =~/Cowork/Notes/dev/nelisp=
+- target files:
+  - =lisp/nelisp-phase47-compiler.el=
+  - =test/nelisp-phase47-compiler-test.el=
+  - =docs/design/97-phase-47-sexp-to-asm-compiler.org=
+  - =docs/design/129-phase47-user-el-aot-compile.org=
+- plan は byte-compile eval command と compiler ERT holdout command を返す
+- implement は bounded orchestrator task を submit する:
+  - =:name= =autoresearch-nelisp-codegen-implementation=
+  - =:cwd= は NeLisp root
+  - =:budget-usd= / =:timeout-sec= / =:heartbeat-timeout-sec=
+  - =:sandbox= / =:no-worktree= / =:worktree-name=
+- harvest は implementation summary を read-only に rank し、manual review
+  checklist を返す
+
+この Phase は Doc43 側の適用 scaffold であり、NeLisp source への直接変更は
+orchestrator task の成果物を review してから採用する。評価 gate は Phase 47
+byte identity / byte-length invariant と =nelisp-phase47-compiler-test= を中心に
+置く。
+
+** Phase 6 — tabulated-list UI (shipped)
+
+- =M-x anvil-autoresearch-dashboard= を追加
+- in-memory orchestrator task table から =autoresearch-*= task だけを表示
+- columns:
+  - stage
+  - target
+  - status
+  - provider
+  - model
+  - elapsed
+  - cost
+  - batch
+  - summary
+- key bindings:
+  - =g=: refresh
+  - =RET=: task plist 詳細 buffer
+- dashboard は進捗観察専用。proposal harvest、source edit、memory promotion は
+  既存 MCP primitive を明示的に呼ぶ。
+
+これで Doc43 の async proposal / implementation task を Emacs 側で一覧確認
+できる。採用判断は引き続き harvest / review helper と手動 review を gate に
+する。
+
 | Phase | scope                                                   | 工数 |
 |-------+---------------------------------------------------------+------|
-| 1     | MCP tool docstring autoresearch (Q1-A) を MVP として     | 中   |
+| 1     | MCP tool docstring autoresearch (Q1-A) を MVP として     | 済   |
 |       | 実装. orchestrator codex 経路 + worktree + bench         |      |
 |       | + budget hard stop. holdout は手動運用.                  |      |
-| 2     | eval-holdout 自動化 + retroactive-revert gate            | 小   |
-| 3     | 探索対象を anvil-orchestrator routing (Q1-B) に拡張      | 小   |
-| 4     | anvil-memory への skill promote pipeline                 | 小   |
-| 5     | NeLisp codegen (Q1-D) への適用 (要 NeLisp 側 API 整備)   | 大   |
-| 6     | tabulated-list UI (進捗観察、anvil-compact Phase 3b 流儀) | 小   |
+| 2     | eval-holdout 自動化 + retroactive-revert gate            | 済   |
+| 2a    | docstring multi-candidate local loop                     | 済   |
+| 2b    | proposal harvest bridge                                  | 済   |
+| 2c    | proposal batch fan-out helper                            | 済   |
+| 2d    | explicit worktree controls                               | 済   |
+| 2e    | memory promotion bridge                                  | 済   |
+| 3     | 探索対象を anvil-orchestrator routing (Q1-B) に拡張      | 済   |
+| 3a    | routing proposal submit                                  | 済   |
+| 3b    | routing proposal harvest/decision                        | 済   |
+| 3c    | routing dry-run patch planner                            | 済   |
+| 3d    | routing implementation submit                            | 済   |
+| 3e    | routing implementation harvest/review                    | 済   |
+| 3f    | routing implementation memory promotion                  | 済   |
+| 4     | anvil-memory への skill promote pipeline                 | 済   |
+| 5     | NeLisp codegen (Q1-D) への適用 scaffold                  | 済   |
+| 6     | tabulated-list UI (進捗観察、anvil-compact Phase 3b 流儀) | 済   |
 
 * 取り込み見送り判断材料
 

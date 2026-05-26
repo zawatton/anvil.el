@@ -1,17 +1,30 @@
 #+title: anvil-taco — self-evolving terminal output compression (TACO Layer 1)
 #+date: 2026-05-24
 #+author: zawatton
-#+property: status DRAFT
+#+property: status PHASE-1-SHIPPED
 #+property: scope GENERIC
 
 * STATUS
   :PROPERTIES:
   :ID:       d1c4e0f2-8f44-4f7c-bc1a-taco-45
   :END:
-~DRAFT~ (2026-05-24) — 論文「TACO: Terminal Agent COmpression」(2026-04
+~PHASE-1-SHIPPED~ (2026-05-25) — 論文「TACO: Terminal Agent COmpression」(2026-04
 arxiv、動画 yt_20260524_taco_terminal_agent_compression) の Layer 1
 (出力圧縮) を anvil-shell-filter (Doc 27) の進化型として取り込む設計案。
 Layer 2/3 (進化・グローバルプール) は別 Phase。
+
+実装状況 (2026-05-25):
+
+- *SHIPPED* — Phase 1 critical-keeper fallback。既知コマンドは従来の
+  =anvil-shell-filter= static dispatcher を優先し、未知コマンドの verbose
+  stdout だけを対象に、error / Traceback / FAILED / fatal / panic 等の
+  critical 行 + 前後 context + non-zero exit の末尾を保持する。
+  =shell-run= の =:filter auto= 内部でのみ発火し、短い clean 出力や
+  critical signal の無い出力は raw passthrough。raw stdout は従来通り
+  tee に保存され、必要なら =shell-tee-get= で完全復元できる。
+  defcustom: =anvil-shell-filter-taco-critical-fallback= /
+  =-min-lines= / =-context-lines= / =-tail-lines= / =-patterns=。
+  ERT: =anvil-shell-filter-test= 57/57 green、byte-compile 0 warning。
 
 論文の核心:
 
@@ -152,7 +165,7 @@ anvil 文脈での Critical 判定:
 - 標準 stderr 出力すべて
 - =Error:= / =Traceback= / =FAILED= / =fatal:= で始まる行
 - exit code が non-zero 時の最終 20 行
-- ユーザー定義 regex (defcustom =anvil-taco-critical-patterns=)
+- ユーザー定義 regex (defcustom =anvil-shell-filter-taco-critical-patterns=)
 
 * Architecture (案)
 

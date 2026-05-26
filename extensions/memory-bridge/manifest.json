@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "Anvil Memory Bridge",
+  "version": "0.1.0",
+  "description": "Inject selected anvil-memory search results into AI chat prompts through the local memory bridge.",
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:8730/*",
+    "http://localhost:8730/*"
+  ],
+  "background": {
+    "service_worker": "service_worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://claude.ai/*",
+        "https://chatgpt.com/*",
+        "https://gemini.google.com/*"
+      ],
+      "js": [
+        "content_script.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "options_page": "options.html"
+}

@@ -398,6 +398,8 @@ empty), so the cache round-trips purely through string ops + `load'
                anvil-server--schema-cache)))
   (anvil-server--schema-cache-write))
 
+(defvar anvil-server--tools-list-cache)
+
 (defun anvil-server-register-cached-tool-fragments
     (server-id lazy-loaders)
   "Register cached tool-list fragments for SERVER-ID.
@@ -1374,6 +1376,16 @@ explicit tools/call.
 
 Set by `anvil-manifest' (Doc 26) to implement ANVIL_PROFILE.")
 
+(defvar anvil-server-tool-fragment-function nil
+  "Optional transformer for tools/list JSON fragments.
+When non-nil, called with (TOOL-ID TOOL-PLIST SERVER-ID
+DEFAULT-FRAGMENT) for every visible tool.  It must return a JSON
+object fragment string, or nil to omit the tool from the response.
+
+Set by `anvil-manifest' Doc 44 Phase 2c to advertise trimmed schemas
+for non-focused dynamic-profile tools while keeping full schemas for
+Top-K and warm LRU tools.")
+
 (defvar anvil-server-tool-dispatch-hook nil
   "Abnormal hook run after a tool handler returns successfully.
 Functions on this hook are called with (TOOL-ID SERVER-ID); the
@@ -1466,8 +1478,11 @@ register / unregister."
          ;; that legitimately varies output by virtual id is wired,
          ;; switch this key to (cons server-id resolved-id) and add
          ;; matching `remhash' calls in the invalidate helper.
-         (cache-key resolved-id)
-         (cached (gethash cache-key anvil-server--tools-list-cache)))
+         (cache-key (format "%s->%s" server-id resolved-id))
+         ;; Fragment transformers can depend on dynamic query / LRU /
+         ;; state-filter context, so cached result JSON would be stale.
+         (cached (and (null anvil-server-tool-fragment-function)
+                      (gethash cache-key anvil-server--tools-list-cache))))
     (if cached
         (anvil-server--jsonrpc-response-from-result-json id cached)
       ;; Fast path (2026-05-24): collect pre-encoded :json-fragment
@@ -1485,7 +1500,12 @@ register / unregister."
              (when (or (null anvil-server-tool-filter-function)
                        (funcall anvil-server-tool-filter-function
                                 tool-id tool server-id))
-               (let ((frag (plist-get tool :json-fragment)))
+               (let* ((default-frag (plist-get tool :json-fragment))
+                      (frag (if anvil-server-tool-fragment-function
+                                (funcall anvil-server-tool-fragment-function
+                                         tool-id tool server-id
+                                         default-frag)
+                              default-frag)))
                  (when frag (push frag fragments)))))
            tools-table))
         (let* ((joined (mapconcat #'identity (nreverse fragments) ","))
@@ -1499,7 +1519,8 @@ register / unregister."
           ;; this small wrapper is cheap.  Avoid mutating this request cache
           ;; there because post-2026-05-17 NeLisp can stall in hash-table
           ;; mutation after the large tools/list string is built.
-          (unless (fboundp 'nelisp--write-stderr-line)
+          (unless (or anvil-server-tool-fragment-function
+                      (fboundp 'nelisp--write-stderr-line))
             (puthash cache-key result-json anvil-server--tools-list-cache))
           (anvil-server--jsonrpc-response-from-result-json id result-json))))))
 
@@ -2357,7 +2378,9 @@ See also:
                               ;; :stability is stable / experimental /
                               ;; deprecated.  Handlers ignore these
                               ;; values; `anvil-discovery' reads them.
-                              :intent :layer :stability))
+                              ;; :preconditions is Doc 44 state-filter
+                              ;; metadata consumed by `anvil-manifest'.
+                              :intent :layer :stability :preconditions))
           (when (plist-member properties k)
             (setq tool (plist-put tool k (plist-get properties k)))))
         ;; Pre-build the tools/list JSON fragment with a hand-rolled

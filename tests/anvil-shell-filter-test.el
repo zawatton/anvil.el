@@ -875,6 +875,64 @@ Pipeline order under test:
         (should (integerp (plist-get row :elapsed-ms)))))))
 
 
+;;;; --- Doc 45 / TACO Phase 1 critical fallback --------------------------
+
+(ert-deftest anvil-shell-filter-test/taco-critical-keeps-error-context ()
+  "TACO critical fallback keeps error-like lines and omits distant noise."
+  (skip-unless (anvil-shell-filter-test--supported-p 'taco-critical))
+  (let* ((anvil-shell-filter-taco-critical-min-lines 5)
+         (anvil-shell-filter-taco-critical-context-lines 1)
+         (raw (string-join
+               (append (cl-loop for i from 1 to 20 collect (format "noise-%02d" i))
+                       '("before" "Traceback (most recent call last):"
+                         "AssertionError: bad value" "after")
+                       (cl-loop for i from 21 to 40 collect (format "noise-%02d" i)))
+               "\n"))
+         (out (anvil-shell-filter-apply 'taco-critical raw)))
+    (should (string-match-p "anvil-taco" out))
+    (should (string-match-p "Traceback" out))
+    (should (string-match-p "AssertionError" out))
+    (should (string-match-p "stdout lines omitted" out))
+    (should-not (string-match-p "noise-01" out))
+    (should-not (string-match-p "noise-40" out))
+    (should (< (length out) (length raw)))))
+
+(ert-deftest anvil-shell-filter-test/taco-critical-auto-for-unknown-run ()
+  "Unknown failing commands use TACO critical fallback under filter=auto."
+  (skip-unless (anvil-shell-filter-test--supported-p 'taco-critical))
+  (anvil-shell-filter-test--with-state
+    (let* ((anvil-shell-filter-taco-critical-min-lines 5)
+           (anvil-shell-filter-taco-critical-tail-lines 2)
+           (raw (string-join
+                 (append (cl-loop for i from 1 to 80
+                                  collect (format "step-%02d ................................" i))
+                         '("FAILED: build target" "tail-a" "tail-b"))
+                 "\n")))
+      (cl-letf (((symbol-function 'anvil-shell)
+                 (lambda (_cmd _opts)
+                   (list :exit 2 :stdout raw :stderr "stderr detail"))))
+        (let ((result (anvil-shell-filter-run "unknown-tool --verbose")))
+          (should (eq 'taco-critical (plist-get result :filter)))
+          (should (equal 2 (plist-get result :exit)))
+          (should (equal "stderr detail" (plist-get result :stderr)))
+          (should (string-match-p "FAILED: build target"
+                                  (plist-get result :compressed)))
+          (should (string-match-p "tail-b" (plist-get result :compressed)))
+          (should (equal raw (anvil-shell-filter-tee-get
+                              (plist-get result :tee-id)))))))))
+
+(ert-deftest anvil-shell-filter-test/taco-critical-short-clean-passthrough ()
+  "Short clean unknown output stays raw passthrough under filter=auto."
+  (skip-unless (anvil-shell-filter-test--supported-p 'taco-critical))
+  (anvil-shell-filter-test--with-state
+    (cl-letf (((symbol-function 'anvil-shell)
+               (lambda (_cmd _opts)
+                 (list :exit 0 :stdout "one\ntwo\nthree" :stderr ""))))
+      (let ((result (anvil-shell-filter-run "unknown-tool")))
+        (should-not (plist-get result :filter))
+        (should (equal "one\ntwo\nthree" (plist-get result :compressed)))))))
+
+
 (provide 'anvil-shell-filter-test)
 
 ;;; anvil-shell-filter-test.el ends here

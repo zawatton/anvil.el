@@ -86,7 +86,7 @@
                gh git-log-graph pip-install npm-install
                docker-ps docker-logs kubectl-get aws-s3-ls
                prettier ruff phase2a-dispatch tee-grep
-               register)
+               register taco-critical)
   "Capability tags this module currently provides.
 Tests in tests/anvil-shell-filter-test.el gate their `skip-unless'
 on membership here so a half-shipped filter never breaks CI.  The
@@ -179,6 +179,48 @@ rtk and OpenAI both publish ~4 chars-per-token for English/code,
 so the default 0.25 tracks that.  Purely an advisory number — the
 byte counts are exact."
   :type 'number
+  :group 'anvil-shell-filter)
+
+(defcustom anvil-shell-filter-taco-critical-fallback t
+  "When non-nil, unknown `shell-run' commands get a safe critical keeper.
+This is Doc 45 / TACO Phase 1: known static filters still win, but
+unknown verbose commands with error-like lines are compressed to the
+critical lines plus small context.  Commands without critical signals
+remain raw passthrough."
+  :type 'boolean
+  :group 'anvil-shell-filter)
+
+(defcustom anvil-shell-filter-taco-critical-min-lines 80
+  "Minimum stdout line count before TACO critical fallback can compress.
+Non-zero exits bypass this threshold because their tail is often useful."
+  :type 'integer
+  :group 'anvil-shell-filter)
+
+(defcustom anvil-shell-filter-taco-critical-context-lines 2
+  "Number of surrounding stdout lines kept around each critical line."
+  :type 'integer
+  :group 'anvil-shell-filter)
+
+(defcustom anvil-shell-filter-taco-critical-tail-lines 20
+  "Number of final stdout lines kept for unknown commands that exit non-zero."
+  :type 'integer
+  :group 'anvil-shell-filter)
+
+(defcustom anvil-shell-filter-taco-critical-patterns
+  '("\\berror\\b"
+    "\\bfatal:"
+    "\\bfailed\\b"
+    "Traceback"
+    "Exception"
+    "AssertionError"
+    "panic"
+    "segmentation fault"
+    "^E[[:space:]]+"
+    "^[[:space:]]*at .*(.*:[0-9]+)")
+  "Case-insensitive regexps whose matching stdout lines are always kept.
+These patterns are intentionally conservative.  Raw stdout is still tee'd
+by `shell-run', so callers can recover the full output if needed."
+  :type '(repeat regexp)
   :group 'anvil-shell-filter)
 
 
@@ -541,6 +583,87 @@ The trailing `Found N errors.' summary is preserved when present."
       (when summary (push summary output))
       (string-join (nreverse output) "\n"))))
 
+(defun anvil-shell-filter--taco-critical-line-p (line)
+  "Return non-nil when LINE matches a configured critical pattern."
+  (let ((case-fold-search t))
+    (cl-some (lambda (re) (string-match-p re line))
+             anvil-shell-filter-taco-critical-patterns)))
+
+(defun anvil-shell-filter--taco-mark-range (keep start end)
+  "Mark KEEP vector indexes from START through END, clamped to bounds."
+  (let ((i (max 0 start))
+        (last (min (1- (length keep)) end)))
+    (while (<= i last)
+      (aset keep i t)
+      (setq i (1+ i)))))
+
+(defun anvil-shell-filter--taco-critical-render (raw &optional stderr exit)
+  "Return TACO Phase 1 critical-keeper output for RAW.
+STDERR is not embedded because `shell-run' returns it separately; it
+only affects the header.  EXIT controls non-zero tail retention."
+  (let* ((lines (split-string (or raw "") "\n"))
+         (line-count (length lines))
+         (context (max 0 anvil-shell-filter-taco-critical-context-lines))
+         (tail (max 0 anvil-shell-filter-taco-critical-tail-lines))
+         (nonzero (and exit (not (zerop exit))))
+         (keep (make-vector line-count nil))
+         (critical-count 0))
+    (cl-loop for line in lines
+             for i from 0
+             when (anvil-shell-filter--taco-critical-line-p line)
+             do (setq critical-count (1+ critical-count))
+             and do (anvil-shell-filter--taco-mark-range
+                     keep (- i context) (+ i context)))
+    (when nonzero
+      (anvil-shell-filter--taco-mark-range
+       keep (- line-count tail) (1- line-count)))
+    (let ((kept (cl-loop for i below line-count count (aref keep i)))
+          (out nil)
+          (gap 0))
+      (push (format "[anvil-taco: kept %d/%d stdout lines; critical=%d%s%s]"
+                    kept line-count critical-count
+                    (if nonzero (format "; exit=%s" exit) "")
+                    (if (and stderr (not (string-empty-p stderr)))
+                        "; stderr returned separately"
+                      ""))
+            out)
+      (cl-loop for line in lines
+               for i from 0
+               do (if (aref keep i)
+                      (progn
+                        (when (> gap 0)
+                          (push (format "...[%d stdout lines omitted]" gap)
+                                out)
+                          (setq gap 0))
+                        (push line out))
+                    (setq gap (1+ gap))))
+      (when (> gap 0)
+        (push (format "...[%d stdout lines omitted]" gap) out))
+      (string-join (nreverse out) "\n"))))
+
+(defun anvil-shell-filter--taco-critical-maybe (raw &optional stderr exit)
+  "Return critical-keeper output for RAW, or nil when passthrough is safer."
+  (when (and anvil-shell-filter-taco-critical-fallback
+             (stringp raw)
+             (not (string-empty-p raw)))
+    (let* ((lines (split-string raw "\n"))
+           (line-count (length lines))
+           (nonzero (and exit (not (zerop exit))))
+           (has-critical
+            (cl-some #'anvil-shell-filter--taco-critical-line-p lines)))
+      (when (and (or nonzero
+                     (>= line-count anvil-shell-filter-taco-critical-min-lines))
+                 (or has-critical nonzero))
+        (let ((compressed
+               (anvil-shell-filter--taco-critical-render raw stderr exit)))
+          (when (< (length compressed) (length raw))
+            compressed))))))
+
+(defun anvil-shell-filter--taco-critical (raw)
+  "Apply TACO Phase 1 critical keeping to RAW, or return RAW unchanged."
+  (or (anvil-shell-filter--taco-critical-maybe raw nil nil)
+      raw))
+
 
 ;;;; --- dispatch / lookup --------------------------------------------------
 
@@ -564,7 +687,8 @@ The trailing `Found N errors.' summary is preserved when present."
     (kubectl-get    . ,#'anvil-shell-filter--kubectl-get)
     (aws-s3-ls      . ,#'anvil-shell-filter--aws-s3-ls)
     (prettier       . ,#'anvil-shell-filter--prettier)
-    (ruff           . ,#'anvil-shell-filter--ruff))
+    (ruff           . ,#'anvil-shell-filter--ruff)
+    (taco-critical  . ,#'anvil-shell-filter--taco-critical))
   "Alist mapping filter tag → pure `(RAW) -> COMPRESSED' function.
 Phase 3 adds `anvil-shell-filter-register' as the public way to install
 additional declarative filters; the alist is still publicly readable
@@ -1050,10 +1174,10 @@ detail."
          (timeout (or (plist-get opts :timeout)
                       anvil-shell-filter-default-timeout))
          (cwd (plist-get opts :cwd))
-         (resolved (cond
-                    ((eq filter-opt 'auto) (anvil-shell-filter-lookup cmd))
-                    ((null filter-opt) nil)
-                    (t filter-opt))))
+         (resolved0 (cond
+                     ((eq filter-opt 'auto) (anvil-shell-filter-lookup cmd))
+                     ((null filter-opt) nil)
+                     (t filter-opt))))
     (when trace-id
       (anvil-shell-filter--trace trace-id "start" trace-start))
     (let* ((result (anvil-shell cmd (list :timeout timeout :cwd cwd
@@ -1064,7 +1188,13 @@ detail."
            (raw (or (plist-get result :stdout) ""))
            (stderr (or (plist-get result :stderr) ""))
            (truncated (plist-get result :truncated))
-           (compressed (anvil-shell-filter-apply resolved raw))
+           (taco-compressed
+            (and (eq filter-opt 'auto)
+                 (null resolved0)
+                 (anvil-shell-filter--taco-critical-maybe raw stderr exit)))
+           (resolved (if taco-compressed 'taco-critical resolved0))
+           (compressed (or taco-compressed
+                           (anvil-shell-filter-apply resolved raw)))
            (_ (when trace-id
                 (anvil-shell-filter--trace trace-id "filter-done" trace-start)))
            (raw-size (length raw))

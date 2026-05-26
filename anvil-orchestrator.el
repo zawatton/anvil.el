@@ -122,6 +122,33 @@ Submits exceeding this value are refused with `user-error'."
   :type 'number
   :group 'anvil-orchestrator)
 
+(defcustom anvil-orchestrator-daily-budget-usd-total nil
+  "Optional daily hard cap in USD across all orchestrator providers.
+When non-nil, queued tasks whose estimated or reserved budget would
+push today's total over the cap are failed before spawn.  Finalized
+tasks also trigger a sweep that cancels remaining queued/running tasks
+after the cap is reached.  Nil disables the cross-task daily cap."
+  :type '(choice (const :tag "Disabled" nil) number)
+  :group 'anvil-orchestrator)
+
+(defcustom anvil-orchestrator-daily-provider-budget-usd nil
+  "Optional per-provider daily hard caps.
+Alist of PROVIDER symbol to USD number.  Uses the same accounting as
+`anvil-orchestrator-daily-budget-usd-total', but only for matching
+provider tasks.  Providers not listed have no provider-specific daily
+cap."
+  :type '(alist :key-type symbol :value-type number)
+  :group 'anvil-orchestrator)
+
+(defcustom anvil-orchestrator-heartbeat-timeout-sec-default nil
+  "Optional default no-output heartbeat timeout in seconds.
+When non-nil, a running task that emits no stdout for this many seconds
+is cancelled and finalized as failed with a heartbeat timeout error.
+Per task, `:heartbeat-timeout-sec' overrides this value.  Nil disables
+heartbeat timeout unless a task explicitly supplies one."
+  :type '(choice (const :tag "Disabled" nil) number)
+  :group 'anvil-orchestrator)
+
 (defcustom anvil-orchestrator-work-dir
   (expand-file-name "anvil-orchestrator" user-emacs-directory)
   "Parent directory for per-task stdout / stderr files.
@@ -1241,6 +1268,134 @@ volatile fields to keep per-event cost at the hash-table level."
           (setq tail (cddr tail))))
       (puthash id task anvil-orchestrator--tasks))))
 
+;;;; --- budget + heartbeat guardrails -------------------------------------
+
+(defun anvil-orchestrator--today-string (&optional now)
+  "Return local YYYY-MM-DD for NOW or current time."
+  (format-time-string "%Y-%m-%d" (seconds-to-time (or now (float-time)))))
+
+(defun anvil-orchestrator--same-day-p (timestamp day)
+  "Return non-nil when TIMESTAMP falls on local DAY (YYYY-MM-DD)."
+  (and (numberp timestamp)
+       (equal (anvil-orchestrator--today-string timestamp) day)))
+
+(defun anvil-orchestrator--estimate-task-cost (task)
+  "Return provider cost estimate for TASK, or nil when unavailable."
+  (let* ((provider (ignore-errors
+                     (anvil-orchestrator--provider (plist-get task :provider))))
+         (estimator (and provider
+                         (anvil-orchestrator-provider-cost-estimator provider))))
+    (when (functionp estimator)
+      (let ((cost (ignore-errors (funcall estimator task))))
+        (and (numberp cost) cost)))))
+
+(defun anvil-orchestrator--task-reserved-budget (task)
+  "Return TASK's budget reservation for daily cap accounting."
+  (or (anvil-orchestrator--estimate-task-cost task)
+      (plist-get task :budget-usd)
+      0.0))
+
+(defun anvil-orchestrator--budget-used-today (&optional provider)
+  "Return actual finished cost for today, optionally filtered by PROVIDER."
+  (let ((day (anvil-orchestrator--today-string))
+        (total 0.0))
+    (maphash
+     (lambda (_id task)
+       (when (and (memq (plist-get task :status) '(done failed cancelled))
+                  (anvil-orchestrator--same-day-p
+                   (plist-get task :finished-at) day)
+                  (or (null provider) (eq (plist-get task :provider) provider)))
+         (let ((cost (plist-get task :cost-usd)))
+           (when (numberp cost)
+             (setq total (+ total cost))))))
+     anvil-orchestrator--tasks)
+    total))
+
+(defun anvil-orchestrator--budget-reserved-running (&optional provider)
+  "Return budget reservations for currently running tasks."
+  (let ((total 0.0))
+    (maphash
+     (lambda (_id task)
+       (when (and (eq (plist-get task :status) 'running)
+                  (or (null provider) (eq (plist-get task :provider) provider)))
+         (setq total (+ total (anvil-orchestrator--task-reserved-budget task)))))
+     anvil-orchestrator--tasks)
+    total))
+
+(defun anvil-orchestrator--daily-provider-budget-limit (provider)
+  "Return daily budget limit for PROVIDER, or nil when unset."
+  (alist-get provider anvil-orchestrator-daily-provider-budget-usd))
+
+(defun anvil-orchestrator--budget-block-reason (task)
+  "Return a human-readable budget block reason for TASK, or nil."
+  (let* ((provider (plist-get task :provider))
+         (reservation (anvil-orchestrator--task-reserved-budget task))
+         (task-budget (plist-get task :budget-usd))
+         (estimate (anvil-orchestrator--estimate-task-cost task)))
+    (cond
+     ((and (numberp task-budget)
+           (numberp estimate)
+           (> estimate task-budget))
+      (format "budget estimate $%.4f exceeds task budget $%.4f"
+              estimate task-budget))
+     ((and (numberp anvil-orchestrator-daily-budget-usd-total)
+           (> (+ (anvil-orchestrator--budget-used-today)
+                 (anvil-orchestrator--budget-reserved-running)
+                 reservation)
+              anvil-orchestrator-daily-budget-usd-total))
+      (format "daily budget cap $%.4f would be exceeded"
+              anvil-orchestrator-daily-budget-usd-total))
+     ((let ((limit (anvil-orchestrator--daily-provider-budget-limit provider)))
+        (and (numberp limit)
+             (> (+ (anvil-orchestrator--budget-used-today provider)
+                   (anvil-orchestrator--budget-reserved-running provider)
+                   reservation)
+                limit)
+             (format "%s daily budget cap $%.4f would be exceeded"
+                     provider limit)))))))
+
+(defun anvil-orchestrator--budget-cap-reached-p (&optional provider)
+  "Return non-nil when today's budget cap is already reached."
+  (or (and (null provider)
+           (numberp anvil-orchestrator-daily-budget-usd-total)
+           (>= (anvil-orchestrator--budget-used-today)
+               anvil-orchestrator-daily-budget-usd-total))
+      (let ((limit (and provider
+                        (anvil-orchestrator--daily-provider-budget-limit
+                         provider))))
+        (and (numberp limit)
+             (>= (anvil-orchestrator--budget-used-today provider) limit)))))
+
+(defun anvil-orchestrator--cancel-nonterminal-by-budget (reason &optional provider)
+  "Cancel queued/running tasks because budget REASON fired.
+When PROVIDER is non-nil, only that provider is affected.  Returns the
+number of tasks for which cancellation was requested."
+  (let ((ids nil)
+        (n 0))
+    (maphash
+     (lambda (id task)
+       (when (and (memq (plist-get task :status) '(queued running))
+                  (or (null provider) (eq (plist-get task :provider) provider)))
+         (push id ids)))
+     anvil-orchestrator--tasks)
+    (dolist (id ids)
+      (when (anvil-orchestrator-cancel id)
+        (setq n (1+ n))
+        (anvil-orchestrator--task-update
+         id :budget-stop-reason reason)))
+    n))
+
+(defun anvil-orchestrator--enforce-budget-after-finalize (task)
+  "Cancel remaining work when final TASK cost reaches a configured cap."
+  (let ((provider (plist-get task :provider)))
+    (when (anvil-orchestrator--budget-cap-reached-p)
+      (anvil-orchestrator--cancel-nonterminal-by-budget
+       "daily budget cap reached"))
+    (when (and provider (anvil-orchestrator--budget-cap-reached-p provider))
+      (anvil-orchestrator--cancel-nonterminal-by-budget
+       (format "%s daily budget cap reached" provider)
+       provider))))
+
 ;;;; --- Phase 7c: live streaming ------------------------------------------
 ;;
 ;; Opt-in per task via `:stream t'.  The filter is always attached at
@@ -1315,6 +1470,7 @@ streaming (`:stream' nil), or when the line is empty.  Invokes
 the owning task has `:stream t', splits CHUNK into newline-delimited
 events to push via `--stream-push-event'.  The buffer insert path
 keeps the existing post-mortem `--finalize' parse intact."
+  (process-put proc 'anvil-last-output-at (float-time))
   ;; 1. Default-filter emulation — append CHUNK at the process mark.
   ;;    Without this, :filter overrides Emacs' built-in buffer fill
   ;;    and `--finalize' finds an empty buffer.
@@ -1580,6 +1736,7 @@ stream-json NDJSON survives round-trip."
     (process-put proc 'anvil-stdout-buffer out-buf)
     (process-put proc 'anvil-stderr-buffer err-buf)
     (process-put proc 'anvil-started-at    (float-time))
+    (process-put proc 'anvil-last-output-at (float-time))
     (puthash (plist-get task :id) proc anvil-orchestrator--running)
     (anvil-orchestrator--task-update
      (plist-get task :id)
@@ -1633,7 +1790,7 @@ stream-json NDJSON survives round-trip."
              (now      (float-time))
              (final    (cond
                         ((eq status 'cancelled) 'cancelled)
-                        ((eq status 'timeout)   'failed)
+                        ((memq status '(timeout heartbeat-timeout)) 'failed)
                         ;; Reaped = sentinel never fired but the OS
                         ;; says the proc is gone.  Trust the exit code.
                         ((eq status 'reaped)
@@ -1643,6 +1800,8 @@ stream-json NDJSON survives round-trip."
              (error-msg
               (cond
                ((eq status 'timeout) "anvil-orchestrator: wall-clock timeout")
+               ((eq status 'heartbeat-timeout)
+                "anvil-orchestrator: heartbeat timeout")
                ((eq status 'cancelled) "anvil-orchestrator: cancelled by user")
                ;; Reaped + failed: sentinel was missed AND exit was non-zero.
                ;; Reaped + done: leave :error nil — the work succeeded, the
@@ -1667,6 +1826,8 @@ stream-json NDJSON survives round-trip."
          :auto-retry-code (plist-get parsed :auto-retry-code)
          :retry-after-ms (and (eq final 'failed)
                               (anvil-orchestrator--stderr-retry-after-ms stderr exit)))
+        (anvil-orchestrator--enforce-budget-after-finalize
+         (anvil-orchestrator--task-get id))
         (anvil-orchestrator--maybe-auto-retry id)
         (anvil-orchestrator--pump)))))
 
@@ -1718,7 +1879,7 @@ count of reaped tasks."
     (length dead)))
 
 (defun anvil-orchestrator--check-timeouts ()
-  "SIGTERM (then SIGKILL) processes exceeding their wall-clock cap.
+  "SIGTERM (then SIGKILL) processes exceeding wall-clock or heartbeat caps.
 
 Also reaps any dead procs lingering in `--running' (sentinel missed)
 so stale `:status running' tasks recover on the next pump tick."
@@ -1731,9 +1892,21 @@ so stale `:status running' tasks recover on the next pump tick."
          (let* ((task (anvil-orchestrator--task-get id))
                 (cap  (or (plist-get task :timeout-sec)
                           anvil-orchestrator-timeout-sec-default))
-                (started (process-get proc 'anvil-started-at)))
-           (when (and started (> (- now started) cap))
-             (process-put proc 'anvil-cancel-reason 'timeout)
+                (heartbeat-cap (or (plist-get task :heartbeat-timeout-sec)
+                                   anvil-orchestrator-heartbeat-timeout-sec-default))
+                (started (process-get proc 'anvil-started-at))
+                (last-output (or (process-get proc 'anvil-last-output-at)
+                                 started))
+                reason)
+           (cond
+            ((and started cap (> (- now started) cap))
+             (setq reason 'timeout))
+            ((and last-output heartbeat-cap
+                  (> heartbeat-cap 0)
+                  (> (- now last-output) heartbeat-cap))
+             (setq reason 'heartbeat-timeout)))
+           (when reason
+             (process-put proc 'anvil-cancel-reason reason)
              (ignore-errors (signal-process proc 'SIGTERM))
              (run-at-time 2 nil
                           (lambda ()
@@ -1780,12 +1953,13 @@ been caught by `--validate-batch')."
 (defun anvil-orchestrator--classify-for-pump (task)
   "Return how to handle TASK at this pump tick.
 One of `drop' / `fail-dep' / `skip-dep' / `skip-prov' / `run'.
-Also returns (pcase `(fail-dep . DEP-NAME)') when a dep has
-already failed so the caller can record the propagation cause."
+Also returns `(fail-dep . DEP-NAME)' or `(budget . REASON)' for
+terminal queue failures that should be persisted without spawning."
   (cond
    ((or (null task) (not (eq (plist-get task :status) 'queued))) 'drop)
    (t
     (let* ((deps (anvil-orchestrator--dep-tasks task))
+           (budget-reason (anvil-orchestrator--budget-block-reason task))
            (failed (cl-find-if
                     (lambda (d)
                       (memq (plist-get d :status) '(failed cancelled)))
@@ -1794,6 +1968,7 @@ already failed so the caller can record the propagation cause."
        (failed (cons 'fail-dep (plist-get failed :name)))
        ((cl-some (lambda (d) (not (eq (plist-get d :status) 'done))) deps)
         'skip-dep)
+       (budget-reason (cons 'budget budget-reason))
        ((let ((prov (plist-get task :provider)))
           (and prov
                (>= (anvil-orchestrator--running-count prov)
@@ -1822,6 +1997,13 @@ everything else runs when global concurrency permits."
             :finished-at (float-time)
             :error       (format "anvil-orchestrator: dependency %s did not succeed"
                                  dep-name)))
+          (`(budget . ,reason)
+           (anvil-orchestrator--task-update
+            id
+            :status      'failed
+            :finished-at (float-time)
+            :error       (format "anvil-orchestrator: budget hard stop: %s"
+                                 reason)))
           ('run
            (condition-case err
                (anvil-orchestrator--spawn task)
@@ -1980,6 +2162,19 @@ Signals `user-error' on missing / malformed fields."
                                input)))
                (t (user-error "anvil-orchestrator: task must be a list, got %S"
                               input)))))
+    (dolist (alias '((:budget_usd . :budget-usd)
+                     (:timeout_sec . :timeout-sec)
+                     (:heartbeat_timeout_sec . :heartbeat-timeout-sec)
+                     (:system_prompt_append . :system-prompt-append)
+                     (:allowed_tools . :allowed-tools)
+                     (:permission_mode . :permission-mode)))
+      (when (and (plist-member task (car alias))
+                 (not (plist-member task (cdr alias))))
+        (setq task (plist-put task (cdr alias) (plist-get task (car alias))))))
+    (dolist (key '(:budget-usd :timeout-sec :heartbeat-timeout-sec))
+      (let ((v (plist-get task key)))
+        (when (and (stringp v) (not (string-empty-p v)))
+          (setq task (plist-put task key (string-to-number v))))))
     (unless (and (stringp (plist-get task :name))
                  (not (string-empty-p (plist-get task :name))))
       (user-error "anvil-orchestrator: task :name missing or empty"))
@@ -2246,6 +2441,29 @@ loop so the Emacs UI stays responsive."
            :error        "anvil-orchestrator: cancelled (process was dead)")))
       t)
      (t nil))))
+
+;;;###autoload
+(defun anvil-orchestrator-stop (&optional reason)
+  "Emergency-stop every queued or running orchestrator task.
+REASON is stored only in the returned plist; individual task records
+continue to use the existing `anvil-orchestrator-cancel' messages so
+single-task cancel semantics stay unchanged.  Returns a plist with
+the requested ids and number successfully cancelled."
+  (let ((ids nil)
+        (cancelled 0))
+    (maphash
+     (lambda (id task)
+       (when (memq (plist-get task :status) '(queued running))
+         (push id ids)))
+     anvil-orchestrator--tasks)
+    (setq ids (nreverse ids))
+    (dolist (id ids)
+      (when (anvil-orchestrator-cancel id)
+        (setq cancelled (1+ cancelled))))
+    (list :stopped cancelled
+          :requested (length ids)
+          :task-ids ids
+          :reason (or reason "manual emergency stop"))))
 
 ;;;###autoload
 (defun anvil-orchestrator-retry (task-id)
@@ -2723,6 +2941,14 @@ MCP Parameters:
   task_id - Task id string to cancel."
   (anvil-server-with-error-handling
    (list :cancelled (and (anvil-orchestrator-cancel task_id) t))))
+
+(defun anvil-orchestrator--tool-stop (&optional reason)
+  "Emergency-stop all queued and running orchestrator tasks.
+
+MCP Parameters:
+  reason - Optional short reason string for the stop response."
+  (anvil-server-with-error-handling
+   (anvil-orchestrator-stop reason)))
 
 (defun anvil-orchestrator--tool-retry (task_id)
   "Re-submit task TASK_ID under a new id.
@@ -3240,7 +3466,7 @@ majority of single-turn responses."
 ;;;###autoload
 (cl-defun anvil-orchestrator-submit-one
     (&key provider prompt model name cwd budget-usd timeout-sec
-          preamble-ref stream on-event policy)
+          heartbeat-timeout-sec preamble-ref stream on-event policy)
   "Submit a single task and return its task-id (not the batch-id).
 
 A light convenience over `anvil-orchestrator-submit' for the
@@ -3281,6 +3507,8 @@ event; the callback lives in-memory only and is not persisted."
                        (when cwd         (list :cwd cwd))
                        (when budget-usd  (list :budget-usd budget-usd))
                        (when timeout-sec (list :timeout-sec timeout-sec))
+                       (when heartbeat-timeout-sec
+                         (list :heartbeat-timeout-sec heartbeat-timeout-sec))
                        (when preamble-ref
                          (list :preamble-ref preamble-ref))
                        (when stream      (list :stream t))
@@ -3293,6 +3521,7 @@ event; the callback lives in-memory only and is not persisted."
 ;;;###autoload
 (cl-defun anvil-orchestrator-submit-and-collect
     (&key provider prompt model name cwd budget-usd timeout-sec
+          heartbeat-timeout-sec
           preamble-ref stream on-event policy
           (collect-timeout-sec 180) (poll-interval-sec 0.5) full)
   "Submit a single task and wait (non-blocking) for its result.
@@ -3326,6 +3555,7 @@ re-collect via `extract-result' later."
                    :cwd cwd
                    :budget-usd budget-usd
                    :timeout-sec timeout-sec
+                   :heartbeat-timeout-sec heartbeat-timeout-sec
                    :preamble-ref preamble-ref
                    :stream stream
                    :on-event on-event
@@ -3393,8 +3623,8 @@ MCP Parameters:
      task_id
      (anvil-orchestrator--coerce-truthy-string full))))
 
-(defun anvil-orchestrator--tool-submit-one (provider prompt
-                                            &optional model name policy)
+(defun anvil-orchestrator--tool-submit-one
+    (provider prompt &optional model name policy heartbeat_timeout_sec)
   "MCP wrapper for `anvil-orchestrator-submit-one'.
 
 MCP Parameters:
@@ -3408,25 +3638,31 @@ MCP Parameters:
              from provider + HHMMSS when omitted.
   policy   - Optional routing policy name (\"speed\" / \"cost\" /
              \"balanced\" / \"quality\") used only when
-             provider=\"auto\"."
+             provider=\"auto\".
+  heartbeat_timeout_sec - Optional no-output timeout seconds."
   (anvil-server-with-error-handling
     (unless (and (stringp provider) (not (string-empty-p provider)))
       (user-error "submit-one: provider required"))
     (unless (and (stringp prompt) (not (string-empty-p prompt)))
       (user-error "submit-one: prompt required"))
-    (let ((task-id (anvil-orchestrator-submit-one
-                    :provider (intern provider)
-                    :prompt   prompt
-                    :model    (and model (not (string-empty-p model)) model)
-                    :name     (and name  (not (string-empty-p name))  name)
-                    :policy   (and policy (not (string-empty-p policy))
-                                   (intern policy)))))
-      (list :task-id task-id))))
+    (cl-labels ((num (s)
+                  (and s (stringp s) (not (string-empty-p s))
+                       (let ((n (string-to-number s)))
+                         (and (> n 0) n)))))
+      (let ((task-id (anvil-orchestrator-submit-one
+                      :provider (intern provider)
+                      :prompt   prompt
+                      :model    (and model (not (string-empty-p model)) model)
+                      :name     (and name  (not (string-empty-p name))  name)
+                      :policy   (and policy (not (string-empty-p policy))
+                                     (intern policy))
+                      :heartbeat-timeout-sec (num heartbeat_timeout_sec))))
+        (list :task-id task-id)))))
 
 (defun anvil-orchestrator--tool-submit-and-collect
     (provider prompt
      &optional model name cwd budget_usd timeout_sec
-     collect_timeout_sec full policy)
+     collect_timeout_sec full policy heartbeat_timeout_sec)
   "MCP wrapper for `anvil-orchestrator-submit-and-collect'.
 
 MCP Parameters:
@@ -3451,7 +3687,8 @@ MCP Parameters:
                          summary truncation.
   policy               - Optional routing policy name used only
                          when provider=\"auto\" (\"speed\" /
-                         \"cost\" / \"balanced\" / \"quality\")."
+                         \"cost\" / \"balanced\" / \"quality\").
+  heartbeat_timeout_sec - Optional no-output timeout seconds."
   (anvil-server-with-error-handling
     (unless (and (stringp provider) (not (string-empty-p provider)))
       (user-error "submit-and-collect: provider required"))
@@ -3469,6 +3706,7 @@ MCP Parameters:
        :cwd      (and cwd   (not (string-empty-p cwd))   cwd)
        :budget-usd          (num budget_usd)
        :timeout-sec         (num timeout_sec)
+       :heartbeat-timeout-sec (num heartbeat_timeout_sec)
        :collect-timeout-sec (or (num collect_timeout_sec) 180)
        :full (anvil-orchestrator--coerce-truthy-string full)
        :policy (and policy (not (string-empty-p policy))
@@ -3964,6 +4202,18 @@ block until every task reaches a terminal state (done / failed
 2s grace).  Already terminal tasks are left alone.")
 
   (anvil-server-register-tool
+   (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-stop)
+   :id "orchestrator-stop"
+   :intent '(orchestrator emergency)
+   :layer 'workflow
+   :server-id anvil-orchestrator--server-id
+   :description
+   "Emergency stop: cancel every queued or running orchestrator task
+(SIGTERM, then SIGKILL after 2s grace for live subprocesses).  Use
+this as the manual hard-stop path when an agent batch is running away;
+already terminal tasks are left alone.")
+
+  (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-retry)
    :id "orchestrator-retry"
    :intent '(orchestrator)
@@ -4142,7 +4392,7 @@ Response plist includes :events / :last-seq / :task-status."
 (defun anvil-orchestrator--unregister-tools ()
   (dolist (id '("orchestrator-submit" "orchestrator-status"
                 "orchestrator-collect" "orchestrator-cancel"
-                "orchestrator-retry"
+                "orchestrator-stop" "orchestrator-retry"
                 "orchestrator-consensus-submit"
                 "orchestrator-consensus-collect"
                 "orchestrator-consensus-judge"

@@ -165,10 +165,10 @@ SERVER-ID defaults to \"default\" and is resolved through
       (should (= 0 (plist-get result :advertised-count))))))
 
 (ert-deftest anvil-manifest-test-cost-lists-available-profiles ()
-  "Handler advertises every profile name (5 legacy + 2 Phase B)."
+  "Handler advertises every profile name, including Doc44 dynamic."
   (anvil-manifest-test--with-server
     (let ((result (anvil-manifest-cost-handler)))
-      (should (equal '(full core nav ultra lean agent edit)
+      (should (equal '(full core nav ultra lean agent edit headless dynamic)
                      (plist-get result :profiles-available))))))
 
 ;;;; --- Phase 1a: per-server-id profile + alias ---------------------------
@@ -285,6 +285,19 @@ and sees only ultra tools while `emacs-eval' still shows everything."
   "`manifest-cost' must always be visible so Claude can introspect."
   (should (member "manifest-cost" anvil-manifest-profile-ultra)))
 
+(ert-deftest anvil-manifest-test-ultra-has-manifest-attention ()
+  "`manifest-attention' must be visible for Doc44 self-inspection."
+  (should (member "manifest-attention" anvil-manifest-profile-ultra)))
+
+(ert-deftest anvil-manifest-test-ultra-has-recovery-suggest ()
+  "`manifest-recovery-suggest' must be visible for Doc44 recovery."
+  (should (member "manifest-recovery-suggest" anvil-manifest-profile-ultra)))
+
+(ert-deftest anvil-manifest-test-ultra-has-docstring-candidates ()
+  "`manifest-docstring-candidates' must be visible for Doc44 Phase 2d."
+  (should (member "manifest-docstring-candidates"
+                  anvil-manifest-profile-ultra)))
+
 (ert-deftest anvil-manifest-test-ultra-under-20-tools ()
   "ultra stays hot-path only (guard against drift)."
   (should (< (length anvil-manifest-profile-ultra) 25)))
@@ -356,6 +369,12 @@ and sees only ultra tools while `emacs-eval' still shows everything."
   (let ((set (anvil-manifest--profile-toolset 'edit)))
     (should (consp set))
     (should (eq (car set) :filter))))
+
+(ert-deftest anvil-manifest-test-toolset-dynamic-is-attention-spec ()
+  "Doc44 dynamic profile returns an attention selector spec."
+  (let ((set (anvil-manifest--profile-toolset 'dynamic)))
+    (should (consp set))
+    (should (eq (car set) :attention))))
 
 (ert-deftest anvil-manifest-test-filter-match-intent-include ()
   "Filter matches when tool intent intersects the include list."
@@ -445,6 +464,200 @@ and sees only ultra tools while `emacs-eval' still shows everything."
                                        '(:intent (x) :layer dev
                                          :stability deprecated)))))
 
+;;;; --- Doc 44 Phase 2a: Tool Attention IsO-lite --------------------------
+
+(ert-deftest anvil-manifest-test-attention-rank-query ()
+  "manifest-attention ranks tools by local lexical query relevance."
+  (anvil-manifest-test--with-intent-tools
+    (let* ((ranked (anvil-manifest--attention-rank "edit file" "default" 3))
+           (ids (mapcar (lambda (row) (plist-get row :id)) ranked)))
+      (should (member "stub-file-edit" ids))
+      (should-not (member "stub-http" ids))
+      (should (> (plist-get (car ranked) :score) 0)))))
+
+(ert-deftest anvil-manifest-test-attention-state-filter ()
+  "Doc44 state-filter drops tools whose preconditions do not match."
+  (anvil-manifest-test--with-intent-tools
+    (anvil-server-register-tool
+     (lambda () "ok") :id "stub-workspace-edit"
+     :description "edit workspace file"
+     :intent '(file-edit) :layer 'core :stability 'stable
+     :preconditions '(:requires (workspace) :excludes (readonly)))
+    (let* ((anvil-manifest-state-tags nil)
+           (none (mapcar (lambda (row) (plist-get row :id))
+                         (anvil-manifest--attention-rank
+                          "workspace edit" "default" 10)))
+           (anvil-manifest-state-tags '(workspace))
+           (ok (mapcar (lambda (row) (plist-get row :id))
+                       (anvil-manifest--attention-rank
+                        "workspace edit" "default" 10)))
+           (anvil-manifest-state-tags '(workspace readonly))
+           (blocked (mapcar (lambda (row) (plist-get row :id))
+                            (anvil-manifest--attention-rank
+                             "workspace edit" "default" 10))))
+      (should-not (member "stub-workspace-edit" none))
+      (should (member "stub-workspace-edit" ok))
+      (should-not (member "stub-workspace-edit" blocked)))))
+
+(ert-deftest anvil-manifest-test-attention-handler-shape ()
+  "manifest-attention handler returns a JSON-encodable plist shape."
+  (anvil-manifest-test--with-intent-tools
+    (let ((res (anvil-manifest-attention-handler
+                "http fetch" "default" "2")))
+      (should (equal "http fetch" (plist-get res :query)))
+      (should (equal "default" (plist-get res :server-id)))
+      (should (vectorp (plist-get res :state-tags)))
+      (should (= 2 (plist-get res :limit)))
+      (should (> (plist-get res :count) 0))
+      (should (vectorp (plist-get res :tools))))))
+
+(ert-deftest anvil-manifest-test-attention-embedding-backend ()
+  "Doc44 Phase 2a full uses embedding vectors when a backend is configured."
+  (anvil-manifest-test--with-intent-tools
+    (let ((anvil-manifest-embedding-backend 'function)
+          (anvil-manifest--summary-index-cache
+           (make-hash-table :test #'equal))
+          (anvil-manifest-embedding-function
+           (lambda (text)
+             (cond
+              ((string-match-p "semantic network" text) [1.0 0.0])
+              ((string-match-p "http fetch" text) [0.95 0.05])
+              ((string-match-p "edit file" text) [0.0 1.0])
+              (t [0.1 0.1])))))
+      (let* ((ranked (anvil-manifest--attention-rank
+                      "semantic network" "default" 2))
+             (top (car ranked))
+             (res (anvil-manifest-attention-handler
+                   "semantic network" "default" 2)))
+        (should (equal "stub-http" (plist-get top :id)))
+        (should (equal "embedding" (plist-get top :score-backend)))
+        (should (equal "embedding" (plist-get res :ranking-backend)))
+        (should (> (plist-get res :summary-index-count) 0))))))
+
+(ert-deftest anvil-manifest-test-visible-dynamic-profile-query ()
+  "Under dynamic, query hits keep full focus while other tools stay visible trimmed."
+  (anvil-manifest-test--with-intent-tools
+    (let ((anvil-manifest-profile 'dynamic)
+          (anvil-manifest-attention-query "http fetch")
+          (anvil-manifest-attention-top-k 1))
+      (let ((http (gethash "stub-http" (gethash "default" anvil-server--tools)))
+            (edit (gethash "stub-file-edit" (gethash "default" anvil-server--tools))))
+        (should (anvil-manifest--visible-p "stub-http" http "default"))
+        (should (anvil-manifest--focused-tool-p "stub-http" "default"))
+        (should (anvil-manifest--visible-p "stub-file-edit" edit "default"))
+        (should-not (anvil-manifest--focused-tool-p
+                     "stub-file-edit" "default"))
+        (should (anvil-manifest--visible-p
+                 "manifest-attention" nil "default"))
+        (should (anvil-manifest--visible-p
+                 "manifest-recovery-suggest" nil "default"))))))
+
+(ert-deftest anvil-manifest-test-visible-dynamic-can-disable-trim-expansion ()
+  "When schema trimming is disabled, dynamic profile falls back to Top-K only."
+  (anvil-manifest-test--with-intent-tools
+    (let ((anvil-manifest-profile 'dynamic)
+          (anvil-manifest-attention-query "http fetch")
+          (anvil-manifest-attention-top-k 1)
+          (anvil-manifest-schema-trim-enabled nil))
+      (let ((http (gethash "stub-http" (gethash "default" anvil-server--tools)))
+            (edit (gethash "stub-file-edit" (gethash "default" anvil-server--tools))))
+        (should (anvil-manifest--visible-p "stub-http" http "default"))
+        (should-not (anvil-manifest--visible-p
+                     "stub-file-edit" edit "default"))))))
+
+(ert-deftest anvil-manifest-test-visible-dynamic-empty-query-fallback ()
+  "Dynamic profile with empty query falls back to the safe agent profile."
+  (anvil-manifest-test--with-intent-tools
+    (let ((anvil-manifest-profile 'dynamic)
+          (anvil-manifest-attention-query ""))
+      (let ((edit (gethash "stub-file-edit" (gethash "default" anvil-server--tools)))
+            (http (gethash "stub-http" (gethash "default" anvil-server--tools))))
+        (should (anvil-manifest--visible-p "stub-file-edit" edit "default"))
+        (should-not (anvil-manifest--visible-p "stub-http" http "default"))))))
+
+(ert-deftest anvil-manifest-test-docstring-candidates-doc43-bridge ()
+  "Doc44 Phase 2d surfaces Doc43 docstring rewrite candidates."
+  (anvil-manifest-test--with-intent-tools
+    (let* ((res (anvil-manifest-docstring-candidates-handler
+                 "edit file" "default" 3))
+           (rows (append (plist-get res :candidates) nil))
+           (top (car rows)))
+      (should (equal (plist-get res :query) "edit file"))
+      (should (<= (length rows) 3))
+      (should (member "stub-file-edit"
+                      (mapcar (lambda (row) (plist-get row :id))
+                              rows)))
+      (should (>= (plist-get top :manifest-score)
+                  (plist-get top :score)))
+      (should (equal (plist-get top :rewrite-tool)
+                     "autoresearch-docstring-propose"))
+      (should (equal (plist-get top :suggested-action)
+                     "propose-docstring-rewrite-for-tool-attention")))))
+
+(ert-deftest anvil-manifest-test-docstring-candidates-query-filters ()
+  "Docstring candidate query narrows candidates by attention relevance."
+  (anvil-manifest-test--with-intent-tools
+    (let* ((res (anvil-manifest-docstring-candidates-handler
+                 "http fetch" "default" 5))
+           (rows (append (plist-get res :candidates) nil))
+           (ids (mapcar (lambda (row) (plist-get row :id)) rows)))
+      (should (member "stub-http" ids))
+      (should-not (member "stub-file-edit" ids)))))
+
+(ert-deftest anvil-manifest-test-schema-trimmer-removes-param-docs ()
+  "Doc44 Phase 2c trims non-focused dynamic tool schemas."
+  (let* ((tool
+          '(:description "Long description first line\nsecond"
+            :schema ((type . "object")
+                     (properties
+                      ("path" . ((type . "string")
+                                 (description . "Long parameter description")))))))
+         (default (anvil-server--build-tool-fragment
+                   "stub-wide" (plist-get tool :description)
+                   (plist-get tool :schema)))
+         (anvil-manifest-profile 'dynamic)
+         (anvil-manifest-attention-query "http fetch")
+         (anvil-manifest-schema-trim-enabled t)
+         (trimmed (anvil-manifest--tool-fragment
+                   "stub-wide" tool "default" default)))
+    (should (string-match-p "\"name\":\"stub-wide\"" trimmed))
+    (should (string-match-p "\"path\"" trimmed))
+    (should-not (string-match-p "Long parameter description" trimmed))
+    (should-not (string-match-p "second" trimmed))))
+
+(ert-deftest anvil-manifest-test-lru-warms-recent-tool ()
+  "Doc44 Phase 2c keeps recently used tools focused."
+  (let ((anvil-manifest--warm-tools nil)
+        (anvil-manifest-attention-query "")
+        (anvil-manifest-warm-tool-limit 2))
+    (anvil-manifest--record-tool-dispatch "a" "default")
+    (anvil-manifest--record-tool-dispatch "b" "default")
+    (anvil-manifest--record-tool-dispatch "c" "default")
+    (should (equal '("c" "b") anvil-manifest--warm-tools))
+    (should (anvil-manifest--focused-tool-p "c" "default"))
+    (should-not (anvil-manifest--focused-tool-p "a" "default"))))
+
+(ert-deftest anvil-manifest-test-recovery-suggest-handler ()
+  "Doc44 Phase 2c recovery handler reports visibility and focus reasons."
+  (anvil-manifest-test--with-intent-tools
+    (let ((anvil-manifest-profile 'dynamic)
+          (anvil-manifest-attention-query "http fetch")
+          (anvil-manifest-attention-top-k 1)
+          (anvil-manifest--warm-tools nil))
+      (let* ((res (anvil-manifest-recovery-suggest-handler
+                   "http fetch" "default" 3))
+             (rows (append (plist-get res :suggestions) nil))
+             (http (cl-find "stub-http" rows
+                            :key (lambda (row)
+                                   (plist-get row :id))
+                            :test #'equal)))
+        (should (equal "http fetch" (plist-get res :query)))
+        (should http)
+        (should (eq t (plist-get http :visible)))
+        (should (eq t (plist-get http :focused)))
+        (should (equal "focused-full-schema"
+                       (plist-get http :reason)))))))
+
 (ert-deftest anvil-manifest-test-unknown-profile-still-errors-phase-b ()
   "Unknown profile continues to signal user-error (no regression)."
   (should-error (anvil-manifest--profile-toolset 'nonsense)
@@ -457,6 +670,8 @@ user editing `anvil-server-id-aliases' by hand."
   (should (member '("emacs-eval-agent" . "emacs-eval")
                   anvil-manifest--default-aliases))
   (should (member '("emacs-eval-edit" . "emacs-eval")
+                  anvil-manifest--default-aliases))
+  (should (member '("emacs-eval-dynamic" . "emacs-eval")
                   anvil-manifest--default-aliases)))
 
 (ert-deftest anvil-manifest-test-default-server-profiles-include-agent-edit ()
@@ -467,6 +682,9 @@ symbols in the default `anvil-manifest-server-profiles'."
                           (default-value 'anvil-manifest-server-profiles)))))
   (should (eq 'edit
               (cdr (assoc "emacs-eval-edit"
+                          (default-value 'anvil-manifest-server-profiles)))))
+  (should (eq 'dynamic
+              (cdr (assoc "emacs-eval-dynamic"
                           (default-value 'anvil-manifest-server-profiles))))))
 
 ;;;; Stage D (Doc 18) — headless profile for non-Emacs user distribution

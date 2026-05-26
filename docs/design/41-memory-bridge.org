@@ -1,13 +1,57 @@
 #+title: anvil-memory-bridge — HTTP API + cross-AI extensions + mobile
 #+date: 2026-04-29
 #+author: zawatton
-#+property: status DEFERRED
+#+property: status PHASE-4-SHIPPED
 #+property: scope GENERIC
 
 * STATUS
   :PROPERTIES:
   :ID:       4f1b9c8a-2e3d-4a5b-9c6e-1a2b3c4d5e6f
   :END:
+~PHASE-4-SHIPPED~ (2026-05-26) — mobile Pattern A thin client scaffold を追加。
+=extensions/mobile-bridge/= に static mobile app を置き、bridge URL / bearer
+token を設定して =/memory/search= と =/memory/save= を呼べるようにした。
+save 失敗時は =localStorage= queue に積み、Replay Queue button または browser
+=online= event で再送する。SSE や background polling は使わない。
+
+~PHASE-3-SHIPPED~ (2026-05-26) — browser extension scaffold を追加。
+bridge 側に configured origin CORS / OPTIONS preflight を実装し、
+=extensions/memory-bridge/= に Manifest V3 side-load extension を追加。
+service worker は =/memory/search= / =/memory/save= / =/memory/health= を呼び、
+content script は Claude.ai / ChatGPT / Gemini 上で =Ctrl+Alt+M= memory
+inject と =Ctrl+Alt+S= selected text save を提供する。extension は options で
+bridge URL / token / topK / enable flag を管理する。
+
+~PHASE-2C-SHIPPED~ (2026-05-26) — read-replica mode を追加。
+=GET /memory/replica/status= は primary/replica mode、primary URL、last event
+id、local write availability を返す。=POST /memory/replica/pull= は Bearer auth
+付きで primary の memory_event SSE / decoded events を取り込み、=save= / =delete=
+events を local DB-direct memory に適用する。=anvil-memory-bridge-replica-mode=
+有効時は通常の local mutating endpoints を =409= で拒否し、multi-master を
+防ぐ。
+
+~PHASE-2B-SHIPPED~ (2026-05-26) — Phase 2a write/auth endpoint に加えて、
+=memory_event= table と =GET /memory/events?since=<id>= を実装。bridge 経由の
+=save= / =access= / =scan= / =prune= / =delete= は event id を返し、
+event endpoint は =text/event-stream= で差分 snapshot を返す。browser
+extension、mobile は deferred のまま。
+
+~PHASE-2A-SHIPPED~ (2026-05-26) — Phase 1 read-only API に加えて、
+Bearer token guarded write/auth endpoints を実装。=POST /memory/save=,
+=PUT /memory/access=, =POST /memory/scan=, =POST /memory/prune=,
+=DELETE /memory/<basename>= を提供し、mutating request は常に
+=Authorization: Bearer <token>= を要求する。=GET= も
+=anvil-memory-bridge-auth-required= 有効時は =/health= 以外で auth を要求する。
+=M-x anvil-memory-bridge-rotate-token= で token を再生成できる。
+
+~PHASE-1-SHIPPED~ (2026-05-26) — =anvil-memory-bridge.el= を追加し、
+localhost read-only JSON API を実装。=GET /memory/search=,
+=/memory/list=, =/memory/get/<basename>=, =/memory/health=,
+=/memory/effective-db-path= を提供する。Doc 42 Phase 3 連携として
+=/worklog/search=, =/worklog/list=, =/worklog/get=, =/worklog/health=,
+=/worklog/effective-db-path= も同じ bridge に載せた。
+=M-x anvil-memory-bridge-start= / =-stop= / =-status= で手動制御する。
+
 ~DEFERRED~ (2026-05-17)。元 ~Phase 0 DRAFT~ (2026-04-29、Phase 2C of
 the memory cross-PC sharing roadmap that started with Phases 1 / 2A /
 2B)。develop → master 統合 gate を通すため一旦 DEFERRED に移送。
@@ -27,11 +71,10 @@ that:
 3. Mobile clients can query and append rows from a phone / tablet
    without running a full Emacs.
 
-No Phase here is implemented yet.  Phases 1 and 2 are the cheapest
-pieces with clear value; Phase 3 and 4 are deferred until 1 / 2 are
-proven.  The whole document is technical only — payment, billing, or
-service-tier discussion belongs outside the anvil.el repo (see the
-memory-side strategy notes).
+Phase 1, Phase 2a, Phase 2b, Phase 2c, Phase 3, and Phase 4 are
+implemented as local-first scaffolds.  The whole document is technical only — payment,
+billing, or service-tier discussion belongs outside the anvil.el repo
+(see the memory-side strategy notes).
 
 * Motivation
 
@@ -56,8 +99,9 @@ streams events to other clients, and gives non-Emacs callers (browsers,
 phones) an HTTP API instead of MCP-over-stdio.
 
 The bridge does *not* replace MCP.  Claude Code keeps its existing
-=memory-search= / =memory-scan= MCP path; the HTTP API is an additional
-surface for clients that cannot speak MCP.
+=memory-search= / =memory-scan= and =worklog-search= / =worklog-add=
+MCP paths; the HTTP API is an additional surface for clients that
+cannot speak MCP.
 
 * Non-goals
 
@@ -73,9 +117,9 @@ surface for clients that cannot speak MCP.
   authoritative index.  Other daemons are read-replicas (Phase 2c) or
   cross-machine clients (Phase 1).
 
-* Phased roadmap (no impl, just design)
+* Phased roadmap
 
-** Phase 1 — read-only HTTP API (~5–8 hours work)
+** Phase 1 — read-only HTTP API (~5–8 hours work) — SHIPPED
 
 Goal: any localhost HTTP client can issue =GET /memory/search?q=…=
 and =GET /memory/list?type=…= and get JSON back.
@@ -90,24 +134,41 @@ GET  /memory/health                    # {:db <path>, :rows N, :uptime-sec N}
 GET  /memory/effective-db-path
 #+end_example
 
+Doc 42 extends the same read-only bridge with worklog endpoints:
+
+#+begin_example
+GET  /worklog/search?q=<query>&machine=<token>&since=<date>&until=<date>&year=<yyyy>&limit=<n>
+GET  /worklog/list?machine=<token>&since=<date>&until=<date>&year=<yyyy>&limit=<n>
+GET  /worklog/get?digest=<sha1>
+GET  /worklog/get?file=<file>&start_line=<n>
+GET  /worklog/health
+GET  /worklog/effective-db-path
+#+end_example
+
 Bodies are JSON (=application/json=, UTF-8).  Each row is a
 straight serialisation of the elisp plist returned by
-=anvil-memory-list= / =anvil-memory-search= today, with =:keyword=
+=anvil-memory-list= / =anvil-memory-search= / =anvil-worklog-list= /
+=anvil-worklog-search= today, with =:keyword=
 keys converted to bare JSON keys (=file=, =type=, =snippet=, =rank=,
 =decay-score=, …).  Numeric fields are JSON numbers, strings are
 JSON strings, =nil= becomes JSON =null=.
 
 *** Implementation notes
 
-- Reuse =anvil-http= server bits (Doc 09) as the front; the
-  search / list handler is just =(anvil-server-encode-handler
-  #'anvil-memory--tool-search)= flipped to take query-string args
-  instead of MCP-shaped args.
+- Shipped as a separate optional module, =anvil-memory-bridge.el=.
+  It reuses the small =make-network-process= HTTP pattern already
+  present in the =anvil-memory-serve= HTML viewer, but dispatches to
+  JSON endpoints instead of rendering HTML.
+- The search / list handlers call the same public APIs as the MCP
+  tools: =anvil-memory-search=, =anvil-memory-list=,
+  =anvil-memory-get=, and =anvil-memory-effective-db-path=.
 - Bind to =127.0.0.1= only.  Phase 1 has no auth; localhost is the
   trust boundary.  Phase 2 adds auth so non-localhost binding
   becomes safe.
 - Port = =anvil-memory-bridge-port=, default 8730 (one above the
-  existing serve port).  Configurable defcustom.
+  existing =anvil-memory-serve-port= 8729).  Configurable defcustom.
+  No central anvil port-registry doc exists as of 2026-05-26; this
+  design doc is the reservation record for 8730.
 - =M-x anvil-memory-bridge-start= / =-stop= for manual control.
   =M-x anvil-memory-bridge-status= shows port + binding.
 - Existing =anvil-memory-serve= command (the HTML browser) is
@@ -115,8 +176,10 @@ JSON strings, =nil= becomes JSON =null=.
 
 *** Test surface
 
-- ERT: hit each endpoint with =url-retrieve-synchronously=, decode
-  JSON, assert shapes.  6–8 tests covers it.
+- ERT: endpoint dispatch tests decode JSON and assert shapes.
+- Live ERT: with =ANVIL_MEMORY_BRIDGE_LIVE=1=, the suite starts an
+  ephemeral loopback listener and hits it via
+  =url-retrieve-synchronously=.
 - Smoke: =curl http://127.0.0.1:8730/memory/search?q=anvil-disk |
   jq '.[].file'= from a shell.
 
@@ -141,7 +204,7 @@ PUT  /memory/access      body = {file}                  # bumps access_count
 POST /memory/scan        body = {roots?}                # invokes anvil-memory-scan
 POST /memory/prune       body = {roots?}                # invokes anvil-memory-prune
 DELETE /memory/<basename>                               # removes row + .md
-GET  /memory/events?since=<id>                          # SSE stream of writes
+GET  /memory/events?since=<id>                          # SSE snapshot of writes
 #+end_example
 
 *** Auth model
@@ -178,7 +241,7 @@ Notes checkouts), Phase 2A's git-merge resolution still applies —
 the bridge does not invent a sync protocol.  Phase 2c below adds an
 optional =read-replica= mode for that case.
 
-*** Phase 2c — read-replicas (optional)
+*** Phase 2c — read-replicas (shipped)
 
 A second daemon can be configured to *follow* a primary daemon's
 event stream (=GET /memory/events?since=…= over SSE) and apply
@@ -193,7 +256,28 @@ Replicas are read-only locally; user writes round-trip through the
 primary.  This is *not* multi-master replication and explicitly
 forbids it.
 
-** Phase 3 — browser extensions (~ unknown, weeks)
+Shipped surface:
+
+- =anvil-memory-bridge-replica-mode=
+- =anvil-memory-bridge-primary-url=
+- =anvil-memory-bridge-replica-pull=
+- =GET /memory/replica/status=
+- =POST /memory/replica/pull=
+
+Supported event application:
+
+- =save=: requires primary payload =name= / =type= / =body=. Bridge
+  saves now include =body= in memory_event payload so replicas can
+  reconstruct DB-direct rows.
+- =delete=: deletes the DB-direct local row by =name= / =file=.
+- =access= / =scan= / =prune= are currently skipped by replicas; they
+  advance =last-event-id= but do not mutate local rows.
+
+When =anvil-memory-bridge-replica-mode= is non-nil, ordinary local
+mutating endpoints return =409 Conflict= and instruct callers to write
+to the primary.  This keeps the topology single-writer.
+
+** Phase 3 — browser extensions (shipped scaffold)
 
 Goal: a Claude.ai chat, ChatGPT chat, or Gemini chat can read /
 write the same memory index by hitting the local bridge from the
@@ -227,6 +311,25 @@ Each provider gets a thin browser extension (Manifest V3) that:
 The extension has no model-side intelligence — that lives in the
 chat itself.  The extension is just a courier for memory <-> browser.
 
+Shipped scaffold:
+
+- =extensions/memory-bridge/manifest.json= (Manifest V3)
+- =service_worker.js=:
+  - =/memory/search=
+  - =/memory/save=
+  - =/memory/health=
+- =content_script.js=:
+  - =Ctrl+Alt+M= injects a compact =<memory ...>= block into the active
+    editor
+  - =Ctrl+Alt+S= saves selected text as a memo through the bridge
+- =options.html= / =options.js=:
+  - bridge URL
+  - bearer token
+  - top-K
+  - enable flag
+- =tests/anvil-memory-bridge-extension-test.el= validates manifest shape
+  and referenced files.
+
 *** CORS
 
 The bridge needs to allow:
@@ -240,6 +343,13 @@ Access-Control-Allow-Origin: https://gemini.google.com
 (Plus =OPTIONS= preflight + the bearer-token header.)  The exact
 origin list is a defcustom so users can add Aider / Cline / Cursor
 when they ship.
+
+Shipped bridge controls:
+
+- =anvil-memory-bridge-cors-allowed-origins=
+- =Access-Control-Allow-Origin= for configured origins
+- =Access-Control-Allow-Headers: Authorization, Content-Type=
+- =OPTIONS= preflight response
 
 *** Extension distribution
 
@@ -260,7 +370,7 @@ versioned alongside the bridge protocol it talks to.
   raw fetch is killed.
 - Extension review delays.  Side-load remains the default.
 
-** Phase 4 — mobile (~ unknown, biggest unknown)
+** Phase 4 — mobile (shipped scaffold)
 
 Goal: a phone can issue the same =GET /memory/search= and =POST
 /memory/save= against the user's home daemon while on cellular
@@ -284,6 +394,19 @@ shell that:
 This is the cheapest Phase 4 path and is fully covered by Phase 2's
 auth / binding model.
 
+Shipped scaffold:
+
+- =extensions/mobile-bridge/index.html=
+- =extensions/mobile-bridge/app.js=
+- =extensions/mobile-bridge/app.webmanifest=
+- =extensions/mobile-bridge/README.md=
+- =tests/anvil-memory-bridge-mobile-test.el=
+
+The app is deliberately static and dependency-free.  It stores bridge
+URL / bearer token in browser localStorage, calls =/memory/search=,
+and POSTs =/memory/save=.  Failed saves are queued in localStorage and
+replayed explicitly or on the browser =online= event.
+
 **** Pattern B — relay over a public service
 
 If the user does *not* run Tailscale, a relay server (anvil-memory's
@@ -304,24 +427,25 @@ deferred until Pattern A's audience asks for it.
 
 * Schema impact
 
-Phase 1–2 do not change the SQLite schema.  Phase 3–4 may want a
-=memory_event= table to track per-row write history for the SSE
-stream.  Sketch:
+Phase 2b adds a bridge-owned =memory_event= table to the same SQLite
+DB used by =anvil-memory=.  It records bridge-side mutating requests
+and backs =GET /memory/events?since=<id>=:
 
 #+begin_example
 CREATE TABLE IF NOT EXISTS memory_event (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   ts          INTEGER NOT NULL,                  -- unix epoch
-  kind        TEXT NOT NULL CHECK (kind IN
-              ('save','prune','access','scan','promote')),
-  file        TEXT NOT NULL,
-  client_id   TEXT                               -- bridge-issued opaque id
+  op          TEXT NOT NULL,
+  file        TEXT,
+  name        TEXT,
+  type        TEXT,
+  payload     TEXT                               -- compact JSON
 );
 CREATE INDEX IF NOT EXISTS memory_event_ts_idx ON memory_event (ts);
 #+end_example
 
-Decision: introduce =memory_event= in Phase 2 (write API needs it
-for the SSE stream).  Phase 1 lives without it.
+Phase 1 lives without it; the table is created lazily when the bridge
+health/events/write path first needs it.
 
 * Risks and unresolved questions
 
@@ -368,25 +492,27 @@ so users do not paste raw tokens into command lines.
 | 1     |       8 | 1 (curl)  |           0 |
 | 2     |      12 | 2         |           1 |
 | 2c    |       6 | 1         |           0 |
+| 3     |       7 | 0         |           1 |
+| 4     |       4 | 0         |           1 |
 | 3     |       4 | 1         |           1 |
 | 4     |       2 | 0         |           0 |
 
 Phase 1 + 2 should keep =make test-all= within 60s wallclock.
 
-* Implementation order (when impl actually starts)
+* Implementation order
 
-1. Phase 1 endpoints + ERT (=memory-bridge-phase1=).  Ship to
-   develop, verify against running daemon for 1 week.
+1. Phase 1 endpoints + ERT (=memory-bridge-phase1=).  SHIPPED as
+   =anvil-memory-bridge.el=.
 2. Phase 2 auth + write endpoints (=memory-bridge-phase2a=).
-   Ship.
+   SHIPPED.
 3. Phase 2 SSE stream + memory_event table (=memory-bridge-phase2b=).
-   Ship.
-4. (Optional) Phase 2c read-replicas — only if the user actually
-   asks.
+   SHIPPED.
+4. Phase 2c read-replicas.  SHIPPED.
 5. Phase 3 browser extensions, separate sub-tree under
-   =extensions/=.  Ship behind feature flag.
-6. Phase 4 mobile patterns A / B.  Pattern B is the largest unknown;
-   defer until at least three Phase 1 / 2 users ask for it.
+   =extensions/=.  SHIPPED scaffold.
+6. Phase 4 mobile Pattern A.  SHIPPED scaffold.
+   Pattern B relay remains out of scope until at least three users ask
+   for it.
 
 Each phase is an independent feat branch off develop, merged
 =--no-ff= as usual.  No phase merges to master until the design-gate
@@ -395,18 +521,20 @@ condition (all docs SHIPPED) clears.
 * References
 
 - Doc 29 — anvil-memory-engine (substrate this bridge fronts)
-- Doc 09 — anvil-http (Phase 1 reuses the server bits)
+- Doc 09 — anvil-http (HTTP client conventions; bridge server is local)
 - Phase 2A commit =fc7a8ac= — anvil-memory-shared-db-roots resolver
 - Phase 2B commit =85fc9f6= — anvil-memory-prune
 
 * TODO when implementation begins
 
-- [ ] Reserve port 8730 in anvil's port-registry doc (if any) so it
+- [X] Reserve port 8730 in anvil's port-registry doc (if any) so it
       does not collide with anvil-orchestrator / anvil-pty-broker.
-- [ ] Decide whether =anvil-memory-bridge= is a separate elisp module
+      There is no central port-registry doc; reservation is recorded
+      above next to the 8729 memory viewer port.
+- [X] Decide whether =anvil-memory-bridge= is a separate elisp module
       (=anvil-memory-bridge.el=) or inlined into =anvil-memory.el=.
       Current preference: separate file, =anvil-optional-modules= load
       (so users who do not need the bridge do not pay for it).
-- [ ] Pick a JSON serialiser: =json.el= (built-in) vs the slightly
+- [X] Pick a JSON serialiser: =json.el= (built-in) vs the slightly
       faster =json-rpc.el= path.  Built-in is enough for Phase 1's
       throughput; revisit only if benchmark says so.

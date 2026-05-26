@@ -1,25 +1,48 @@
 #+title: anvil-orchestrator budget + heartbeat (Paperclip-style hard stops)
 #+date: 2026-05-24
 #+author: zawatton
-#+property: status DRAFT
+#+property: status PHASE-0-2A-SHIPPED
 #+property: scope GENERIC
 
 * STATUS
   :PROPERTIES:
   :ID:       d1c4e0f2-8f44-4f7c-bc1a-paperclip-47
   :END:
-~DRAFT~ (2026-05-24) — Paperclip (動画 yt_20260524_paperclip_multi_agent_
+~PHASE-0-2A-SHIPPED~ (2026-05-25) — Paperclip (動画 yt_20260524_paperclip_multi_agent_
 management) の二重安全装置 (ハートビート + 予算ハードストップ) を
 anvil-orchestrator + anvil-worker-probe に取り込む設計案。動画の
 「月 30 万円超え暴走事故」を防ぐ実用機能。
+
+実装状況 (2026-05-25):
+
+- *SHIPPED* — Phase 0 manual emergency stop。公開 API
+  =anvil-orchestrator-stop= と MCP tool =orchestrator-stop= を追加。
+  全 queued / running task を一括で既存 =anvil-orchestrator-cancel= 経路に
+  流し、queued は即 cancelled、live subprocess は SIGTERM → 2 秒後
+  SIGKILL の既存 grace を使う。done / failed / cancelled は変更しない。
+  これは Paperclip 型 hard stop の手動 kill switch で、budget/heartbeat
+  自動発火の前段として使える。ERT 追加。
+- *SHIPPED* — Phase 1a budget hard-stop guard。provider の既存
+  =cost-estimator= を使い、見積が task budget を超える queued task は
+  spawn 前に failed にする。任意 defcustom
+  =anvil-orchestrator-daily-budget-usd-total= と
+  =anvil-orchestrator-daily-provider-budget-usd= を追加し、設定時は当日
+  実費 + running 予約 + 起動予定 reservation が cap を超える task を
+  spawn 前に止める。finalize 後に cap 到達した場合は残 queued/running
+  task を自動 cancel。
+- *SHIPPED* — Phase 2a heartbeat timeout。process filter が stdout 最終
+  出力時刻を更新し、pump の timeout scan が =:heartbeat-timeout-sec= または
+  =anvil-orchestrator-heartbeat-timeout-sec-default= を超えた無出力 running
+  task を =heartbeat-timeout= として SIGTERM → SIGKILL grace に流す。
+  default は nil で、静かな長時間 task を誤停止しない opt-in。
 
 Paperclip 採用要素 (anvil 既存と比較):
 
 | 機能                          | Paperclip | anvil 既存                        |
 |-------------------------------+-----------+-----------------------------------|
-| ハートビート (生存信号)        | あり      | anvil-worker-probe quick-alive-p  |
-| タスク単位予算上限            | あり      | **未実装**                        |
-| エージェント単位予算上限      | あり      | **未実装**                        |
+| ハートビート (生存信号)        | あり      | no-output heartbeat timeout 実装  |
+| タスク単位予算上限            | あり      | 見積 > task budget を spawn 前停止 |
+| エージェント単位予算上限      | あり      | provider daily cap 実装           |
 | 90% 警告 → 100% 強制停止       | あり      | **未実装**                        |
 | ゴールアラインメント 4 層     | あり      | scope 外 (Doc 17 session で議論)  |
 | マルチカンパニー分離          | あり      | 当面不要 (1 人事業主)             |

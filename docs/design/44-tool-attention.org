@@ -1,13 +1,50 @@
 #+title: anvil-manifest Phase 2 — Tool Attention (intent search + state filter + lazy load)
 #+date: 2026-05-24
 #+author: zawatton
-#+property: status DRAFT
+#+property: status PHASE-2A-2B-2C-2D-SHIPPED
 #+property: scope GENERIC
 
 * STATUS
   :PROPERTIES:
   :ID:       d1c4e0f2-8f44-4f7c-bc1a-tool-attention-44
   :END:
+~PHASE-2A-SHIPPED~ (2026-05-26) — embedding backend + tool-summary-index を
+追加。=anvil-manifest-embedding-backend= は =lexical= / =function= /
+=command= を選択でき、=function= は =anvil-manifest-embedding-function=、
+=command= は stdin→stdout の JSON/whitespace numeric vector command を呼ぶ。
+backend が未設定・失敗・次元不一致の時は既存 lexical scorer に fallback する。
+=manifest-attention= は =:ranking-backend= と =:summary-index-count= を返し、
+embedding cosine 類似度が使える時はそれで Top-K を並べる。
+
+~PHASE-2C-SHIPPED~ (2026-05-26) — schema-trimmer + LRU + recovery-suggest
+を追加。=anvil-server= に tools/list fragment transformer hook を追加し、
+dynamic profile では Top-K / manifest self tools / warm LRU tools は full
+schema、その他の state-compatible tools は short description + parameter
+name/type-only schema で advertise できるようにした。tool dispatch hook で
+recent tool LRU を更新し、=manifest-recovery-suggest= MCP tool が query に
+対して visible/focused/state reason を返す。
+
+~PHASE-2B-SHIPPED~ (2026-05-26) — state-filter を追加。tool 登録 metadata
+=:preconditions= を =anvil-server-register-tool= が保持し、=anvil-manifest= の
+dynamic profile / =manifest-attention= ranking が
+=anvil-manifest-state-tags= (=ANVIL_STATE_TAGS=) と照合して現在実行不能な
+tool を落とす。precondition は symbol、required symbol list、または
+=:requires= / =:excludes= / =:any= plist を受け付ける。
+
+~PHASE-2D-SHIPPED~ (2026-05-26) — Doc 43 連携として
+=manifest-docstring-candidates= MCP tool を追加。=autoresearch-docstrings=
+の弱い MCP description 評価を呼び出し、任意の natural-language query に
+対する local attention score / manifest-score を付与して、follow-up を
+=autoresearch-docstring-propose= に向ける。これで Q4(c)/(b) の
+docstring 書き直し候補抽出を Tool Attention 側から直接開始できる。
+
+~PHASE-2A-LITE-SHIPPED~ (2026-05-25) — 外部 embedding 依存なしの
+local IsO-lite を =anvil-manifest.el= に実装済み。=manifest-attention=
+MCP tool は query を tool id / description / intent / layer metadata に
+lexical matching して Top-K を返す。=ANVIL_PROFILE=dynamic= では
+=ANVIL_ATTENTION_QUERY= と =anvil-manifest-attention-top-k= に基づいて
+tools/list を絞る。query が空の時は agent profile に fallback する。
+
 ~DRAFT~ (2026-05-24) — Doc 26 anvil-manifest (Phase 1 + 1a + 1b SHIPPED)
 の Phase 2 拡張。論文「Tool Attention is All You Need」(2026 解説動画
 yt_20260524_tool_attention_mcp_tax) の 3 部品を anvil 層に取り込む。
@@ -174,14 +211,64 @@ Doc 26 の Phase 1 は env =ANVIL_PROFILE= で profile 指定。Phase 2 は:
 
 | Phase | scope                                                     | 工数 |
 |-------+-----------------------------------------------------------+------|
-| 2a    | embedding service + tool-summary-index + IsO Top-K のみ  | 中   |
+| 2a-lite | local lexical IsO-lite + dynamic profile + Top-K tool    | 済   |
+|       | =manifest-attention= / =ANVIL_PROFILE=dynamic=             |      |
+| 2a    | embedding service + tool-summary-index + IsO Top-K のみ  | 済   |
 |       | (state-filter / lazy-load なし、まず IsO 精度を測る)     |      |
-| 2b    | state-filter 追加 (:preconditions タグ + evaluator)       | 小   |
-| 2c    | schema-trimmer + LRU + recovery-suggest                   | 小   |
-| 2d    | docstring 一括書き直し (Q4 (c) → Doc 43 連携)             | 小   |
+| 2b    | state-filter 追加 (:preconditions タグ + evaluator)       | 済   |
+| 2c    | schema-trimmer + LRU + recovery-suggest                   | 済   |
+| 2d    | docstring 一括書き直し候補抽出 (Q4 → Doc 43 連携)         | 済   |
 
 → Phase 2a 単体で論文ベース効果の大半が出るはず (IsO が支配的)。
    2b/2c は marginal gain で gating する。
+
+** Phase 2b — state-filter (shipped)
+
+- tool registration metadata として =:preconditions= を許可
+- =anvil-manifest-state-tags= / =ANVIL_STATE_TAGS= で現在 state tags を指定
+- =:preconditions= の形:
+  - =workspace= のような単一 symbol
+  - =(workspace writable)= のような全必須 symbol list
+  - =(:requires (workspace) :excludes (readonly) :any (repo buffer))=
+- dynamic profile と =manifest-attention= ranking は state に合わない tool を
+  Top-K 候補から除外する
+- query 空時の agent fallback にも同じ state-filter を適用する
+
+** Phase 2c — schema-trimmer + LRU + recovery-suggest (shipped)
+
+- =anvil-server-tool-fragment-function= を追加し、tools/list の visible tool
+  JSON fragment を profile 側で差し替え可能にした
+- dynamic profile で =anvil-manifest-schema-trim-enabled= が non-nil の時:
+  - Top-K Tool Attention hits は full schema
+  - =manifest-*= self-inspection tools は full schema
+  - dispatch hook で warm LRU に入った最近利用 tool は full schema
+  - それ以外の state-compatible tool は short description +
+    parameter-name/type-only schema
+- =anvil-manifest-warm-tool-limit= で warm LRU size を制御
+- =manifest-recovery-suggest= MCP tool を追加し、query に対して tool ごとの
+  =:visible= / =:focused= / =:state-matches= / =:reason= を返す
+- =anvil-server= の tools/list cache は fragment transformer 有効時に stale
+  cache を避ける
+
+** Phase 2d — Doc43 docstring rewrite candidate bridge (shipped)
+
+- =manifest-docstring-candidates= MCP tool を追加
+- Doc43 =anvil-autoresearch-docstrings= を lazy require して、弱い MCP
+  description / parameter docs を rank する
+- =query= がある場合は =anvil-manifest--attention-score= で Tool Attention
+  関連度を加算し、=:manifest-score= で並べる
+- 各 candidate に follow-up 情報を付与:
+  - =:rewrite-tool= = "autoresearch-docstring-propose"
+  - =:rewrite-args= =(:tool-id ... :server-id ...)=
+  - =:suggested-action= =
+    "propose-docstring-rewrite-for-tool-attention"=
+- =manifest-docstring-candidates= は =ultra= profile に含め、Tool Attention
+  自己改善の入口を常時見える位置に置く
+
+この Phase は「書き直しの実行」ではなく、Tool Attention の精度改善対象を
+Doc43 の proposal/apply loop に渡す bridge。実際の rewrite proposal は
+=autoresearch-docstring-propose=、採用 apply は
+=autoresearch-docstring-apply= 側で行う。
 
 * 評価メトリクス
 

@@ -160,6 +160,72 @@ subprocess left behind by BODY before removing the work dir."
               (list :name "b" :provider 'test :prompt "y" :budget-usd 0.40)))
        :type 'user-error))))
 
+(ert-deftest anvil-orchestrator-test-budget-estimate-blocks-before-spawn ()
+  "A provider estimate above task budget fails the task without spawning."
+  (anvil-orchestrator-test--with-fresh
+    (anvil-orchestrator-register-provider
+     'expensive
+     :cli "sh"
+     :version-check (lambda () t)
+     :build-cmd (lambda (_task)
+                  (anvil-test-fixtures-stub-cmd
+                   anvil-orchestrator-test--stream-json 0))
+     :parse-output #'anvil-orchestrator--claude-parse-output
+     :cost-estimator (lambda (_task) 2.0))
+    (let* ((batch (anvil-orchestrator-submit
+                   (list (list :name "too-much" :provider 'expensive
+                               :prompt "x" :budget-usd 1.0))))
+           (id (car (gethash batch anvil-orchestrator--batches)))
+           (task (anvil-orchestrator--task-get id)))
+      (should (eq 'failed (plist-get task :status)))
+      (should (string-match-p "budget hard stop"
+                              (plist-get task :error)))
+      (should-not (gethash id anvil-orchestrator--running)))))
+
+(ert-deftest anvil-orchestrator-test-daily-budget-cap-blocks-start ()
+  "Daily budget cap accounts for previous finished cost before spawn."
+  (anvil-orchestrator-test--with-fresh
+    (anvil-orchestrator-register-provider
+     'metered
+     :cli "sh"
+     :version-check (lambda () t)
+     :build-cmd (lambda (_task)
+                  (anvil-test-fixtures-stub-cmd
+                   anvil-orchestrator-test--stream-json 0))
+     :parse-output #'anvil-orchestrator--claude-parse-output
+     :cost-estimator (lambda (_task) 0.40))
+    (let ((anvil-orchestrator-daily-budget-usd-total 0.50))
+      (anvil-orchestrator--persist
+       (list :id "spent" :provider 'metered :prompt "x" :status 'done
+             :finished-at (float-time) :cost-usd 0.20))
+      (let* ((batch (anvil-orchestrator-submit
+                     (list (list :name "blocked" :provider 'metered
+                                 :prompt "x" :budget-usd 1.0))))
+             (id (car (gethash batch anvil-orchestrator--batches)))
+             (task (anvil-orchestrator--task-get id)))
+        (should (eq 'failed (plist-get task :status)))
+        (should (string-match-p "daily budget cap"
+                                (plist-get task :error)))))))
+
+(ert-deftest anvil-orchestrator-test-daily-budget-cap-cancels-remaining ()
+  "After a task reaches the daily cap, remaining queued work is cancelled."
+  (anvil-orchestrator-test--with-fresh
+    (let ((anvil-orchestrator-daily-budget-usd-total 0.50))
+      (anvil-orchestrator--persist
+       (list :id "done-budget" :provider 'test :prompt "x" :status 'done
+             :finished-at (float-time) :cost-usd 0.50))
+      (anvil-orchestrator--persist
+       (list :id "q-budget" :provider 'test :prompt "x" :status 'queued))
+      (setq anvil-orchestrator--queue '("q-budget"))
+      (anvil-orchestrator--enforce-budget-after-finalize
+       (anvil-orchestrator--task-get "done-budget"))
+      (let ((queued (anvil-orchestrator--task-get "q-budget")))
+        (should (eq 'cancelled (plist-get queued :status)))
+        (should (string-match-p "cancelled before start"
+                                (plist-get queued :error)))
+        (should (equal "daily budget cap reached"
+                       (plist-get queued :budget-stop-reason)))))))
+
 ;;;; --- happy path --------------------------------------------------------
 
 (ert-deftest anvil-orchestrator-test-submit-and-collect-one-task ()
@@ -273,6 +339,28 @@ subprocess left behind by BODY before removing the work dir."
         ;; cleanup: cancel the running one too so fresh macro can clean up
         (anvil-orchestrator-cancel (car ids))
         (anvil-orchestrator-test--wait-batch batch 10)))))
+
+(ert-deftest anvil-orchestrator-test-stop-cancels-all-queued-tasks ()
+  "Emergency stop cancels every non-terminal task and leaves done tasks alone."
+  (anvil-orchestrator-test--with-fresh
+    (dolist (task '("q1" "q2"))
+      (anvil-orchestrator--persist
+       (list :id task :provider 'test :prompt "x" :status 'queued)))
+    (anvil-orchestrator--persist
+     (list :id "done-1" :provider 'test :prompt "x" :status 'done))
+    (setq anvil-orchestrator--queue '("q1" "q2"))
+    (let ((result (anvil-orchestrator-stop "manual panic")))
+      (should (= 2 (plist-get result :requested)))
+      (should (= 2 (plist-get result :stopped)))
+      (should (equal '("q1" "q2") (plist-get result :task-ids)))
+      (should (equal "manual panic" (plist-get result :reason))))
+    (should-not anvil-orchestrator--queue)
+    (should (eq 'cancelled
+                (plist-get (anvil-orchestrator--task-get "q1") :status)))
+    (should (eq 'cancelled
+                (plist-get (anvil-orchestrator--task-get "q2") :status)))
+    (should (eq 'done
+                (plist-get (anvil-orchestrator--task-get "done-1") :status)))))
 
 ;;;; --- state persistence -------------------------------------------------
 
@@ -3062,6 +3150,30 @@ next pump tick without waiting for its wall-clock cap."
     (should (memq (plist-get (anvil-orchestrator--task-get "auto-1") :status)
                   '(done failed)))
     (should-not (gethash "auto-1" anvil-orchestrator--running))))
+
+(ert-deftest anvil-orchestrator-test-check-timeouts-heartbeat-stale ()
+  "Heartbeat timeout marks a live but silent process for cancellation."
+  (anvil-orchestrator-test--with-fresh
+    (let* ((proc (make-process
+                  :name "test-orch-heartbeat"
+                  :buffer (generate-new-buffer " *test-orch-heartbeat*")
+                  :command (list "sh" "-c" "sleep 30")
+                  :connection-type 'pipe
+                  :sentinel #'ignore
+                  :noquery t)))
+      (process-put proc 'anvil-task-id "hb-1")
+      (process-put proc 'anvil-started-at (- (float-time) 10))
+      (process-put proc 'anvil-last-output-at (- (float-time) 10))
+      (puthash "hb-1" proc anvil-orchestrator--running)
+      (anvil-orchestrator--persist
+       (list :id "hb-1" :provider 'test :prompt "x" :status 'running
+             :heartbeat-timeout-sec 0.01 :started-at (- (float-time) 10)))
+      (unwind-protect
+          (progn
+            (anvil-orchestrator--check-timeouts)
+            (should (eq 'heartbeat-timeout
+                        (process-get proc 'anvil-cancel-reason))))
+        (ignore-errors (signal-process proc 'SIGKILL))))))
 
 (provide 'anvil-orchestrator-test)
 ;;; anvil-orchestrator-test.el ends here
