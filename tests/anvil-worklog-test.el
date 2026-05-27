@@ -226,6 +226,18 @@ Binds:
       (dolist (r only-29)
         (should (equal "2026-04-29" (plist-get r :date)))))))
 
+(ert-deftest anvil-worklog-test/search-year-filter ()
+  ":year restricts hits via worklog_entry without touching FTS columns."
+  (skip-unless (anvil-worklog-test--supported-p 'search))
+  (anvil-worklog-test--with-env
+    (anvil-worklog-test--seed root)
+    (anvil-worklog-scan)
+    (let ((hits (anvil-worklog-search "Doc" :year 2026)))
+      (should hits)
+      (dolist (r hits)
+        (should (= 2026 (plist-get r :year)))))
+    (should-not (anvil-worklog-search "Doc" :year 2025))))
+
 
 ;;;; --- list -------------------------------------------------------------
 

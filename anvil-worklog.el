@@ -806,27 +806,34 @@ ordered by FTS rank (best first).  Empty / whitespace QUERY returns nil."
     (when (and q (not (string-empty-p q)))
       (let* ((where (list "worklog_fts MATCH ?"))
              (args (list q))
-             (filtered (anvil-worklog--apply-filters where args
-                                                     machine since until year))
-             (where (car filtered))
-             (args (cdr filtered))
              (lim (or limit 20))
-             ;; Subquery to surface (file, start_line) keys, then JOIN
-             ;; back to worklog_entry for the full row.  Rank ordering
-             ;; is preserved via the LIMIT on the inner query.
              (sql (concat
                    "SELECT e.file, e.start_line, e.end_line, e.machine,
                            e.year, e.date, e.title, e.body, e.digest
-                      FROM worklog_entry e
-                      JOIN (SELECT file, start_line, rank
-                              FROM worklog_fts
-                              WHERE " (mapconcat #'identity (nreverse where) " AND ")
-                   "      ORDER BY rank LIMIT " (number-to-string lim) ") f
-                        ON f.file = e.file AND f.start_line = e.start_line
-                      ORDER BY f.rank"))
-             (rows (apply #'sqlite-select db sql
-                          (if args (list (nreverse args)) nil))))
-        (mapcar #'anvil-worklog--row->plist rows)))))
+                      FROM worklog_fts
+                      JOIN worklog_entry e
+                        ON worklog_fts.file = e.file
+                       AND worklog_fts.start_line = e.start_line
+                     WHERE ")))
+        (when (and machine (not (string-empty-p machine)))
+          (push "worklog_fts.machine = ?" where)
+          (push machine args))
+        (when (and since (not (string-empty-p since)))
+          (push "worklog_fts.date >= ?" where)
+          (push since args))
+        (when (and until (not (string-empty-p until)))
+          (push "worklog_fts.date <= ?" where)
+          (push until args))
+        (when year
+          (push "e.year = ?" where)
+          (push year args))
+        (setq sql
+              (concat sql
+                      (mapconcat #'identity (nreverse where) " AND ")
+                      " ORDER BY rank LIMIT " (number-to-string lim)))
+        (let ((rows (apply #'sqlite-select db sql
+                           (if args (list (nreverse args)) nil))))
+          (mapcar #'anvil-worklog--row->plist rows))))))
 
 (defun anvil-worklog-get (file start-line)
   "Return the worklog entry plist for (FILE, START-LINE) or nil."
