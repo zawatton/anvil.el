@@ -58,6 +58,9 @@
 ;;   org-read-outline          :headline-only   index fast-path already wired
 ;;   org-read-headline         :headline-only   index fast-path already wired
 ;;   org-read-by-id            :headline-only   index fast-path already wired
+;;   org-agenda-view           :tree-walk       agenda generation in temp buffer
+;;   org-habit-summary         :tree-walk       org-habit parsing in temp buffer
+;;   org-capture-string        :tree-walk       invokes org-capture template
 ;;   org-update-todo-state     :tree-walk       writes via `org-todo' in buffer
 ;;   org-add-todo              :tree-walk       inserts heading + props in buffer
 ;;   org-rename-headline       :tree-walk       writes via `org-edit-headline'
@@ -79,6 +82,28 @@
 (require 'org)
 (require 'org-id)
 (require 'url-util)
+
+(defvar org-agenda-buffer-name)
+(defvar org-agenda-files)
+(defvar org-agenda-span)
+(defvar org-agenda-start-day)
+(defvar org-agenda-window-setup)
+(defvar org-capture-entry)
+(defvar org-capture-initial)
+(defvar org-habit-preceding-days)
+
+(declare-function org-capture-finalize "org-capture" (&optional stay-with-capture))
+(declare-function org-capture-select-template "org-capture" (keys))
+(declare-function org-habit-deadline "org-habit" (habit))
+(declare-function org-habit-deadline-repeat "org-habit" (habit))
+(declare-function org-habit-done-dates "org-habit" (habit))
+(declare-function org-habit-get-faces "org-habit" (habit today))
+(declare-function org-habit-get-urgency "org-habit" (habit today))
+(declare-function org-habit-parse-todo "org-habit" (&optional pom))
+(declare-function org-habit-repeat-type "org-habit" (habit))
+(declare-function org-habit-scheduled "org-habit" (habit))
+(declare-function org-habit-scheduled-repeat "org-habit" (habit))
+(declare-function org-is-habit-p "org-habit" (&optional pom))
 
 (defcustom anvil-org-allowed-files nil
   "List of absolute paths to Org files that can be accessed via MCP."
@@ -766,6 +791,201 @@ Throws error for invalid types or malformed JSON."
    (t
     (anvil-org--tool-validation-error "Invalid tags format: %s" tags))))
 
+(defun anvil-org--truthy-string-p (value)
+  "Return non-nil when VALUE represents true on the MCP wire."
+  (cond
+   ((eq value t) t)
+   ((or (null value) (eq value :false)) nil)
+   ((stringp value)
+    (member (downcase (string-trim value)) '("1" "t" "true" "yes")))
+   (t value)))
+
+(defun anvil-org--parse-string-list-json (value field)
+  "Parse VALUE as a JSON array of strings for FIELD.
+Empty or nil VALUE returns nil."
+  (when (and value (not (string-empty-p (string-trim value))))
+    (condition-case err
+        (let ((parsed (json-parse-string value :array-type 'list)))
+          (unless (and (listp parsed)
+                       (cl-every #'stringp parsed))
+            (anvil-org--tool-validation-error
+             "%s must be a JSON array of strings" field))
+          parsed)
+      (json-error
+       (anvil-org--tool-validation-error
+        "Invalid %s JSON: %s" field (error-message-string err))))))
+
+(defun anvil-org--org-files-for-tool (&optional files_json)
+  "Return Org files selected by FILES_JSON, allowed files, or agenda files."
+  (let* ((requested (anvil-org--parse-string-list-json files_json "files_json"))
+         (files (cond
+                 (requested requested)
+                 (anvil-org-allowed-files-enabled anvil-org-allowed-files)
+                 (t (org-agenda-files t)))))
+    (unless files
+      (anvil-org--tool-validation-error
+       "No Org files available; pass files_json or configure org-agenda-files/anvil-org-allowed-files"))
+    (mapcar (lambda (file)
+              (let ((expanded (expand-file-name file)))
+                (unless (file-exists-p expanded)
+                  (anvil-org--tool-validation-error
+                   "Org file does not exist: %s" expanded))
+                (when (and anvil-org-allowed-files-enabled
+                           (not (anvil-org--find-allowed-file expanded)))
+                  (anvil-org--tool-file-access-error expanded))
+                expanded))
+            files)))
+
+(defun anvil-org--parse-positive-integer (value field)
+  "Parse VALUE as a positive integer named FIELD, or return nil."
+  (when (and value (stringp value)
+             (not (string-empty-p (string-trim value))))
+    (let ((n (string-to-number value)))
+      (unless (> n 0)
+        (anvil-org--tool-validation-error
+         "%s must be a positive integer, got: %s" field value))
+      n)))
+
+(defun anvil-org--capture-target-file (target)
+  "Return capture TARGET file when TARGET is statically inspectable."
+  (pcase target
+    ((and (pred stringp) file) file)
+    (`(file ,file) file)
+    (`(file+headline ,file . ,_) file)
+    (`(file+olp ,file . ,_) file)
+    (`(file+regexp ,file . ,_) file)
+    (`(file+datetree ,file . ,_) file)
+    (`(file+weektree ,file . ,_) file)
+    (`(file+function ,file . ,_) file)
+    (_ nil)))
+
+(defun anvil-org--capture-template-by-key (keys)
+  "Return the org-capture template selected by KEYS."
+  (require 'org-capture)
+  (unless (and (stringp keys)
+               (not (string-empty-p (string-trim keys))))
+    (anvil-org--tool-validation-error
+     "keys must be a non-empty org-capture template key string"))
+  (condition-case err
+      (org-capture-select-template keys)
+    (error
+     (anvil-org--tool-validation-error
+      "Cannot select org-capture template %S: %s"
+      keys (error-message-string err)))))
+
+(defun anvil-org--days-to-iso-date (days)
+  "Convert Org absolute DAYS value to YYYY-MM-DD."
+  (require 'calendar)
+  (pcase-let ((`(,month ,day ,year)
+               (calendar-gregorian-from-absolute days)))
+    (format "%04d-%02d-%02d" year month day)))
+
+(defun anvil-org--iso-date-to-time (date field)
+  "Parse DATE as YYYY-MM-DD for FIELD and return an Emacs time."
+  (unless (and (stringp date)
+               (string-match
+                "\\`\\([0-9][0-9][0-9][0-9]\\)-\\([0-9][0-9]\\)-\\([0-9][0-9]\\)\\'"
+                date))
+    (anvil-org--tool-validation-error
+     "%s must be YYYY-MM-DD, got: %s" field date))
+  (encode-time 0 0 0
+               (string-to-number (match-string 3 date))
+               (string-to-number (match-string 2 date))
+               (string-to-number (match-string 1 date))))
+
+(defun anvil-org--habit-streak (done-dates repeat-days)
+  "Return current completion streak from DONE-DATES and REPEAT-DAYS."
+  (let ((dates (sort (delete-dups (copy-sequence done-dates)) #'>))
+        (streak 0)
+        prev)
+    (while dates
+      (let ((d (pop dates)))
+        (cond
+         ((zerop streak)
+          (setq streak 1)
+          (setq prev d))
+         ((<= (- prev d) repeat-days)
+          (setq streak (1+ streak))
+          (setq prev d))
+         (t
+          (setq dates nil)))))
+    streak))
+
+(defun anvil-org--habit-completion-ratio (done-dates repeat-days today-days)
+  "Return recent completion ratio for DONE-DATES up to TODAY-DAYS."
+  (let* ((window (max 1 org-habit-preceding-days))
+         (start (- today-days window))
+         (expected (max 1 (ceiling (/ (float window) repeat-days))))
+         (actual (cl-count-if (lambda (d) (and (> d start)
+                                               (<= d today-days)))
+                              done-dates)))
+    (/ (float (min actual expected)) expected)))
+
+(defun anvil-org--habit-status (habit today-days)
+  "Return symbolic status for HABIT at TODAY-DAYS."
+  (let ((face (car (org-habit-get-faces habit today-days))))
+    (pcase face
+      ('org-habit-clear-face "clear")
+      ('org-habit-ready-face "ready")
+      ('org-habit-alert-face "alert")
+      ('org-habit-overdue-face "overdue")
+      (_ (symbol-name face)))))
+
+(defun anvil-org--habit-row (file today-time)
+  "Return a JSON-ready habit row at point in FILE."
+  (require 'org-habit)
+  (let* ((today-days (time-to-days today-time))
+         (title (org-get-heading t t t t))
+         (id (org-entry-get nil "ID"))
+         (habit (org-habit-parse-todo (point)))
+         (done-dates (org-habit-done-dates habit))
+         (repeat-days (org-habit-scheduled-repeat habit))
+         (last-done (car (sort (copy-sequence done-dates) #'>))))
+    `((file . ,file)
+      (line . ,(line-number-at-pos))
+      (title . ,title)
+      (level . ,(org-current-level))
+      (todo . ,(or (org-get-todo-state) ""))
+      (tags . ,(vconcat (org-get-tags nil t)))
+      (id . ,(or id ""))
+      (scheduled . ,(anvil-org--days-to-iso-date
+                     (org-habit-scheduled habit)))
+      (scheduled_repeat_days . ,repeat-days)
+      (deadline . ,(anvil-org--days-to-iso-date
+                    (org-habit-deadline habit)))
+      (deadline_repeat_days . ,(org-habit-deadline-repeat habit))
+      (repeat_type . ,(org-habit-repeat-type habit))
+      (done_dates . ,(vconcat (mapcar #'anvil-org--days-to-iso-date
+                                      (sort (copy-sequence done-dates) #'<))))
+      (last_done . ,(if last-done
+                        (anvil-org--days-to-iso-date last-done)
+                      ""))
+      (streak . ,(anvil-org--habit-streak done-dates repeat-days))
+      (completion_ratio . ,(anvil-org--habit-completion-ratio
+                            done-dates repeat-days today-days))
+      (urgency . ,(org-habit-get-urgency habit today-time))
+      (status . ,(anvil-org--habit-status habit today-days)))))
+
+(defun anvil-org--collect-habits-in-file (file today-time)
+  "Collect habit rows from FILE using TODAY-TIME as the reference date."
+  (let (rows)
+    (anvil-org--with-org-file file
+      (require 'org-habit)
+      (while (re-search-forward org-heading-regexp nil t)
+        (org-back-to-heading t)
+        (when (org-is-habit-p (point))
+          (push
+           (condition-case err
+               (anvil-org--habit-row file today-time)
+             (error
+              `((file . ,file)
+                (line . ,(line-number-at-pos))
+                (title . ,(org-get-heading t t t t))
+                (error . ,(error-message-string err)))))
+           rows))
+        (forward-line 1)))
+    (nreverse rows)))
+
 (defun anvil-org--navigate-to-parent-or-top (parent-path parent-id)
   "Navigate to parent headline or top of file.
 PARENT-PATH is a list of headline titles (or nil for top-level).
@@ -972,6 +1192,120 @@ BODY-END is the buffer position where body ends."
 (defun anvil-org--tool-get-allowed-files ()
   "Return the list of allowed Org files."
   (json-encode `((files . ,(vconcat anvil-org-allowed-files)))))
+
+(defun anvil-org--tool-capture-string
+    (keys content &optional allow_unvalidated_target)
+  "Capture CONTENT with the org-capture template selected by KEYS.
+CONTENT is passed as `org-capture-initial', so templates should use
+%i to insert it.  When the template target file can be inspected, it
+is checked against `anvil-org-allowed-files'.  Dynamic targets are
+blocked unless ALLOW_UNVALIDATED_TARGET is truthy.
+
+MCP Parameters:
+  keys - org-capture template key string, e.g. \"t\" or \"jm\"
+  content - Initial text available to the template as %i
+  allow_unvalidated_target - Optional true/false string.  Set true
+                             only for trusted dynamic function
+                             targets that cannot be pre-validated."
+  (let* ((entry (anvil-org--capture-template-by-key keys))
+         (target (nth 3 entry))
+         (target-file (anvil-org--capture-target-file target))
+         (allow-unvalidated
+          (anvil-org--truthy-string-p allow_unvalidated_target)))
+    (cond
+     (target-file
+      (when (and anvil-org-allowed-files-enabled
+                 (not (anvil-org--find-allowed-file target-file)))
+        (anvil-org--tool-file-access-error target-file)))
+     ((and anvil-org-allowed-files-enabled
+           (not allow-unvalidated))
+      (anvil-org--tool-validation-error
+       "Cannot validate dynamic org-capture target for template %S; pass allow_unvalidated_target=true only for trusted templates"
+       keys)))
+    (require 'org-capture)
+    (let ((org-capture-initial (or content ""))
+          (org-capture-entry entry))
+      (condition-case err
+          (save-window-excursion
+            (org-capture)
+            (org-capture-finalize))
+        (error
+         (anvil-org--tool-validation-error
+          "org-capture template %S failed: %s"
+          keys (error-message-string err)))))
+    (when target-file
+      (let ((expanded (expand-file-name target-file)))
+        (when (file-exists-p expanded)
+          (anvil-org--refresh-file-buffers expanded))))
+    (json-encode
+     `((success . t)
+       (keys . ,keys)
+       (target_file . ,(or (and target-file (expand-file-name target-file))
+                           ""))))))
+
+(defun anvil-org--tool-agenda-view
+    (&optional keys start_day span files_json)
+  "Render an Org agenda view and return its plain text.
+When FILES_JSON is omitted, the tool uses `anvil-org-allowed-files'
+under allowed-files mode, otherwise `org-agenda-files'.
+
+MCP Parameters:
+  keys - Optional org-agenda dispatcher key, e.g. \"a\", \"t\", or a
+         custom command key.  Omit or pass empty string for daily
+         agenda list.
+  start_day - Optional YYYY-MM-DD start day for agenda-list views
+  span - Optional positive integer string for agenda span in days
+  files_json - Optional JSON array of Org file paths to use as
+               `org-agenda-files'."
+  (require 'org-agenda)
+  (let* ((files (anvil-org--org-files-for-tool files_json))
+         (span-days (anvil-org--parse-positive-integer span "span"))
+         (agenda-key (and keys (string-trim keys)))
+         (agenda-buffer-name org-agenda-buffer-name)
+         (existing (get-buffer agenda-buffer-name)))
+    (let ((org-agenda-files files)
+          (org-agenda-span (or span-days org-agenda-span))
+          (org-agenda-start-day (and start_day
+                                     (not (string-empty-p
+                                           (string-trim start_day)))
+                                     start_day))
+          (org-agenda-window-setup 'current-window))
+      (unwind-protect
+          (save-window-excursion
+            (if (and agenda-key (not (string-empty-p agenda-key)))
+                (org-agenda nil agenda-key)
+              (org-agenda-list nil start_day span-days))
+            (with-current-buffer agenda-buffer-name
+              (substring-no-properties (buffer-string))))
+        (unless existing
+          (when-let* ((buf (get-buffer agenda-buffer-name)))
+            (kill-buffer buf)))))))
+
+(defun anvil-org--tool-habit-summary (&optional files_json today)
+  "Return org-habit status, streak, and completion data as JSON.
+Habits are headlines with STYLE=habit.  Invalid habit entries are
+returned with an error field instead of aborting the whole scan.
+
+MCP Parameters:
+  files_json - Optional JSON array of Org file paths to scan.  Omit
+               to use allowed files or `org-agenda-files'.
+  today - Optional YYYY-MM-DD reference date.  Defaults to today."
+  (require 'org-habit)
+  (let* ((files (anvil-org--org-files-for-tool files_json))
+         (today-time (if (and today
+                              (stringp today)
+                              (not (string-empty-p (string-trim today))))
+                         (anvil-org--iso-date-to-time today "today")
+                       (current-time)))
+         (rows (apply #'append
+                      (mapcar (lambda (file)
+                                (anvil-org--collect-habits-in-file
+                                 file today-time))
+                              files))))
+    (json-encode
+     `((today . ,(anvil-org--days-to-iso-date (time-to-days today-time)))
+       (count . ,(length rows))
+       (habits . ,(vconcat rows))))))
 
 ;; PHASE-C-IDE-SPLIT-CANDIDATE: writes via org-todo in real buffer
 (defun anvil-org--tool-update-todo-state (uri current_state new_state)
@@ -1604,6 +1938,83 @@ Use cases:
    :server-id anvil-org--server-id)
 
   (anvil-server-register-tool
+   #'anvil-org--tool-agenda-view
+   :id "org-agenda-view"
+   :intent '(org-read agenda)
+   :layer 'workflow
+   :description
+   "Render an Org agenda view using Emacs' own org-agenda engine and
+return the plain-text agenda buffer.  Use this when the agent needs
+the same scheduled/deadline/TODO view a human would see in Emacs,
+without reimplementing agenda logic.
+
+Parameters:
+  keys - Optional org-agenda dispatcher key (string).  Examples:
+         \"a\" daily/weekly agenda, \"t\" global TODO list, or a
+         custom command key from org-agenda-custom-commands.  Empty
+         means direct org-agenda-list.
+  start_day - Optional YYYY-MM-DD start date for agenda-list views
+  span - Optional positive integer string for number of days
+  files_json - Optional JSON array of Org file paths to bind as
+               org-agenda-files.  Omit to use anvil-org-allowed-files
+               when access restrictions are enabled, otherwise the
+               user's org-agenda-files.
+
+Returns: Plain text agenda output with text properties stripped."
+   :read-only t
+   :server-id anvil-org--server-id)
+
+  (anvil-server-register-tool
+   #'anvil-org--tool-habit-summary
+   :id "org-habit-summary"
+   :intent '(org-read agenda habit)
+   :layer 'workflow
+   :description
+   "Summarize Org habits using org-habit itself.  Scans STYLE=habit
+headlines and returns scheduled/deadline dates, repeat intervals,
+done dates, current status, urgency, recent completion ratio, and a
+repeat-aware streak count.
+
+Parameters:
+  files_json - Optional JSON array of Org file paths to scan.  Omit
+               to use anvil-org-allowed-files when restrictions are
+               enabled, otherwise org-agenda-files.
+  today - Optional YYYY-MM-DD reference date.  Defaults to today.
+
+Returns JSON object:
+  today - Reference date
+  count - Number of habit rows
+  habits - Array of habit objects.  Invalid habit entries include an
+           error field instead of aborting the whole scan."
+   :read-only t
+   :server-id anvil-org--server-id)
+
+  (anvil-server-register-tool
+   #'anvil-org--tool-capture-string
+   :id "org-capture-string"
+   :intent '(org-edit capture)
+   :layer 'workflow
+   :description
+   "Invoke an org-capture template noninteractively.  CONTENT is
+passed as org-capture-initial, so the target template must include
+%i if the caller wants CONTENT inserted.  Static file targets are
+validated against anvil-org-allowed-files before capture runs.
+
+Parameters:
+  keys - org-capture template key string, e.g. \"t\" or \"jm\"
+  content - Initial text available to the template as %i
+  allow_unvalidated_target - Optional true/false string.  Dynamic
+                             function targets cannot be pre-validated;
+                             pass true only for trusted templates.
+
+Returns JSON object:
+  success - true on success
+  keys - Template key used
+  target_file - Expanded target file when statically known, else empty"
+   :read-only nil
+   :server-id anvil-org--server-id)
+
+  (anvil-server-register-tool
    #'anvil-org--tool-update-todo-state
    :id "org-update-todo-state"
    :intent '(org-edit)
@@ -1999,6 +2410,9 @@ Use this resource to:
    "org-get-tag-config" anvil-org--server-id)
   (anvil-server-unregister-tool
    "org-get-allowed-files" anvil-org--server-id)
+  (anvil-server-unregister-tool "org-agenda-view" anvil-org--server-id)
+  (anvil-server-unregister-tool "org-habit-summary" anvil-org--server-id)
+  (anvil-server-unregister-tool "org-capture-string" anvil-org--server-id)
   (anvil-server-unregister-tool
    "org-update-todo-state" anvil-org--server-id)
   (anvil-server-unregister-tool "org-add-todo" anvil-org--server-id)

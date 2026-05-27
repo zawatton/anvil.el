@@ -1,6 +1,6 @@
 #+title: Persistent Org Index — SQLite-backed Headline/Tag/ID Cache
 #+date: 2026-04-15
-#+property: status DRAFT
+#+property: status PHASE-1-2-3-4-5A-SHIPPED
 #+property: scope CONVENTION-COUPLED
 
 * STATUS

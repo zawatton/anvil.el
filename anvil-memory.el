@@ -75,6 +75,11 @@
 ;; `/api/...' route needs it and the dep is ~free (core Emacs).
 (require 'json)
 
+;; Doc 48 (WHISPER session delta) persists per-root index snapshots in
+;; anvil-state.  Non-fatal: when anvil-state is absent the session-delta
+;; degrades to a full MEMORY.md body (see `anvil-memory-session-delta').
+(require 'anvil-state nil t)
+
 
 ;;;; --- group + defcustoms -------------------------------------------------
 
@@ -152,7 +157,7 @@ onto this alist; built-ins stay in the list for defaults."
          search save-check duplicates audit-urls
          decay promote regenerate reindex-fts llm-verdict
          mdl-distill export-html serve contradictions
-         add export-md get)
+         add export-md get session-delta)
   "Capability tags this module currently provides.
 Tests in tests/anvil-memory-test.el gate their `skip-unless' on
 membership here so a half-shipped feature never breaks CI.")
@@ -253,6 +258,46 @@ with `:model'."
 `anvil-memory-save-check' dispatches a verdict classification.
 Each call also forwards this as :timeout-sec to the provider.
 Kept short because the expected output is a single keyword."
+  :type 'integer
+  :group 'anvil-memory)
+
+(defcustom anvil-memory-whisper-full-threshold 0.4
+  "Delta ratio above which `anvil-memory-session-delta' falls back to full.
+When (added + changed + removed) / total-current exceeds this fraction,
+emitting the delta is no cheaper than regenerating the whole MEMORY.md
+body, so session-delta returns the full index (mode `full') instead.
+A float in the (0.0 1.0] range."
+  :type 'float
+  :group 'anvil-memory)
+
+(defcustom anvil-memory-whisper-snapshot-max-age-days 7
+  "Maximum age in days of a stored WHISPER snapshot before forcing full.
+A snapshot older than this is treated as stale so a long-idle machine
+re-baselines cleanly instead of emitting a giant catch-up delta."
+  :type 'integer
+  :group 'anvil-memory)
+
+(defcustom anvil-memory-whisper-state-ns "anvil-memory"
+  "`anvil-state' namespace holding per-root WHISPER index snapshots."
+  :type 'string
+  :group 'anvil-memory)
+
+(defcustom anvil-memory-index-line-max-chars 200
+  "Maximum characters per `MEMORY.md' index line (Doc 48 Phase 6c).
+`anvil-memory-regenerate-index' clips a line's DESCRIPTION tail and
+appends an ellipsis when the rendered `- [NAME](BASE) — DESC' line
+exceeds this many characters, so the index stays inside the harness
+auto-load budget instead of being silently truncated.  nil or a
+non-positive value disables clipping (full descriptions are kept)."
+  :type '(choice (const :tag "Disabled" nil) integer)
+  :group 'anvil-memory)
+
+(defcustom anvil-memory-index-budget-bytes 24400
+  "Byte budget `anvil-memory-lint-index' compares the index against.
+The Claude Code harness only loads roughly the first 24.4KB / 200
+lines of `MEMORY.md'; entries beyond that are dropped.  The lint
+reports total UTF-8 bytes against this budget so over-long (often
+CJK, 3 bytes/char) descriptions can be shortened at the source."
   :type 'integer
   :group 'anvil-memory)
 
@@ -1349,11 +1394,492 @@ writes it to disk (the memory-pruner skill owns that step)."
               (name (or (and fm (plist-get fm :name))
                         (anvil-memory--fallback-display-name path)))
               (desc (or (and fm (plist-get fm :description)) "")))
-         (if (string-empty-p desc)
-             (format "- [%s](%s)" name base)
-           (format "- [%s](%s) — %s" name base desc))))
+         (anvil-memory--truncate-index-line
+          (if (string-empty-p desc)
+              (format "- [%s](%s)" name base)
+            (format "- [%s](%s) — %s" name base desc))
+          anvil-memory-index-line-max-chars)))
      scoped
      "\n")))
+
+
+;;;; --- Phase 6c: MEMORY.md index line lint (Doc 48) ----------------------
+
+(defun anvil-memory--truncate-index-line (line max)
+  "Return LINE clipped to MAX characters with a trailing ellipsis.
+LINE is a rendered `MEMORY.md' index line.  When MAX is nil, a
+non-positive integer, or LINE already fits, LINE is returned
+unchanged.  Otherwise the tail (the description) is dropped so the
+result is exactly MAX characters including the appended ellipsis."
+  (if (or (null max) (not (integerp max)) (<= max 0)
+          (<= (length line) max))
+      line
+    (concat (substring line 0 (max 1 (1- max))) "…")))
+
+(defun anvil-memory-lint-index (&optional root)
+  "Audit `MEMORY.md' index line lengths under ROOT for length health.
+ROOT defaults to the first effective root.  Read-only: measures the
+raw (un-clipped) `- [NAME](BASE) — DESC' line each memory would emit
+and reports which exceed `anvil-memory-index-line-max-chars'.
+
+Returns a plist:
+
+  (:total N :over-count M :limit-chars L :budget-bytes B
+   :total-bytes TB :over-budget OB
+   :over ((:name NAME :base BASE :chars C :bytes BY) ...))
+
+:total-bytes is the raw UTF-8 size the full index would occupy (one
+newline counted per line); :over-budget is how far that exceeds
+`anvil-memory-index-budget-bytes' (0 when it fits).  :over lists the
+entries longer than the per-line limit, longest first."
+  (let* ((root (or root (car (anvil-memory--effective-roots)))))
+    (unless (and root (stringp root))
+      (user-error "anvil-memory-lint-index: no ROOT"))
+    (let* ((abs-root (file-name-as-directory (expand-file-name root)))
+           (rows (anvil-memory-list nil :with-decay t :sort 'decay))
+           (scoped (cl-remove-if-not
+                    (lambda (r)
+                      (string-prefix-p abs-root (plist-get r :file)))
+                    rows))
+           (limit anvil-memory-index-line-max-chars)
+           (total 0) (total-bytes 0) (over nil))
+      (dolist (row scoped)
+        (let* ((path (plist-get row :file))
+               (base (file-name-nondirectory path))
+               (body (or (anvil-memory--get-body path) ""))
+               (fm (anvil-memory--parse-frontmatter body))
+               (name (or (and fm (plist-get fm :name))
+                         (anvil-memory--fallback-display-name path)))
+               (desc (or (and fm (plist-get fm :description)) ""))
+               (line (if (string-empty-p desc)
+                         (format "- [%s](%s)" name base)
+                       (format "- [%s](%s) — %s" name base desc)))
+               (chars (length line))
+               (bytes (length (encode-coding-string line 'utf-8))))
+          (cl-incf total)
+          (setq total-bytes (+ total-bytes bytes 1))
+          (when (and (integerp limit) (> limit 0) (> chars limit))
+            (push (list :name name :base base :chars chars :bytes bytes)
+                  over))))
+      (setq over (cl-sort over #'> :key (lambda (e) (plist-get e :chars))))
+      (list :total total
+            :over-count (length over)
+            :limit-chars limit
+            :budget-bytes anvil-memory-index-budget-bytes
+            :total-bytes total-bytes
+            :over-budget (max 0 (- total-bytes
+                                   anvil-memory-index-budget-bytes))
+            :over over))))
+
+
+;;;; --- Phase 6: WHISPER session delta (Doc 48) ---------------------------
+
+(defconst anvil-memory--whisper-snapshot-version 1
+  "Schema version of the WHISPER snapshot plist stored in `anvil-state'.")
+
+(defun anvil-memory--whisper-entries (root)
+  "Return WHISPER entry plists for memories indexed under ROOT.
+Each entry is (:name NAME :base BASENAME :desc DESC :hash BODY-SHA1).
+Name / desc resolution mirrors `anvil-memory-regenerate-index' so the
+delta keys stay aligned with the MEMORY.md index lines."
+  (let* ((abs-root (file-name-as-directory (expand-file-name root)))
+         (rows (anvil-memory-list nil :with-decay t :sort 'decay))
+         (scoped (cl-remove-if-not
+                  (lambda (r)
+                    (string-prefix-p abs-root (plist-get r :file)))
+                  rows)))
+    (mapcar
+     (lambda (row)
+       (let* ((path (plist-get row :file))
+              (base (file-name-nondirectory path))
+              (body (or (anvil-memory--get-body path) ""))
+              (fm (anvil-memory--parse-frontmatter body))
+              (name (or (and fm (plist-get fm :name))
+                        (anvil-memory--fallback-display-name path)))
+              (desc (or (and fm (plist-get fm :description)) "")))
+         (list :name name :base base :desc desc
+               :hash (secure-hash 'sha1 body))))
+     scoped)))
+
+(defun anvil-memory--whisper-digest (entries)
+  "Return an order-independent SHA1 over ENTRIES' name+hash pairs."
+  (secure-hash
+   'sha1
+   (mapconcat
+    (lambda (e) (format "%s\t%s" (plist-get e :name) (plist-get e :hash)))
+    (cl-sort (copy-sequence entries) #'string<
+             :key (lambda (e) (or (plist-get e :name) "")))
+    "\n")))
+
+(defun anvil-memory--whisper-diff (prev-entries entries)
+  "Diff PREV-ENTRIES against ENTRIES (both lists of WHISPER entry plists).
+Returns (:added LIST :changed LIST :removed LIST) keyed by :name, with
+:changed detected via a differing :hash.  Pure — performs no IO."
+  (let ((prev-by-name (make-hash-table :test 'equal))
+        (cur-names (make-hash-table :test 'equal))
+        (added nil) (changed nil) (removed nil))
+    (dolist (e prev-entries)
+      (puthash (plist-get e :name) e prev-by-name))
+    (dolist (e entries)
+      (let* ((name (plist-get e :name))
+             (old (gethash name prev-by-name)))
+        (puthash name t cur-names)
+        (cond
+         ((null old) (push e added))
+         ((not (equal (plist-get old :hash) (plist-get e :hash)))
+          (push e changed)))))
+    (dolist (e prev-entries)
+      (unless (gethash (plist-get e :name) cur-names)
+        (push e removed)))
+    (list :added (nreverse added)
+          :changed (nreverse changed)
+          :removed (nreverse removed))))
+
+(defun anvil-memory--whisper-format (added changed removed)
+  "Render ADDED / CHANGED / REMOVED entry lists as an injection block.
+Returns the empty string when all three lists are empty."
+  (if (and (null added) (null changed) (null removed))
+      ""
+    (let* ((section
+            (lambda (label items show-desc)
+              (when items
+                (concat
+                 label "\n"
+                 (mapconcat
+                  (lambda (e)
+                    (let ((name (plist-get e :name))
+                          (base (plist-get e :base))
+                          (desc (plist-get e :desc)))
+                      (cond
+                       ((not show-desc) (format "- %s" name))
+                       ((and desc (not (string-empty-p desc)))
+                        (format "- [%s](%s) — %s" name base desc))
+                       (t (format "- [%s](%s)" name base)))))
+                  items "\n")))))
+           (blocks (delq nil
+                         (list (funcall section "### 追加" added t)
+                               (funcall section "### 更新" changed t)
+                               (funcall section "### 削除" removed nil)))))
+      (concat "## メモリ差分 (前回セッション以降)\n\n"
+              (mapconcat #'identity blocks "\n\n")))))
+
+(defun anvil-memory--whisper-snapshot-key (root)
+  "Return the `anvil-state' key holding ROOT's WHISPER snapshot."
+  (format "whisper-snapshot:%s"
+          (file-name-as-directory (expand-file-name root))))
+
+(defun anvil-memory--whisper-load-snapshot (root)
+  "Return the stored WHISPER snapshot plist for ROOT, or nil."
+  (when (fboundp 'anvil-state-get)
+    (anvil-state-get (anvil-memory--whisper-snapshot-key root)
+                     :ns anvil-memory-whisper-state-ns)))
+
+(defun anvil-memory--whisper-store-snapshot (root entries digest)
+  "Persist a WHISPER snapshot for ROOT built from ENTRIES / DIGEST.
+No-op (returns nil) when `anvil-state' is unavailable."
+  (when (fboundp 'anvil-state-set)
+    (anvil-state-set
+     (anvil-memory--whisper-snapshot-key root)
+     (list :version anvil-memory--whisper-snapshot-version
+           :built-at (truncate (float-time))
+           :digest digest
+           :entries entries)
+     :ns anvil-memory-whisper-state-ns)
+    t))
+
+;;;###autoload
+(cl-defun anvil-memory-session-delta (root &key force-full no-commit)
+  "Return memory context for ROOT as a delta from the previous session.
+
+Compares the current decay-ranked index against a snapshot stored in
+`anvil-state' (Doc 48 WHISPER) and returns a plist:
+
+  (:mode delta|full :reason R :total N :ratio F
+   :added LIST :changed LIST :removed LIST :text TEXT)
+
+In `delta' mode TEXT lists only added / changed / removed entries (the
+empty string when nothing changed).  In `full' mode TEXT is the full
+`anvil-memory-regenerate-index' body, returned when:
+
+  - FORCE-FULL is non-nil, or
+  - `anvil-state' is unavailable, or
+  - no snapshot exists yet, or
+  - the snapshot is older than
+    `anvil-memory-whisper-snapshot-max-age-days', or
+  - the current index is empty while the snapshot had entries
+    (state-clear guard), or
+  - the delta ratio exceeds `anvil-memory-whisper-full-threshold'.
+
+Unless NO-COMMIT is non-nil the snapshot baseline is advanced to the
+current index as a side effect, so the next call diffs from now."
+  (unless (and root (stringp root))
+    (user-error "anvil-memory-session-delta: ROOT must be a string"))
+  (let* ((entries (anvil-memory--whisper-entries root))
+         (total (length entries))
+         (digest (anvil-memory--whisper-digest entries))
+         (prev (unless force-full (anvil-memory--whisper-load-snapshot root)))
+         (result
+          (cl-flet ((full (reason)
+                      (list :mode 'full :reason reason :total total
+                            :ratio 1.0 :added nil :changed nil :removed nil
+                            :text (anvil-memory-regenerate-index root))))
+            (cond
+             (force-full (full "forced"))
+             ((not (fboundp 'anvil-state-get)) (full "no-state"))
+             ((null prev) (full "no-snapshot"))
+             ((not (integerp (plist-get prev :built-at)))
+              (full "bad-snapshot"))
+             ((> (/ (- (truncate (float-time)) (plist-get prev :built-at))
+                    86400.0)
+                 anvil-memory-whisper-snapshot-max-age-days)
+              (full "stale-snapshot"))
+             ((and (= total 0) (plist-get prev :entries))
+              (full "empty-current-guard"))
+             (t
+              (let* ((d (anvil-memory--whisper-diff
+                         (plist-get prev :entries) entries))
+                     (added (plist-get d :added))
+                     (changed (plist-get d :changed))
+                     (removed (plist-get d :removed))
+                     (delta-n (+ (length added) (length changed)
+                                 (length removed)))
+                     (ratio (if (> total 0) (/ (float delta-n) total)
+                              (if (> delta-n 0) 1.0 0.0))))
+                (if (> ratio anvil-memory-whisper-full-threshold)
+                    (full "delta-exceeds-threshold")
+                  (list :mode 'delta
+                        :reason (if (= delta-n 0) "no-change" "ok")
+                        :total total :ratio ratio
+                        :added added :changed changed :removed removed
+                        :text (anvil-memory--whisper-format
+                               added changed removed)))))))))
+    (unless no-commit
+      (anvil-memory--whisper-store-snapshot root entries digest))
+    result))
+
+;;;###autoload
+(defun anvil-memory-commit-snapshot (root)
+  "Advance ROOT's WHISPER snapshot baseline to the current index.
+Builds the current entry set + digest and stores it via `anvil-state'
+without computing or injecting a delta.  Used by the Stop hook (Doc
+48 Phase 6d) so the next session's delta is measured from this
+session's end.  Returns (:total N :digest DIGEST :stored S) where
+STORED is non-nil when anvil-state accepted the write."
+  (unless (and root (stringp root))
+    (user-error "anvil-memory-commit-snapshot: ROOT must be a string"))
+  (let* ((entries (anvil-memory--whisper-entries root))
+         (digest (anvil-memory--whisper-digest entries))
+         (stored (anvil-memory--whisper-store-snapshot root entries digest)))
+    (list :total (length entries) :digest digest :stored (and stored t))))
+
+;;;###autoload
+(defun anvil-memory-session-stop-sync (root &optional no-scan)
+  "Stop-hook consolidation for ROOT (Doc 48 Phase 6d).
+Re-scans ROOT (absorbing memory .md files edited by other agents)
+unless NO-SCAN is non-nil, then advances the WHISPER snapshot baseline
+via `anvil-memory-commit-snapshot'.  Generates or alters no memories.
+Returns (:scanned N-OR-nil :total M :digest D :stored S)."
+  (unless (and root (stringp root))
+    (user-error "anvil-memory-session-stop-sync: ROOT must be a string"))
+  (let ((scanned (unless no-scan (anvil-memory-scan (list root))))
+        (committed (anvil-memory-commit-snapshot root)))
+    (append (list :scanned scanned) committed)))
+
+
+;;;; --- Phase 6e: orchestrator memory-candidate harvest (Doc 48) ----------
+
+(defcustom anvil-memory-harvest-provider 'claude
+  "Orchestrator provider used by `anvil-memory-harvest-candidates'.
+Extraction is an analysis / judgement task, so the default is `claude'
+per the orchestrator role split.  Override per call if desired."
+  :type 'symbol
+  :group 'anvil-memory)
+
+(defcustom anvil-memory-harvest-timeout-sec 120
+  "Wall-clock cap in seconds for the harvest orchestrator call."
+  :type 'integer
+  :group 'anvil-memory)
+
+(defcustom anvil-memory-harvest-dup-threshold 0.5
+  "Jaccard similarity at/above which a harvested candidate is flagged dup.
+`anvil-memory-harvest-candidates' runs each candidate through
+`anvil-memory-save-check' and marks `:likely-duplicate' when the most
+similar existing memory scores at least this much.  A float in (0 1]."
+  :type 'float
+  :group 'anvil-memory)
+
+(defconst anvil-memory--harvest-prompt-template
+  "You extract DURABLE cross-session memory candidates from a Claude Code
+work session.  Only keep facts worth remembering in future sessions:
+stable user preferences, confirmed working agreements / corrections,
+ongoing project goals or constraints not derivable from the repo, and
+pointers to external resources.  Skip anything transient, anything the
+repo or git history already records, and anything you are unsure about.
+
+For EACH candidate output exactly one block and nothing else around it:
+
+@@CANDIDATE
+type: one of user|feedback|project|reference|memo
+name: short kebab-case slug (type prefix optional)
+description: one line under 150 characters
+body: the fact; for feedback / project add a why and a how-to-apply
+@@END
+
+If nothing is worth saving, output exactly:
+@@NONE
+
+=== SESSION MATERIAL ===
+%s"
+  "Prompt template for `anvil-memory-harvest-candidates' (one %s slot).")
+
+(defun anvil-memory--harvest-transcript-text (path &optional max-chars)
+  "Best-effort plain-text tail of a Claude JSONL transcript at PATH.
+Concatenates user / assistant message text and returns the last
+MAX-CHARS characters (default 12000), or nil when PATH is unreadable.
+Tolerant of malformed lines."
+  (when (and path (file-readable-p path))
+    (let ((max-chars (or max-chars 12000))
+          (chunks nil))
+      (with-temp-buffer
+        (insert-file-contents path)
+        (goto-char (point-min))
+        (while (not (eobp))
+          (let* ((line (buffer-substring-no-properties
+                        (line-beginning-position) (line-end-position)))
+                 (obj (ignore-errors
+                        (let ((json-object-type 'plist)
+                              (json-array-type 'list))
+                          (json-read-from-string line))))
+                 (msg (and obj (or (plist-get obj :message) obj)))
+                 (content (and msg (plist-get msg :content))))
+            (cond
+             ((stringp content) (push content chunks))
+             ((listp content)
+              (dolist (part content)
+                (when (and (listp part)
+                           (equal (plist-get part :type) "text"))
+                  (push (plist-get part :text) chunks))))))
+          (forward-line 1)))
+      (let ((text (mapconcat #'identity (nreverse (delq nil chunks)) "\n")))
+        (if (> (length text) max-chars)
+            (substring text (- (length text) max-chars))
+          text)))))
+
+(defun anvil-memory--harvest-parse (raw)
+  "Parse @@CANDIDATE blocks out of RAW model text into candidate plists.
+Returns a list of (:type :name :description :body); empty when RAW is
+nil, signals `@@NONE', or has no well-formed blocks (a block needs at
+least a name and a body)."
+  (when (and raw (not (string-match-p "@@NONE" raw)))
+    (let ((case-fold-search t)
+          (start 0) (out nil))
+      (while (string-match "@@CANDIDATE\\(\\(?:.\\|\n\\)*?\\)@@END" raw start)
+        ;; Capture the block text + advance START *before* the field
+        ;; regexes below clobber the match data (else `match-end' would
+        ;; point inside BLOCK and the same block re-matches forever).
+        (let ((block (match-string 1 raw))
+              (next (match-end 0)))
+          (setq start next)
+          (let* ((field (lambda (key)
+                          (when (string-match
+                                 (concat "^[ \t]*" key
+                                         ":[ \t]*\\(.*\\(?:\n[ \t].*\\)*\\)")
+                                 block)
+                            (string-trim (match-string 1 block)))))
+                 (type (funcall field "type"))
+                 (name (funcall field "name"))
+                 (desc (funcall field "description"))
+                 (body (funcall field "body")))
+            (when (and name body)
+              (push (list :type (or type "memo")
+                          :name name
+                          :description (or desc "")
+                          :body body)
+                    out)))))
+      (nreverse out))))
+
+;;;###autoload
+(cl-defun anvil-memory-harvest-candidates
+    (&key text transcript-path provider dup-threshold)
+  "Extract durable memory CANDIDATES from session material (Doc 48 Phase 6e).
+
+Submits TEXT (or, when TEXT is empty, the extracted tail of the JSONL
+transcript at TRANSCRIPT-PATH) to orchestrator PROVIDER (default
+`anvil-memory-harvest-provider') and parses @@CANDIDATE blocks out of
+the reply.  Each candidate is run through `anvil-memory-save-check' and
+annotated with its most similar existing memory plus a
+`:likely-duplicate' flag (DUP-THRESHOLD, default
+`anvil-memory-harvest-dup-threshold').
+
+Review-only: nothing is persisted and no memory is added — the caller
+decides what to `memory-add'.  Returns a plist:
+
+  (:status ok|empty|error :provider P :reason R
+   :candidate-count N :candidates (...) :raw RAW)"
+  (let* ((provider (or provider anvil-memory-harvest-provider))
+         (dup-threshold (or dup-threshold anvil-memory-harvest-dup-threshold))
+         (material (or (and text (not (string-empty-p (string-trim text))) text)
+                       (and transcript-path
+                            (anvil-memory--harvest-transcript-text
+                             transcript-path)))))
+    (cond
+     ((or (null material) (string-empty-p (string-trim material)))
+      (list :status 'error :provider provider
+            :reason "no material (pass :text or a readable :transcript-path)"
+            :candidate-count 0 :candidates nil :raw nil))
+     ((not (fboundp 'anvil-orchestrator-submit-and-collect))
+      (list :status 'error :provider provider
+            :reason "anvil-orchestrator unavailable"
+            :candidate-count 0 :candidates nil :raw nil))
+     (t
+      (let* ((prompt (format anvil-memory--harvest-prompt-template material))
+             (res (ignore-errors
+                    (anvil-orchestrator-submit-and-collect
+                     :provider provider
+                     :prompt prompt
+                     :name "memory-harvest"
+                     :collect-timeout-sec anvil-memory-harvest-timeout-sec)))
+             (status (and res (plist-get res :status)))
+             (raw (and res (plist-get res :summary))))
+        (if (not (eq status 'done))
+            (list :status 'error :provider provider
+                  :reason (format "orchestrator %s"
+                                  (or (and res (plist-get res :error))
+                                      status "no-response"))
+                  :candidate-count 0 :candidates nil :raw raw)
+          (let* ((parsed (anvil-memory--harvest-parse raw))
+                 (annotated
+                  (mapcar
+                   (lambda (c)
+                     (let* ((similar
+                             (ignore-errors
+                               (anvil-memory-save-check
+                                (plist-get c :name) (plist-get c :body) 3)))
+                            (top (when similar
+                                   (apply #'max
+                                          (mapcar
+                                           (lambda (s)
+                                             (or (plist-get s :similarity) 0.0))
+                                           similar)))))
+                       (append
+                        c
+                        (list :similar
+                              (mapcar
+                               (lambda (s)
+                                 (list :file (plist-get s :file)
+                                       :type (plist-get s :type)
+                                       :similarity (plist-get s :similarity)))
+                               similar)
+                              :top-similarity (or top 0.0)
+                              :likely-duplicate
+                              (and top (>= top dup-threshold))))))
+                   parsed)))
+            (list :status (if annotated 'ok 'empty)
+                  :provider provider
+                  :reason (if annotated "ok" "no candidates")
+                  :candidate-count (length annotated)
+                  :candidates annotated
+                  :raw raw))))))))
 
 
 ;;;; --- Phase 2b-i: FTS tokenizer reindex ---------------------------------
@@ -2333,6 +2859,72 @@ Returns (:body TEXT) — read-only; the caller writes the file."
   (anvil-server-with-error-handling
    (list :body (anvil-memory-regenerate-index root))))
 
+(defun anvil-memory--tool-session-delta (root &optional full)
+  "Return a session-delta memory block for ROOT (Doc 48 WHISPER).
+
+MCP Parameters:
+  root - Directory whose indexed memory files should be diffed
+         against the previous session (same ROOT semantics as
+         `memory-regenerate').
+  full - Optional truthy flag.  When set, skips the delta and
+         returns the full MEMORY.md body (mode `full').
+
+Returns (:mode delta|full :reason R :total N :ratio F
+         :added [...] :changed [...] :removed [...] :text TEXT).
+Advances the snapshot baseline as a side effect."
+  (anvil-server-with-error-handling
+   (anvil-memory-session-delta
+    root :force-full (anvil-memory--coerce-bool full))))
+
+(defun anvil-memory--tool-lint-index (&optional root)
+  "Audit MEMORY.md index line lengths under ROOT (Doc 48 Phase 6c).
+
+MCP Parameters:
+  root - Optional directory whose index lines are measured.  Omit to
+         use the first effective memory root.
+
+Returns (:total N :over-count M :limit-chars L :budget-bytes B
+         :total-bytes TB :over-budget OB :over [...]).  Read-only."
+  (anvil-server-with-error-handling
+   (anvil-memory-lint-index
+    (and root (not (string-empty-p root)) root))))
+
+(defun anvil-memory--tool-stop-sync (root &optional no-scan)
+  "Advance ROOT's WHISPER snapshot at session end (Doc 48 Phase 6d).
+
+MCP Parameters:
+  root    - Directory whose memory index snapshot is re-baselined.
+  no-scan - Optional truthy flag.  When set, skips the .md re-scan and
+            only commits the snapshot from the current index.
+
+Returns (:scanned N :total M :digest D :stored S).  Intended for the
+Stop hook; advances the next session's delta baseline."
+  (anvil-server-with-error-handling
+   (anvil-memory-session-stop-sync
+    root (anvil-memory--coerce-bool no-scan))))
+
+(defun anvil-memory--tool-harvest-candidates (&optional text transcript-path
+                                                        provider)
+  "Extract durable memory candidates from session material (Doc 48 Phase 6e).
+
+MCP Parameters:
+  text            - Session material to harvest (a summary / pasted
+                    excerpts).  Either this or transcript-path is required.
+  transcript-path - Optional path to a Claude JSONL transcript; its text
+                    tail is harvested when text is empty.
+  provider        - Optional orchestrator provider id (default claude).
+
+Review-only: returns candidates + save-check duplicate hints.  Nothing is
+persisted and no memory is added — you decide what to memory-add."
+  (anvil-server-with-error-handling
+   (anvil-memory-harvest-candidates
+    :text (and text (not (string-empty-p text)) text)
+    :transcript-path (and transcript-path
+                          (not (string-empty-p transcript-path))
+                          transcript-path)
+    :provider (and provider (not (string-empty-p provider))
+                   (intern provider)))))
+
 (defun anvil-memory--tool-reindex-fts (&optional tokenizer)
   "Rebuild memory_body_fts with TOKENIZER (trigram / unicode61).
 
@@ -2680,6 +3272,58 @@ using YAML frontmatter when present (fallback: prettified file
 stem).  Read-only — the caller (memory-pruner skill) writes the
 returned body to disk after human review."
      :read-only t)
+
+    (,(anvil-server-encode-handler #'anvil-memory--tool-session-delta)
+     :id "memory-session-delta"
+     :intent '(memory)
+     :layer 'workflow
+     :description
+     "Return memory context for ROOT as a delta from the previous session
+(Doc 48 WHISPER).  Compares the current decay-ranked index against a
+snapshot stored in anvil-state and returns only added / changed /
+removed entries (mode `delta'), or the full MEMORY.md body (mode
+`full') when no usable snapshot exists, the snapshot is stale, the
+index was cleared, or the delta exceeds
+`anvil-memory-whisper-full-threshold'.  Advances the snapshot baseline
+as a side effect; pass full=true to force a full body.")
+
+    (,(anvil-server-encode-handler #'anvil-memory--tool-lint-index)
+     :id "memory-lint-index"
+     :intent '(memory admin)
+     :layer 'workflow
+     :description
+     "Audit MEMORY.md index line lengths under ROOT (Doc 48 Phase 6c).
+Reports how many `- [NAME](FILE) — DESC' lines exceed
+`anvil-memory-index-line-max-chars', the raw UTF-8 byte total of the
+index, and how far that total overruns the harness auto-load budget
+(`anvil-memory-index-budget-bytes', ~24.4KB).  Use it to find the
+descriptions to shorten so the full index loads without truncation.
+Read-only."
+     :read-only t)
+
+    (,(anvil-server-encode-handler #'anvil-memory--tool-stop-sync)
+     :id "memory-stop-sync"
+     :intent '(memory)
+     :layer 'workflow
+     :description
+     "Advance ROOT's WHISPER snapshot baseline at session end (Doc 48
+Phase 6d).  Re-scans the memory directory (absorbing .md files edited
+by other agents) unless no-scan is set, then commits the current
+index as the snapshot so the next session's delta is measured from
+this session's end.  Generates or alters no memories.")
+
+    (,(anvil-server-encode-handler #'anvil-memory--tool-harvest-candidates)
+     :id "memory-harvest-candidates"
+     :intent '(memory)
+     :layer 'workflow
+     :description
+     "Extract durable cross-session memory CANDIDATES from session material
+via the orchestrator (Doc 48 Phase 6e).  Pass text (a summary / excerpts)
+or a transcript-path.  Each candidate is run through save-check and tagged
+with its most similar existing memory + a likely-duplicate flag.
+Review-only: nothing is persisted and no memory is added — you decide what
+to memory-add.  On-demand only (no hook); the orchestrator call has a
+latency / usage cost.")
 
     (,(anvil-server-encode-handler #'anvil-memory--tool-reindex-fts)
      :id "memory-reindex-fts"

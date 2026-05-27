@@ -81,6 +81,32 @@ Each function receives one argument, a plist with keys:
   :type 'regexp
   :group 'anvil-claude-watchdog)
 
+(defcustom anvil-claude-watchdog-resume-command "claude --resume %s"
+  "Format string used to stage a Claude resume command in tmux.
+The single `%s' placeholder is replaced with the session id derived
+from the hung session's jsonl filename."
+  :type 'string
+  :group 'anvil-claude-watchdog)
+
+(defcustom anvil-claude-watchdog-mcp-child-cmd-regex
+  (regexp-opt '("anvil-stdio.sh"
+                "emacs --batch"
+                "github-mcp-server")
+              'words)
+  "Regex matched against child cmdlines for the State=S hang variant."
+  :type 'regexp
+  :group 'anvil-claude-watchdog)
+
+(defcustom anvil-claude-watchdog-spinner-window 30
+  "Seconds since jsonl mtime that count as active spinner output."
+  :type 'integer
+  :group 'anvil-claude-watchdog)
+
+(defcustom anvil-claude-watchdog-child-stagnation-threshold 30
+  "Seconds of zero MCP child IO delta before :hang-variant verdict."
+  :type 'integer
+  :group 'anvil-claude-watchdog)
+
 (defconst anvil-claude-watchdog--state-ns "claude-watchdog-events"
   "anvil-state namespace for event history.")
 
@@ -158,6 +184,38 @@ The regex is `anvil-claude-watchdog-claude-cmd-regex'."
               (push pid pids))))))
     (nreverse pids)))
 
+(defun anvil-claude-watchdog--child-pids (pid)
+  "Return direct child PIDs of PID according to /proc/*/status."
+  (let (children)
+    (dolist (entry (directory-files "/proc" nil "\\`[0-9]+\\'"))
+      (let* ((child (string-to-number entry))
+             (status (and (> child 0)
+                          (anvil-claude-watchdog--read-file
+                           (format "/proc/%d/status" child)))))
+        (when (and status
+                   (string-match "^PPid:\\s-+\\([0-9]+\\)" status)
+                   (= (string-to-number (match-string 1 status)) pid))
+          (push child children))))
+    (nreverse children)))
+
+(defun anvil-claude-watchdog--list-mcp-children (pid)
+  "Return MCP child samples for Claude PID.
+Each row is a plist (:pid :cmdline :rchar :wchar :syscw)."
+  (let (rows)
+    (dolist (child (anvil-claude-watchdog--child-pids pid))
+      (when-let* ((cmdline (anvil-claude-watchdog--proc-cmdline child))
+                  (_ (string-match-p
+                      anvil-claude-watchdog-mcp-child-cmd-regex
+                      cmdline))
+                  (io (anvil-claude-watchdog--proc-io child)))
+        (push (list :pid child
+                    :cmdline cmdline
+                    :rchar (nth 0 io)
+                    :wchar (nth 1 io)
+                    :syscw (nth 2 io))
+              rows)))
+    (nreverse rows)))
+
 ;;; jsonl resolution
 
 (defun anvil-claude-watchdog--cwd-to-project-slug (cwd)
@@ -185,14 +243,15 @@ SLUG = path with `/' replaced by `-' and a leading dash."
 ;;; Heuristic
 
 (cl-defun anvil-claude-watchdog--classify
-    (&key prev now stagnation-threshold jsonl-staleness)
+    (&key prev now stagnation-threshold jsonl-staleness
+          spinner-window child-stagnation-threshold)
   "Return verdict symbol based on PREV (or nil) vs NOW samples.
 
 PREV and NOW are plists with at least :rchar :wchar :state :sampled-at
 and optionally :jsonl-mtime.  STAGNATION-THRESHOLD and JSONL-STALENESS
 are integers in seconds.
 
-Returns one of: `:healthy', `:suspicious', `:hang'.
+Returns one of: `:healthy', `:suspicious', `:hang', `:hang-variant'.
 
 `:hang' requires:
   - State R (running, consuming CPU)
@@ -200,7 +259,12 @@ Returns one of: `:healthy', `:suspicious', `:hang'.
     stagnation is at least STAGNATION-THRESHOLD seconds old
   - either rchar delta > 0 since last sample OR the latest jsonl
     mtime is older than JSONL-STALENESS seconds (i.e. persist
-    really has nothing fresh)."
+    really has nothing fresh).
+
+`:hang-variant' catches the State=S spinner case from Doc 40 Phase
+1c: Claude itself may still update jsonl recently, but every tracked
+MCP child has zero rchar/wchar delta for the configured child
+stagnation window."
   (cl-block nil
     (unless prev (cl-return :healthy))
     (let* ((dt (- (plist-get now :sampled-at)
@@ -211,12 +275,21 @@ Returns one of: `:healthy', `:suspicious', `:hang'.
            (mtime (plist-get now :jsonl-mtime))
            (now-time (plist-get now :sampled-at))
            (jsonl-age (when mtime (- now-time mtime)))
+           (spinner-window (or spinner-window
+                               anvil-claude-watchdog-spinner-window))
+           (child-stagnation-threshold
+            (or child-stagnation-threshold
+                anvil-claude-watchdog-child-stagnation-threshold))
            (stagnant-since
             (or (plist-get prev :wchar-stagnant-since)
                 (and (zerop dwchar) (plist-get prev :sampled-at))))
            (stagnant-secs
-            (when stagnant-since (- now-time stagnant-since))))
+            (when stagnant-since (- now-time stagnant-since)))
+           (variant (anvil-claude-watchdog--classify-child-variant
+                     prev now dt jsonl-age spinner-window
+                     child-stagnation-threshold)))
       (cond
+       (variant :hang-variant)
        ;; Output advanced — clearly healthy.
        ((> dwchar 0) :healthy)
        ;; Not running OR no input arriving and jsonl fresh — idle or normal pause.
@@ -236,6 +309,40 @@ Returns one of: `:healthy', `:suspicious', `:hang'.
                  (and jsonl-age (>= jsonl-age jsonl-staleness))))
         :hang)
        (t :suspicious)))))
+
+(defun anvil-claude-watchdog--child-by-pid (children)
+  "Return hash table mapping child :pid to child plist."
+  (let ((table (make-hash-table :test #'eql)))
+    (dolist (child children)
+      (puthash (plist-get child :pid) child table))
+    table))
+
+(defun anvil-claude-watchdog--classify-child-variant
+    (prev now dt jsonl-age spinner-window child-stagnation-threshold)
+  "Return non-nil when PREV/NOW match the Doc 40 State=S child variant."
+  (let* ((state (plist-get now :state))
+         (now-children (plist-get now :mcp-children))
+         (prev-table (anvil-claude-watchdog--child-by-pid
+                      (plist-get prev :mcp-children)))
+         (matched 0)
+         (all-static t))
+    (when (and (member state '("R" "S"))
+               jsonl-age
+               (<= jsonl-age spinner-window)
+               dt
+               (>= dt child-stagnation-threshold)
+               now-children)
+      (dolist (child now-children)
+        (let ((prev-child (gethash (plist-get child :pid) prev-table)))
+          (if (not prev-child)
+              (setq all-static nil)
+            (cl-incf matched)
+            (unless (and (zerop (- (plist-get child :rchar)
+                                   (plist-get prev-child :rchar)))
+                         (zerop (- (plist-get child :wchar)
+                                   (plist-get prev-child :wchar))))
+              (setq all-static nil)))))
+      (and (> matched 0) all-static))))
 
 (defun anvil-claude-watchdog--update-stagnation (prev now)
   "Carry forward or reset :wchar-stagnant-since on NOW given PREV."
@@ -274,7 +381,9 @@ Returns one of: `:healthy', `:suspicious', `:hang'.
             :state state
             :cwd cwd
             :jsonl-path jsonl-path
-            :jsonl-mtime jsonl-mtime))))
+            :jsonl-mtime jsonl-mtime
+            :mcp-children
+            (anvil-claude-watchdog--list-mcp-children pid)))))
 
 (defun anvil-claude-watchdog--record-event (now verdict)
   "Persist NOW + VERDICT into anvil-state under the watchdog ns."
@@ -315,7 +424,7 @@ Returns one of: `:healthy', `:suspicious', `:hang'.
 
 (defun anvil-claude-watchdog--dispatch (now verdict)
   "Run side effects for VERDICT given NOW sample."
-  (when (eq verdict :hang)
+  (when (memq verdict '(:hang :hang-variant))
     (anvil-claude-watchdog--notify now)
     (anvil-claude-watchdog--record-event now verdict)
     (run-hook-with-args 'anvil-claude-watchdog-on-hang-functions
@@ -336,7 +445,11 @@ Returns one of: `:healthy', `:suspicious', `:hang'.
                              :stagnation-threshold
                              anvil-claude-watchdog-stagnation-threshold
                              :jsonl-staleness
-                             anvil-claude-watchdog-jsonl-staleness)))
+                             anvil-claude-watchdog-jsonl-staleness
+                             :spinner-window
+                             anvil-claude-watchdog-spinner-window
+                             :child-stagnation-threshold
+                             anvil-claude-watchdog-child-stagnation-threshold)))
               (puthash pid (plist-put now :verdict verdict)
                        anvil-claude-watchdog--samples)
               (anvil-claude-watchdog--dispatch now verdict))))
@@ -428,6 +541,102 @@ MCP Parameters:
     (message "anvil-claude-watchdog (%d watched):\n%s"
              (hash-table-count anvil-claude-watchdog--samples)
              (mapconcat #'identity (nreverse rows) "\n"))))
+
+;;; Manual recovery (Phase 2)
+
+(defun anvil-claude-watchdog--hang-samples ()
+  "Return samples currently classified as :hang."
+  (let (rows)
+    (maphash (lambda (_pid sample)
+               (when (memq (plist-get sample :verdict)
+                           '(:hang :hang-variant))
+                 (push sample rows)))
+             anvil-claude-watchdog--samples)
+    (nreverse rows)))
+
+(defun anvil-claude-watchdog--session-id-from-jsonl (path)
+  "Return Claude session id inferred from JSONL PATH, or nil."
+  (when (and path (string-match "\\([^/]+\\)\\.jsonl\\'" path))
+    (match-string 1 path)))
+
+(defun anvil-claude-watchdog--tmux-panes ()
+  "Return tmux panes as plists (:pane ID :cwd DIR), or nil."
+  (when (executable-find "tmux")
+    (with-temp-buffer
+      (when (zerop (call-process
+                    "tmux" nil t nil
+                    "list-panes" "-a" "-F" "#{pane_id}\t#{pane_current_path}"))
+        (let (rows)
+          (dolist (line (split-string (buffer-string) "\n" t))
+            (when (string-match "\\`\\([^\t]+\\)\t\\(.+\\)\\'" line)
+              (push (list :pane (match-string 1 line)
+                          :cwd (match-string 2 line))
+                    rows)))
+          (nreverse rows))))))
+
+(defun anvil-claude-watchdog--find-tmux-pane (cwd)
+  "Return a tmux pane id whose current path matches CWD, or nil."
+  (when cwd
+    (let ((target (file-truename cwd))
+          found)
+      (dolist (row (anvil-claude-watchdog--tmux-panes))
+        (let ((pane-cwd (ignore-errors
+                          (file-truename (plist-get row :cwd)))))
+          (when (and pane-cwd (equal pane-cwd target))
+            (setq found (plist-get row :pane)))))
+      found)))
+
+(defun anvil-claude-watchdog--stage-resume (pane session-id)
+  "Stage `claude --resume SESSION-ID' in tmux PANE without pressing Enter."
+  (when (and pane session-id (executable-find "tmux"))
+    (let ((cmd (format anvil-claude-watchdog-resume-command session-id)))
+      (when (zerop (call-process "tmux" nil nil nil
+                                 "send-keys" "-t" pane cmd))
+        cmd))))
+
+;;;###autoload
+(defun anvil-claude-watchdog-recover (&optional pid assume-yes)
+  "Manually recover one confirmed hung Claude Code process.
+
+This command is intentionally interactive and confirmation-gated.  It
+only considers samples whose last verdict is `:hang' unless PID is
+provided by Lisp.  On confirmation it sends SIGKILL to PID and, when a
+session jsonl and matching tmux pane are known, stages
+`claude --resume <session-id>' in that pane without pressing Enter.
+
+Returns a plist (:pid :killed :session-id :pane :staged-command)."
+  (interactive)
+  (let* ((hangs (anvil-claude-watchdog--hang-samples))
+         (pid* (or pid
+                   (let ((choices
+                          (mapcar (lambda (s)
+                                    (number-to-string (plist-get s :pid)))
+                                  hangs)))
+                     (unless choices
+                       (user-error "anvil-claude-watchdog: no hung PID known"))
+                     (string-to-number
+                      (completing-read "Recover PID: " choices nil t)))))
+         (sample (or (cl-find pid* hangs
+                              :key (lambda (s) (plist-get s :pid)))
+                     (gethash pid* anvil-claude-watchdog--samples)))
+         (jsonl (plist-get sample :jsonl-path))
+         (session-id (anvil-claude-watchdog--session-id-from-jsonl jsonl))
+         (cwd (plist-get sample :cwd))
+         (pane (anvil-claude-watchdog--find-tmux-pane cwd)))
+    (unless sample
+      (user-error "anvil-claude-watchdog: no sample for PID %s" pid*))
+    (unless (or assume-yes
+                (yes-or-no-p
+                 (format "SIGKILL PID %d and stage resume command? " pid*)))
+      (user-error "anvil-claude-watchdog: recovery cancelled"))
+    (signal-process pid* 9)
+    (let ((staged (and session-id pane
+                       (anvil-claude-watchdog--stage-resume pane session-id))))
+      (list :pid pid*
+            :killed t
+            :session-id session-id
+            :pane pane
+            :staged-command staged))))
 
 (provide 'anvil-claude-watchdog)
 ;;; anvil-claude-watchdog.el ends here

@@ -1,7 +1,7 @@
 #+title: anvil-acp — Agent Client Protocol Bridge
 #+date: 2026-04-21
 #+author: zawatton
-#+property: status DRAFT
+#+property: status DEFERRED
 #+property: scope GENERIC
 
 * STATUS

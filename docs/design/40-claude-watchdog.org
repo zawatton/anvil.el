@@ -1,22 +1,46 @@
 #+title: anvil-claude-watchdog — Detect Claude Code TUI deadlock
 #+date: 2026-04-29
 #+author: zawatton
-#+property: status DRAFT
+#+property: status PHASE-1C-2-SHIPPED
 #+property: scope GENERIC
 
 * STATUS
   :PROPERTIES:
   :ID:       3a4d1ec0-7b5f-4e6a-9b21-9c4d40b6d8c1
   :END:
-~Phase 1 DRAFT~ (2026-04-29、feat/doc-40-claude-watchdog-phase1)。
+~PHASE-1C-2-SHIPPED~ (2026-05-26) — Phase 1c の State=S 亜種検知を追加。
+Claude 本体が =State S= で jsonl が直近更新されている spinner 状態でも、
+tracked MCP child (=anvil-stdio.sh= / =emacs --batch= /
+=github-mcp-server= など) が 30 秒以上 rchar/wchar ともに完全停止していれば
+=:hang-variant= と判定し、既存の通知・event record・hook・manual recovery
+flow に合流する。
+
+~PHASE-2-SHIPPED~ (2026-05-26) — Phase 1 の procfs/jsonl deadlock
+検知、desktop 通知、anvil-state event log、=anvil-claude-watchdog-recent=
+に加え、Phase 2 の手動 recovery コマンド
+=M-x anvil-claude-watchdog-recover= を実装。recovery は確認 prompt 後に
+対象 PID へ SIGKILL を送り、jsonl basename から
+=claude --resume <session-id>= を作り、同 cwd の tmux pane に Enter なしで
+stage する。自動 recovery は引き続き対象外。
+
+~DEFERRED~ (2026-05-17)。元 ~Phase 1 DRAFT~ (2026-04-29、
+feat/doc-40-claude-watchdog-phase1)。develop → master 統合 gate を
+通すため一旦 DEFERRED 扱いに移送。実需 (deadlock 再発 + 検知漏れ
+シナリオの蓄積) を待ってから着手再開する。Phase 1 MVP 仕様自体は
+本文に保存済。
 
 *Phase 1 MVP:* Linux procfs + jsonl mtime での Claude Code (Anthropic
 CLI) deadlock 検知 + desktop 通知 + anvil-state event ログ。
-auto-recovery は含めない (false positive リスクのため Phase 2 に分離)。
+auto-recovery は含めない (false positive リスクのため、Phase 2 も
+確認付き manual recovery のみに限定)。
 
-*Phase 2 (deferred):* =M-x anvil-claude-watchdog-recover= 手動起動の
+*Phase 2 (SHIPPED):* =M-x anvil-claude-watchdog-recover= 手動起動の
 recovery コマンド。対象 PID 選択 → 確認 prompt → SIGKILL → tmux pane
 探索 → =claude --resume <session-id>= を Enter なしで stage。
+
+*Phase 1c (SHIPPED):* =State S= + jsonl spinner + MCP child IO 完全停止の
+亜種シグネチャを =:hang-variant= として検知し、Phase 1/2 と同じ dispatch /
+manual recovery に合流。
 
 *module placement:* =anvil-optional-modules= (procfs/Linux/SIGKILL/
 tmux 依存のため default 非搭載、opt-in)。
@@ -52,7 +76,7 @@ mtime を 30s 周期で sample して **rchar 増加 + wchar 静止 + State R**
 * Non-Goals
 
 - macOS / Windows サポート (procfs 専用、Phase 1 では out of scope)
-- 自動 recovery (Phase 2 で別 PR、user 確認 prompt 必須)
+- 自動 recovery (false positive リスクがあるため対象外。Phase 2 は手動のみ)
 - claude 以外のプロセス監視 (本 module 名は claude-watchdog)
 
 * Detection algorithm
@@ -103,7 +127,7 @@ jsonl partial write) ため 60s 連続静止は強いシグナル。
   - =anvil-claude-watchdog-on-hang-functions= hook 起動
     (user 拡張可能、e.g. journal 追記、tmux status-line 更新)
 
-** Phase 2 (deferred)
+** Phase 2 — manual recovery — SHIPPED
 
 - =M-x anvil-claude-watchdog-recover=:
   - 確定 hang 中の PID 一覧から 1 つ選択
@@ -122,12 +146,17 @@ jsonl partial write) ため 60s 連続静止は強いシグナル。
 - =anvil-claude-watchdog-jsonl-staleness= (default 120s)
 - =anvil-claude-watchdog-on-hang-functions= (hook, args =(plist)=)
 - =anvil-claude-watchdog-event-ttl= (default 7 days)
+- =anvil-claude-watchdog-resume-command= (default =claude --resume %s=)
+- =anvil-claude-watchdog-mcp-child-cmd-regex=
+- =anvil-claude-watchdog-spinner-window= (default 30s)
+- =anvil-claude-watchdog-child-stagnation-threshold= (default 30s)
 
 ** Commands
 
 - =M-x anvil-claude-watchdog-enable= — register MCP tool + start timer
 - =M-x anvil-claude-watchdog-disable= — stop timer + unregister
 - =M-x anvil-claude-watchdog-status= — show currently watched PIDs
+- =M-x anvil-claude-watchdog-recover= — confirmation-gated manual recovery
 
 ** MCP tool
 
@@ -142,6 +171,8 @@ jsonl partial write) ため 60s 連続静止は強いシグナル。
   - jsonl mtime fallback (mock /proc 不在時)
   - event ring buffer の TTL 期限切れ
   - hook 起動の dispatch 確認
+  - manual recovery の cancel / SIGKILL / tmux stage 確認
+  - State=S + MCP child IO 静止の =:hang-variant= 判定と dispatch 確認
 
 * Dependencies
 
@@ -155,10 +186,10 @@ jsonl partial write) ため 60s 連続静止は強いシグナル。
 
 - Phase 1a: 基本骨格 (sampling + heuristic + 通知) ← 本 PR
 - Phase 1b: hook + MCP tool ← 本 PR
-- Phase 1c (別 PR): State=S 亜種シグネチャ対応 (下記)
-- Phase 2 (別 PR): recovery コマンド (=M-x anvil-claude-watchdog-recover=)
+- Phase 1c: State=S 亜種シグネチャ対応 — SHIPPED
+- Phase 2: recovery コマンド (=M-x anvil-claude-watchdog-recover=) — SHIPPED
 
-** Phase 1c — State=S 亜種シグネチャ (follow-up)
+** Phase 1c — State=S 亜種シグネチャ — SHIPPED
 
 2026-04-29 10:24 JST に上記 Phase 1 設計後、別の hang variant が
 実測された (memory =feedback_claude_code_concurrent_mcp_hang.md=
@@ -184,10 +215,11 @@ Phase 1c で追加判定軸:
                   for >= 30s
 #+end_example
 
-実装: =anvil-claude-watchdog--list-mcp-children= helper を足し、
+実装済み: =anvil-claude-watchdog--list-mcp-children= helper を足し、
 各 child の =/proc/PID/io= も sample。全 child が IO 完全静止 + claude
 spinner 表示中なら =:hang-variant= verdict を立てて同 dispatch flow に
-合流。
+合流。=:hang-variant= は =anvil-claude-watchdog--hang-samples= に含まれるため
+manual recovery の対象にもなる。
 
 * Open questions
 

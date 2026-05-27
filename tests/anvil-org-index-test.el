@@ -1034,3 +1034,31 @@ Also stubs `set-process-sentinel', `set-process-query-on-exit-flag',
               (should (string-match-p "exit=0 elapsed=" body))
               (should (string-match-p "\\bOK\\b" body)))))
       (ignore-errors (delete-file tmp-log)))))
+
+
+;;;; --- §7.6 WAL checkpoint -----------------------------------------------
+
+(ert-deftest anvil-org-index-test-checkpoint-noop-when-closed ()
+  "`anvil-org-index-checkpoint' is a no-op when DB is not open."
+  (let ((anvil-org-index--db nil))
+    (should (null (anvil-org-index-checkpoint)))))
+
+(ert-deftest anvil-org-index-test-checkpoint-runs-when-open ()
+  "`anvil-org-index-checkpoint' returns t when run against an open DB."
+  (skip-unless (anvil-org-index-test--have-sqlite))
+  (anvil-org-index-test--with-seeded _f
+    (should (eq t (anvil-org-index-checkpoint)))))
+
+(ert-deftest anvil-org-index-test-checkpoint-timer-installed ()
+  "`anvil-org-index-enable' installs the checkpoint idle-timer."
+  (skip-unless (anvil-org-index-test--have-sqlite))
+  (let ((anvil-org-index-checkpoint-idle-interval 3600))
+    (anvil-org-index-test--with-seeded _f
+      (should (timerp anvil-org-index--checkpoint-timer)))))
+
+(ert-deftest anvil-org-index-test-checkpoint-timer-disabled-when-nil ()
+  "Setting interval to nil keeps the checkpoint timer slot empty."
+  (skip-unless (anvil-org-index-test--have-sqlite))
+  (let ((anvil-org-index-checkpoint-idle-interval nil))
+    (anvil-org-index-test--with-seeded _f
+      (should (null anvil-org-index--checkpoint-timer)))))

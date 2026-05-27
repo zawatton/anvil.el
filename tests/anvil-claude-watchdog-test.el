@@ -19,7 +19,8 @@
 (require 'anvil-claude-watchdog)
 
 (cl-defun anvil-claude-watchdog-test--sample
-    (&key sampled-at rchar wchar state jsonl-mtime stagnant-since)
+    (&key sampled-at rchar wchar state jsonl-mtime stagnant-since
+          mcp-children)
   "Construct a test sample plist with sensible defaults."
   (list :pid 12345
         :sampled-at (or sampled-at 1000.0)
@@ -30,7 +31,16 @@
         :cwd "/home/x/proj"
         :jsonl-path "/tmp/x.jsonl"
         :jsonl-mtime jsonl-mtime
-        :wchar-stagnant-since stagnant-since))
+        :wchar-stagnant-since stagnant-since
+        :mcp-children mcp-children))
+
+(defun anvil-claude-watchdog-test--child (pid rchar wchar)
+  "Construct a tracked MCP child sample."
+  (list :pid pid
+        :cmdline "emacs --batch stage-d"
+        :rchar rchar
+        :wchar wchar
+        :syscw 0))
 
 (ert-deftest anvil-claude-watchdog-test/healthy-no-prev ()
   "First sample is always healthy."
@@ -127,8 +137,50 @@ Mirrors the 2026-04-29 production hang signature."
     (should (eq :healthy
                 (anvil-claude-watchdog--classify
                  :prev prev :now now
+                :stagnation-threshold 60
+                :jsonl-staleness 120)))))
+
+(ert-deftest anvil-claude-watchdog-test/hang-variant-state-S-children-static ()
+  "State S + fresh jsonl spinner + static MCP children → hang variant."
+  (let* ((prev (anvil-claude-watchdog-test--sample
+                :sampled-at 1000.0 :rchar 100 :wchar 200 :state "S"
+                :jsonl-mtime 999.0
+                :mcp-children
+                (list (anvil-claude-watchdog-test--child 2001 10 20)
+                      (anvil-claude-watchdog-test--child 2002 30 40))))
+         (now (anvil-claude-watchdog-test--sample
+               :sampled-at 1031.0 :rchar 101 :wchar 201 :state "S"
+               :jsonl-mtime 1030.0
+               :mcp-children
+               (list (anvil-claude-watchdog-test--child 2001 10 20)
+                     (anvil-claude-watchdog-test--child 2002 30 40)))))
+    (should (eq :hang-variant
+                (anvil-claude-watchdog--classify
+                 :prev prev :now now
                  :stagnation-threshold 60
-                 :jsonl-staleness 120)))))
+                 :jsonl-staleness 120
+                 :spinner-window 30
+                 :child-stagnation-threshold 30)))))
+
+(ert-deftest anvil-claude-watchdog-test/hang-variant-child-io-advances-healthy ()
+  "State S spinner does not trip variant when any MCP child has IO."
+  (let* ((prev (anvil-claude-watchdog-test--sample
+                :sampled-at 1000.0 :rchar 100 :wchar 200 :state "S"
+                :jsonl-mtime 999.0
+                :mcp-children
+                (list (anvil-claude-watchdog-test--child 2001 10 20))))
+         (now (anvil-claude-watchdog-test--sample
+               :sampled-at 1031.0 :rchar 101 :wchar 201 :state "S"
+               :jsonl-mtime 1030.0
+               :mcp-children
+               (list (anvil-claude-watchdog-test--child 2001 11 20)))))
+    (should (eq :healthy
+                (anvil-claude-watchdog--classify
+                 :prev prev :now now
+                 :stagnation-threshold 60
+                 :jsonl-staleness 120
+                 :spinner-window 30
+                 :child-stagnation-threshold 30)))))
 
 (ert-deftest anvil-claude-watchdog-test/update-stagnation-resets-on-output ()
   "When wchar advances, :wchar-stagnant-since resets to nil."
@@ -190,6 +242,22 @@ Mirrors the 2026-04-29 production hang signature."
       (should (= 1 (length captured)))
       (should (eq :hang (plist-get (car captured) :verdict))))))
 
+(ert-deftest anvil-claude-watchdog-test/dispatch-runs-hook-on-hang-variant ()
+  "On :hang-variant verdict the same hook/record flow runs."
+  (let (captured recorded)
+    (cl-letf* (((symbol-function 'anvil-claude-watchdog--notify) #'ignore)
+               ((symbol-function 'anvil-claude-watchdog--record-event)
+                (lambda (_n verdict) (setq recorded verdict) "k"))
+               (anvil-claude-watchdog-on-hang-functions
+                (list (lambda (info) (push info captured)))))
+      (anvil-claude-watchdog--dispatch
+       (anvil-claude-watchdog-test--sample :state "S")
+       :hang-variant)
+      (should (= 1 (length captured)))
+      (should (eq :hang-variant recorded))
+      (should (eq :hang-variant
+                  (plist-get (car captured) :verdict))))))
+
 (ert-deftest anvil-claude-watchdog-test/dispatch-skips-on-healthy ()
   "Healthy verdicts do not trigger the hook."
   (let (captured)
@@ -201,6 +269,76 @@ Mirrors the 2026-04-29 production hang signature."
         (anvil-claude-watchdog--dispatch
          (anvil-claude-watchdog-test--sample) :healthy))
       (should (null captured)))))
+
+(ert-deftest anvil-claude-watchdog-test/session-id-from-jsonl ()
+  "Recovery derives the Claude session id from a jsonl basename."
+  (should (equal "abc-123"
+                 (anvil-claude-watchdog--session-id-from-jsonl
+                  "/home/x/.claude/projects/p/abc-123.jsonl")))
+  (should-not (anvil-claude-watchdog--session-id-from-jsonl nil)))
+
+(ert-deftest anvil-claude-watchdog-test/find-tmux-pane-by-cwd ()
+  "Recovery can map a hung sample cwd back to a tmux pane."
+  (cl-letf (((symbol-function 'anvil-claude-watchdog--tmux-panes)
+             (lambda ()
+               (list (list :pane "%1" :cwd "/tmp")
+                     (list :pane "%2" :cwd "/home/x/proj")))))
+    (should (equal "%2"
+                   (anvil-claude-watchdog--find-tmux-pane "/home/x/proj")))
+    (should-not (anvil-claude-watchdog--find-tmux-pane "/missing"))))
+
+(ert-deftest anvil-claude-watchdog-test/recover-kills-and-stages-resume ()
+  "Manual recovery sends SIGKILL and stages, but does not press Enter."
+  (let ((anvil-claude-watchdog--samples (make-hash-table :test #'eql))
+        killed
+        staged)
+    (let ((sample (anvil-claude-watchdog-test--sample
+                   :sampled-at 1000.0 :state "R")))
+      (setq sample (plist-put sample :verdict :hang))
+      (setq sample (plist-put sample :jsonl-path "/tmp/session-xyz.jsonl"))
+      (setq sample (plist-put sample :cwd "/home/x/proj"))
+      (puthash 12345 sample anvil-claude-watchdog--samples))
+    (cl-letf (((symbol-function 'yes-or-no-p) (lambda (_) t))
+              ((symbol-function 'signal-process)
+               (lambda (pid sig) (setq killed (list pid sig))))
+              ((symbol-function 'anvil-claude-watchdog--find-tmux-pane)
+               (lambda (_cwd) "%9"))
+              ((symbol-function 'anvil-claude-watchdog--stage-resume)
+               (lambda (pane sid)
+                 (setq staged (list pane sid))
+                 (format "claude --resume %s" sid))))
+      (let ((result (anvil-claude-watchdog-recover 12345)))
+        (should (equal '(12345 9) killed))
+        (should (equal '("%9" "session-xyz") staged))
+        (should (equal "session-xyz" (plist-get result :session-id)))
+        (should (equal "%9" (plist-get result :pane)))
+        (should (equal "claude --resume session-xyz"
+                       (plist-get result :staged-command)))))))
+
+(ert-deftest anvil-claude-watchdog-test/recover-sees-hang-variant ()
+  "Manual recovery treats :hang-variant samples as recoverable hangs."
+  (let ((anvil-claude-watchdog--samples (make-hash-table :test #'eql)))
+    (puthash 12345
+             (append (anvil-claude-watchdog-test--sample)
+                     (list :verdict :hang-variant))
+             anvil-claude-watchdog--samples)
+    (should (= 1 (length (anvil-claude-watchdog--hang-samples))))))
+
+(ert-deftest anvil-claude-watchdog-test/recover-cancel-does-not-kill ()
+  "A negative confirmation cancels before SIGKILL."
+  (let ((anvil-claude-watchdog--samples (make-hash-table :test #'eql))
+        killed)
+    (puthash 12345
+             (append (anvil-claude-watchdog-test--sample)
+                     (list :verdict :hang))
+             anvil-claude-watchdog--samples)
+    (cl-letf (((symbol-function 'yes-or-no-p) (lambda (_) nil))
+              ((symbol-function 'anvil-claude-watchdog--find-tmux-pane)
+               (lambda (_cwd) nil))
+              ((symbol-function 'signal-process)
+               (lambda (&rest _) (setq killed t))))
+      (should-error (anvil-claude-watchdog-recover 12345))
+      (should-not killed))))
 
 (provide 'anvil-claude-watchdog-test)
 ;;; anvil-claude-watchdog-test.el ends here

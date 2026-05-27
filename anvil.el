@@ -4,7 +4,7 @@
 
 ;; Author: zawatton
 ;; Keywords: comm, tools, ai, mcp
-;; Version: 1.1.1
+;; Version: 1.2.0
 ;; Package-Requires: ((emacs "28.2"))
 ;; URL: https://github.com/zawatton21/anvil.el
 
@@ -115,15 +115,110 @@ These are not loaded by default.  Available modules:
                 `session' (Stop event).  Five MCP tools: compact-
                 estimate / -should-trigger / -snapshot / -restore /
                 -hook.
+- `harness-telemetry' — Doc 46 Phase 1 runtime-harness failure
+                classifier + 4-class SQLite telemetry (no-exec /
+                contract-violation / stall / reasoning).  Hooks
+                into `anvil-server-tool-error-hook' (raised from
+                inside `anvil-server-with-error-handling' and the
+                tools/call dispatcher) to classify every failure
+                with a static rule table and persist the event
+                into a `harness_failures' table inside the
+                anvil-worklog DB file.  Three MCP tools —
+                harness-telemetry-record / -stats / -recent —
+                expose the recorder + aggregator queries so
+                later modules (Doc 43-47) can measure their
+                effect against a 1-2 week baseline.  Requires
+                Emacs 29+ for SQLite; soft-deps on
+                `anvil-worklog' for the DB path resolver.
+- `autoresearch' — Doc 43 Phase 0 read-only candidate scanner for
+                local web / X / YouTube summaries and anvil design
+                docs.  Adds `autoresearch-scan', which returns
+                ranked implementation candidates with file, line,
+                evidence, source kind, score, and suggested action.
+                Phase 1a adds `autoresearch-docstrings', a read-only
+                evaluator that ranks weak MCP tool description /
+                parameter-doc targets for Q1-A docstring
+                autoresearch.  Phase 1b adds
+                `autoresearch-docstring-plan', a read-only planner
+                that returns the current description, scored issues,
+                registration-site hint, deterministic draft
+                description, and rewrite prompt.  Phase 1c adds
+                `autoresearch-docstring-patch', a read-only dry-run
+                patch candidate generator for the registered
+                `:description' string.  Phase 1d adds
+                `autoresearch-docstring-apply', a local deterministic
+                apply/eval loop for one description literal: apply
+                reviewed rewrite, run optional eval command, and
+                revert automatically on eval failure.  Phase 1e adds
+                `autoresearch-docstring-propose', which submits one
+                bounded orchestrator task with budget, timeout,
+                heartbeat timeout, cwd, and sandbox metadata to
+                propose a replacement description without applying it.
+                Phase 2 adds `holdout_command' to
+                `autoresearch-docstring-apply': after a kept inner
+                eval, a failing holdout command retroactively restores
+                the original file.  Phase 2a adds
+                `autoresearch-docstring-run', which tries multiple
+                candidate descriptions against eval / holdout gates
+                and keeps only the lowest issue-score passing rewrite.
+                Phase 2b adds `autoresearch-docstring-harvest', which
+                collects successful orchestrator proposal summaries
+                and feeds them into that multi-candidate gate.
+                Phase 2c adds `autoresearch-docstring-propose-batch',
+                which fan-outs N bounded proposal tasks in one
+                orchestrator batch for direct harvest.  Phase 2d adds
+                explicit `no_worktree' / `worktree_name' controls so
+                Doc 43 proposal tasks can opt out of, or name,
+                orchestrator worktree isolation.  Phase 2e adds
+                `autoresearch-docstring-promote-memory', which stores
+                accepted run / harvest results as DB-direct
+                anvil-memory rows.  Phase 3 adds
+                `autoresearch-routing-evaluate' and
+                `autoresearch-routing-plan' for read-only Q1-B
+                orchestrator routing autoresearch.  Phase 3a adds
+                `autoresearch-routing-propose' to submit one bounded
+                routing proposal task without mutating routing
+                settings.  Phase 3b adds
+                `autoresearch-routing-harvest' to collect and rank
+                routing proposal summaries for review without applying
+                them.  Phase 3c adds
+                `autoresearch-routing-patch-plan' to turn a selected
+                proposal into target-file hints, an implementation
+                prompt, and verification commands without editing
+                source.  Phase 3d adds
+                `autoresearch-routing-implement' to submit that
+                implementation prompt as one bounded orchestrator task.
+                Phase 3e adds
+                `autoresearch-routing-implementation-harvest' to
+                collect implementation summaries and return a selected
+                review candidate plus checklist.  Phase 3f adds
+                `autoresearch-routing-implementation-promote-memory'
+                to store accepted implementation summaries as
+                DB-direct anvil-memory rows.  Phase 5 adds
+                `autoresearch-nelisp-codegen-plan',
+                `autoresearch-nelisp-codegen-implement', and
+                `autoresearch-nelisp-codegen-harvest' to apply the
+                same bounded implementation / harvest pattern to
+                NeLisp Phase 47 codegen without editing NeLisp from
+                the MCP tool itself.  Phase 6 adds
+                `anvil-autoresearch-dashboard', a tabulated-list UI
+                over current `autoresearch-*' orchestrator tasks.
 - `claude-watchdog' — Detect Claude Code (Anthropic CLI) TUI deadlock
                 via /proc + jsonl mtime polling.  When wchar stops
                 advancing while State=R and the session jsonl goes
                 stale, raises a desktop notification + records the
                 event under `anvil-state' ns=claude-watchdog-events.
+                Phase 1c also detects the State=S spinner variant
+                where tracked MCP child processes have zero rchar /
+                wchar delta and emits `:hang-variant' through the
+                same dispatch path.
                 One MCP tool `anvil-claude-watchdog-recent' for
-                debugging.  Phase 1 = detection only; auto-recovery
-                is deferred to Phase 2.  Linux only (procfs);
-                requires `state' (Doc 40 Phase 1).
+                debugging.  Manual recovery is available as
+                `M-x anvil-claude-watchdog-recover': confirmation
+                gated SIGKILL plus tmux staging of
+                `claude --resume <session-id>' without pressing
+                Enter.  Linux only (procfs); requires `state'
+                (Doc 40 Phase 1 + 1c + 2).
 - `http'      — HTTP client via `url-retrieve-synchronously' with a
                 state-backed ETag/TTL cache (Doc 09 Phase 1a)
 - `orchestrator' — Parallel AI CLI dispatcher (claude today, more
@@ -173,13 +268,28 @@ These are not loaded by default.  Available modules:
                 helpers with `ts' so `.ts' must not be handed to JS
                 tools and vice versa (Doc 21 Phase 1b).
 - `manifest'  — Per-session tools/list filter driven by
-                `ANVIL_PROFILE' (ultra / nav / core / lean / full).
+                `ANVIL_PROFILE' (ultra / nav / core / lean / full /
+                dynamic).
                 Handlers remain live regardless of profile; only the
                 advertised manifest shrinks.  Opt-in: primarily useful
                 for orchestrator child sessions where per-session
-                manifest cost dominates (Doc 26 Phase 1).  Add
-                `manifest' last in the module list so it sees every
-                earlier registration.
+                manifest cost dominates (Doc 26 Phase 1).  Doc 44
+                Phase 2a adds `manifest-attention' and the `dynamic'
+                profile: Tool Attention ranking over tool id,
+                description, intent, and layer metadata, driven by
+                `ANVIL_ATTENTION_QUERY', with optional function /
+                command embedding backends and lexical fallback.
+                Doc 44 Phase 2b adds
+                state filtering via tool `:preconditions' and
+                `ANVIL_STATE_TAGS'.  Doc 44 Phase 2c adds dynamic
+                schema trimming, warm LRU full-schema retention, and
+                `manifest-recovery-suggest'.  Doc 44 Phase 2d adds
+                `manifest-docstring-candidates', a Doc43 bridge that
+                ranks weak MCP descriptions for Tool Attention
+                quality and points follow-up at
+                `autoresearch-docstring-propose'.  Add `manifest'
+                last in the module list so it sees every earlier
+                registration.
 - `discovery' — Intent-based MCP tool discovery.  Adds the
                 `anvil-tools-by-intent' tool that answers
                 \"which registered tools match intent X / layer Y?\"
@@ -255,6 +365,29 @@ These are not loaded by default.  Available modules:
                 29+.  Phase 1b (FTS5 + contradiction detection +
                 URL HEAD) and Phase 2 (decay + promote) stay
                 DRAFT.
+- `memory-bridge' — Doc 41 Phase 2c localhost JSON API in front of
+                `anvil-memory' plus Doc 42 Phase 3 read-only worklog
+                endpoints.  Provides `anvil-memory-bridge-start' /
+                -stop / -status / -rotate-token; GET endpoints for
+                /memory/search, /memory/list, /memory/get/<name>,
+                /memory/events, /memory/health, and
+                /memory/effective-db-path;
+                guarded write endpoints for /memory/save,
+                /memory/access, /memory/scan, /memory/prune, and
+                DELETE /memory/<name>; plus /worklog/search,
+                /worklog/list, /worklog/get, /worklog/health, and
+                /worklog/effective-db-path.  Phase 2c adds read-replica
+                mode with /memory/replica/status,
+                /memory/replica/pull, and
+                `anvil-memory-bridge-replica-pull'.  Phase 3 adds
+                configured-origin CORS / OPTIONS preflight and a
+                side-load Manifest V3 browser extension under
+                extensions/memory-bridge for Claude.ai, ChatGPT, and
+                Gemini memory injection.  Phase 4 adds a dependency-free
+                static mobile thin client under extensions/mobile-bridge
+                with localStorage offline save queue replay.  The module
+                only loads the bridge; it does not auto-start the
+                listener.
 - `memory-obs' — Session lifecycle observation capture.  Records
                 Claude Code hook events (session-start, user-prompt,
                 post-tool-use, stop, session-end) into a separate

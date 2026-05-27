@@ -79,9 +79,9 @@ If IS-ERROR is non-nil, also increment the error counter."
   (let ((metrics
          (anvil-server-metrics--get
           (format "tools/call:%s" tool-name))))
-    (cl-incf (anvil-server-metrics-calls metrics))
+    (condition-case nil (cl-incf (anvil-server-metrics-calls metrics)) (error nil))
     (when is-error
-      (cl-incf (anvil-server-metrics-errors metrics)))))
+      (condition-case nil (cl-incf (anvil-server-metrics-errors metrics)) (error nil)))))
 
 ;;; Public functions
 

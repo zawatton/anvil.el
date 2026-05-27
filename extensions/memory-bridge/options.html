@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Anvil Memory Bridge</title>
+    <style>
+      body {
+        font: 14px system-ui, sans-serif;
+        margin: 24px;
+        max-width: 560px;
+      }
+      label {
+        display: block;
+        margin: 12px 0;
+      }
+      input[type="text"],
+      input[type="password"],
+      input[type="number"] {
+        box-sizing: border-box;
+        display: block;
+        margin-top: 4px;
+        width: 100%;
+      }
+      button {
+        margin-top: 8px;
+      }
+      #status {
+        margin-left: 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Anvil Memory Bridge</h1>
+    <label>
+      <input id="enabled" type="checkbox">
+      Enable injection
+    </label>
+    <label>
+      Bridge URL
+      <input id="bridgeUrl" type="text">
+    </label>
+    <label>
+      Bearer token
+      <input id="token" type="password">
+    </label>
+    <label>
+      Search result limit
+      <input id="topK" type="number" min="1" max="20">
+    </label>
+    <button id="save" type="button">Save</button>
+    <button id="health" type="button">Check</button>
+    <span id="status"></span>
+    <script src="options.js"></script>
+  </body>
+</html>

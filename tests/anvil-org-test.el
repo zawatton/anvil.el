@@ -336,4 +336,64 @@ no-ops in that case; the tool must detect the no-op and throw."
               (should (bufferp (car result))))
           (kill-buffer (find-buffer-visiting path)))))))
 
+(ert-deftest anvil-org-test-capture-string-static-target ()
+  "org-capture-string invokes a validated static file template."
+  (require 'org-capture)
+  (anvil-org-test--with-temp-org
+   "* Inbox\n"
+   (lambda (path)
+     (let ((anvil-org-allowed-files (list path))
+           (anvil-org-allowed-files-enabled t)
+           (org-capture-templates
+            `(("t" "Task" entry (file+headline ,path "Inbox")
+               "** TODO %i"))))
+       (let ((response
+              (json-parse-string
+               (anvil-org--tool-capture-string "t" "Captured body" nil)
+               :object-type 'alist))
+             (content (anvil-org-test--read path)))
+         (should (eq t (alist-get 'success response)))
+         (should (string-match-p "^\\*\\* TODO Captured body" content)))))))
+
+(ert-deftest anvil-org-test-agenda-view-renders-allowed-files ()
+  "org-agenda-view renders a scheduled item from allowed files."
+  (anvil-org-test--with-temp-org
+   "* TODO Agenda Task\nSCHEDULED: <2026-05-25 Mon>\n"
+   (lambda (path)
+     (let ((anvil-org-allowed-files (list path))
+           (anvil-org-allowed-files-enabled t))
+       (let ((text (anvil-org--tool-agenda-view
+                    "" "2026-05-25" "1" nil)))
+         (should (string-match-p "Agenda Task" text))
+         (should (string-match-p "Monday" text)))))))
+
+(ert-deftest anvil-org-test-habit-summary-streak ()
+  "org-habit-summary reports habit streak and completion metadata."
+  (anvil-org-test--with-temp-org
+   (concat
+    "* TODO Drink water\n"
+    "SCHEDULED: <2026-05-25 Mon .+1d>\n"
+    ":PROPERTIES:\n:STYLE: habit\n:ID: habit-id\n:END:\n"
+    ":LOGBOOK:\n"
+    "- State \"DONE\"       from \"TODO\"       [2026-05-24 Sun]\n"
+    "- State \"DONE\"       from \"TODO\"       [2026-05-23 Sat]\n"
+    ":END:\n")
+   (lambda (path)
+     (let ((anvil-org-allowed-files (list path))
+           (anvil-org-allowed-files-enabled t)
+           (org-log-done 'time))
+       (let* ((response
+               (json-parse-string
+                (anvil-org--tool-habit-summary nil "2026-05-25")
+                :object-type 'alist
+                :array-type 'list))
+              (habits (alist-get 'habits response))
+              (habit (car habits)))
+         (should (= 1 (alist-get 'count response)))
+         (should (equal "Drink water" (alist-get 'title habit)))
+         (should (equal "habit-id" (alist-get 'id habit)))
+         (should (= 2 (alist-get 'streak habit)))
+         (should (equal "alert" (alist-get 'status habit)))
+         (should (> (alist-get 'completion_ratio habit) 0.0)))))))
+
 ;;; anvil-org-test.el ends here

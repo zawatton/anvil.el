@@ -75,12 +75,18 @@
 (defconst anvil-shell-filter--gain-ns "shell-gain"
   "`anvil-state' namespace holding per-day gain entries.")
 
+(defconst anvil-shell-filter--trace-ns "shell-trace"
+  "`anvil-state' namespace holding per-phase trace events for
+`anvil-shell-filter-run' invocations.  Populated only when
+`anvil-shell-filter-trace-events' is non-nil.")
+
 (defconst anvil-shell-filter-supported
   '(git-status git-log git-diff rg find ls pytest ert-batch
                emacs-batch make dispatch tee gain
                gh git-log-graph pip-install npm-install
                docker-ps docker-logs kubectl-get aws-s3-ls
-               prettier ruff phase2a-dispatch tee-grep)
+               prettier ruff phase2a-dispatch tee-grep
+               register taco-critical)
   "Capability tags this module currently provides.
 Tests in tests/anvil-shell-filter-test.el gate their `skip-unless'
 on membership here so a half-shipped filter never breaks CI.  The
@@ -92,6 +98,44 @@ same list so each test can self-describe its capability gate.")
   "Seconds raw output is retained under the shell-tee namespace.
 `anvil-state' prunes expired rows lazily on `GET' and eagerly on
 `anvil-state-vacuum'; callers do not need to sweep."
+  :type 'integer
+  :group 'anvil-shell-filter)
+
+(defcustom anvil-shell-tee-max-bytes (* 4 1024 1024)
+  "Maximum bytes stored per shell-run tee entry.
+Larger raw stdout is truncated with a sentinel before storage
+in `anvil-state'.  Caps the per-call cost of
+`anvil-shell-filter--tee-put' and prevents unbounded growth of
+`anvil-state.db' when commands emit large output (e.g. cargo
+test logs).  Set to nil to disable capping (the historical
+behaviour).  `anvil-shell-filter-tee-get' returns the capped
+string; for genuinely large output prefer file redirection."
+  :type '(choice integer (const :tag "No cap" nil))
+  :group 'anvil-shell-filter)
+
+(defcustom anvil-shell-filter-trace-events nil
+  "When non-nil, emit per-phase trace rows for each
+`anvil-shell-filter-run' invocation into `anvil-state' under
+namespace `shell-trace'.
+
+Each call produces five rows keyed by a unique trace id —
+`<id>-start', `<id>-exec-done', `<id>-filter-done',
+`<id>-tee-done', `<id>-return' — recording phase name, absolute
+Unix timestamp, and elapsed milliseconds since the run start.
+TTL = `anvil-shell-trace-ttl-sec'.
+
+Opt-in observability.  When nil the run path adds zero state
+writes (zero-cost).  Inspect by querying
+  SELECT k, v FROM kv WHERE ns = \\='shell-trace\\='
+during or after a suspected hang to learn which phase blocked."
+  :type 'boolean
+  :group 'anvil-shell-filter)
+
+(defcustom anvil-shell-trace-ttl-sec 600
+  "TTL (seconds) for trace events emitted when
+`anvil-shell-filter-trace-events' is non-nil.  Defaults to 10
+minutes — long enough to inspect a recent hang, short enough
+that traces do not accumulate."
   :type 'integer
   :group 'anvil-shell-filter)
 
@@ -135,6 +179,48 @@ rtk and OpenAI both publish ~4 chars-per-token for English/code,
 so the default 0.25 tracks that.  Purely an advisory number — the
 byte counts are exact."
   :type 'number
+  :group 'anvil-shell-filter)
+
+(defcustom anvil-shell-filter-taco-critical-fallback t
+  "When non-nil, unknown `shell-run' commands get a safe critical keeper.
+This is Doc 45 / TACO Phase 1: known static filters still win, but
+unknown verbose commands with error-like lines are compressed to the
+critical lines plus small context.  Commands without critical signals
+remain raw passthrough."
+  :type 'boolean
+  :group 'anvil-shell-filter)
+
+(defcustom anvil-shell-filter-taco-critical-min-lines 80
+  "Minimum stdout line count before TACO critical fallback can compress.
+Non-zero exits bypass this threshold because their tail is often useful."
+  :type 'integer
+  :group 'anvil-shell-filter)
+
+(defcustom anvil-shell-filter-taco-critical-context-lines 2
+  "Number of surrounding stdout lines kept around each critical line."
+  :type 'integer
+  :group 'anvil-shell-filter)
+
+(defcustom anvil-shell-filter-taco-critical-tail-lines 20
+  "Number of final stdout lines kept for unknown commands that exit non-zero."
+  :type 'integer
+  :group 'anvil-shell-filter)
+
+(defcustom anvil-shell-filter-taco-critical-patterns
+  '("\\berror\\b"
+    "\\bfatal:"
+    "\\bfailed\\b"
+    "Traceback"
+    "Exception"
+    "AssertionError"
+    "panic"
+    "segmentation fault"
+    "^E[[:space:]]+"
+    "^[[:space:]]*at .*(.*:[0-9]+)")
+  "Case-insensitive regexps whose matching stdout lines are always kept.
+These patterns are intentionally conservative.  Raw stdout is still tee'd
+by `shell-run', so callers can recover the full output if needed."
+  :type '(repeat regexp)
   :group 'anvil-shell-filter)
 
 
@@ -497,6 +583,87 @@ The trailing `Found N errors.' summary is preserved when present."
       (when summary (push summary output))
       (string-join (nreverse output) "\n"))))
 
+(defun anvil-shell-filter--taco-critical-line-p (line)
+  "Return non-nil when LINE matches a configured critical pattern."
+  (let ((case-fold-search t))
+    (cl-some (lambda (re) (string-match-p re line))
+             anvil-shell-filter-taco-critical-patterns)))
+
+(defun anvil-shell-filter--taco-mark-range (keep start end)
+  "Mark KEEP vector indexes from START through END, clamped to bounds."
+  (let ((i (max 0 start))
+        (last (min (1- (length keep)) end)))
+    (while (<= i last)
+      (aset keep i t)
+      (setq i (1+ i)))))
+
+(defun anvil-shell-filter--taco-critical-render (raw &optional stderr exit)
+  "Return TACO Phase 1 critical-keeper output for RAW.
+STDERR is not embedded because `shell-run' returns it separately; it
+only affects the header.  EXIT controls non-zero tail retention."
+  (let* ((lines (split-string (or raw "") "\n"))
+         (line-count (length lines))
+         (context (max 0 anvil-shell-filter-taco-critical-context-lines))
+         (tail (max 0 anvil-shell-filter-taco-critical-tail-lines))
+         (nonzero (and exit (not (zerop exit))))
+         (keep (make-vector line-count nil))
+         (critical-count 0))
+    (cl-loop for line in lines
+             for i from 0
+             when (anvil-shell-filter--taco-critical-line-p line)
+             do (setq critical-count (1+ critical-count))
+             and do (anvil-shell-filter--taco-mark-range
+                     keep (- i context) (+ i context)))
+    (when nonzero
+      (anvil-shell-filter--taco-mark-range
+       keep (- line-count tail) (1- line-count)))
+    (let ((kept (cl-loop for i below line-count count (aref keep i)))
+          (out nil)
+          (gap 0))
+      (push (format "[anvil-taco: kept %d/%d stdout lines; critical=%d%s%s]"
+                    kept line-count critical-count
+                    (if nonzero (format "; exit=%s" exit) "")
+                    (if (and stderr (not (string-empty-p stderr)))
+                        "; stderr returned separately"
+                      ""))
+            out)
+      (cl-loop for line in lines
+               for i from 0
+               do (if (aref keep i)
+                      (progn
+                        (when (> gap 0)
+                          (push (format "...[%d stdout lines omitted]" gap)
+                                out)
+                          (setq gap 0))
+                        (push line out))
+                    (setq gap (1+ gap))))
+      (when (> gap 0)
+        (push (format "...[%d stdout lines omitted]" gap) out))
+      (string-join (nreverse out) "\n"))))
+
+(defun anvil-shell-filter--taco-critical-maybe (raw &optional stderr exit)
+  "Return critical-keeper output for RAW, or nil when passthrough is safer."
+  (when (and anvil-shell-filter-taco-critical-fallback
+             (stringp raw)
+             (not (string-empty-p raw)))
+    (let* ((lines (split-string raw "\n"))
+           (line-count (length lines))
+           (nonzero (and exit (not (zerop exit))))
+           (has-critical
+            (cl-some #'anvil-shell-filter--taco-critical-line-p lines)))
+      (when (and (or nonzero
+                     (>= line-count anvil-shell-filter-taco-critical-min-lines))
+                 (or has-critical nonzero))
+        (let ((compressed
+               (anvil-shell-filter--taco-critical-render raw stderr exit)))
+          (when (< (length compressed) (length raw))
+            compressed))))))
+
+(defun anvil-shell-filter--taco-critical (raw)
+  "Apply TACO Phase 1 critical keeping to RAW, or return RAW unchanged."
+  (or (anvil-shell-filter--taco-critical-maybe raw nil nil)
+      raw))
+
 
 ;;;; --- dispatch / lookup --------------------------------------------------
 
@@ -520,10 +687,21 @@ The trailing `Found N errors.' summary is preserved when present."
     (kubectl-get    . ,#'anvil-shell-filter--kubectl-get)
     (aws-s3-ls      . ,#'anvil-shell-filter--aws-s3-ls)
     (prettier       . ,#'anvil-shell-filter--prettier)
-    (ruff           . ,#'anvil-shell-filter--ruff))
+    (ruff           . ,#'anvil-shell-filter--ruff)
+    (taco-critical  . ,#'anvil-shell-filter--taco-critical))
   "Alist mapping filter tag → pure `(RAW) -> COMPRESSED' function.
-Users can `setf' new entries to register additional filters before
-Phase 3 adds a public register API.")
+Phase 3 adds `anvil-shell-filter-register' as the public way to install
+additional declarative filters; the alist is still publicly readable
+for legacy callers that walked the entries directly.")
+
+(defvar anvil-shell-filter--match-command-table nil
+  "Alist of (REGEX . TAG) populated by `anvil-shell-filter-register'.
+Consulted by `anvil-shell-filter-lookup' as a fallback when the
+hand-written cond-tree returns nil.  Order = registration order;
+first match wins so later registrations shadow earlier ones with
+the same regex.  Each `anvil-shell-filter-register' call removes
+any prior cell whose cdr equals TAG before pushing the fresh entry,
+so re-registering a tag never leaves orphan rows.")
 
 (defun anvil-shell-filter-lookup (cmd)
   "Return the filter tag for the first token(s) of shell command CMD, or nil.
@@ -565,7 +743,9 @@ is expected to fall through to raw passthrough."
        ((equal first "ls") 'ls)
        ((equal first "pytest") 'pytest)
        ((equal first "make") 'make)
-       (t nil)))))
+       (t (cl-loop for (regex . tag) in anvil-shell-filter--match-command-table
+                   when (string-match-p regex cmd)
+                   return tag))))))
 
 (defun anvil-shell-filter-apply (name raw)
   "Apply filter tag NAME to string RAW.
@@ -582,6 +762,282 @@ returns a tag that hasn't been implemented yet."
         raw)))))
 
 
+;;;; --- declarative register API (Phase 3) ---------------------------------
+
+;; Doc 27 Phase 3 — register API + 8-stage pipeline.  Lets a filter be
+;; declared as data (a plist of regex / int / string knobs) instead of
+;; a hand-coded `(defun ...)'.  The seed corpus is the rtk TOML import
+;; (vendor/rtk-filters/), but the same API serves user-defined filters
+;; in `~/.emacs.d/anvil-shell-filters.el'.
+
+;; rtk specs author regex against Rust's `regex' crate; Elisp's regex
+;; dialect differs (capturing groups need `\\(', alternation needs
+;; `\\|', `\\s' / `\\d' / `\\w' need POSIX class equivalents).  The
+;; translator below covers the small subset rtk filters actually use,
+;; so vendored TOMLs stay byte-identical to upstream and only the
+;; in-Emacs registration translates.
+
+(defun anvil-shell-filter--rust-regex-to-elisp (pattern)
+  "Translate a (small subset of) Rust regex PATTERN into Elisp regex.
+
+Handles the idioms rtk filters use:
+
+  \\s → [[:space:]]      \\S → [^[:space:]]
+  \\d → [0-9]            \\D → [^0-9]
+  \\w → [A-Za-z0-9_]     \\W → [^A-Za-z0-9_]
+
+Capturing / alternation differences (outside character classes):
+
+  (        → \\(
+  )        → \\)
+  |        → \\|
+
+Non-capturing groups `(?:' become Elisp's `\\(?:'.  Named captures
+`(?P<name>...)' are downgraded to `\\(?:...\\)' — the captured text
+is unused by the filter pipeline.  `\\b' / `\\n' / `\\t' / `\\\\'
+pass through unchanged."
+  (if (or (null pattern) (not (stringp pattern)) (string-empty-p pattern))
+      pattern
+    (let ((out (make-string 0 0))
+          (i 0)
+          (n (length pattern))
+          (in-class nil))
+      (while (< i n)
+        (let ((c (aref pattern i)))
+          (cond
+           ;; Inside [...] keep everything verbatim except an escape pair.
+           (in-class
+            (cond
+             ((eq c ?\\)
+              (when (< (1+ i) n)
+                (setq out (concat out (string c (aref pattern (1+ i))))))
+              (cl-incf i 2))
+             ((eq c ?\])
+              (setq out (concat out "]"))
+              (setq in-class nil)
+              (cl-incf i))
+             (t
+              (setq out (concat out (string c)))
+              (cl-incf i))))
+           ;; Backslash escapes outside char class.
+           ((eq c ?\\)
+            (let ((nx (and (< (1+ i) n) (aref pattern (1+ i)))))
+              (cond
+               ((eq nx ?s) (setq out (concat out "[[:space:]]"))   (cl-incf i 2))
+               ((eq nx ?S) (setq out (concat out "[^[:space:]]"))  (cl-incf i 2))
+               ((eq nx ?d) (setq out (concat out "[0-9]"))         (cl-incf i 2))
+               ((eq nx ?D) (setq out (concat out "[^0-9]"))        (cl-incf i 2))
+               ((eq nx ?w) (setq out (concat out "[A-Za-z0-9_]"))  (cl-incf i 2))
+               ((eq nx ?W) (setq out (concat out "[^A-Za-z0-9_]")) (cl-incf i 2))
+               ;; Passthrough: \b \n \t \\ \. \( \) \| etc.
+               ;; In particular \( / \) / \| stay as literal escapes.
+               (t (setq out (concat out (string c (or nx ?\\))))
+                  (cl-incf i (if nx 2 1))))))
+           ((eq c ?\[)
+            (setq out (concat out "["))
+            (setq in-class t)
+            (cl-incf i))
+           ;; Group open: detect (?: and (?P<name>
+           ((eq c ?\()
+            (cond
+             ;; (?:...
+             ((and (< (+ i 2) n)
+                   (eq (aref pattern (1+ i)) ?\?)
+                   (eq (aref pattern (+ i 2)) ?:))
+              (setq out (concat out "\\(?:"))
+              (cl-incf i 3))
+             ;; (?P<name>... → downgrade to (?: by skipping past ">"
+             ((and (< (+ i 3) n)
+                   (eq (aref pattern (1+ i)) ?\?)
+                   (eq (aref pattern (+ i 2)) ?P)
+                   (eq (aref pattern (+ i 3)) ?<))
+              (let ((close (cl-position ?> pattern :start (+ i 4))))
+                (setq out (concat out "\\(?:"))
+                (setq i (if close (1+ close) (+ i 4)))))
+             (t
+              (setq out (concat out "\\("))
+              (cl-incf i))))
+           ((eq c ?\))
+            (setq out (concat out "\\)"))
+            (cl-incf i))
+           ((eq c ?|)
+            (setq out (concat out "\\|"))
+            (cl-incf i))
+           (t
+            (setq out (concat out (string c)))
+            (cl-incf i)))))
+      out)))
+
+(defun anvil-shell-filter--xlat-cell-pattern (cell)
+  "Translate the car of CELL (a (PATTERN . X) cons) via the Rust→Elisp helper."
+  (cons (anvil-shell-filter--rust-regex-to-elisp (car cell)) (cdr cell)))
+
+(defconst anvil-shell-filter--ansi-csi-re
+  "\x1b\\[[0-9;?]*[a-zA-Z]"
+  "Regex matching ANSI CSI escape sequences (SGR + cursor moves).")
+
+(defun anvil-shell-filter--strip-ansi (raw)
+  "Strip ANSI CSI / SGR escape sequences from RAW string."
+  (replace-regexp-in-string anvil-shell-filter--ansi-csi-re "" raw))
+
+(defun anvil-shell-filter--apply-replace (raw replace-list)
+  "Apply REPLACE-LIST `((PATTERN . REPLACEMENT) ...)' to RAW in order."
+  (let ((out raw))
+    (dolist (cell replace-list out)
+      (setq out (replace-regexp-in-string (car cell) (cdr cell) out)))))
+
+(defun anvil-shell-filter--apply-strip-lines (raw regex-list)
+  "Drop every line of RAW matching ANY regex in REGEX-LIST.
+A nil REGEX-LIST returns RAW unchanged."
+  (if (null regex-list)
+      raw
+    (let* ((lines (split-string raw "\n"))
+           (kept  (cl-remove-if
+                   (lambda (line)
+                     (cl-some (lambda (re) (string-match-p re line))
+                              regex-list))
+                   lines)))
+      (string-join kept "\n"))))
+
+(defun anvil-shell-filter--apply-keep-lines (raw regex-list)
+  "Keep only lines of RAW matching at least one regex in REGEX-LIST.
+A nil REGEX-LIST returns RAW unchanged (= no filtering)."
+  (if (null regex-list)
+      raw
+    (let* ((lines (split-string raw "\n"))
+           (kept  (cl-remove-if-not
+                   (lambda (line)
+                     (cl-some (lambda (re) (string-match-p re line))
+                              regex-list))
+                   lines)))
+      (string-join kept "\n"))))
+
+(defun anvil-shell-filter--apply-truncate (raw n)
+  "Right-trim each line of RAW to N chars; lines longer get `...' appended.
+Nil or non-positive N returns RAW unchanged."
+  (if (or (not (numberp n)) (<= n 0))
+      raw
+    (string-join
+     (mapcar (lambda (line)
+               (if (> (length line) n)
+                   (concat (substring line 0 (max 0 (- n 3))) "...")
+                 line))
+             (split-string raw "\n"))
+     "\n")))
+
+(defun anvil-shell-filter--apply-tail-lines (raw n)
+  "Keep only the last N lines of RAW.  Nil / non-positive N returns RAW."
+  (if (or (not (numberp n)) (<= n 0))
+      raw
+    (let ((lines (split-string raw "\n")))
+      (string-join (last lines n) "\n"))))
+
+(defun anvil-shell-filter--apply-max-lines (raw n)
+  "Keep only the first N lines of RAW.  Nil / non-positive N returns RAW."
+  (if (or (not (numberp n)) (<= n 0))
+      raw
+    (let* ((lines (split-string raw "\n"))
+           (cut   (cl-subseq lines 0 (min n (length lines)))))
+      (string-join cut "\n"))))
+
+(defun anvil-shell-filter--match-output-short-circuit (raw match-list)
+  "Return MESSAGE for the first regex in MATCH-LIST that matches RAW, else nil.
+MATCH-LIST is `((PATTERN . MESSAGE) ...)'."
+  (cl-loop for (pat . msg) in match-list
+           when (string-match-p pat raw)
+           return msg))
+
+;;;###autoload
+(cl-defun anvil-shell-filter-register
+    (tag &key match-command strip-ansi filter-stderr replace match-output
+         strip-lines-matching keep-lines-matching truncate-lines-at
+         max-lines tail-lines on-empty description)
+  "Register a declarative filter under TAG (a symbol).
+
+The pipeline runs in this order on every call:
+
+  1. strip-ansi          (when non-nil — drops ANSI CSI / SGR escapes)
+  2. replace             ((PATTERN . REPLACEMENT) cells, in order)
+  3. match-output        ((PATTERN . MESSAGE) cells; first match short-circuits)
+  4. strip-lines-matching (drop any line matching ANY regex in the list)
+  5. keep-lines-matching  (keep only lines matching ANY regex; nil = no-op)
+  6. truncate-lines-at   (right-trim each line to N chars; appends `...')
+  7. tail-lines          (keep only last N lines)
+  8. max-lines           (keep only first N lines AFTER tail)
+  9. on-empty fallback   (return :on-empty verbatim when result trims empty)
+
+Existing entries with the same TAG are replaced; the previous match-command
+entry (if any) is removed from `anvil-shell-filter--match-command-table'
+before the new one is pushed, so re-registering never leaves orphans.
+
+DESCRIPTION and FILTER-STDERR are accepted for spec parity with the rtk
+TOML schema but are currently advisory only — stderr is already merged
+into stdout by `anvil-shell-filter-run'.
+
+Returns TAG.
+
+Every regex in PROPS (`:match-command' / `:strip-lines-matching' /
+`:keep-lines-matching' / patterns in `:replace' and `:match-output')
+is run through `anvil-shell-filter--rust-regex-to-elisp' before
+storage so vendored rtk TOMLs (Rust regex dialect) work as-is."
+  (ignore filter-stderr description)
+  (let* ((match-command (anvil-shell-filter--rust-regex-to-elisp match-command))
+         (replace (mapcar #'anvil-shell-filter--xlat-cell-pattern replace))
+         (match-output (mapcar #'anvil-shell-filter--xlat-cell-pattern match-output))
+         (strip-lines-matching
+          (mapcar #'anvil-shell-filter--rust-regex-to-elisp strip-lines-matching))
+         (keep-lines-matching
+          (mapcar #'anvil-shell-filter--rust-regex-to-elisp keep-lines-matching))
+         (closure
+         (lambda (raw)
+           (let* ((s (if strip-ansi
+                         (anvil-shell-filter--strip-ansi raw)
+                       raw))
+                  (s (anvil-shell-filter--apply-replace s replace))
+                  (mo (and match-output
+                           (anvil-shell-filter--match-output-short-circuit
+                            s match-output))))
+             (if mo
+                 mo
+               (let* ((s (anvil-shell-filter--apply-strip-lines
+                          s strip-lines-matching))
+                      (s (anvil-shell-filter--apply-keep-lines
+                          s keep-lines-matching))
+                      (s (anvil-shell-filter--apply-truncate
+                          s truncate-lines-at))
+                      (s (anvil-shell-filter--apply-tail-lines
+                          s tail-lines))
+                      (s (anvil-shell-filter--apply-max-lines
+                          s max-lines)))
+                 (if (and on-empty (string-empty-p (string-trim s)))
+                     on-empty
+                   s)))))))
+    (setf (alist-get tag anvil-shell-filter-handlers) closure)
+    (when match-command
+      (setq anvil-shell-filter--match-command-table
+            (cl-remove-if (lambda (cell) (eq (cdr cell) tag))
+                          anvil-shell-filter--match-command-table))
+      (push (cons match-command tag)
+            anvil-shell-filter--match-command-table))
+    tag))
+
+;;;###autoload
+(defun anvil-shell-filter-register-from-spec (spec)
+  "Register a filter from SPEC, a plist with :tag plus the same keys
+accepted by `anvil-shell-filter-register'.
+
+Used by the auto-generated `anvil-shell-filter-builtin.el' bridge so
+each rtk-derived call site stays one line.  SPEC must contain :tag;
+all other keywords are forwarded verbatim."
+  (let ((tag (plist-get spec :tag))
+        (kw  (cl-loop for (k v) on spec by #'cddr
+                      unless (eq k :tag)
+                      append (list k v))))
+    (unless tag
+      (error "anvil-shell-filter-register-from-spec: SPEC missing :tag — %S" spec))
+    (apply #'anvil-shell-filter-register tag kw)))
+
+
 ;;;; --- tee + gain statistics ----------------------------------------------
 
 (defun anvil-shell-filter--new-id ()
@@ -590,10 +1046,41 @@ returns a tag that hasn't been implemented yet."
           (truncate (float-time))
           (random #x1000000)))
 
+(defun anvil-shell-filter--trace-new-id ()
+  "Generate a short trace-id (`tr-<epoch>-<rand>')."
+  (format "tr-%x-%x"
+          (truncate (float-time))
+          (random #x1000000)))
+
+(defun anvil-shell-filter--trace (id phase start-time)
+  "Record a phase trace row for PHASE under trace ID.
+START-TIME is the timestamp captured when the run began; the
+record carries the elapsed milliseconds between START-TIME and
+now.  No-op when `anvil-shell-filter-trace-events' is nil."
+  (when anvil-shell-filter-trace-events
+    (ignore-errors
+      (anvil-state-set
+       (format "%s-%s" id phase)
+       (list :phase phase
+             :at (truncate (float-time))
+             :elapsed-ms (truncate (* 1000 (float-time
+                                            (time-since start-time)))))
+       :ns anvil-shell-filter--trace-ns
+       :ttl anvil-shell-trace-ttl-sec))))
+
 (defun anvil-shell-filter--tee-put (raw)
-  "Store RAW under a fresh tee-id, return the id string."
-  (let ((id (anvil-shell-filter--new-id)))
-    (anvil-state-set id raw
+  "Store RAW under a fresh tee-id, return the id string.
+When `anvil-shell-tee-max-bytes' is non-nil and RAW exceeds it,
+the stored value is truncated with a sentinel so `anvil-state.db'
+cannot grow unboundedly per invocation."
+  (let* ((id (anvil-shell-filter--new-id))
+         (cap anvil-shell-tee-max-bytes)
+         (capped (if (and (integerp cap) (> (length raw) cap))
+                     (concat (substring raw 0 cap)
+                             (format "\n…[anvil-shell-tee: truncated %d bytes]"
+                                     (- (length raw) cap)))
+                   raw)))
+    (anvil-state-set id capped
                      :ns anvil-shell-filter--tee-ns
                      :ttl anvil-shell-tee-ttl-sec)
     id))
@@ -680,34 +1167,53 @@ Returns a plist:
 Raw stdout is always tee'd so callers can fetch the full output
 via `anvil-shell-filter-tee-get' when compression hid material
 detail."
-  (let* ((filter-opt (or (plist-get opts :filter) 'auto))
+  (let* ((trace-id (and anvil-shell-filter-trace-events
+                        (anvil-shell-filter--trace-new-id)))
+         (trace-start (and trace-id (current-time)))
+         (filter-opt (or (plist-get opts :filter) 'auto))
          (timeout (or (plist-get opts :timeout)
                       anvil-shell-filter-default-timeout))
          (cwd (plist-get opts :cwd))
-         (resolved (cond
-                    ((eq filter-opt 'auto) (anvil-shell-filter-lookup cmd))
-                    ((null filter-opt) nil)
-                    (t filter-opt)))
-         (result (anvil-shell cmd (list :timeout timeout :cwd cwd
-                                        :max-output nil)))
-         (exit (plist-get result :exit))
-         (raw (or (plist-get result :stdout) ""))
-         (stderr (or (plist-get result :stderr) ""))
-         (truncated (plist-get result :truncated))
-         (compressed (anvil-shell-filter-apply resolved raw))
-         (raw-size (length raw))
-         (compressed-size (length compressed))
-         (tee-id (anvil-shell-filter--tee-put raw)))
-    (when resolved
-      (anvil-shell-filter--gain-record resolved raw-size compressed-size))
-    (list :exit exit
-          :filter resolved
-          :compressed compressed
-          :raw-size raw-size
-          :compressed-size compressed-size
-          :tee-id tee-id
-          :stderr stderr
-          :truncated truncated)))
+         (resolved0 (cond
+                     ((eq filter-opt 'auto) (anvil-shell-filter-lookup cmd))
+                     ((null filter-opt) nil)
+                     (t filter-opt))))
+    (when trace-id
+      (anvil-shell-filter--trace trace-id "start" trace-start))
+    (let* ((result (anvil-shell cmd (list :timeout timeout :cwd cwd
+                                          :max-output nil)))
+           (_ (when trace-id
+                (anvil-shell-filter--trace trace-id "exec-done" trace-start)))
+           (exit (plist-get result :exit))
+           (raw (or (plist-get result :stdout) ""))
+           (stderr (or (plist-get result :stderr) ""))
+           (truncated (plist-get result :truncated))
+           (taco-compressed
+            (and (eq filter-opt 'auto)
+                 (null resolved0)
+                 (anvil-shell-filter--taco-critical-maybe raw stderr exit)))
+           (resolved (if taco-compressed 'taco-critical resolved0))
+           (compressed (or taco-compressed
+                           (anvil-shell-filter-apply resolved raw)))
+           (_ (when trace-id
+                (anvil-shell-filter--trace trace-id "filter-done" trace-start)))
+           (raw-size (length raw))
+           (compressed-size (length compressed))
+           (tee-id (anvil-shell-filter--tee-put raw))
+           (_ (when trace-id
+                (anvil-shell-filter--trace trace-id "tee-done" trace-start))))
+      (when resolved
+        (anvil-shell-filter--gain-record resolved raw-size compressed-size))
+      (when trace-id
+        (anvil-shell-filter--trace trace-id "return" trace-start))
+      (list :exit exit
+            :filter resolved
+            :compressed compressed
+            :raw-size raw-size
+            :compressed-size compressed-size
+            :tee-id tee-id
+            :stderr stderr
+            :truncated truncated))))
 
 
 ;;;; --- tee-grep: regex line filter + per-line truncate -------------------

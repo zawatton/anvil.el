@@ -1,7 +1,7 @@
 #+title: anvil-pty-broker Phase 2 — Interactive TUI over the Broker
 #+date: 2026-04-19
 #+author: zawatton
-#+property: status DRAFT
+#+property: status DEFERRED
 #+property: scope WINDOWS-ONLY
 
 * STATUS

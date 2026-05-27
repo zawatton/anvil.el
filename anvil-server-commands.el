@@ -83,6 +83,14 @@ snippet), use `anvil-server-describe-setup'."
   (interactive)
   (message "MCP server: %s" (if anvil-server--running "Running" "Stopped")))
 
+(defun anvil-server--batch-write-stdout (s)
+  "Write S to stdout, flushing when the standalone primitive is present."
+  (cond
+   ((and (fboundp 'nelisp--write-stdout-bytes) (stringp s))
+    (nelisp--write-stdout-bytes s))
+   (t
+    (princ s))))
+
 (defun anvil-server--batch-emit-response (resp framing-p)
   "Emit RESP to stdout, framed if FRAMING-P is non-nil.
 
@@ -97,13 +105,12 @@ Legacy responses are emitted as a single line terminated by `terpri'."
       ;; Encode via the canonical framing helper so byte length matches
       ;; the UTF-8 wire representation.
       (let ((frame (anvil-server-mcp-frame-encode resp)))
-        ;; `princ' on a unibyte string writes the bytes verbatim in
-        ;; --batch mode.  Avoid any decoding round-trips.
+        ;; Standalone NeLisp's direct byte writer flushes per call.  Host
+        ;; Emacs falls back to `princ' for ordinary --batch tests.
         (let ((coding-system-for-write 'utf-8))
-          (princ frame))))
+          (anvil-server--batch-write-stdout frame))))
      (t
-      (princ resp)
-      (terpri)))))
+      (anvil-server--batch-write-stdout (concat resp "\n"))))))
 
 (defun anvil-server--batch-skip-blank-lines ()
   "Drain consecutive blank lines from STDIN and return next non-blank.
@@ -163,40 +170,68 @@ Example:
         (sniffed-line nil)
         (first-iter t))
     (anvil-server-start)
+    (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+      (nelisp--write-stderr-line
+       (format "[STDIO] start loop t=%.3f" (float-time))))
     (while anvil-server--running
       (let* ((req
               (cond
                ;; First iteration: sniff one line to decide framing.
                (first-iter
                 (setq first-iter nil)
-                (let ((peek (ignore-errors
-                              (read-from-minibuffer ""))))
+                (let* ((t0 (float-time))
+                       (peek (ignore-errors
+                               (read-from-minibuffer "")))
+                       (t1 (float-time)))
+                  (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+                    (nelisp--write-stderr-line
+                     (format "[STDIO] peek %.3fs len=%d" (- t1 t0)
+                             (if peek (length peek) -1))))
                   (cond
                    ((null peek) nil) ; EOF before any input
                    ((anvil-server-mcp-detect-framing-p peek)
                     (setq framing-p t)
-                    ;; The peek line is the first header — read remaining
-                    ;; headers + body using the framed path, prepending
-                    ;; the already-consumed header line.
-                    (anvil-server--batch-read-framed-with-prefix peek))
-                   (t
-                    ;; Legacy mode: peek line is the JSON body itself.
-                    peek))))
-               ;; Subsequent iterations: dispatch by mode.
+                    (let* ((tA (float-time))
+                           (body (anvil-server--batch-read-framed-with-prefix peek))
+                           (tB (float-time)))
+                      (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+                        (nelisp--write-stderr-line
+                         (format "[STDIO] framed-read-with-prefix %.3fs len=%d"
+                                 (- tB tA)
+                                 (if body (length body) -1))))
+                      body))
+                   (t peek))))
                (framing-p
-                (anvil-server--batch-read-framed-message))
+                (let* ((tA (float-time))
+                       (body (anvil-server--batch-read-framed-message))
+                       (tB (float-time)))
+                  (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+                    (nelisp--write-stderr-line
+                     (format "[STDIO] framed-read %.3fs len=%d"
+                             (- tB tA)
+                             (if body (length body) -1))))
+                  body))
                (t
                 (ignore-errors (read-from-minibuffer ""))))))
         (cond
          ((null req)
-          ;; EOF — exit loop.
           (setq anvil-server--running nil))
          ((and (stringp req) (not (string-empty-p req)))
-          (let ((resp (anvil-server-process-jsonrpc req server-id)))
-            (anvil-server--batch-emit-response resp framing-p)))
-         (t
-          ;; Empty request: silently ignore (legacy line mode).
-          nil))))
+          (let* ((tC (float-time))
+                 (resp (anvil-server-process-jsonrpc req server-id))
+                 (tD (float-time)))
+            (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+              (nelisp--write-stderr-line
+               (format "[STDIO] process-jsonrpc %.3fs resp-len=%d"
+                       (- tD tC)
+                       (if resp (length resp) -1))))
+            (let ((tE (float-time)))
+              (anvil-server--batch-emit-response resp framing-p)
+              (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+                (nelisp--write-stderr-line
+                 (format "[STDIO] emit-response %.3fs"
+                         (- (float-time) tE)))))))
+         (t nil))))
     (when anvil-server--running
       (anvil-server-stop))
     (ignore sniffed-line)))

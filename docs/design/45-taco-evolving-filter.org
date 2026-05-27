@@ -1,0 +1,280 @@
+#+title: anvil-taco — self-evolving terminal output compression (TACO Layer 1)
+#+date: 2026-05-24
+#+author: zawatton
+#+property: status PHASE-1-SHIPPED
+#+property: scope GENERIC
+
+* STATUS
+  :PROPERTIES:
+  :ID:       d1c4e0f2-8f44-4f7c-bc1a-taco-45
+  :END:
+~PHASE-1-SHIPPED~ (2026-05-25) — 論文「TACO: Terminal Agent COmpression」(2026-04
+arxiv、動画 yt_20260524_taco_terminal_agent_compression) の Layer 1
+(出力圧縮) を anvil-shell-filter (Doc 27) の進化型として取り込む設計案。
+Layer 2/3 (進化・グローバルプール) は別 Phase。
+
+実装状況 (2026-05-25):
+
+- *SHIPPED* — Phase 1 critical-keeper fallback。既知コマンドは従来の
+  =anvil-shell-filter= static dispatcher を優先し、未知コマンドの verbose
+  stdout だけを対象に、error / Traceback / FAILED / fatal / panic 等の
+  critical 行 + 前後 context + non-zero exit の末尾を保持する。
+  =shell-run= の =:filter auto= 内部でのみ発火し、短い clean 出力や
+  critical signal の無い出力は raw passthrough。raw stdout は従来通り
+  tee に保存され、必要なら =shell-tee-get= で完全復元できる。
+  defcustom: =anvil-shell-filter-taco-critical-fallback= /
+  =-min-lines= / =-context-lines= / =-tail-lines= / =-patterns=。
+  ERT: =anvil-shell-filter-test= 57/57 green、byte-compile 0 warning。
+
+論文の核心:
+
+- ターミナルエージェント出力履歴は O(n²) で膨張、後半 1 ステップで数十万
+  トークン消費
+- Lost-in-the-Middle で中盤エラーログを見落とす
+- 既存の static filter (正規表現/手書きルール/学習型) は固定圧縮器で、
+  新ツール追加に追随できず破綻
+- TACO は **進化する圧縮機**: タスク実行中に観測分布へ動的適応
+- アブレーション: 進化を除去すると -1.7pp、グローバルプール除去は -0.2pp
+  → 「事前蓄積より動的進化が支配的」
+
+* Motivation
+
+Doc 27 (anvil-shell-filter) は静的 filter table (60 件) で実装済:
+
+- =git status= / =rg= / =pytest= 等は強力に効く (rtk 由来で実証)
+- *未知コマンド* (例: 新しい CLI、業務固有 script) は素通し
+- 新コマンド追加には手で filter を書く必要あり (Phase 4 業務固有 filter)
+
+TACO のアプローチを取り込めば:
+
+1. 未知コマンドの出力を **その場でルール生成** して圧縮
+2. 過剰圧縮 (エージェントが「フルアウトプット見せて」と要求 / 同コマンド
+   再実行) を検知して自動緩和
+3. Critical 行 (error / stack trace) は絶対保持
+4. Tool Attention (Doc 44) が context 入口の選別、TACO は出口の圧縮、
+   組み合わせで累乗効果
+
+論文実証データ:
+
+- 7-Zip 展開ルール自動発見: 保持は error 行 + "Everything is OK" のみ、
+  124 回適用で苦情 0・信頼度 1.0
+- objdump 逆アセンブル: 圧縮率 0.146 (元の 15%)、苦情なし
+- ターミナル外 (SWE-bench Lite +0.82pp / Devin-Eval +1.64pp / Rust-bench
+  +1.05pp) でも効果
+
+* Existing anvil との接続マップ
+
+| anvil module           | TACO Layer 1 での役割                          |
+|------------------------+-----------------------------------------------|
+| anvil-shell-filter (27)| static filter table (60件)、絶対保持の基盤    |
+| anvil-state            | tee の延長で per-command 観測履歴 (TTL付き)   |
+| anvil-orchestrator     | 「ルール生成」LLM 呼出し (codex経由)          |
+| anvil-worklog          | 過剰圧縮 / 苦情シグナルの長期保存             |
+| anvil-session-events   | エージェントの「再実行」シグナル検出元        |
+
+→ 新規 module = =anvil-taco.el= 1 個。Doc 27 を inner として呼ぶ。
+
+* Open Questions (要議論)
+
+** Q1. Layer 1 だけ取るか、Layer 2/3 まで取るか
+
+論文の 3 層構成:
+
+- *Layer 1* — 出力圧縮 (Critical 保持 + ノイズ削除)
+- *Layer 2* — タスク内ルール進化 (未知出力 → LLM ルール生成、過剰圧縮
+  検知で保守的修正)
+- *Layer 3* — グローバルプール (タスク横断、信頼度閾値で昇格、RDNTK 収束
+  判定)
+
+アブレーション結果: Layer 3 除去 -0.2pp (ほぼ無影響)、Layer 2 除去 -1.7pp。
+
+→ Layer 1 + 2 が essential、Layer 3 は marginal。
+
+選択肢:
+
+- (a) Layer 1 のみ取り込み (静的圧縮を anvil-shell-filter で既に持つので
+      ROI 低い)
+- (b) Layer 1 + 2 取り込み (動的進化が本体、~3-5日 → ~1-2週に拡大)
+- (c) 全 3 層
+
+→ **推奨**: (b) Layer 1+2。Layer 1 単独だと既存 anvil-shell-filter と
+   差別化が薄い。Layer 2 (進化) が論文の core value。
+
+(変更: 元マトリクス「Layer 1 のみ ~3-5日」前提を Layer 1+2 ~1-2週に
+revise。)
+
+** Q2. ルール生成 LLM をどこに置くか
+
+論文ではタスク内 LLM がルール生成。anvil 文脈:
+
+- (a) anvil-orchestrator codex 経路 (Pro plan 既存、規約 OK)
+- (b) tiny local model (HF transformers 等)
+- (c) main Claude session 自身に「このコマンド出力のルールを書け」
+
+→ **推奨**: (a) codex。orchestrator で既に subprocess 経路ある。
+   レイテンシ (10-30s) は許容範囲 (1 コマンドの初回のみ)。
+
+** Q3. 過剰圧縮検知 (= 苦情シグナル)
+
+論文の苦情検知パターン:
+
+1. エージェントが "show me the full output" を要求
+2. 同じコマンドを引数同じで再実行する
+3. session-events に "review tool call" が連続出現
+
+→ anvil 文脈:
+
+- (1) → Claude transcript の正規表現 detector
+- (2) → anvil-shell-tee の hit 履歴で重複検出
+- (3) → anvil-session-events で連続パターン検出
+
+3 シグナルすべて anvil 既存 primitive で取れる。
+
+** Q4. ルール保持期間 (TTL)
+
+論文: グローバルプールは信頼度 + 使用実績で promote/demote。
+
+anvil 文脈での TTL 案:
+
+- session-local rule: session 終了で破棄 (= Layer 2 のみ)
+- worktree-local rule: worktree 削除で破棄
+- global rule: anvil-state 永続化、信頼度 < 0.5 で 30日後 GC
+
+→ 初手は session-local + worktree-local のみ。global は Phase 3 (= TACO
+   Layer 3) で。
+
+** Q5. 既存 anvil-shell-filter との競合解決
+
+同じコマンド (例: =git status=) に対して:
+
+- anvil-shell-filter (Doc 27) は static rule で 600 トークンに圧縮
+- anvil-taco は session-local rule を生成しようとする
+
+どちらが勝つか?
+
+→ **推奨**: anvil-shell-filter (static) が優先、anvil-taco は未対応
+   コマンドで fallback。Doc 27 の dispatcher が "no filter" を返した
+   時のみ TACO 経路に入る設計。
+
+** Q6. Critical 行の判定基準
+
+論文では "error" / "stack trace" を絶対保持。
+
+anvil 文脈での Critical 判定:
+
+- 標準 stderr 出力すべて
+- =Error:= / =Traceback= / =FAILED= / =fatal:= で始まる行
+- exit code が non-zero 時の最終 20 行
+- ユーザー定義 regex (defcustom =anvil-shell-filter-taco-critical-patterns=)
+
+* Architecture (案)
+
+** 主要 component
+
+#+begin_example
+[anvil-taco]
+   ├─ classifier
+   │    ├─ known-command? → Doc 27 dispatcher へ
+   │    └─ unknown        → Layer 2 進化経路へ
+   ├─ critical-keeper
+   │    └─ regex + exit-code + stderr で絶対保持行を確保
+   ├─ rule-evolver (Layer 2)
+   │    ├─ first-encounter → orchestrator-submit (codex)
+   │    │    "このコマンド出力の圧縮ルールを書け" prompt
+   │    ├─ apply
+   │    └─ store as session-local rule
+   ├─ complaint-detector
+   │    ├─ transcript regex "show full" 検出
+   │    ├─ tee 重複再実行検出
+   │    └─ session-events 連続 review 検出
+   ├─ rule-relaxer
+   │    └─ complaint detect → 削除範囲を狭める修正
+   ├─ rule-store
+   │    ├─ session-local (memory)
+   │    ├─ worktree-local (anvil-state)
+   │    └─ global (anvil-state, Phase 3)
+   └─ MCP surface
+        ├─ taco-run / taco-rules-list / taco-rule-show
+        └─ taco-stats (圧縮率、苦情率、ルール数)
+#+end_example
+
+** ループ
+
+#+begin_example
+[command 実行要求]
+   ↓
+[classifier]    known? → Doc 27 へ委譲、終了
+   ↓ unknown
+[critical-keeper] 絶対保持行を確保
+   ↓
+[rule-evolver]  既存 rule あれば apply
+   │            なければ LLM 呼出しで新規生成
+   ↓
+[apply rule]    圧縮結果を返す
+   ↓
+[complaint-detector] (次ターン以降) 苦情検出?
+   ↓ yes
+[rule-relaxer]  削除範囲を狭めて update
+#+end_example
+
+* Phase 分割案
+
+| Phase | scope                                                     | 工数 |
+|-------+-----------------------------------------------------------+------|
+| 1     | Layer 1 のみ (critical-keeper + fallback すべき素通し)    | 小   |
+|       | Doc 27 dispatcher 未対応コマンドで critical-keeper だけ   |      |
+|       | 動かす。圧縮は弱いが安全。                                |      |
+| 2     | Layer 2 rule-evolver (LLM 呼出し + session-local store)   | 中   |
+| 3     | complaint-detector + rule-relaxer (進化の本体)            | 小   |
+| 4     | worktree-local rule の永続化                              | 小   |
+| 5     | Layer 3 global rule + RDNTK 収束判定 (Phase 2 後 marginal | 中   |
+|       | gain 確認してから着手)                                    |      |
+
+* 評価メトリクス
+
+- 圧縮率 = compressed_tokens / raw_tokens (target ≤ 0.3)
+- 苦情率 = complaints / total_compressions (target < 5%)
+- per-session 累積トークン (anvil-state-tracked)
+- ルール生成コスト (codex API tokens / rule)
+
+* 安全策
+
+- Critical 保持は **rule-evolver より優先**。LLM が "remove error line"
+  と言っても無視。
+- 1 コマンド初回は LLM 呼出し overhead あり (10-30s)、cache miss 警告を
+  emit。
+- ルール暴走防止: 同一コマンドで 3 回連続「苦情→緩和」が起きたら static
+  fallback (= 素通し) に切替。
+- LLM 生成ルールは sandbox eval (eval されない、正規表現 / 行範囲指定の
+  declarative DSL のみ)。
+
+* 取り込み見送り判断材料
+
+- Phase 1 で critical-keeper の絶対保持が機能する (false negative=0)
+- Phase 2 で初回コスト ≤ 30s、再利用率 ≥ 70%
+- Phase 3 で苦情率 ≤ 5% に収束
+
+* 既存 doc との関係
+
+- Doc 27 (shell-filter) — known-command の static dispatcher、TACO は
+  unknown-command を担当
+- Doc 10 (orchestrator) — ルール生成 LLM 呼出し
+- Doc 08 (state) — rule store
+- Doc 17 (session) — session-events で苦情検出
+- Doc 42 (worklog-index) — 苦情 / 圧縮率の長期統計
+- Doc 44 (tool-attention) — 入口の選別と組み合わせて累乗効果
+- Doc 46 (runtime-harness-telemetry) — TACO の苦情は「反復停滞」分類で
+  記録
+
+* References
+
+- 元動画: [[file:~/Cowork/Notes/capture/yt/yt_20260524_taco_terminal_agent_compression.org][yt_20260524_taco_terminal_agent_compression.org]]
+  (さとるチャンネル、約 24 分)
+- 論文 "TACO: Terminal Agent COmpression" (2026-04 arxiv、原典要確認)
+
+* Decision Log
+
+- 2026-05-24 — DRAFT 起票。Q1 (Layer 1 vs Layer 1+2) と Q5 (Doc 27
+  との競合解決) が議論の中心。Layer 1 単独だと既存 anvil-shell-filter
+  との差別化薄、Layer 2 まで含めて初めて論文の core value が得られる
+  ことを明示。

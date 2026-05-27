@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Anvil Mobile Memory</title>
+    <link rel="manifest" href="app.webmanifest">
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f7f7f4;
+        --ink: #1f2430;
+        --muted: #646b78;
+        --line: #d7d9dc;
+        --accent: #233348;
+        --panel: #ffffff;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        background: var(--bg);
+        color: var(--ink);
+        font: 15px system-ui, sans-serif;
+        margin: 0;
+      }
+      main {
+        margin: 0 auto;
+        max-width: 720px;
+        padding: 16px;
+      }
+      header {
+        align-items: baseline;
+        border-bottom: 1px solid var(--line);
+        display: flex;
+        justify-content: space-between;
+        margin-bottom: 16px;
+        padding-bottom: 12px;
+      }
+      h1 {
+        font-size: 20px;
+        margin: 0;
+      }
+      section {
+        margin: 18px 0;
+      }
+      label {
+        display: block;
+        font-weight: 600;
+        margin: 10px 0;
+      }
+      input,
+      select,
+      textarea {
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        display: block;
+        font: inherit;
+        margin-top: 5px;
+        padding: 10px;
+        width: 100%;
+      }
+      textarea {
+        min-height: 118px;
+        resize: vertical;
+      }
+      button {
+        background: var(--accent);
+        border: 0;
+        border-radius: 6px;
+        color: white;
+        font: inherit;
+        margin: 6px 6px 6px 0;
+        padding: 10px 12px;
+      }
+      .secondary {
+        background: #596575;
+      }
+      .row {
+        display: grid;
+        gap: 10px;
+        grid-template-columns: 1fr 1fr;
+      }
+      .result {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        margin: 8px 0;
+        padding: 10px;
+      }
+      .muted {
+        color: var(--muted);
+      }
+      @media (max-width: 560px) {
+        .row {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Anvil Memory</h1>
+        <span id="status" class="muted">offline queue: 0</span>
+      </header>
+
+      <section>
+        <label>
+          Bridge URL
+          <input id="bridgeUrl" autocomplete="url" placeholder="http://100.x.y.z:8730">
+        </label>
+        <label>
+          Bearer token
+          <input id="token" autocomplete="off" type="password">
+        </label>
+        <button id="saveSettings" type="button">Save Settings</button>
+        <button id="health" class="secondary" type="button">Check Bridge</button>
+      </section>
+
+      <section>
+        <label>
+          Search
+          <input id="query" placeholder="Search memory">
+        </label>
+        <button id="search" type="button">Search</button>
+        <div id="results"></div>
+      </section>
+
+      <section>
+        <div class="row">
+          <label>
+            Name
+            <input id="name" placeholder="mobile_note_...">
+          </label>
+          <label>
+            Type
+            <select id="type">
+              <option value="memo">memo</option>
+              <option value="feedback">feedback</option>
+              <option value="project">project</option>
+              <option value="reference">reference</option>
+              <option value="user">user</option>
+            </select>
+          </label>
+        </div>
+        <label>
+          Body
+          <textarea id="body" placeholder="Write a memory entry"></textarea>
+        </label>
+        <button id="saveMemory" type="button">Save Memory</button>
+        <button id="flush" class="secondary" type="button">Replay Queue</button>
+      </section>
+    </main>
+    <script src="app.js"></script>
+  </body>
+</html>

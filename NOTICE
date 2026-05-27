@@ -1,0 +1,13 @@
+anvil.el — NOTICE
+==================
+
+This product includes filter definitions copied verbatim from rtk-ai/rtk
+(https://github.com/rtk-ai/rtk), licensed under the Apache License 2.0.
+The vendored files live under `vendor/rtk-filters/`. See
+`vendor/rtk-filters/SOURCE` for the exact upstream commit.
+
+Attribution required by Apache-2.0 §4 is satisfied by:
+  * preserving the upstream license terms (full LICENSE text mirrored at
+    vendor/rtk-filters/LICENSE),
+  * crediting the source as above,
+  * documenting modifications: NONE — files are byte-identical to upstream.

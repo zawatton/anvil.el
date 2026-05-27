@@ -17,14 +17,17 @@ with that in mind.
 * TL;DR
 
 anvil.el is a workbench for AI agents.  Optional modules (memory / orchestrator / session / http / …) each add their own tools when you enable them.
-Claude Code, Claude Desktop, GPT, local LLMs via Ollama — anything
+Claude Code, Codex CLI, Claude Desktop, GPT, local LLMs via Ollama — anything
 that speaks [[https://modelcontextprotocol.io/][Model Context Protocol]] can edit files, navigate org-mode,
 run elisp, query SQLite, and more *through Emacs primitives* instead
 of generic =sed= / =grep= / =read-whole-file= round-trips.  That
 swap is where the token savings come from.
 
-v1.0 (2026-04) ships the first stable release, plus a Rust runtime
-that lets you run anvil *without an Emacs install at all*.
+v1.0 (2026-04) shipped the first stable release, plus a Rust runtime
+that lets you run anvil *without an Emacs install at all*.  The
+2026-05 update adds the AI-enhancement layer:
+Tool Attention for shrinking tool manifests, cross-AI memory/worklog
+bridges, a safe autoresearch loop, and a Claude Code watchdog.
 
 [[file:STORY.org][STORY.org]] ([[file:STORY.ja.org][日本語]]) tells the longer "why this exists" story.
 
@@ -50,7 +53,7 @@ A typical refactoring session saves *15,000-25,000 tokens*.
 
 #+begin_example
        ┌──────────────────────────┐
-       │  Claude Code  /  Cursor  │
+       │ Claude Code / Codex CLI  │
        │  (any MCP-speaking AI)   │
        └────────────┬─────────────┘
                     │ MCP / stdio JSON-RPC
@@ -93,7 +96,7 @@ Pick a path based on what you want.
 
 For users who want the MCP tool surface without an Emacs daemon —
 CI runners, ephemeral containers, or "I don't use Emacs but want to
-cut Claude Code token use."
+cut Claude Code / Codex CLI token use."
 
 #+begin_src bash
 # 1. Clone NeLisp + build the Rust runtime
@@ -116,7 +119,7 @@ not invoked.  Surface today via this path: =file-*= / =shell-*= /
 
 ** Path B — Emacs integrated (recommended for Emacs users)
 
-For day-to-day Emacs users.  Pin to v1.1.1 via your favourite
+For day-to-day Emacs users.  Pin to v1.2.0 via your favourite
 package manager.
 
 *** Quick install (one command)
@@ -142,17 +145,17 @@ installed.
 #+begin_src emacs-lisp
 ;; async-installer
 (async-installer-git-add "https://github.com/zawatton/anvil.el.git"
-                         :tag "v1.1.1"
+                         :tag "v1.2.0"
                          :main "anvil.el")
 
 ;; or straight.el
 (straight-use-package
  '(anvil :type git :host github :repo "zawatton/anvil.el"
-         :branch "v1.1.1"))
+         :branch "v1.2.0"))
 
 ;; or elpaca
 (elpaca (anvil :host github :repo "zawatton/anvil.el"
-               :ref "v1.1.1"))
+               :ref "v1.2.0"))
 #+end_src
 
 After installing:
@@ -224,13 +227,13 @@ Full walkthrough including Claude Code / Claude Desktop config:
 * For non-Emacs users — what setup costs you
 
 Anvil runs in the background as an MCP server.  Your day-to-day
-editor (VSCode / Cursor / Neovim / Claude Code itself) does not
+editor (VSCode / Cursor / Neovim / Claude Code / Codex CLI itself) does not
 change.
 
 #+begin_example
   AI client ──MCP──▶ Anvil (Emacs daemon, headless) ──▶ file ops
   (VSCode / Cursor /                                    (only diffs cross)
-   Claude Code, …)
+   Claude Code / Codex CLI, …)
 #+end_example
 
 You don't have to open an Emacs window or write =init.el=.
@@ -261,8 +264,12 @@ sister package).  Highlights:
 | =anvil-ide.el= split (v1.0) | Emacs-only IDE layer (treesit nav, =worker-ui= dashboard, =info-lookup-symbol=) moved out to [[https://github.com/zawatton/anvil-ide.el][zawatton/anvil-ide.el]].  Install both for the original feature set; install only =anvil.el= if you want the AI-side workbench without the human IDE surface |
 | Treesit subprocess fallback (v1.0) | Doc 38 Phase F + G — =anvil-ts= / =-js= / =-py= structural ops keep working on hosts without an Emacs tree-sitter (e.g. NeLisp standalone) via Python =ast= / acorn subprocess fallback.  Token-efficient AST queries preserved on the Rust substrate |
 | =anvil-orchestrator= | Fan out one prompt to up to five AI CLIs (=claude= / =aider= / =gemini= / =ollama= / =codex=) in parallel. Jaccard consensus + meta-LLM judge + DAG dependencies + =anvil-cron= integration for nightly PDCA loops |
-| =anvil-memory= (v0.4.0) | Auto-memory engine with Bayesian TTL + FTS5 full-text search.  16 MCP tools: memory-scan / -audit / -search / -duplicates / -promote, etc.  Surfaces stale rows, detects contradictions, tracks URL liveness.  Multi-provider: auto-detects =~/.claude/projects/*/memory/=, =~/.codex/memories/=, =~/.gemini/memories/=, Continue / Aider / Cline / Cursor — one SQLite DB shared across every AI CLI the user has installed |
-| =anvil-tools-by-intent= + =anvil-manifest= (v0.4.0) | Intent-based tool discovery plus =ANVIL_PROFILE= filter.  Tools tagged with =:intent / :layer / :stability= are discoverable via runtime query; =agent= / =edit= / =ultra= profiles shrink =tools/list= ~3-7× for orchestrator child sessions (full ~20k → ultra ~2.7k tokens of manifest) |
+| =anvil-memory= (v0.4.0 + 2026-05) | Auto-memory engine with Bayesian TTL + FTS5 full-text search.  Scans multi-provider =.md= memories, supports DB-primary =memory-add= / =memory-get= / =memory-export-md=, WHISPER session deltas, contradiction scans, static HTML export, and review-only memory harvesting.  Designed for one per-machine SQLite DB plus text export, not binary DB merges |
+| =anvil-memory-bridge= (2026-05) | Local JSON bridge in front of =anvil-memory= and =anvil-worklog=.  Adds read/write memory endpoints, event stream, read-replica pull, worklog search/list/get endpoints, configured-origin CORS, a side-load browser extension for Claude.ai / ChatGPT / Gemini, and a static mobile thin client with offline save queue |
+| =anvil-autoresearch= (2026-05) | Safe self-improvement primitives: scan local Web/X/YouTube/design notes for implementation candidates, rank weak MCP docstrings, propose / harvest / apply descriptions behind eval+holdout gates, route provider-mapping experiments through the orchestrator, scaffold NeLisp Phase 47 codegen tasks, and watch progress in a tabulated-list dashboard |
+| =anvil-tools-by-intent= + =anvil-manifest= (v0.4.0 + 2026-05) | Intent-based tool discovery plus =ANVIL_PROFILE= filter.  The 2026-05 update adds Tool Attention: dynamic query-based ranking, optional embedding backends, state preconditions, schema trimming, warm LRU full-schema retention, recovery suggestions, and a Doc43 bridge for docstring rewrite candidates |
+| =anvil-worklog= (2026-05) | SQLite-backed AI worklog index.  Old org logs can be scanned, new entries are DB-primary via =worklog-add=, and bridge endpoints expose read-only search/list/get to other AI clients.  The DB handle self-recovers after file replacement/unlink events and uses short write transactions for =worklog-add= |
+| =anvil-claude-watchdog= (2026-05) | Linux procfs/jsonl watchdog for Claude Code TUI hangs.  Detects State=R stalls and the State=S spinner/MCP-child-IO variant, records events, notifies the desktop, and offers confirmation-gated manual recovery via =claude --resume= staged in tmux |
 | =anvil-sexp= / =sexp-cst= / =py= / =ts= / =js= (v0.4.0) | Language-aware structural edits.  Reader-based Elisp edits, tree-sitter CST for Python / TypeScript / TSX / JavaScript — AST-level refactors without touching whole files |
 | =anvil-session= + Claude Code hooks (v0.4.0) | Session snapshot / resume + 5 lifecycle hooks (PreCompact / SessionStart / PostToolUse / UserPromptSubmit / SessionEnd).  Captures branch + task summary with 14-day TTL so session restarts don't re-cold |
 | =anvil-shell-filter= (v0.4.0) | Shell output compression — 20 bundled filters for git / rg / pytest / ert-batch / docker-logs etc.  Raw output stashed with TTL so callers can still recover full text when needed |
@@ -270,7 +277,7 @@ sister package).  Highlights:
 | =org-read-outline= / =org-read-headline= | Read just the headings or a single subtree, even on a 13,000-line org. No full-file read needed |
 | =anvil-worker= | Dispatch long-running tasks (OCR, PDF conversion, batch file scans) to a separate background Emacs. The interactive Emacs never freezes |
 | Large org file editing | Edit org files of 1.2 MB or more without truncation (avoids the Windows file-mount issue) |
-| LLM client agnostic | Claude Code / Claude Desktop / GPT / local LLMs via Ollama — all speak through MCP |
+| LLM client agnostic | Claude Code / Codex CLI / Claude Desktop / GPT / local LLMs via Ollama — all speak through MCP |
 | =anvil-modes-allow-buffer-modify= | Configure major modes where Anvil tools modify live buffers directly rather than visiting files, preserving unsaved changes. |
 
 For numerical evidence and detailed case studies, see [[https://github.com/zawatton/anvil.el#efficiency--why-anvil-saves-ai-tokens][Efficiency — why Anvil saves AI tokens]].
@@ -343,10 +350,21 @@ manifest prelude that Claude Code parses at session start shrinks:
 | =ultra= | 17               | ~2,740        | Hot tools + =ts_extended= lazy-load   |
 | =agent= (v0.4.0) | ≈60 (intent-filtered) | ~6,500  | Orchestrator / session / memory / edit |
 | =edit=  (v0.4.0) | ≈40 (intent-filtered) | ~4,200  | Pure file / org / code / json editor   |
+| =dynamic= (2026-05) | Top-K + warm LRU | query-dependent | Tool Attention + schema trimming |
 
 Measure your own profile cost at any time via the =manifest-cost=
 MCP tool (returns ={:profile :advertised-count :registered-count
 :approx-tokens}=).
+
+The 2026-05 update extends this into a Tool Attention layer.  Set
+=ANVIL_PROFILE=dynamic= and optionally =ANVIL_ATTENTION_QUERY= to
+rank tools by the current intent; tools whose =:preconditions= do
+not match =ANVIL_STATE_TAGS= are filtered out.  When schema trimming
+is enabled, only the Top-K focused tools, manifest self-tools, and
+recent warm-LRU tools keep full schemas; the rest advertise compact
+name/type-only schemas.  =manifest-recovery-suggest= explains why a
+tool is hidden or unfocused, and =manifest-docstring-candidates=
+hands weak descriptions to Doc43 autoresearch.
 
 *Orchestrator child sessions* (Doc 26 Phase 1b, extended in Doc 34
 Phase B) auto-inject =--mcp-config= pointing at =emacs-eval-PROFILE=
@@ -645,10 +663,14 @@ budget goes to reasoning about your code, not re-reading it.
 | =orchestrator-routing= | Per-provider latency routing for =orchestrator-routing-select= (v0.4.0) | orchestrator |
 | =orchestrator-presets= | Named consensus provider combinations (v0.4.0) | orchestrator |
 | =pty-broker=  | Node-pty TCP broker for spawning processes that need a real TTY (opt.) | Node.js, node-pty |
-| =memory= (v0.4.0) | Auto-memory index + TTL audit + access tracker, 16 MCP tools over =~/.claude/projects/*/memory/*.md= (opt.) | Emacs 29+ |
+| =memory= (v0.4.0 + 2026-05) | Auto-memory index + TTL audit + access tracker, DB-primary add/get/export, WHISPER session deltas, contradiction scans, static HTML export, and review-only harvest candidates (opt.) | Emacs 29+ |
+| =memory-bridge= (2026-05) | Local HTTP/JSON API for memory + worklog, write auth, event stream, read-replica pull, CORS, browser extension, mobile thin client (opt.) | =memory=, =worklog= |
+| =worklog= (2026-05) | AI worklog org scan + DB-primary =worklog-add= + search/list/get/export tools; stale SQLite handle recovery for long-lived daemons (opt.) | Emacs 29+ |
+| =autoresearch= (2026-05) | Candidate scan, MCP docstring proposal/apply/harvest gates, routing experiments, NeLisp codegen task scaffold, tabulated-list dashboard (opt.) | =orchestrator=, optional =memory= |
+| =claude-watchdog= (2026-05) | Linux Claude Code hang detector + desktop notification + confirmation-gated tmux resume staging (opt.) | Linux procfs, tmux for recovery |
 | =session= (v0.4.0) | Session snapshot / resume + 5 Claude Code lifecycle hooks (opt.) | =state= |
 | =discovery= (v0.4.0) | Intent-based MCP tool discovery (=anvil-tools-by-intent=) + per-tool usage counter (opt.) | =state= |
-| =manifest= (v0.4.0) | Per-session =tools/list= filter driven by =ANVIL_PROFILE= (ultra / nav / core / lean / full / agent / edit) (opt.) | — |
+| =manifest= (v0.4.0 + 2026-05) | Per-session =tools/list= filter driven by =ANVIL_PROFILE=; dynamic Tool Attention adds query ranking, state filtering, schema trimming, warm LRU, and recovery hints (opt.) | — |
 | =disclosure= (v0.4.0) | 3-layer read contract + citation URI scheme + =disclosure-help= (opt.) | =org-index= |
 | =shell-filter= (v0.4.0) | Shell output compression with 20 bundled filters + tee + gain stats (opt.) | =state= |
 | =data= (v0.4.0) | JSON path-based edits with preview-by-default: data-get-path / data-set-path / data-delete-path / data-list-keys (opt.) | — |
@@ -861,6 +883,45 @@ Phase 2 adds:
 
 Requires Emacs 29+ (via =anvil-state=).
 
+** Autoresearch module (optional)
+
+=anvil-autoresearch= is the safe, review-gated version of the
+"agent improves itself" loop.  It does not run unbounded experiments
+on its own.  Instead, it provides small MCP primitives that make each
+step inspectable:
+
+- =autoresearch-scan= — rank implementation candidates from local
+  Web/X/YouTube summaries and =docs/design=.
+- =autoresearch-docstrings= / =-plan= / =-patch= — find weak MCP tool
+  descriptions and produce dry-run rewrite candidates.
+- =autoresearch-docstring-apply= / =-run= / =-harvest= — apply
+  reviewed candidates behind eval and holdout gates, reverting on
+  failure.
+- =autoresearch-routing-*= — evaluate, propose, harvest, and review
+  orchestrator provider-routing improvements.
+- =autoresearch-nelisp-codegen-*= — scaffold NeLisp Phase 47 codegen
+  implementation tasks without editing the NeLisp repo from the MCP
+  tool itself.
+
+=M-x anvil-autoresearch-dashboard= opens a =tabulated-list= view of
+current =autoresearch-*= orchestrator tasks.  The dashboard is
+observational: =g= refreshes, =RET= opens the task plist; harvest,
+apply, and memory promotion remain explicit tool calls.
+
+** Claude Code watchdog (optional, Linux)
+
+=anvil-claude-watchdog= watches Claude Code sessions from outside the
+TUI using Linux =/proc= counters and jsonl mtimes.  It detects the
+classic "stream still alive but UI/jsonl stopped" stall, plus the
+State=S spinner variant where tracked MCP child processes stop
+advancing both =rchar= and =wchar=.  Events are recorded through
+=anvil-state= and can trigger desktop notification.
+
+Recovery is manual by design.  =M-x anvil-claude-watchdog-recover=
+asks for confirmation, sends =SIGKILL= to the selected stuck process,
+derives =claude --resume <session-id>= from the jsonl basename, and
+stages that command in the matching tmux pane without pressing Enter.
+
 ** Memory module (optional) — indexing auto-memory across AI CLIs
 
 The =memory= module is an opt-in, provider-agnostic index over
@@ -930,17 +991,29 @@ a single SQLite DB (=~/.emacs.d/anvil-memory-index.db=):
 - =memory-regenerate-index= — emit a fresh =MEMORY.md= body
   sorted by decay-score (read-only output; the caller decides
   whether to write).
+- =memory-add= / =memory-get= / =memory-export-md= — DB-primary
+  write/read/export path.  New memories can be inserted straight
+  into SQLite, fetched without reading the backing =.md= file, and
+  rendered back to a Markdown file when another AI needs file-based
+  interchange.
+- =memory-session-delta= / =memory-stop-sync= — WHISPER session
+  context.  The first call returns a full decay-ranked index; later
+  calls return only added / changed / removed memory rows until the
+  delta grows too large.
+- =memory-harvest-candidates= — review-only extraction of durable
+  memory candidates from session text or transcripts.  It never
+  persists by itself; the caller decides which candidates to save.
 
 Non-Claude clients reach these by connecting to the same anvil
-MCP server; the module never writes into =.md= files (promote is
-the only file operation, and that is a rename), so it is safe to
-point at memory directories managed by other tools.
+MCP server.  The ordinary scan/search/list/audit path is read-only
+against provider-managed =.md= files; mutations are explicit
+(=memory-promote= rename, =memory-add= DB insert, or
+=memory-export-md= caller-driven Markdown export).
 
-*** Sharing the DB across machines
+*** DB location and cross-machine sharing
 
-The metadata DB defaults to =<user-emacs-directory>/anvil-memory-index.db=,
-but you can point one or more machines at the same SQLite file
-(commonly stored inside a notes git repo) without symlinks:
+The metadata DB defaults to =<user-emacs-directory>/anvil-memory-index.db=.
+You can redirect a machine to a notes repo-local DB without symlinks:
 
 #+begin_src emacs-lisp
 (setq anvil-memory-shared-db-roots
@@ -957,9 +1030,78 @@ is resolved on first DB access by checking, in order:
 4. Default =<user-emacs-directory>/anvil-memory-index.db=
 
 Use =(anvil-memory-effective-db-path)= to confirm which path the
-module is using.  The DB is binary, so commit / pull it through
-git as-is (run a =PRAGMA wal_checkpoint(FULL)= before commit so
-the WAL writes flush into the main file).
+module is using.
+
+Do not merge one SQLite file between multiple machines through git.
+The current operational model is:
+
+- keep the =.anvil-memory/*.db= files per machine and gitignored;
+- use =memory-export-md= when a DB-direct memory should become a
+  file-based artifact for other AIs;
+- let =memory-scan= re-index those exported files on another
+  machine.
+
+This avoids binary merge conflicts and stale open SQLite handles in
+long-lived Emacs daemons.
+
+*** Memory bridge — cross-AI and mobile access
+
+The =memory-bridge= optional module puts a small localhost JSON API in
+front of =anvil-memory= and =anvil-worklog=.  This is for clients that
+cannot speak the Emacs MCP server directly: browser chat UIs, mobile
+thin clients, another machine over Tailscale, or a read replica.
+
+#+begin_src emacs-lisp
+(add-to-list 'anvil-optional-modules 'memory)
+(add-to-list 'anvil-optional-modules 'worklog)
+(add-to-list 'anvil-optional-modules 'memory-bridge)
+(anvil-enable)
+(anvil-memory-bridge-start)
+#+end_src
+
+Default binding is =127.0.0.1:8730=.  Read endpoints include
+=/memory/search=, =/memory/list=, =/memory/get/<name>=,
+=/memory/events=, =/worklog/search=, =/worklog/list=, and
+=/worklog/get=.  Mutating memory endpoints require
+=Authorization: Bearer <token>=; rotate the token with
+=M-x anvil-memory-bridge-rotate-token=.
+
+Two thin clients live under =extensions/=:
+
+- =extensions/memory-bridge/= — Manifest V3 browser extension for
+  Claude.ai, ChatGPT, and Gemini.  =Ctrl+Alt+M= searches/injects
+  memory; =Ctrl+Alt+S= saves selected text.
+- =extensions/mobile-bridge/= — dependency-free static mobile app.
+  It stores bridge URL/token in =localStorage= and queues failed
+  saves for replay when back online.
+
+Read-replica mode is intentionally single-writer: replicas can pull
+primary =memory_event= rows, but local mutating endpoints return =409=
+so two machines do not silently diverge.
+
+** Worklog module (optional)
+
+The =worklog= module indexes AI work logs separately from long-term
+memory.  It can scan legacy =capture/ai-logs-*.org= archives, but new
+entries are DB-primary via =worklog-add= rather than manual org
+appends.  Search/list/get are exposed as MCP tools and also through
+=memory-bridge= for non-Emacs clients.
+
+Like =memory=, =worklog= is intended to use a per-machine SQLite DB.
+Use =worklog-export-org= when you want a human-readable org snapshot
+for git or cross-machine interchange.  The 2026-05 develop branch also
+teaches the long-lived daemon to detect when its SQLite file was
+replaced or unlinked and reopen it automatically before the next DB
+operation.
+
+Typical use:
+
+#+begin_src text
+worklog-add(title, body)
+worklog-search("Doc43 autoresearch")
+worklog-get("anvil-worklog:db:linux-debian:2026", 1779295660)
+worklog-export-org(machine, year)
+#+end_src
 
 ** Git helpers
 
@@ -1019,7 +1161,7 @@ Requires Emacs 29+ (for the built-in =sqlite-*= used by =anvil-state=).
 * Client setup — connecting your AI to Anvil
 
 After Anvil is running inside Emacs, you need to register it as
-an MCP server in your AI client (Claude Desktop, Claude Code CLI,
+an MCP server in your AI client (Claude Desktop, Claude Code CLI, Codex CLI,
 or any other MCP-compatible client).
 
 The bridge is a small shell script (=anvil-stdio.sh=) that speaks
@@ -1342,7 +1484,7 @@ it's the same idea wearing a bigger coat.
 
 Yes. Anvil is an MCP server that runs as a background daemon — you
 never have to open an Emacs window. Keep using whatever editor you
-already use (VSCode / Cursor / Neovim / Claude Code itself).
+already use (VSCode / Cursor / Neovim / Claude Code / Codex CLI itself).
 
 What you actually need:
 
@@ -1356,7 +1498,7 @@ knowledge required to capture the AI-token savings.
 * Internals — bridge + worker pool
 
 #+begin_example
-  Claude / GPT / Local LLM
+  Claude / Codex / GPT / Local LLM
          |
     MCP (JSON-RPC via stdio)
          |

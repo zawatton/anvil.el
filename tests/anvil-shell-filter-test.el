@@ -593,6 +593,346 @@
        (should (string-match-p "fib-30 PASS" raw))))))
 
 
+
+;;;; --- Phase 3 register API ----------------------------------------------
+
+;; Each test isolates state by binding `anvil-shell-filter-handlers' and
+;; `anvil-shell-filter--match-command-table' to fresh local copies so a
+;; registered tag never bleeds across tests.
+
+(defmacro anvil-shell-filter-test--with-clean-registry (&rest body)
+  "Run BODY with cloned filter registry + match-command-table.
+Restores both globals on exit so registered test tags do not leak."
+  (declare (indent 0))
+  `(let ((anvil-shell-filter-handlers
+          (copy-sequence anvil-shell-filter-handlers))
+         (anvil-shell-filter--match-command-table
+          (copy-sequence anvil-shell-filter--match-command-table)))
+     ,@body))
+
+(ert-deftest anvil-shell-filter-test/register-rust-regex-translator-basic ()
+  "Translator handles \\s / \\d / capturing groups / alternation."
+  (skip-unless (anvil-shell-filter-test--supported-p 'register))
+  (let ((xlat #'anvil-shell-filter--rust-regex-to-elisp))
+    (should (equal (funcall xlat "^df(\\s|$)")
+                   "^df\\([[:space:]]\\|$\\)"))
+    (should (equal (funcall xlat "^brew\\s+(install|upgrade)\\b")
+                   "^brew[[:space:]]+\\(install\\|upgrade\\)\\b"))
+    (should (equal (funcall xlat "Audited \\d+ package")
+                   "Audited [0-9]+ package"))
+    ;; Empty / nil pass through.
+    (should (null (funcall xlat nil)))
+    (should (equal (funcall xlat "") ""))))
+
+(ert-deftest anvil-shell-filter-test/register-rust-regex-translator-noncap-and-class ()
+  "Translator preserves non-capturing groups + leaves char class contents alone."
+  (skip-unless (anvil-shell-filter-test--supported-p 'register))
+  (let ((xlat #'anvil-shell-filter--rust-regex-to-elisp))
+    ;; (?:foo|bar) → \(?:foo\|bar\)
+    (should (equal (funcall xlat "(?:^|/)liquibase(?:\\s|$)")
+                   "\\(?:^\\|/\\)liquibase\\(?:[[:space:]]\\|$\\)"))
+    ;; Char class contents stay verbatim — `(' / `|' inside [...] are literal.
+    (should (equal (funcall xlat "[a-z(|)]+")
+                   "[a-z(|)]+"))
+    ;; \b is preserved verbatim — Elisp shares this escape.
+    (should (string-match-p "\\\\b" (funcall xlat "^foo\\b")))))
+
+(ert-deftest anvil-shell-filter-test/register-rust-regex-end-to-end-df ()
+  "After register, df.toml-style match_command actually matches `df -h'."
+  (skip-unless (anvil-shell-filter-test--supported-p 'register))
+  (anvil-shell-filter-test--with-clean-registry
+    (anvil-shell-filter-register
+     'df-spec :match-command "^df(\\s|$)" :max-lines 5)
+    (should (eq (anvil-shell-filter-lookup "df -h") 'df-spec))
+    (should (eq (anvil-shell-filter-lookup "df") 'df-spec))
+    ;; Doesn't overreach to `dfu' or `differ'.
+    (should (null (anvil-shell-filter-lookup "differ a b")))))
+
+(ert-deftest anvil-shell-filter-test/register-pipeline-order ()
+  "Verify the 8-stage pipeline runs every stage in the documented order.
+
+Pipeline order under test:
+  1. strip-ansi  : `\\x1b[31mFOO line\\x1b[0m' → `FOO line'
+  2. replace     : `FOO' → `FUU'
+  3. match-output: NEVER-MATCH regex → no short-circuit
+  4. strip-lines : drops `^noise'
+  5. keep-lines  : keeps `keep' / `FUU' lines
+  6. truncate    : 12-char wrap with `...'
+  7. tail-lines  : last 5
+  8. max-lines   : first 3 of those
+  9. on-empty    : not triggered (output non-empty)"
+  (skip-unless (anvil-shell-filter-test--supported-p 'register))
+  (anvil-shell-filter-test--with-clean-registry
+    (anvil-shell-filter-register
+     'pipeline-order
+     :strip-ansi t
+     :replace '(("FOO" . "FUU"))
+     :match-output '(("NEVER-MATCH" . "short-circuit-msg"))
+     :strip-lines-matching '("^noise")
+     :keep-lines-matching '("keep" "FUU")
+     :truncate-lines-at 12
+     :tail-lines 5
+     :max-lines 3
+     :on-empty "EMPTY")
+    (let* ((raw (concat "\x1b[31mFOO line\x1b[0m\n"
+                        "noise line drop\n"
+                        "keep one\n"
+                        "this is a very long keep line\n"
+                        "keep three\n"
+                        "keep four\n"
+                        "keep five\n"))
+           (out (anvil-shell-filter-apply 'pipeline-order raw))
+           (lines (split-string out "\n")))
+      ;; strip-ansi + replace ran and were observable in the output.
+      (should-not (string-match-p "\x1b" out)) ; ANSI stripped
+      (should-not (string-match-p "FOO" out))  ; replaced FOO → FUU
+      (should-not (string-match-p "noise" out)) ; strip-lines dropped it
+      ;; truncate to 12 chars produced at least one trimmed line.
+      (should (cl-some (lambda (l) (and (> (length l) 0)
+                                        (string-suffix-p "..." l)))
+                       lines))
+      (dolist (l lines) (should (<= (length l) 12)))
+      ;; tail 5 then max 3 → at most 3 lines.
+      (should (<= (length lines) 3)))))
+
+(ert-deftest anvil-shell-filter-test/register-strip-ansi-only ()
+  "strip-ansi alone removes CSI sequences without altering other content."
+  (skip-unless (anvil-shell-filter-test--supported-p 'register))
+  (anvil-shell-filter-test--with-clean-registry
+    (anvil-shell-filter-register 'ansi-only :strip-ansi t)
+    (let ((out (anvil-shell-filter-apply
+                'ansi-only "\x1b[1;31merror:\x1b[0m bad")))
+      (should (equal out "error: bad")))))
+
+(ert-deftest anvil-shell-filter-test/register-replace-multiple ()
+  "Multiple replace cells apply in order."
+  (skip-unless (anvil-shell-filter-test--supported-p 'register))
+  (anvil-shell-filter-test--with-clean-registry
+    (anvil-shell-filter-register
+     'rep-multi :replace '(("foo" . "bar") ("bar" . "baz")))
+    ;; foo → bar, then bar → baz, so result is "baz baz" (both substitutions
+    ;; applied in order means the first foo→bar feeds into bar→baz).
+    (should (equal (anvil-shell-filter-apply 'rep-multi "foo bar") "baz baz"))))
+
+(ert-deftest anvil-shell-filter-test/register-match-output-short-circuit ()
+  "First match in match-output returns its message and skips later stages."
+  (skip-unless (anvil-shell-filter-test--supported-p 'register))
+  (anvil-shell-filter-test--with-clean-registry
+    (anvil-shell-filter-register
+     'short-circuit
+     :match-output '(("FATAL" . "fatal-detected")
+                     ("WARN"  . "warn-detected"))
+     :max-lines 1)  ; would hide "FATAL" if pipeline continued
+    (should (equal (anvil-shell-filter-apply
+                    'short-circuit "line1\nFATAL boom\nline3")
+                   "fatal-detected"))
+    (should (equal (anvil-shell-filter-apply
+                    'short-circuit "line1\nWARN soft\nline3")
+                   "warn-detected"))
+    ;; No match → falls through to max-lines.
+    (should (equal (anvil-shell-filter-apply
+                    'short-circuit "line1\nline2\nline3")
+                   "line1"))))
+
+(ert-deftest anvil-shell-filter-test/register-strip-and-keep-combined ()
+  "strip-lines drops noise, keep-lines retains only signal."
+  (skip-unless (anvil-shell-filter-test--supported-p 'register))
+  (anvil-shell-filter-test--with-clean-registry
+    (anvil-shell-filter-register
+     'strip-keep
+     :strip-lines-matching '("^DEBUG")
+     :keep-lines-matching  '("ERROR" "WARN"))
+    (let ((out (anvil-shell-filter-apply
+                'strip-keep
+                (concat "DEBUG x\nERROR y\nINFO z\nWARN w\nDEBUG q"))))
+      (should (string-match-p "ERROR y" out))
+      (should (string-match-p "WARN w" out))
+      (should-not (string-match-p "DEBUG" out))
+      (should-not (string-match-p "INFO" out)))))
+
+(ert-deftest anvil-shell-filter-test/register-truncate-lines-at ()
+  "truncate-lines-at right-trims long lines and appends `...'."
+  (skip-unless (anvil-shell-filter-test--supported-p 'register))
+  (anvil-shell-filter-test--with-clean-registry
+    (anvil-shell-filter-register 'trunc :truncate-lines-at 10)
+    (let ((out (anvil-shell-filter-apply
+                'trunc "short\nthis line is way too long")))
+      (should (equal (car (split-string out "\n")) "short"))
+      (should (string-suffix-p "..."
+                               (cadr (split-string out "\n"))))
+      (should (= (length (cadr (split-string out "\n"))) 10)))))
+
+(ert-deftest anvil-shell-filter-test/register-tail-then-max ()
+  "tail-lines runs first, then max-lines selects the head of the tail window."
+  (skip-unless (anvil-shell-filter-test--supported-p 'register))
+  (anvil-shell-filter-test--with-clean-registry
+    (anvil-shell-filter-register 'tm :tail-lines 4 :max-lines 2)
+    ;; 6 input lines → tail 4 = lines 3-6 → max 2 of those = lines 3-4.
+    (let ((out (anvil-shell-filter-apply
+                'tm "L1\nL2\nL3\nL4\nL5\nL6")))
+      (should (equal out "L3\nL4")))))
+
+(ert-deftest anvil-shell-filter-test/register-on-empty-fallback ()
+  "on-empty fallback returned when post-pipeline result trims to empty."
+  (skip-unless (anvil-shell-filter-test--supported-p 'register))
+  (anvil-shell-filter-test--with-clean-registry
+    (anvil-shell-filter-register
+     'oe :keep-lines-matching '("NEVER-MATCHES") :on-empty "OK-NOOP")
+    (should (equal (anvil-shell-filter-apply 'oe "a\nb\nc") "OK-NOOP"))
+    ;; Whitespace-only post-pipeline also trips on-empty.
+    (should (equal (anvil-shell-filter-apply 'oe "")  "OK-NOOP"))))
+
+(ert-deftest anvil-shell-filter-test/register-lookup-falls-through-to-match-command-table ()
+  "Unknown first-token falls through to match-command-table regex."
+  (skip-unless (anvil-shell-filter-test--supported-p 'register))
+  (anvil-shell-filter-test--with-clean-registry
+    (anvil-shell-filter-register 'mytool :match-command "^mytool\\b")
+    (should (eq (anvil-shell-filter-lookup "mytool --foo bar") 'mytool))
+    ;; Existing first-token rule still wins for known cmds.
+    (should (eq (anvil-shell-filter-lookup "git status") 'git-status))
+    ;; Truly unrelated cmds still return nil.
+    (should (null (anvil-shell-filter-lookup "uname -a")))))
+
+(ert-deftest anvil-shell-filter-test/register-from-spec-passthrough ()
+  "register-from-spec forwards every keyword and returns the tag."
+  (skip-unless (anvil-shell-filter-test--supported-p 'register))
+  (anvil-shell-filter-test--with-clean-registry
+    (let ((tag (anvil-shell-filter-register-from-spec
+                '(:tag spec-tag
+                       :match-command "^spec-tag\\b"
+                       :max-lines 2))))
+      (should (eq tag 'spec-tag))
+      (should (eq (anvil-shell-filter-lookup "spec-tag args")
+                  'spec-tag))
+      (should (equal (anvil-shell-filter-apply 'spec-tag "L1\nL2\nL3")
+                     "L1\nL2")))
+    ;; Missing :tag signals an error (caller bug, not silent fallthrough).
+    (should-error (anvil-shell-filter-register-from-spec
+                   '(:match-command "^x\\b" :max-lines 1)))))
+
+(ert-deftest anvil-shell-filter-test/register-replaces-existing-tag ()
+  "Re-registering a tag replaces the handler and removes prior match-cmd row."
+  (skip-unless (anvil-shell-filter-test--supported-p 'register))
+  (anvil-shell-filter-test--with-clean-registry
+    (anvil-shell-filter-register 'reapp :match-command "^old-cmd\\b" :max-lines 1)
+    (anvil-shell-filter-register 'reapp :match-command "^new-cmd\\b" :max-lines 5)
+    ;; New regex wins, old regex no longer maps to this tag.
+    (should (eq (anvil-shell-filter-lookup "new-cmd args") 'reapp))
+    (should (null (anvil-shell-filter-lookup "old-cmd args")))
+    ;; Match-command-table has exactly ONE cell pointing to 'reapp.
+    (should (= 1 (cl-count 'reapp anvil-shell-filter--match-command-table
+                           :key #'cdr)))))
+
+
+;;;; --- §7.3 tee-put cap (regression for state.db bloat) ----------------
+
+(ert-deftest anvil-shell-filter-test/tee-put-respects-max-bytes ()
+  "Tee-put truncates raw when it exceeds `anvil-shell-tee-max-bytes'."
+  (skip-unless (anvil-shell-filter-test--supported-p 'tee))
+  (anvil-shell-filter-test--with-state
+    (let* ((anvil-shell-tee-max-bytes 32)
+           (raw (concat (make-string 200 ?x) "TAIL"))
+           (id (anvil-shell-filter--tee-put raw))
+           (got (anvil-shell-filter-tee-get id)))
+      (should (stringp got))
+      (should (string-match-p "anvil-shell-tee: truncated" got))
+      (should (< (length got) (length raw))))))
+
+(ert-deftest anvil-shell-filter-test/tee-put-cap-nil-keeps-full ()
+  "Setting `anvil-shell-tee-max-bytes' to nil disables capping."
+  (skip-unless (anvil-shell-filter-test--supported-p 'tee))
+  (anvil-shell-filter-test--with-state
+    (let* ((anvil-shell-tee-max-bytes nil)
+           (raw (make-string 1000 ?y))
+           (id (anvil-shell-filter--tee-put raw))
+           (got (anvil-shell-filter-tee-get id)))
+      (should (equal raw got)))))
+
+
+;;;; --- §7.1 trace events ------------------------------------------------
+
+(ert-deftest anvil-shell-filter-test/trace-events-disabled-no-rows ()
+  "When `anvil-shell-filter-trace-events' is nil, no trace rows accrue."
+  (skip-unless (anvil-shell-filter-test--supported-p 'tee))
+  (anvil-shell-filter-test--with-state
+    (let ((anvil-shell-filter-trace-events nil))
+      (anvil-shell-filter--trace "tr-test" "start" (current-time))
+      (should (null (anvil-state-list-keys
+                     :ns anvil-shell-filter--trace-ns))))))
+
+(ert-deftest anvil-shell-filter-test/trace-events-enabled-records-phase ()
+  "When enabled, `--trace' writes a phase row with elapsed-ms."
+  (skip-unless (anvil-shell-filter-test--supported-p 'tee))
+  (anvil-shell-filter-test--with-state
+    (let* ((anvil-shell-filter-trace-events t)
+           (start (current-time)))
+      (anvil-shell-filter--trace "tr-x" "start" start)
+      (let ((row (anvil-state-get
+                  "tr-x-start" :ns anvil-shell-filter--trace-ns)))
+        (should (listp row))
+        (should (equal "start" (plist-get row :phase)))
+        (should (integerp (plist-get row :at)))
+        (should (integerp (plist-get row :elapsed-ms)))))))
+
+
+;;;; --- Doc 45 / TACO Phase 1 critical fallback --------------------------
+
+(ert-deftest anvil-shell-filter-test/taco-critical-keeps-error-context ()
+  "TACO critical fallback keeps error-like lines and omits distant noise."
+  (skip-unless (anvil-shell-filter-test--supported-p 'taco-critical))
+  (let* ((anvil-shell-filter-taco-critical-min-lines 5)
+         (anvil-shell-filter-taco-critical-context-lines 1)
+         (raw (string-join
+               (append (cl-loop for i from 1 to 20 collect (format "noise-%02d" i))
+                       '("before" "Traceback (most recent call last):"
+                         "AssertionError: bad value" "after")
+                       (cl-loop for i from 21 to 40 collect (format "noise-%02d" i)))
+               "\n"))
+         (out (anvil-shell-filter-apply 'taco-critical raw)))
+    (should (string-match-p "anvil-taco" out))
+    (should (string-match-p "Traceback" out))
+    (should (string-match-p "AssertionError" out))
+    (should (string-match-p "stdout lines omitted" out))
+    (should-not (string-match-p "noise-01" out))
+    (should-not (string-match-p "noise-40" out))
+    (should (< (length out) (length raw)))))
+
+(ert-deftest anvil-shell-filter-test/taco-critical-auto-for-unknown-run ()
+  "Unknown failing commands use TACO critical fallback under filter=auto."
+  (skip-unless (anvil-shell-filter-test--supported-p 'taco-critical))
+  (anvil-shell-filter-test--with-state
+    (let* ((anvil-shell-filter-taco-critical-min-lines 5)
+           (anvil-shell-filter-taco-critical-tail-lines 2)
+           (raw (string-join
+                 (append (cl-loop for i from 1 to 80
+                                  collect (format "step-%02d ................................" i))
+                         '("FAILED: build target" "tail-a" "tail-b"))
+                 "\n")))
+      (cl-letf (((symbol-function 'anvil-shell)
+                 (lambda (_cmd _opts)
+                   (list :exit 2 :stdout raw :stderr "stderr detail"))))
+        (let ((result (anvil-shell-filter-run "unknown-tool --verbose")))
+          (should (eq 'taco-critical (plist-get result :filter)))
+          (should (equal 2 (plist-get result :exit)))
+          (should (equal "stderr detail" (plist-get result :stderr)))
+          (should (string-match-p "FAILED: build target"
+                                  (plist-get result :compressed)))
+          (should (string-match-p "tail-b" (plist-get result :compressed)))
+          (should (equal raw (anvil-shell-filter-tee-get
+                              (plist-get result :tee-id)))))))))
+
+(ert-deftest anvil-shell-filter-test/taco-critical-short-clean-passthrough ()
+  "Short clean unknown output stays raw passthrough under filter=auto."
+  (skip-unless (anvil-shell-filter-test--supported-p 'taco-critical))
+  (anvil-shell-filter-test--with-state
+    (cl-letf (((symbol-function 'anvil-shell)
+               (lambda (_cmd _opts)
+                 (list :exit 0 :stdout "one\ntwo\nthree" :stderr ""))))
+      (let ((result (anvil-shell-filter-run "unknown-tool")))
+        (should-not (plist-get result :filter))
+        (should (equal "one\ntwo\nthree" (plist-get result :compressed)))))))
+
+
 (provide 'anvil-shell-filter-test)
 
 ;;; anvil-shell-filter-test.el ends here

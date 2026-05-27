@@ -111,6 +111,216 @@ MCP Parameters:
     (should-not (assoc "_args" props))
     (should (equal ["task_id"] required))))
 
+(ert-deftest anvil-test-schema-cache-reuses-identical-schema-and-fragment ()
+  "A warm schema cache must skip schema and fragment generation."
+  (defun anvil-test--schema-cache-tool (path &optional mode)
+    "Read PATH using MODE.
+
+MCP Parameters:
+  path - File path to read
+  mode - Optional read mode"
+    (list path mode))
+  (let* ((id "anvil-test-schema-cache")
+         (description "Read a file for schema cache testing")
+         (server-id "anvil-test-schema-cache-server")
+         (cache-file (make-temp-file "anvil-schema-cache-test-"))
+         (arglist (help-function-arglist
+                   'anvil-test--schema-cache-tool t))
+         (fresh-schema
+          (anvil-server--generate-schema-from-function
+           'anvil-test--schema-cache-tool arglist))
+         (fresh-fragment
+          (anvil-server--build-tool-fragment
+           id description fresh-schema)))
+    (unwind-protect
+        (let ((anvil-server-schema-cache-file cache-file)
+              (anvil-server--schema-cache nil)
+              (anvil-server--schema-cache-loaded nil))
+          (anvil-server-unregister-tool id server-id)
+          (anvil-server-register-tool
+           #'anvil-test--schema-cache-tool
+           :id id
+           :description description
+           :server-id server-id)
+          (let* ((tools-table (anvil-server--get-server-tools server-id))
+                 (tool (gethash id tools-table)))
+            (should (equal fresh-schema (plist-get tool :schema)))
+            (should (equal fresh-fragment (plist-get tool :json-fragment))))
+          (anvil-server-unregister-tool id server-id)
+          ;; Force the next registration to reload the on-disk cache.
+          (setq anvil-server--schema-cache nil)
+          (setq anvil-server--schema-cache-loaded nil)
+          (let ((schema-calls 0)
+                (fragment-calls 0))
+            (cl-letf (((symbol-function
+                        'anvil-server--generate-schema-from-function)
+                       (lambda (&rest _args)
+                         (setq schema-calls (1+ schema-calls))
+                         (error "schema generation was not skipped")))
+                      ((symbol-function
+                        'anvil-server--build-tool-fragment)
+                       (lambda (&rest _args)
+                         (setq fragment-calls (1+ fragment-calls))
+                         (error "fragment generation was not skipped"))))
+              (anvil-server-register-tool
+               #'anvil-test--schema-cache-tool
+               :id id
+               :description description
+               :server-id server-id))
+            (let* ((tools-table (anvil-server--get-server-tools server-id))
+                   (tool (gethash id tools-table)))
+              (should (= 0 schema-calls))
+              (should (= 0 fragment-calls))
+              (should (equal fresh-schema (plist-get tool :schema)))
+              (should (equal fresh-fragment
+                             (plist-get tool :json-fragment))))))
+      (anvil-server-unregister-tool id server-id)
+      (when (file-exists-p cache-file)
+        (delete-file cache-file)))))
+
+(ert-deftest anvil-test-schema-cache-signature-does-not-read-docstring ()
+  "Signature construction must be stable before cache lookup."
+  (cl-letf (((symbol-function 'documentation)
+             (lambda (&rest _args)
+               (error "documentation must not be called"))))
+    (should (string-match-p
+             ":doc nil"
+             (anvil-server--schema-cache-signature
+              'anvil-test--schema-cache-tool
+              '(path &optional mode)
+              "Read a file for schema cache testing"
+              nil)))))
+
+(ert-deftest anvil-test-schema-cache-registers-lazy-tool-fragments ()
+  "Cached fragments can advertise tools before their modules are loaded."
+  (let* ((server-id "anvil-test-lazy-fragments")
+         (cache-file (make-temp-file "anvil-lazy-fragments-"))
+         (fragment "{\"name\":\"lazy-tool\",\"description\":\"Lazy\",\"inputSchema\":{\"type\":\"object\"}}")
+         (loader-called nil))
+    (unwind-protect
+        (progn
+          (write-region
+           (concat
+            "(setq anvil-server--schema-cache-file-data '"
+            (prin1-to-string
+             (list :version anvil-server--schema-cache-version
+                   :entries
+                   (list
+                    (list :id "lazy-tool"
+                          :signature "sig"
+                          :schema '((type . "object"))
+                          :fragment fragment))))
+            ")\n")
+           nil cache-file)
+          (let ((anvil-server-schema-cache-file cache-file)
+                (anvil-server--schema-cache nil)
+                (anvil-server--schema-cache-loaded nil))
+            (should
+             (= 1
+                (anvil-server-register-cached-tool-fragments
+                 server-id
+                 `(("lazy-tool" .
+                    ,(lambda (&rest _)
+                       (setq loader-called t)))))))
+            (let* ((tools-table (anvil-server--get-server-tools server-id))
+                   (tool (gethash "lazy-tool" tools-table)))
+              (should (plist-get tool :lazy-placeholder))
+              (should (equal fragment (plist-get tool :json-fragment)))
+              (should-not loader-called))))
+      (remhash server-id anvil-server--tools)
+      (when (file-exists-p cache-file)
+        (delete-file cache-file)))))
+
+(ert-deftest anvil-test-lazy-placeholder-is-replaced-by-real-registration ()
+  "Loading a module may replace its cached placeholder with a real tool."
+  (defun anvil-test--lazy-real-tool ()
+    "Return ok."
+    "ok")
+  (let* ((server-id "anvil-test-lazy-replace")
+         (tools-table (anvil-server--get-server-tools server-id)))
+    (unwind-protect
+        (progn
+          (puthash "lazy-real"
+                   (list :id "lazy-real"
+                         :json-fragment "{}"
+                         :lazy-placeholder t)
+                   tools-table)
+          (anvil-server-register-tool
+           #'anvil-test--lazy-real-tool
+           :id "lazy-real"
+           :description "Real lazy tool"
+           :server-id server-id)
+          (let ((tool (gethash "lazy-real" tools-table)))
+            (should-not (plist-get tool :lazy-placeholder))
+            (should (eq 'anvil-test--lazy-real-tool
+                        (plist-get tool :handler)))))
+      (remhash server-id anvil-server--tools))))
+
+(ert-deftest anvil-test-tools-call-loads-lazy-placeholder ()
+  "tools/call loads a lazy placeholder before dispatching."
+  (defun anvil-test--lazy-call-tool ()
+    "Return ok."
+    "ok")
+  (let* ((server-id "anvil-test-lazy-call")
+         (tools-table (anvil-server--get-server-tools server-id))
+         (loader-called nil))
+    (unwind-protect
+        (progn
+          (puthash "lazy-call"
+                   (list :id "lazy-call"
+                         :json-fragment "{}"
+                         :lazy-placeholder t
+                         :lazy-loader
+                         (lambda (&rest _)
+                           (setq loader-called t)
+                           (anvil-server-register-tool
+                            #'anvil-test--lazy-call-tool
+                            :id "lazy-call"
+                            :description "Lazy call tool"
+                            :server-id server-id)))
+                   tools-table)
+          (let* ((resp
+                  (anvil-server--handle-tools-call
+                   "lazy-call-id"
+                   '((name . "lazy-call") (arguments . ()))
+                   (make-anvil-server-metrics)
+                   server-id))
+                 (decoded (json-read-from-string resp))
+                 (result (alist-get 'result decoded))
+                 (content (alist-get 'content result))
+                 (text (alist-get 'text (aref content 0))))
+            (should loader-called)
+            (should (equal "ok" text))))
+      (remhash server-id anvil-server--tools))))
+
+(ert-deftest anvil-test-scan-int-after-tolerates-whitespace ()
+  "Standalone scanner must accept normal JSON whitespace before numbers."
+  (should (equal 42 (anvil-server--scan-int-after "{\"id\": 42,}" "\"id\":")))
+  (should (equal 42 (anvil-server--scan-int-after "{\"id\":42,}" "\"id\":")))
+  (should (equal 7 (anvil-server--scan-int-after "{\"id\":\t7 }" "\"id\":")))
+  (should (equal -3 (anvil-server--scan-int-after "{\"id\": -3 }" "\"id\":"))))
+
+(ert-deftest anvil-test-scan-string-after-tolerates-whitespace ()
+  "Standalone scanner must accept normal JSON whitespace before strings."
+  (should (equal "tools/list"
+                 (anvil-server--scan-string-after
+                  "{\"method\": \"tools/list\"}" "\"method\":")))
+  (should (equal "tools/list"
+                 (anvil-server--scan-string-after
+                  "{\"method\":\"tools/list\"}" "\"method\":")))
+  (should (equal "a\"b\\c"
+                 (anvil-server--scan-string-after
+                  "{\"name\": \"a\\\"b\\\\c\"}" "\"name\":"))))
+
+(ert-deftest anvil-test-scan-json-value-after-tolerates-string-id ()
+  "JSON-RPC ids may be strings as well as numbers."
+  (should (equal "abc"
+                 (anvil-server--scan-json-value-after
+                  "{\"id\": \"abc\"}" "\"id\":")))
+  (should (equal 17
+                 (anvil-server--scan-json-value-after
+                  "{\"id\": 17}" "\"id\":"))))
+
 (ert-deftest anvil-test-dispatch-tolerates-stale-underscore-args ()
   "A client with a stale schema that still sends `_args' must not error.
 The dispatcher silently drops `_'-prefixed provided params so a mid-flight

@@ -236,7 +236,10 @@ Returns a plist:
                                anvil-orchestrator-routing-quality-order)
                      "quality: no candidate appears in quality-order")))
      ;; Function policy: caller decides.  Given full per-candidate.
-     ((functionp pol)
+     ;; Some policy symbols (notably `speed') may be fbound in the
+     ;; user's Emacs, so only non-symbol callables count as custom
+     ;; function policies.
+     ((and (not (symbolp pol)) (functionp pol))
       (setq picked (funcall pol prompt cands per)
             reason "user-provided function policy"))
      ;; Insufficient samples across the board: cold-start fallback.
@@ -261,7 +264,7 @@ Returns a plist:
      (t
       (setq reason (format "unknown policy %S — returning nil" pol))))
     (list :provider picked
-          :policy (if (functionp pol) 'user pol)
+          :policy (if (and (not (symbolp pol)) (functionp pol)) 'user pol)
           :candidates cands
           :per-candidate per
           :cold-start cold
