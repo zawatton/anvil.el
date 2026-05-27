@@ -264,11 +264,11 @@ sister package).  Highlights:
 | =anvil-ide.el= split (v1.0) | Emacs-only IDE layer (treesit nav, =worker-ui= dashboard, =info-lookup-symbol=) moved out to [[https://github.com/zawatton/anvil-ide.el][zawatton/anvil-ide.el]].  Install both for the original feature set; install only =anvil.el= if you want the AI-side workbench without the human IDE surface |
 | Treesit subprocess fallback (v1.0) | Doc 38 Phase F + G — =anvil-ts= / =-js= / =-py= structural ops keep working on hosts without an Emacs tree-sitter (e.g. NeLisp standalone) via Python =ast= / acorn subprocess fallback.  Token-efficient AST queries preserved on the Rust substrate |
 | =anvil-orchestrator= | Fan out one prompt to up to five AI CLIs (=claude= / =aider= / =gemini= / =ollama= / =codex=) in parallel. Jaccard consensus + meta-LLM judge + DAG dependencies + =anvil-cron= integration for nightly PDCA loops |
-| =anvil-memory= (v0.4.0) | Auto-memory engine with Bayesian TTL + FTS5 full-text search.  16 MCP tools: memory-scan / -audit / -search / -duplicates / -promote, etc.  Surfaces stale rows, detects contradictions, tracks URL liveness.  Multi-provider: auto-detects =~/.claude/projects/*/memory/=, =~/.codex/memories/=, =~/.gemini/memories/=, Continue / Aider / Cline / Cursor — one SQLite DB shared across every AI CLI the user has installed |
+| =anvil-memory= (v0.4.0 + 2026-05) | Auto-memory engine with Bayesian TTL + FTS5 full-text search.  Scans multi-provider =.md= memories, supports DB-primary =memory-add= / =memory-get= / =memory-export-md=, WHISPER session deltas, contradiction scans, static HTML export, and review-only memory harvesting.  Designed for one per-machine SQLite DB plus text export, not binary DB merges |
 | =anvil-memory-bridge= (2026-05) | Local JSON bridge in front of =anvil-memory= and =anvil-worklog=.  Adds read/write memory endpoints, event stream, read-replica pull, worklog search/list/get endpoints, configured-origin CORS, a side-load browser extension for Claude.ai / ChatGPT / Gemini, and a static mobile thin client with offline save queue |
 | =anvil-autoresearch= (2026-05) | Safe self-improvement primitives: scan local Web/X/YouTube/design notes for implementation candidates, rank weak MCP docstrings, propose / harvest / apply descriptions behind eval+holdout gates, route provider-mapping experiments through the orchestrator, scaffold NeLisp Phase 47 codegen tasks, and watch progress in a tabulated-list dashboard |
 | =anvil-tools-by-intent= + =anvil-manifest= (v0.4.0 + 2026-05) | Intent-based tool discovery plus =ANVIL_PROFILE= filter.  The 2026-05 update adds Tool Attention: dynamic query-based ranking, optional embedding backends, state preconditions, schema trimming, warm LRU full-schema retention, recovery suggestions, and a Doc43 bridge for docstring rewrite candidates |
-| =anvil-worklog= (2026-05) | SQLite-backed AI worklog index.  Old org logs can be scanned, new entries are DB-primary via =worklog-add=, and bridge endpoints expose read-only search/list/get to other AI clients |
+| =anvil-worklog= (2026-05) | SQLite-backed AI worklog index.  Old org logs can be scanned, new entries are DB-primary via =worklog-add=, and bridge endpoints expose read-only search/list/get to other AI clients.  The DB handle self-recovers after file replacement/unlink events and uses short write transactions for =worklog-add= |
 | =anvil-claude-watchdog= (2026-05) | Linux procfs/jsonl watchdog for Claude Code TUI hangs.  Detects State=R stalls and the State=S spinner/MCP-child-IO variant, records events, notifies the desktop, and offers confirmation-gated manual recovery via =claude --resume= staged in tmux |
 | =anvil-sexp= / =sexp-cst= / =py= / =ts= / =js= (v0.4.0) | Language-aware structural edits.  Reader-based Elisp edits, tree-sitter CST for Python / TypeScript / TSX / JavaScript — AST-level refactors without touching whole files |
 | =anvil-session= + Claude Code hooks (v0.4.0) | Session snapshot / resume + 5 lifecycle hooks (PreCompact / SessionStart / PostToolUse / UserPromptSubmit / SessionEnd).  Captures branch + task summary with 14-day TTL so session restarts don't re-cold |
@@ -662,9 +662,9 @@ budget goes to reasoning about your code, not re-reading it.
 | =orchestrator-routing= | Per-provider latency routing for =orchestrator-routing-select= (v0.4.0) | orchestrator |
 | =orchestrator-presets= | Named consensus provider combinations (v0.4.0) | orchestrator |
 | =pty-broker=  | Node-pty TCP broker for spawning processes that need a real TTY (opt.) | Node.js, node-pty |
-| =memory= (v0.4.0) | Auto-memory index + TTL audit + access tracker, 16 MCP tools over =~/.claude/projects/*/memory/*.md= (opt.) | Emacs 29+ |
+| =memory= (v0.4.0 + 2026-05) | Auto-memory index + TTL audit + access tracker, DB-primary add/get/export, WHISPER session deltas, contradiction scans, static HTML export, and review-only harvest candidates (opt.) | Emacs 29+ |
 | =memory-bridge= (2026-05) | Local HTTP/JSON API for memory + worklog, write auth, event stream, read-replica pull, CORS, browser extension, mobile thin client (opt.) | =memory=, =worklog= |
-| =worklog= (2026-05) | AI worklog org scan + DB-primary =worklog-add= + search/list/get/export tools (opt.) | Emacs 29+ |
+| =worklog= (2026-05) | AI worklog org scan + DB-primary =worklog-add= + search/list/get/export tools; stale SQLite handle recovery for long-lived daemons (opt.) | Emacs 29+ |
 | =autoresearch= (2026-05) | Candidate scan, MCP docstring proposal/apply/harvest gates, routing experiments, NeLisp codegen task scaffold, tabulated-list dashboard (opt.) | =orchestrator=, optional =memory= |
 | =claude-watchdog= (2026-05) | Linux Claude Code hang detector + desktop notification + confirmation-gated tmux resume staging (opt.) | Linux procfs, tmux for recovery |
 | =session= (v0.4.0) | Session snapshot / resume + 5 Claude Code lifecycle hooks (opt.) | =state= |
@@ -957,17 +957,29 @@ a single SQLite DB (=~/.emacs.d/anvil-memory-index.db=):
 - =memory-regenerate-index= — emit a fresh =MEMORY.md= body
   sorted by decay-score (read-only output; the caller decides
   whether to write).
+- =memory-add= / =memory-get= / =memory-export-md= — DB-primary
+  write/read/export path.  New memories can be inserted straight
+  into SQLite, fetched without reading the backing =.md= file, and
+  rendered back to a Markdown file when another AI needs file-based
+  interchange.
+- =memory-session-delta= / =memory-stop-sync= — WHISPER session
+  context.  The first call returns a full decay-ranked index; later
+  calls return only added / changed / removed memory rows until the
+  delta grows too large.
+- =memory-harvest-candidates= — review-only extraction of durable
+  memory candidates from session text or transcripts.  It never
+  persists by itself; the caller decides which candidates to save.
 
 Non-Claude clients reach these by connecting to the same anvil
-MCP server; the module never writes into =.md= files (promote is
-the only file operation, and that is a rename), so it is safe to
-point at memory directories managed by other tools.
+MCP server.  The ordinary scan/search/list/audit path is read-only
+against provider-managed =.md= files; mutations are explicit
+(=memory-promote= rename, =memory-add= DB insert, or
+=memory-export-md= caller-driven Markdown export).
 
-*** Sharing the DB across machines
+*** DB location and cross-machine sharing
 
-The metadata DB defaults to =<user-emacs-directory>/anvil-memory-index.db=,
-but you can point one or more machines at the same SQLite file
-(commonly stored inside a notes git repo) without symlinks:
+The metadata DB defaults to =<user-emacs-directory>/anvil-memory-index.db=.
+You can redirect a machine to a notes repo-local DB without symlinks:
 
 #+begin_src emacs-lisp
 (setq anvil-memory-shared-db-roots
@@ -984,9 +996,19 @@ is resolved on first DB access by checking, in order:
 4. Default =<user-emacs-directory>/anvil-memory-index.db=
 
 Use =(anvil-memory-effective-db-path)= to confirm which path the
-module is using.  The DB is binary, so commit / pull it through
-git as-is (run a =PRAGMA wal_checkpoint(FULL)= before commit so
-the WAL writes flush into the main file).
+module is using.
+
+Do not merge one SQLite file between multiple machines through git.
+The current operational model is:
+
+- keep the =.anvil-memory/*.db= files per machine and gitignored;
+- use =memory-export-md= when a DB-direct memory should become a
+  file-based artifact for other AIs;
+- let =memory-scan= re-index those exported files on another
+  machine.
+
+This avoids binary merge conflicts and stale open SQLite handles in
+long-lived Emacs daemons.
 
 *** Memory bridge — cross-AI and mobile access
 
@@ -1031,12 +1053,20 @@ entries are DB-primary via =worklog-add= rather than manual org
 appends.  Search/list/get are exposed as MCP tools and also through
 =memory-bridge= for non-Emacs clients.
 
+Like =memory=, =worklog= is intended to use a per-machine SQLite DB.
+Use =worklog-export-org= when you want a human-readable org snapshot
+for git or cross-machine interchange.  The 2026-05 develop branch also
+teaches the long-lived daemon to detect when its SQLite file was
+replaced or unlinked and reopen it automatically before the next DB
+operation.
+
 Typical use:
 
 #+begin_src text
 worklog-add(title, body)
 worklog-search("Doc43 autoresearch")
 worklog-get("anvil-worklog:db:linux-debian:2026", 1779295660)
+worklog-export-org(machine, year)
 #+end_src
 
 ** Git helpers

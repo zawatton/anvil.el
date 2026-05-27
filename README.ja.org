@@ -178,8 +178,12 @@ Anvil の default install は *約 40 個の MCP ツール* を提供します (
 | =anvil-ide.el= split (v1.0) | Emacs 専用の IDE 層 (treesit ナビゲーション、=worker-ui= dashboard、=info-lookup-symbol=) を [[https://github.com/zawatton/anvil-ide.el][zawatton/anvil-ide.el]] に分離。元の機能セットが欲しいなら両方 install、人間用 IDE surface 不要で AI 側 workbench だけ欲しい場合は =anvil.el= のみで OK |
 | Treesit subprocess fallback (v1.0) | Doc 38 Phase F + G ── =anvil-ts= / =-js= / =-py= の構造編集が、Emacs tree-sitter の無いホスト (NeLisp standalone 等) でも Python =ast= / acorn の subprocess fallback で稼働。Rust substrate でもトークン効率の良い AST query が維持される |
 | =anvil-orchestrator= | 1 つのプロンプトを最大 5 つの AI CLI (=claude= / =aider= / =gemini= / =ollama= / =codex=) に並列 fan-out。Jaccard 合意 + meta-LLM judge + DAG 依存 + =anvil-cron= 連携で夜間 PDCA |
-| =anvil-memory= (v0.4.0) | Bayesian TTL + FTS5 全文検索 の auto-memory エンジン。MCP ツール 16 本 (memory-scan / -audit / -search / -duplicates / -promote 等)。=~/.claude/projects/*/memory/=、=~/.codex/memories/=、=~/.gemini/memories/=、Continue / Aider / Cline / Cursor を auto-detect し、インストール済の AI CLI の auto-memory を 1 つの SQLite DB で横断インデックス。陳腐化行検出・矛盾検出・URL 生存確認を全プロバイダ横断で実施 |
-| =anvil-tools-by-intent= + =anvil-manifest= (v0.4.0) | Intent-based tool discovery + =ANVIL_PROFILE= フィルタ。tool 毎に =:intent / :layer / :stability= tag、=agent= / =edit= / =ultra= profile で orchestrator 子セッションの =tools/list= を 3〜7 倍圧縮 (full ~20k → ultra ~2.7k tokens) |
+| =anvil-memory= (v0.4.0 + 2026-05) | Bayesian TTL + FTS5 全文検索の auto-memory エンジン。multi-provider の =.md= memory を scan し、DB-primary な =memory-add= / =memory-get= / =memory-export-md=、WHISPER session delta、矛盾 scan、HTML export、review-only memory harvest を提供。SQLite DB は machine ごとに持ち、共有が必要なものは Markdown export する前提 |
+| =anvil-memory-bridge= (2026-05) | =anvil-memory= / =anvil-worklog= の前段に置く localhost JSON bridge。memory read/write endpoint、event stream、read-replica pull、worklog search/list/get、CORS、Claude.ai / ChatGPT / Gemini 用 browser extension、offline queue 付き mobile thin client を提供 |
+| =anvil-autoresearch= (2026-05) | 安全な自己改善 primitive。ローカルの Web/X/YouTube/design note から実装候補を scan、弱い MCP docstring を rank、eval+holdout gate 越しに提案・harvest・apply、provider routing 実験、NeLisp codegen task scaffold、tabulated-list dashboard を提供 |
+| =anvil-tools-by-intent= + =anvil-manifest= (v0.4.0 + 2026-05) | Intent-based tool discovery + =ANVIL_PROFILE= フィルタ。2026-05 の Tool Attention で query ranking、optional embedding backend、state precondition、schema trimming、warm LRU full-schema 保持、recovery suggestion、Doc43 docstring rewrite candidate 連携を追加 |
+| =anvil-worklog= (2026-05) | SQLite-backed AI 作業ログ index。旧 org log は scan、新規は =worklog-add= で DB-primary。search/list/get/export を MCP と memory-bridge から提供。DB ファイルの差し替え・unlink 後も stale handle を検出して再 open し、=worklog-add= は短い transaction で書き込む |
+| =anvil-claude-watchdog= (2026-05) | Linux procfs/jsonl ベースの Claude Code TUI hang watchdog。State=R stall と State=S spinner/MCP-child-IO 停止 variant を検出し、event 記録、desktop notification、確認付き =claude --resume= tmux staging を提供 |
 | =anvil-sexp= / =sexp-cst= / =py= / =ts= / =js= (v0.4.0) | 言語別構造編集。Elisp は reader ベース、Python / TypeScript / TSX / JavaScript は tree-sitter CST — ファイル全文に触らず AST 単位で refactor |
 | =anvil-session= + Claude Code lifecycle hooks (v0.4.0) | セッション snapshot / resume + 5 lifecycle hook (PreCompact / SessionStart / PostToolUse / UserPromptSubmit / SessionEnd)。branch + task summary を 14 日 TTL で保存、再起動時の cold 再構築を回避 |
 | =anvil-shell-filter= (v0.4.0) | shell 出力圧縮 — git / rg / pytest / ert-batch / docker-logs など 20 filter 同梱。raw は TTL 付きで stash、必要時に復元可 |
@@ -224,9 +228,19 @@ Doc 26 の =anvil-manifest= は、クライアントが virtual server-id
 | =ultra= | 17           | ~2,740        | hot tool + =ts_extended= lazy       |
 | =agent= (v0.4.0) | ≈60 (intent filter) | ~6,500 | orchestrator / session / memory / edit |
 | =edit=  (v0.4.0) | ≈40 (intent filter) | ~4,200 | ファイル / org / code / json 編集専用  |
+| =dynamic= (2026-05) | Top-K + warm LRU | query 依存 | Tool Attention + schema trimming |
 
 =manifest-cost= MCP ツールを叩けば現状の profile / advertised-count /
 registered-count / approx-tokens がいつでも取得できます。
+
+2026-05 update では、この仕組みが Tool Attention layer に拡張されています。
+=ANVIL_PROFILE=dynamic= と、必要に応じて =ANVIL_ATTENTION_QUERY= を設定すると
+現在の意図で tool が rank されます。=:preconditions= が =ANVIL_STATE_TAGS= に
+合わない tool は隠され、schema trimming 有効時は Top-K の focused tool、
+manifest 自身の tool、最近使った warm LRU tool だけが full schema を持ちます。
+それ以外は name/type 中心の compact schema で広告されます。
+=manifest-recovery-suggest= は tool が隠れた理由を説明し、
+=manifest-docstring-candidates= は弱い説明文を Doc43 autoresearch へ渡します。
 
 *Orchestrator 子セッション* (Doc 26 Phase 1b + Doc 34 Phase B) は
 =anvil-orchestrator-manifest-profile= を設定するだけで、自動生成された
@@ -469,7 +483,7 @@ Anvil を使うと:
 | =data=       | UTF-8 強制の JSON/CSV 読み書き                 | —                |
 | =xlsx=       | Excel 読み書き（オプション）                   | Python, openpyxl |
 | =pdf=        | PDF テキスト抽出（オプション）                 | Python, pymupdf  |
-| =ide=        | xref、診断、imenu、tree-sitter（オプション）   | project.el       |
+| =ide= (split) | 2026-04 に [[https://github.com/zawatton/anvil-ide.el][zawatton/anvil-ide.el]] へ分離。=anvil.el= は NeLisp で走る AI 側 workbench、=anvil-ide.el= は xref / diagnostics / imenu / tree-sitter / info-look / worker-ui dashboard を持つ Emacs 専用 IDE 層 | anvil-ide.el repo |
 | =cron=       | ワーカーディスパッチ付きスケジュールタスクランナー | —            |
 | =elisp=      | エージェント向け Elisp 開発ツール（オプション）| —                |
 | =browser=    | agent-browser 経由の Web fetch / interact / capture / screenshot（オプション） | agent-browser CLI |
@@ -479,10 +493,14 @@ Anvil を使うと:
 | =orchestrator-routing= | provider 別レイテンシルーティング =orchestrator-routing-select= (v0.4.0) | =orchestrator= |
 | =orchestrator-presets= | 名前付き合意 provider 組合せ (v0.4.0) | =orchestrator= |
 | =pty-broker= | 実 TTY を要するプロセス向け node-pty TCP broker（オプション） | Node.js, node-pty |
-| =memory= (v0.4.0) | auto-memory index + TTL audit + アクセストラッカー。=~/.claude/projects/*/memory/*.md= 上で動作、MCP ツール 16 本 | Emacs 29+ |
+| =memory= (v0.4.0 + 2026-05) | auto-memory index + TTL audit + access tracker、DB-primary add/get/export、WHISPER session delta、矛盾 scan、HTML export、review-only harvest candidates（オプション） | Emacs 29+ |
+| =memory-bridge= (2026-05) | memory + worklog の localhost HTTP/JSON API、write auth、event stream、read-replica pull、CORS、browser extension、mobile thin client（オプション） | =memory=, =worklog= |
+| =worklog= (2026-05) | AI 作業ログ org scan + DB-primary =worklog-add= + search/list/get/export。長時間 daemon 向け stale SQLite handle recovery 付き（オプション） | Emacs 29+ |
+| =autoresearch= (2026-05) | candidate scan、MCP docstring proposal/apply/harvest gate、routing 実験、NeLisp codegen task scaffold、tabulated-list dashboard（オプション） | =orchestrator=, optional =memory= |
+| =claude-watchdog= (2026-05) | Linux Claude Code hang detector + desktop notification + 確認付き tmux resume staging（オプション） | Linux procfs, tmux |
 | =session= (v0.4.0) | セッション snapshot / resume + Claude Code lifecycle hook 5 本 | =state= |
 | =discovery= (v0.4.0) | Intent-based tool discovery (=anvil-tools-by-intent=) + tool 毎 usage counter | =state= |
-| =manifest= (v0.4.0) | =ANVIL_PROFILE= によるセッション別 =tools/list= フィルタ (ultra / nav / core / lean / full / agent / edit) | — |
+| =manifest= (v0.4.0 + 2026-05) | =ANVIL_PROFILE= によるセッション別 =tools/list= フィルタ。dynamic Tool Attention で query ranking、state filtering、schema trimming、warm LRU、recovery hint を追加（オプション） | — |
 | =disclosure= (v0.4.0) | 3 層 read 契約 + citation URI scheme + =disclosure-help= | =org-index= |
 | =shell-filter= (v0.4.0) | shell 出力圧縮。20 filter 同梱 + tee + gain 統計 | =state= |
 | =data= (v0.4.0) | JSON path ベース編集 (preview-first): data-get-path / data-set-path / data-delete-path / data-list-keys | — |
@@ -712,11 +730,110 @@ tool が使えます:
 - =memory-promote OLD NEW-TYPE= — rename + 索引更新
 - =memory-regenerate-index= — decay 降順で =MEMORY.md= body 生成
   (read-only 出力、実際の write は呼び出し側の責任)
+- =memory-add= / =memory-get= / =memory-export-md= — DB-primary な
+  write/read/export 経路。新規 memory を SQLite に直接追加し、
+  backing =.md= を直接 read せずに本文取得し、他 AI と file で
+  受け渡す必要がある時だけ Markdown に戻せます。
+- =memory-session-delta= / =memory-stop-sync= — WHISPER session context。
+  初回は decay 順の full index、以後は追加・変更・削除分だけを返し、
+  delta が大きくなりすぎた場合は full に戻ります。
+- =memory-harvest-candidates= — session text / transcript から永続化候補を
+  review-only で抽出。自動保存はせず、どれを =memory-add= するかは
+  呼び出し側が決めます。
 
 Claude 以外の MCP クライアントは同じ anvil サーバに接続すれば
-これらの tool を呼べます。モジュールは =.md= 本文に書き込まない
-(ファイル操作は promote の rename のみ) ので、他ツールが管理する
-memory ディレクトリに向けても安全です。
+これらの tool を呼べます。通常の scan/search/list/audit は provider
+管理の =.md= に対して read-only です。変更は明示的な操作
+(=memory-promote= の rename、=memory-add= の DB insert、
+=memory-export-md= の caller-driven Markdown export) に限られます。
+
+*** DB 配置とマシン間共有
+
+metadata DB の既定値は =<user-emacs-directory>/anvil-memory-index.db= です。
+notes repo 配下の DB を使いたい場合は symlink ではなく root 指定で
+redirect できます:
+
+#+begin_src emacs-lisp
+(setq anvil-memory-shared-db-roots
+      '("~/Cowork/Notes"))
+#+end_src
+
+=anvil-memory-db-path= が既定値のままなら、DB path は初回 access 時に
+次の順で解決されます:
+
+1. =ANVIL_MEMORY_DB= environment variable
+2. =anvil-memory-db-path= (明示 customize 時)
+3. =.anvil-memory/anvil-memory-index.db= を含む
+   =anvil-memory-shared-db-roots= の最初の entry
+4. 既定の =<user-emacs-directory>/anvil-memory-index.db=
+
+実際の path は =(anvil-memory-effective-db-path)= で確認できます。
+
+複数マシンで 1 つの SQLite file を git merge しないでください。
+現在の運用モデルは:
+
+- =.anvil-memory/*.db= は machine ごとに保持し、gitignore する
+- DB-direct memory を他 AI に渡す必要がある時だけ =memory-export-md=
+  で Markdown artifact にする
+- 別マシンでは =memory-scan= で export 済み =.md= を再 index する
+
+これにより binary merge conflict と、長時間 Emacs daemon が古い
+SQLite handle を持ち続ける問題を避けます。
+
+*** Memory bridge — cross-AI / mobile access
+
+=memory-bridge= optional module は =anvil-memory= と =anvil-worklog= の
+前段に localhost JSON API を置きます。Emacs MCP server を直接話せない
+browser chat UI、mobile thin client、Tailscale 越しの別マシン、
+read replica から使うための層です。
+
+#+begin_src emacs-lisp
+(add-to-list 'anvil-optional-modules 'memory)
+(add-to-list 'anvil-optional-modules 'worklog)
+(add-to-list 'anvil-optional-modules 'memory-bridge)
+(anvil-enable)
+(anvil-memory-bridge-start)
+#+end_src
+
+既定 bind は =127.0.0.1:8730= です。read endpoint は
+=/memory/search=、=/memory/list=、=/memory/get/<name>=、
+=/memory/events=、=/worklog/search=、=/worklog/list=、=/worklog/get=。
+memory の mutate endpoint は =Authorization: Bearer <token>= が必要で、
+=M-x anvil-memory-bridge-rotate-token= で token を rotate できます。
+
+=extensions/= 配下には thin client があります:
+
+- =extensions/memory-bridge/= — Claude.ai / ChatGPT / Gemini 用の
+  Manifest V3 browser extension。=Ctrl+Alt+M= で memory 検索・注入、
+  =Ctrl+Alt+S= で選択 text を保存。
+- =extensions/mobile-bridge/= — 依存なしの static mobile app。
+  bridge URL/token を =localStorage= に保存し、失敗した save は
+  online 復帰時に replay します。
+
+read-replica mode は single-writer 前提です。replica は primary の
+=memory_event= row を pull できますが、local mutate endpoint は =409=
+を返し、複数マシンが silently diverge しないようにします。
+
+** Worklog モジュール（オプション）
+
+=worklog= モジュールは long-term memory とは別に AI 作業ログを index します。
+legacy な =capture/ai-logs-*.org= archive は scan できますが、新規 entry は
+org 手動追記ではなく =worklog-add= による DB-primary です。search/list/get は
+MCP tool と memory-bridge の両方から使えます。
+
+=memory= と同じく、=worklog= も machine ごとの SQLite DB を前提にします。
+git や他マシンとの受け渡しには =worklog-export-org= で human-readable な
+org snapshot を作ります。2026-05 の develop では、長時間 daemon が
+SQLite file の差し替え・unlink を検出し、次の DB 操作前に自動 reopen します。
+
+典型的な使い方:
+
+#+begin_src text
+worklog-add(title, body)
+worklog-search("Doc43 autoresearch")
+worklog-get("anvil-worklog:db:linux-debian:2026", 1779295660)
+worklog-export-org(machine, year)
+#+end_src
 
 * クライアント設定 — AI を Anvil に接続する
 
