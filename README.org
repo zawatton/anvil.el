@@ -17,7 +17,7 @@ with that in mind.
 * TL;DR
 
 anvil.el is a workbench for AI agents.  Optional modules (memory / orchestrator / session / http / …) each add their own tools when you enable them.
-Claude Code, Claude Desktop, GPT, local LLMs via Ollama — anything
+Claude Code, Codex CLI, Claude Desktop, GPT, local LLMs via Ollama — anything
 that speaks [[https://modelcontextprotocol.io/][Model Context Protocol]] can edit files, navigate org-mode,
 run elisp, query SQLite, and more *through Emacs primitives* instead
 of generic =sed= / =grep= / =read-whole-file= round-trips.  That
@@ -53,7 +53,7 @@ A typical refactoring session saves *15,000-25,000 tokens*.
 
 #+begin_example
        ┌──────────────────────────┐
-       │  Claude Code  /  Cursor  │
+       │ Claude Code / Codex CLI  │
        │  (any MCP-speaking AI)   │
        └────────────┬─────────────┘
                     │ MCP / stdio JSON-RPC
@@ -96,7 +96,7 @@ Pick a path based on what you want.
 
 For users who want the MCP tool surface without an Emacs daemon —
 CI runners, ephemeral containers, or "I don't use Emacs but want to
-cut Claude Code token use."
+cut Claude Code / Codex CLI token use."
 
 #+begin_src bash
 # 1. Clone NeLisp + build the Rust runtime
@@ -227,13 +227,13 @@ Full walkthrough including Claude Code / Claude Desktop config:
 * For non-Emacs users — what setup costs you
 
 Anvil runs in the background as an MCP server.  Your day-to-day
-editor (VSCode / Cursor / Neovim / Claude Code itself) does not
+editor (VSCode / Cursor / Neovim / Claude Code / Codex CLI itself) does not
 change.
 
 #+begin_example
   AI client ──MCP──▶ Anvil (Emacs daemon, headless) ──▶ file ops
   (VSCode / Cursor /                                    (only diffs cross)
-   Claude Code, …)
+   Claude Code / Codex CLI, …)
 #+end_example
 
 You don't have to open an Emacs window or write =init.el=.
@@ -277,7 +277,7 @@ sister package).  Highlights:
 | =org-read-outline= / =org-read-headline= | Read just the headings or a single subtree, even on a 13,000-line org. No full-file read needed |
 | =anvil-worker= | Dispatch long-running tasks (OCR, PDF conversion, batch file scans) to a separate background Emacs. The interactive Emacs never freezes |
 | Large org file editing | Edit org files of 1.2 MB or more without truncation (avoids the Windows file-mount issue) |
-| LLM client agnostic | Claude Code / Claude Desktop / GPT / local LLMs via Ollama — all speak through MCP |
+| LLM client agnostic | Claude Code / Codex CLI / Claude Desktop / GPT / local LLMs via Ollama — all speak through MCP |
 
 For numerical evidence and detailed case studies, see [[https://github.com/zawatton/anvil.el#efficiency--why-anvil-saves-ai-tokens][Efficiency — why Anvil saves AI tokens]].
 For the full module list, see [[https://github.com/zawatton/anvil.el#modules][Modules]].
@@ -1127,7 +1127,7 @@ Requires Emacs 29+ (for the built-in =sqlite-*= used by =anvil-state=).
 * Client setup — connecting your AI to Anvil
 
 After Anvil is running inside Emacs, you need to register it as
-an MCP server in your AI client (Claude Desktop, Claude Code CLI,
+an MCP server in your AI client (Claude Desktop, Claude Code CLI, Codex CLI,
 or any other MCP-compatible client).
 
 The bridge is a small shell script (=anvil-stdio.sh=) that speaks
@@ -1450,7 +1450,7 @@ it's the same idea wearing a bigger coat.
 
 Yes. Anvil is an MCP server that runs as a background daemon — you
 never have to open an Emacs window. Keep using whatever editor you
-already use (VSCode / Cursor / Neovim / Claude Code itself).
+already use (VSCode / Cursor / Neovim / Claude Code / Codex CLI itself).
 
 What you actually need:
 
@@ -1464,7 +1464,7 @@ knowledge required to capture the AI-token savings.
 * Internals — bridge + worker pool
 
 #+begin_example
-  Claude / GPT / Local LLM
+  Claude / Codex / GPT / Local LLM
          |
     MCP (JSON-RPC via stdio)
          |
