@@ -329,6 +329,83 @@ Binds:
       (should (equal today (plist-get id :date)))
       (should (equal "linux-test-host" (plist-get id :machine))))))
 
+(ert-deftest anvil-worklog-test/add-reopens-after-db-file-unlinked ()
+  "A long-lived daemon recovers when the DB file is replaced or removed."
+  (skip-unless (anvil-worklog-test--supported-p 'add))
+  (anvil-worklog-test--with-env
+    (let ((db-path anvil-worklog-db-path))
+      (anvil-worklog-add "before unlink" "old body"
+                         :date "2026-04-29"
+                         :machine "linux-debian"
+                         :year 2026)
+      ;; Simulate git conflict resolution / checkout replacing the DB
+      ;; under an already-open SQLite handle.
+      (delete-file db-path)
+      (let ((id (anvil-worklog-add "after unlink" "new body"
+                                   :date "2026-04-29"
+                                   :machine "linux-debian"
+                                   :year 2026)))
+        (should (file-exists-p db-path))
+        (should (= 1 (plist-get id :start-line)))
+        (should (equal "after unlink"
+                       (plist-get
+                        (car (anvil-worklog-list
+                              :limit 1 :machine "linux-debian"))
+                        :title)))))))
+
+(ert-deftest anvil-worklog-test/add-reopens-symlink-target-after-unlink ()
+  "Stale detection follows symlinks, matching the ~/.emacs.d DB layout."
+  (skip-unless (anvil-worklog-test--supported-p 'add))
+  (let* ((root (make-temp-file "anvil-wlsymlink-" t))
+         (target (expand-file-name "target.db" root))
+         (link (expand-file-name "link.db" root))
+         (anvil-worklog-db-path link)
+         (anvil-worklog--db nil)
+         (anvil-worklog--resolved-db-path nil)
+         (anvil-worklog--db-file-id nil)
+         (anvil-worklog-shared-db-roots nil)
+         (anvil-worklog-roots (list root)))
+    (unwind-protect
+        (progn
+          (make-symbolic-link target link)
+          (anvil-worklog-enable)
+          (anvil-worklog-add "before target unlink" "old body"
+                             :date "2026-04-29"
+                             :machine "linux-debian"
+                             :year 2026)
+          (delete-file target)
+          (let ((id (anvil-worklog-add "after target unlink" "new body"
+                                       :date "2026-04-29"
+                                       :machine "linux-debian"
+                                       :year 2026)))
+            (should (file-exists-p target))
+            (should (= 1 (plist-get id :start-line)))
+            (should (equal "after target unlink"
+                           (plist-get
+                            (car (anvil-worklog-list
+                                  :limit 1 :machine "linux-debian"))
+                            :title)))))
+      (when (fboundp 'anvil-worklog-disable)
+        (anvil-worklog-disable))
+      (ignore-errors (delete-directory root t)))))
+
+(ert-deftest anvil-worklog-test/add-rolls-back-entry-when-fts-insert-fails ()
+  "worklog-add does not leave a worklog_entry row without its FTS row."
+  (skip-unless (anvil-worklog-test--supported-p 'add))
+  (anvil-worklog-test--with-env
+    (let ((orig (symbol-function 'sqlite-execute)))
+      (cl-letf (((symbol-function 'sqlite-execute)
+                 (lambda (db sql &optional values)
+                   (if (string-match-p "INSERT INTO worklog_fts" sql)
+                       (error "forced FTS failure")
+                     (funcall orig db sql values)))))
+        (should-error
+         (anvil-worklog-add "rollback target" "body"
+                            :date "2026-04-29"
+                            :machine "linux-debian"
+                            :year 2026))))
+    (should-not (anvil-worklog-list :limit 5 :machine "linux-debian"))))
+
 (ert-deftest anvil-worklog-test/add-auto-increments-start-line ()
   "Successive calls with the same (machine, year) get consecutive
 start_line values; switching namespace resets the counter."

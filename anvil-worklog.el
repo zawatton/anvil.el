@@ -106,6 +106,15 @@ Non-existent directories are silently skipped."
                  (const :tag "unicode61 (default)" unicode61))
   :group 'anvil-worklog)
 
+(defcustom anvil-worklog-sqlite-busy-timeout-ms 5000
+  "SQLite busy timeout applied to the worklog DB connection.
+
+This gives short-lived readers or auto-export jobs time to finish
+instead of surfacing transient `database is locked' errors to MCP
+clients."
+  :type 'integer
+  :group 'anvil-worklog)
+
 (defconst anvil-worklog-supported
   '(scan prune search list get add export)
   "Capability tags this module currently provides.
@@ -134,6 +143,15 @@ because there is no on-disk file to check existence against.")
 (defvar anvil-worklog--resolved-db-path nil
   "Cached path returned by `anvil-worklog--resolve-db-path' on first open.
 Reset by `anvil-worklog--close' so a re-open re-runs detection.")
+
+(defvar anvil-worklog--db-file-id nil
+  "File identity recorded when `anvil-worklog--db' was opened.
+
+The value is `(PATH INODE DEVICE)'.  If the path disappears or its
+identity changes while the Emacs daemon keeps an old SQLite handle
+open, the next DB access closes and reopens the handle.  This recovers
+from git conflict resolution / checkout operations that replace or
+unlink the DB file while MCP clients are still alive.")
 
 (defun anvil-worklog--default-db-path ()
   "Return the un-redirected default DB path."
@@ -169,6 +187,29 @@ Reset by `anvil-worklog--close' so a re-open re-runs detection.")
   (unless (and (fboundp 'sqlite-available-p) (sqlite-available-p))
     (user-error
      "anvil-worklog: Emacs SQLite backend unavailable (needs Emacs 29+)")))
+
+(defun anvil-worklog--file-id (path)
+  "Return a stable identity plist for PATH, or nil when PATH is absent."
+  (when-let* ((true (ignore-errors (file-truename path)))
+              (attrs (file-attributes true)))
+    (list true (nth 10 attrs) (nth 11 attrs))))
+
+(defun anvil-worklog--db-handle-stale-p ()
+  "Return non-nil when the cached SQLite handle no longer matches PATH."
+  (and anvil-worklog--db
+       anvil-worklog--resolved-db-path
+       (not (equal anvil-worklog--db-file-id
+                   (anvil-worklog--file-id
+                    anvil-worklog--resolved-db-path)))))
+
+(defun anvil-worklog--apply-connection-pragmas (db)
+  "Apply per-connection PRAGMAs to DB."
+  (when (and (integerp anvil-worklog-sqlite-busy-timeout-ms)
+             (>= anvil-worklog-sqlite-busy-timeout-ms 0))
+    (sqlite-execute
+     db
+     (format "PRAGMA busy_timeout = %d"
+             anvil-worklog-sqlite-busy-timeout-ms))))
 
 (defun anvil-worklog--sqlite-supports-trigram-p (db)
   "Return non-nil when DB's SQLite build ships the FTS5 trigram tokenizer."
@@ -242,6 +283,8 @@ Reset by `anvil-worklog--close' so a re-open re-runs detection.")
       (setq anvil-worklog--resolved-db-path path)
       (make-directory (file-name-directory path) t)
       (setq anvil-worklog--db (sqlite-open path))
+      (setq anvil-worklog--db-file-id (anvil-worklog--file-id path))
+      (anvil-worklog--apply-connection-pragmas anvil-worklog--db)
       (anvil-worklog--ensure-schema)))
   anvil-worklog--db)
 
@@ -249,10 +292,29 @@ Reset by `anvil-worklog--close' so a re-open re-runs detection.")
   (when anvil-worklog--db
     (ignore-errors (sqlite-close anvil-worklog--db))
     (setq anvil-worklog--db nil))
-  (setq anvil-worklog--resolved-db-path nil))
+  (setq anvil-worklog--resolved-db-path nil)
+  (setq anvil-worklog--db-file-id nil))
 
 (defun anvil-worklog--db ()
+  (when (anvil-worklog--db-handle-stale-p)
+    (anvil-worklog--close))
   (or anvil-worklog--db (anvil-worklog--open)))
+
+(defmacro anvil-worklog--with-transaction (db &rest body)
+  "Run BODY inside a SQLite transaction on DB.
+
+The transaction is deliberately small and local to one public write
+operation.  On error, a best-effort ROLLBACK runs before re-signalling."
+  (declare (indent 1))
+  `(let ((--anvil-worklog-committed nil))
+     (unwind-protect
+         (progn
+           (sqlite-execute ,db "BEGIN IMMEDIATE")
+           (prog1 (progn ,@body)
+             (sqlite-execute ,db "COMMIT")
+             (setq --anvil-worklog-committed t)))
+       (unless --anvil-worklog-committed
+         (ignore-errors (sqlite-execute ,db "ROLLBACK"))))))
 
 
 ;;;; --- parsing ----------------------------------------------------------
@@ -658,20 +720,21 @@ Returns =(:file SYNTHETIC :start-line N :machine M :year Y :date D
          (body-trimmed (replace-regexp-in-string "[ \t\n]+\\'" "" body))
          (digest (anvil-worklog--digest body-trimmed))
          (now (truncate (float-time))))
-    (sqlite-execute
-     db
-     "INSERT INTO worklog_entry
-        (file, start_line, end_line, machine, year, date,
-         title, body, digest, scanned_at)
-        VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
-     (list file start-line machine* year* date*
-           title body-trimmed digest now))
-    (sqlite-execute
-     db
-     "INSERT INTO worklog_fts
-        (file, start_line, machine, date, title, body)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
-     (list file start-line machine* date* title body-trimmed))
+    (anvil-worklog--with-transaction db
+      (sqlite-execute
+       db
+       "INSERT INTO worklog_entry
+          (file, start_line, end_line, machine, year, date,
+           title, body, digest, scanned_at)
+          VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+       (list file start-line machine* year* date*
+             title body-trimmed digest now))
+      (sqlite-execute
+       db
+       "INSERT INTO worklog_fts
+          (file, start_line, machine, date, title, body)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+       (list file start-line machine* date* title body-trimmed)))
     (list :file file
           :start-line start-line
           :machine machine*
