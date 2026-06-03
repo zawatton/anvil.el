@@ -7,13 +7,12 @@
 ;;   1. Async eval result formatting (queue wait vs runtime split,
 ;;      job lifecycle plist fields).
 ;;
-;;   2. The architecture α NeLisp interpreter backend
-;;      (`anvil-eval--nelisp' + `anvil-eval--locate-nelisp-binary' +
+;;   2. The pure Elisp NeLisp evaluator backend
+;;      (`anvil-eval--nelisp' + `anvil-eval--locate-nelisp-source-directory' +
 ;;      the `nelisp-eval' MCP tool registration).
 ;;
-;; NeLisp tests skip cleanly when the `nelisp' binary cannot be
-;; located so the suite is safe to ship in CI on hosts that have not
-;; built the Rust runtime.
+;; NeLisp tests skip cleanly when the pure Elisp NeLisp source directory
+;; cannot be located.
 
 ;;; Code:
 
@@ -112,49 +111,55 @@
 
 ;;;; --- guards -------------------------------------------------------------
 
-(defun anvil-eval-test--nelisp-bin-or-skip ()
-  "Return the located `nelisp' binary path, or skip the calling test."
-  (let ((anvil-eval--nelisp-binary-cache 'unset))
-    (or (anvil-eval--locate-nelisp-binary)
-        (ert-skip "nelisp binary not found on this host"))))
+(defun anvil-eval-test--nelisp-source-or-skip ()
+  "Return the located pure Elisp NeLisp source directory, or skip."
+  (let ((anvil-eval--nelisp-source-cache 'unset))
+    (or (anvil-eval--locate-nelisp-source-directory)
+        (ert-skip "pure Elisp nelisp source directory not found"))))
 
 
-;;;; --- locate-nelisp-binary ----------------------------------------------
+;;;; --- locate-nelisp-source-directory ------------------------------------
 
-(ert-deftest anvil-eval-test-locate-honours-explicit-override ()
-  "When `anvil-eval-nelisp-binary' points at an existing executable
-the resolver returns it without consulting PATH or env vars."
-  (let* ((tmp (make-temp-file "anvil-eval-test-bin-")))
+(defun anvil-eval-test--make-source-dir ()
+  "Create a temporary directory that looks like a NeLisp source dir."
+  (let ((dir (make-temp-file "anvil-eval-test-nelisp-src-" t)))
+    (with-temp-file (expand-file-name "nelisp-read.el" dir))
+    (with-temp-file (expand-file-name "nelisp-eval.el" dir))
+    (with-temp-file (expand-file-name "nelisp-macro.el" dir))
+    dir))
+
+(ert-deftest anvil-eval-test-locate-source-honours-explicit-override ()
+  "When `anvil-eval-nelisp-source-directory' points at a source dir,
+the resolver returns it without consulting env vars."
+  (let* ((tmp (anvil-eval-test--make-source-dir)))
     (unwind-protect
-        (progn
-          (set-file-modes tmp #o755)
-          (let ((anvil-eval-nelisp-binary tmp)
-                (anvil-eval--nelisp-binary-cache 'unset)
-                (process-environment
-                 (cons "NELISP_BIN=/nonexistent/should-not-be-used"
-                       process-environment)))
-            (should (equal tmp (anvil-eval--locate-nelisp-binary)))))
-      (when (file-exists-p tmp) (delete-file tmp)))))
+        (let ((anvil-eval-nelisp-source-directory tmp)
+              (anvil-eval--nelisp-source-cache 'unset)
+              (process-environment
+               (cons "NELISP_ELISP_DIR=/nonexistent/should-not-be-used"
+                     process-environment)))
+          (should (equal (expand-file-name tmp)
+                         (anvil-eval--locate-nelisp-source-directory))))
+      (when (file-directory-p tmp) (delete-directory tmp t)))))
 
-(ert-deftest anvil-eval-test-locate-honours-env-var ()
-  "When `anvil-eval-nelisp-binary' is nil and $NELISP_BIN points at an
-existing executable the resolver picks it up."
-  (let* ((tmp (make-temp-file "anvil-eval-test-envbin-")))
+(ert-deftest anvil-eval-test-locate-source-honours-env-var ()
+  "When `anvil-eval-nelisp-source-directory' is nil and $NELISP_ELISP_DIR
+points at a source dir, the resolver picks it up."
+  (let* ((tmp (anvil-eval-test--make-source-dir)))
     (unwind-protect
-        (progn
-          (set-file-modes tmp #o755)
-          (let ((anvil-eval-nelisp-binary nil)
-                (anvil-eval--nelisp-binary-cache 'unset)
-                (process-environment
-                 (cons (concat "NELISP_BIN=" tmp) process-environment)))
-            (should (equal tmp (anvil-eval--locate-nelisp-binary)))))
-      (when (file-exists-p tmp) (delete-file tmp)))))
+        (let ((anvil-eval-nelisp-source-directory nil)
+              (anvil-eval--nelisp-source-cache 'unset)
+              (process-environment
+               (cons (concat "NELISP_ELISP_DIR=" tmp) process-environment)))
+          (should (equal (expand-file-name tmp)
+                         (anvil-eval--locate-nelisp-source-directory))))
+      (when (file-directory-p tmp) (delete-directory tmp t)))))
 
-(ert-deftest anvil-eval-test-locate-caches-result ()
-  "Second call returns the same path without re-probing."
-  (anvil-eval-test--nelisp-bin-or-skip)
-  (let ((first (anvil-eval--locate-nelisp-binary))
-        (second (anvil-eval--locate-nelisp-binary)))
+(ert-deftest anvil-eval-test-locate-source-caches-result ()
+  "Second call returns the same source directory without re-probing."
+  (anvil-eval-test--nelisp-source-or-skip)
+  (let ((first (anvil-eval--locate-nelisp-source-directory))
+        (second (anvil-eval--locate-nelisp-source-directory)))
     (should (equal first second))
     (should (stringp first))))
 
@@ -162,25 +167,35 @@ existing executable the resolver picks it up."
 ;;;; --- anvil-eval--nelisp -------------------------------------------------
 
 (ert-deftest anvil-eval-test-nelisp-arithmetic ()
-  "`(+ 1 2)' on the NeLisp interpreter returns \"3\"."
-  (anvil-eval-test--nelisp-bin-or-skip)
-  (should (equal "3" (anvil-eval--nelisp "(+ 1 2)"))))
+  "`(+ 1 2)' on the pure Elisp NeLisp evaluator returns \"3\"."
+  (anvil-eval-test--nelisp-source-or-skip)
+  (let ((anvil-eval-nelisp-reset-before-eval t))
+    (should (equal "3" (anvil-eval--nelisp "(+ 1 2)")))))
+
+(ert-deftest anvil-eval-test-nelisp-keeps-repl-state ()
+  "`nelisp-eval' keeps NeLisp definitions across calls by default."
+  (anvil-eval-test--nelisp-source-or-skip)
+  (let ((anvil-eval-nelisp-reset-before-eval t))
+    (should (equal "nelisp-eval-test-repl-x"
+                   (anvil-eval--nelisp "(defvar nelisp-eval-test-repl-x 41)"))))
+  (let ((anvil-eval-nelisp-reset-before-eval nil))
+    (should (equal "42" (anvil-eval--nelisp "(+ nelisp-eval-test-repl-x 1)")))))
 
 (ert-deftest anvil-eval-test-nelisp-keyword-self-eval ()
-  "Keywords self-evaluate on NeLisp (Phase 8.x fix shipped 2026-04-27)."
-  (anvil-eval-test--nelisp-bin-or-skip)
-  (should (equal ":foo" (anvil-eval--nelisp ":foo"))))
+  "Keywords self-evaluate on the pure Elisp NeLisp evaluator."
+  (anvil-eval-test--nelisp-source-or-skip)
+  (let ((anvil-eval-nelisp-reset-before-eval t))
+    (should (equal ":foo" (anvil-eval--nelisp ":foo")))))
 
 (ert-deftest anvil-eval-test-nelisp-string-len ()
-  "Round-trip a string operation through the subprocess."
-  (anvil-eval-test--nelisp-bin-or-skip)
-  (should (equal "5" (anvil-eval--nelisp "(length \"hello\")"))))
+  "Round-trip a string operation through the pure Elisp evaluator."
+  (anvil-eval-test--nelisp-source-or-skip)
+  (let ((anvil-eval-nelisp-reset-before-eval t))
+    (should (equal "5" (anvil-eval--nelisp "(length \"hello\")")))))
 
-(ert-deftest anvil-eval-test-nelisp-missing-binary-errors ()
-  "When no binary can be located the eval helper signals an error.
-Force the cache to a `nil' result so the resolver short-circuits to
-\"not found\" without consulting PATH or env vars."
-  (let ((anvil-eval--nelisp-binary-cache nil))
+(ert-deftest anvil-eval-test-nelisp-missing-source-errors ()
+  "When no source directory can be located, the eval helper signals an error."
+  (let ((anvil-eval--nelisp-source-cache nil))
     (should-error (anvil-eval--nelisp "(+ 1 2)") :type 'error)))
 
 

@@ -22,6 +22,7 @@
 
 ;;; Code:
 
+(require 'cl-lib)
 (require 'anvil-server)
 
 ;;; Customization
@@ -44,16 +45,23 @@ Improves performance ~4x on large org files."
   :type 'boolean
   :group 'anvil-eval)
 
-(defcustom anvil-eval-nelisp-binary nil
-  "Absolute path to the NeLisp interpreter `nelisp' binary.
-When nil (default) `anvil-eval--locate-nelisp-binary' performs a PATH
-lookup plus a small list of well-known dev / install locations."
-  :type '(choice (const :tag "Auto-detect" nil) file)
-  :group 'anvil-eval)
-
 (defcustom anvil-eval-nelisp-timeout 30
   "Hard timeout in seconds for synchronous `nelisp-eval' tool calls."
   :type 'integer
+  :group 'anvil-eval)
+
+(defcustom anvil-eval-nelisp-source-directory nil
+  "Directory containing pure Elisp NeLisp sources, or nil for auto-detect.
+The directory must contain `nelisp-read.el', `nelisp-eval.el', and
+`nelisp-macro.el'."
+  :type '(choice (const :tag "Auto-detect" nil) directory)
+  :group 'anvil-eval)
+
+(defcustom anvil-eval-nelisp-reset-before-eval nil
+  "When non-nil, reset pure Elisp NeLisp state before each `nelisp-eval' call.
+The default nil keeps MCP calls REPL-like: definitions from previous
+calls remain available in NeLisp's own global/function tables."
+  :type 'boolean
   :group 'anvil-eval)
 
 ;;; Tool timeout
@@ -127,91 +135,76 @@ Only available in Emacs with thread support.")
           (result (eval form t)))
      (format "%S" result))))
 
-;;; NeLisp interpreter eval tool (architecture α: anvil → NeLisp)
+;;; NeLisp eval tool (pure Elisp REPL)
 
-(defvar anvil-eval--nelisp-binary-cache 'unset
-  "Cached result of `anvil-eval--locate-nelisp-binary'.
-Symbol `unset' means \"not yet probed\" so a successful nil result
-(= binary genuinely absent) is also memoised.")
+(defvar anvil-eval--nelisp-source-cache 'unset
+  "Cached result of `anvil-eval--locate-nelisp-source-directory'.")
 
-(defun anvil-eval--locate-nelisp-binary ()
-  "Return absolute path to the NeLisp `nelisp' binary, or nil.
-Resolution order: `anvil-eval-nelisp-binary' override, `$NELISP_BIN'
-env, PATH lookup, then a small set of known dev / install locations.
-Result is cached for the daemon lifetime; reset the cache via
-\\(setq anvil-eval--nelisp-binary-cache \\='unset\\)."
+(defvar anvil-eval--nelisp-loaded nil
+  "Non-nil once the pure Elisp NeLisp evaluator has been loaded.")
+
+(declare-function nelisp--reset "nelisp-eval" ())
+(declare-function nelisp-eval-string "nelisp-eval" (str))
+
+(defun anvil-eval--locate-nelisp-source-directory ()
+  "Return directory containing pure Elisp NeLisp sources, or nil."
   (cond
-   ((not (eq anvil-eval--nelisp-binary-cache 'unset))
-    anvil-eval--nelisp-binary-cache)
+   ((not (eq anvil-eval--nelisp-source-cache 'unset))
+    anvil-eval--nelisp-source-cache)
    (t
     (let ((found
-           (or (and anvil-eval-nelisp-binary
-                    (file-executable-p anvil-eval-nelisp-binary)
-                    anvil-eval-nelisp-binary)
-               (let ((env (getenv "NELISP_BIN")))
-                 (and env (file-executable-p env) env))
-               (executable-find "nelisp")
-               (cl-some (lambda (p) (and (file-executable-p p) p))
-                        (list (expand-file-name
-                               "Cowork/Notes/dev/nelisp/nelisp-runtime/target/release/nelisp"
-                               (or (getenv "HOME") "~"))
-                              (expand-file-name
-                               "Notes/dev/nelisp/nelisp-runtime/target/release/nelisp"
-                               (or (getenv "HOME") "~"))
-                              "/usr/local/bin/nelisp")))))
-      (setq anvil-eval--nelisp-binary-cache found)))))
+           (cl-some
+            (lambda (dir)
+              (let ((expanded (and dir (expand-file-name dir))))
+                (and expanded
+                     (file-readable-p (expand-file-name "nelisp-read.el" expanded))
+                     (file-readable-p (expand-file-name "nelisp-eval.el" expanded))
+                     (file-readable-p (expand-file-name "nelisp-macro.el" expanded))
+                     expanded)))
+            (list anvil-eval-nelisp-source-directory
+                  (getenv "NELISP_ELISP_DIR")
+                  (expand-file-name "Cowork/Notes/dev/nelisp/src"
+                                    (or (getenv "HOME") "~"))
+                  (expand-file-name "Notes/dev/nelisp/src"
+                                    (or (getenv "HOME") "~"))))))
+      (setq anvil-eval--nelisp-source-cache found)))))
+
+(defun anvil-eval--ensure-nelisp ()
+  "Load the pure Elisp NeLisp evaluator and initialize REPL state."
+  (let ((src-dir (anvil-eval--locate-nelisp-source-directory)))
+    (unless src-dir
+      (error "pure Elisp nelisp sources not found — set anvil-eval-nelisp-source-directory or NELISP_ELISP_DIR"))
+    (let ((load-path (cons src-dir load-path)))
+      (require 'nelisp-eval)
+      (require 'nelisp-macro))
+    (unless anvil-eval--nelisp-loaded
+      (nelisp--reset)
+      (setq anvil-eval--nelisp-loaded t))))
+
+(defun anvil-eval--nelisp-host (expression)
+  "Evaluate EXPRESSION through the pure Elisp NeLisp evaluator."
+  (anvil-eval--ensure-nelisp)
+  (when (and anvil-eval-nelisp-reset-before-eval
+             (fboundp 'nelisp--reset))
+    (nelisp--reset))
+  (prin1-to-string (nelisp-eval-string expression)))
 
 (defun anvil-eval--nelisp (expression)
-  "Evaluate EXPRESSION on the NeLisp interpreter (= subprocess) and
-return the result as a string.
+  "Evaluate EXPRESSION with the pure Elisp NeLisp evaluator.
 
-Spawns the standalone `nelisp' Rust binary via `nelisp eval EXPR' so
-the evaluation is fully isolated from the host Emacs daemon — useful
-for portability validation, sandbox eval, and exercising the
-NeLisp-only code path that anvil.el delegates to via
-fboundp guard + fallback (architecture α).
+This runs inside the host Emacs daemon, but through NeLisp's own
+reader/evaluator and NeLisp-owned global/function tables.  Calls are
+stateful by default so the MCP tool behaves like a practical REPL.
 
 MCP Parameters:
   expression - NeLisp / Elisp expression to evaluate (string, required)
                Example: \"(+ 1 2 3)\"
-               Example: \"(length \\\"hello\\\")\"
-
-Errors when the binary cannot be located, the subprocess exits
-non-zero, or `anvil-eval-nelisp-timeout' fires."
+               Example: \"(length \\\"hello\\\")\""
   (anvil-server-with-error-handling
-   (let ((bin (anvil-eval--locate-nelisp-binary)))
-     (unless bin
-       (error "nelisp binary not found — set anvil-eval-nelisp-binary or NELISP_BIN"))
-     (with-temp-buffer
-       (let* ((stderr-file (make-temp-file "anvil-nelisp-eval-stderr-"))
-              (exit-code
-               (unwind-protect
-                   (with-timeout (anvil-eval-nelisp-timeout
-                                  (error "nelisp-eval timed out after %ds"
-                                         anvil-eval-nelisp-timeout))
-                     (call-process bin nil
-                                   (list (current-buffer) stderr-file)
-                                   nil
-                                   "eval" expression))
-                 (when (file-exists-p stderr-file)
-                   (when (zerop (or (nth 7 (file-attributes stderr-file)) 0))
-                     (delete-file stderr-file)))))
-              (stdout (string-trim (buffer-string)))
-              (stderr (and (file-exists-p stderr-file)
-                           (with-temp-buffer
-                             (insert-file-contents stderr-file)
-                             (string-trim (buffer-string))))))
-         (when (and stderr-file (file-exists-p stderr-file))
-           (delete-file stderr-file))
-         (cond
-          ((not (eq exit-code 0))
-           (error "nelisp exit %S: %s"
-                  exit-code (or stderr stdout "(no output)")))
-          ((and stderr (not (string-empty-p stderr)))
-           ;; Non-zero stderr but exit 0 — surface it to the caller as
-           ;; a string suffix so they can see warnings / messages.
-           (format "%s\n;; stderr:\n%s" stdout stderr))
-          (t stdout)))))))
+   (with-timeout (anvil-eval-nelisp-timeout
+                  (error "nelisp-eval timed out after %ds"
+                         anvil-eval-nelisp-timeout))
+     (anvil-eval--nelisp-host expression))))
 
 ;;; Async eval tools
 
@@ -421,12 +414,9 @@ Useful for checking what's running or debugging stuck jobs."
    :intent '(eval)
    :layer 'dev
    :description
-   "Evaluate expression on the NeLisp interpreter (= subprocess) and
-return the result.  Architecture α companion to emacs-eval — runs
-the form fully isolated from the host Emacs daemon, so it doubles as
-a portability check (= form behaves the same on NeLisp's pure Elisp
-runtime) and a sandbox evaluator (= no access to anvil-* / Emacs
-state)."
+   "Evaluate expression with the pure Elisp NeLisp evaluator and
+return the printed result.  Uses NeLisp's reader/evaluator and keeps
+NeLisp globals across calls, so it behaves as a practical MCP REPL."
    :server-id anvil-eval--server-id))
 
 (defun anvil-eval-disable ()
