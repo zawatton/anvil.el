@@ -140,34 +140,49 @@ Only available in Emacs with thread support.")
 (defvar anvil-eval--nelisp-source-cache 'unset
   "Cached result of `anvil-eval--locate-nelisp-source-directory'.")
 
+(defvar anvil-eval--nelisp-source-cache-key nil
+  "Candidate directory list used for `anvil-eval--nelisp-source-cache'.")
+
 (defvar anvil-eval--nelisp-loaded nil
   "Non-nil once the pure Elisp NeLisp evaluator has been loaded.")
 
 (declare-function nelisp--reset "nelisp-eval" ())
 (declare-function nelisp-eval-string "nelisp-eval" (str))
 
+(defun anvil-eval--nelisp-source-candidates ()
+  "Return candidate pure Elisp NeLisp source directories."
+  (list anvil-eval-nelisp-source-directory
+        (getenv "NELISP_ELISP_DIR")
+        (expand-file-name "Cowork/Notes/dev/nelisp/src"
+                          (or (getenv "HOME") "~"))
+        (expand-file-name "Notes/dev/nelisp/src"
+                          (or (getenv "HOME") "~"))))
+
+(defun anvil-eval--nelisp-source-directory-p (dir)
+  "Return non-nil when DIR contains the pure Elisp NeLisp evaluator."
+  (let ((expanded (and dir (expand-file-name dir))))
+    (and expanded
+         (file-readable-p (expand-file-name "nelisp-read.el" expanded))
+         (file-readable-p (expand-file-name "nelisp-eval.el" expanded))
+         (file-readable-p (expand-file-name "nelisp-macro.el" expanded))
+         expanded)))
+
+(defun anvil-eval-nelisp-clear-source-cache ()
+  "Clear cached pure Elisp NeLisp source discovery state."
+  (interactive)
+  (setq anvil-eval--nelisp-source-cache 'unset)
+  (setq anvil-eval--nelisp-source-cache-key nil))
+
 (defun anvil-eval--locate-nelisp-source-directory ()
   "Return directory containing pure Elisp NeLisp sources, or nil."
-  (cond
-   ((not (eq anvil-eval--nelisp-source-cache 'unset))
-    anvil-eval--nelisp-source-cache)
-   (t
-    (let ((found
-           (cl-some
-            (lambda (dir)
-              (let ((expanded (and dir (expand-file-name dir))))
-                (and expanded
-                     (file-readable-p (expand-file-name "nelisp-read.el" expanded))
-                     (file-readable-p (expand-file-name "nelisp-eval.el" expanded))
-                     (file-readable-p (expand-file-name "nelisp-macro.el" expanded))
-                     expanded)))
-            (list anvil-eval-nelisp-source-directory
-                  (getenv "NELISP_ELISP_DIR")
-                  (expand-file-name "Cowork/Notes/dev/nelisp/src"
-                                    (or (getenv "HOME") "~"))
-                  (expand-file-name "Notes/dev/nelisp/src"
-                                    (or (getenv "HOME") "~"))))))
-      (setq anvil-eval--nelisp-source-cache found)))))
+  (let ((candidates (anvil-eval--nelisp-source-candidates)))
+    (if (and (not (eq anvil-eval--nelisp-source-cache 'unset))
+             (equal candidates anvil-eval--nelisp-source-cache-key))
+        anvil-eval--nelisp-source-cache
+      (let ((found (cl-some #'anvil-eval--nelisp-source-directory-p
+                            candidates)))
+        (setq anvil-eval--nelisp-source-cache-key candidates)
+        (setq anvil-eval--nelisp-source-cache found)))))
 
 (defun anvil-eval--ensure-nelisp ()
   "Load the pure Elisp NeLisp evaluator and initialize REPL state."
@@ -189,6 +204,13 @@ Only available in Emacs with thread support.")
     (nelisp--reset))
   (prin1-to-string (nelisp-eval-string expression)))
 
+(defun anvil-eval--reset-nelisp-host ()
+  "Reset the pure Elisp NeLisp evaluator and keep it loaded."
+  (anvil-eval--ensure-nelisp)
+  (nelisp--reset)
+  (setq anvil-eval--nelisp-loaded t)
+  "nelisp-eval reset")
+
 (defun anvil-eval--nelisp (expression)
   "Evaluate EXPRESSION with the pure Elisp NeLisp evaluator.
 
@@ -205,6 +227,17 @@ MCP Parameters:
                   (error "nelisp-eval timed out after %ds"
                          anvil-eval-nelisp-timeout))
      (anvil-eval--nelisp-host expression))))
+
+(defun anvil-eval--nelisp-reset ()
+  "Reset the stateful pure Elisp NeLisp REPL.
+
+Use this when a previous `nelisp-eval' call intentionally changed
+globals/functions or when recovering from a bad exploratory session."
+  (anvil-server-with-error-handling
+   (with-timeout (anvil-eval-nelisp-timeout
+                  (error "nelisp-eval reset timed out after %ds"
+                         anvil-eval-nelisp-timeout))
+     (anvil-eval--reset-nelisp-host))))
 
 ;;; Async eval tools
 
@@ -417,6 +450,14 @@ Useful for checking what's running or debugging stuck jobs."
    "Evaluate expression with the pure Elisp NeLisp evaluator and
 return the printed result.  Uses NeLisp's reader/evaluator and keeps
 NeLisp globals across calls, so it behaves as a practical MCP REPL."
+   :server-id anvil-eval--server-id)
+  (anvil-server-register-tool
+   #'anvil-eval--nelisp-reset
+   :id "nelisp-eval-reset"
+   :intent '(eval admin)
+   :layer 'dev
+   :description
+   "Reset the stateful pure Elisp NeLisp REPL used by nelisp-eval."
    :server-id anvil-eval--server-id))
 
 (defun anvil-eval-disable ()
@@ -426,6 +467,7 @@ NeLisp globals across calls, so it behaves as a practical MCP REPL."
   (anvil-server-unregister-tool "emacs-eval-result" anvil-eval--server-id)
   (anvil-server-unregister-tool "emacs-eval-jobs" anvil-eval--server-id)
   (anvil-server-unregister-tool "nelisp-eval" anvil-eval--server-id)
+  (anvil-server-unregister-tool "nelisp-eval-reset" anvil-eval--server-id)
   (advice-remove 'anvil-server--handle-tools-call
                  #'anvil-eval--timeout-advice)
   (advice-remove 'anvil-server--handle-tools-call
