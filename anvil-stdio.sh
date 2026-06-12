@@ -25,6 +25,15 @@ SOCKET=""
 SERVER_ID=""
 EMACS_MCP_DEBUG_LOG=${EMACS_MCP_DEBUG_LOG:-""}
 
+# GNU base64 tolerates stray non-alphabet bytes with --ignore-garbage;
+# BSD/macOS base64 has no such flag.  Probe once at startup and pass
+# the flag only where supported.
+if printf 'Zg==' | base64 -d --ignore-garbage >/dev/null 2>&1; then
+	_anvil_b64_flags="--ignore-garbage"
+else
+	_anvil_b64_flags=""
+fi
+
 # Debug logging setup
 if [ -n "$EMACS_MCP_DEBUG_LOG" ]; then
 	# Verify log file is writable
@@ -391,7 +400,7 @@ while IFS= read -r line; do
 	# instead of silently killing the script under `set -e -o pipefail'.
 	_anvil_decode_err="/tmp/mcp-decode-err.$$-$(date +%s%N)"
 	set +e
-	formatted_response=$(printf '%s' "$base64_response" | base64 -d --ignore-garbage 2>"$_anvil_decode_err")
+	formatted_response=$(printf '%s' "$base64_response" | base64 -d $_anvil_b64_flags 2>"$_anvil_decode_err")
 	_anvil_decode_rc=$?
 	set -e
 	if [ "$_anvil_decode_rc" != 0 ]; then
