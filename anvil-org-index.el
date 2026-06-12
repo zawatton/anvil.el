@@ -1098,17 +1098,106 @@ a full parse rather than pick the wrong entry."
     (unless failed current)))
 
 ;;;###autoload
-(defun anvil-org-index-read-by-id (org-id)
-  "Return the text of the entire subtree whose :ID: property is ORG-ID.
-Uses the index to locate (file, line-range) in one SELECT, then
-reads only that line range of the file.  Signals `user-error' if
-ORG-ID is not in the index."
+(defun anvil-org-index--lookup-id-bounded (db org-id max-depth)
+  "Return (path line-start line-end level hid) for ORG-ID, bounded by MAX-DEPTH.
+MAX-DEPTH is a positive integer: 1 keeps just the target heading and
+its body, 2 adds immediate children, and so on.  A nil or non-positive
+MAX-DEPTH returns the full subtree range."
+  (let* ((row (car (anvil-org-index--select
+                    db
+                    "SELECT h.id, h.level, f.id, f.path, h.line_start
+                       FROM headline h JOIN file f ON f.id = h.file_id
+                      WHERE h.org_id = ? LIMIT 1"
+                    (list org-id)))))
+    (when row
+      (let* ((hid     (nth 0 row))
+             (level   (nth 1 row))
+             (file-id (nth 2 row))
+             (path    (nth 3 row))
+             (start   (nth 4 row))
+             (sibling-row (car (anvil-org-index--select
+                                db
+                                "SELECT MIN(line_start) FROM headline
+                                  WHERE file_id = ? AND line_start > ?
+                                    AND level <= ?"
+                                (list file-id start level))))
+             (sibling-start (car sibling-row))
+             (full-end (if (and sibling-start (numberp sibling-start))
+                           (1- sibling-start)
+                         0))
+             (cap-level (and max-depth
+                             (integerp max-depth)
+                             (> max-depth 0)
+                             (+ level (1- max-depth))))
+             (bounded-end
+              (if (not cap-level)
+                  full-end
+                (let* ((deeper-row
+                        (car (anvil-org-index--select
+                              db
+                              "SELECT MIN(line_start) FROM headline
+                                WHERE file_id = ? AND line_start > ?
+                                  AND level > ?
+                                  AND (? = 0 OR line_start <= ?)"
+                              (list file-id start cap-level
+                                    full-end full-end))))
+                       (deeper-start (car deeper-row)))
+                  (if (and deeper-start (numberp deeper-start))
+                      (1- deeper-start)
+                    full-end)))))
+        (list path start bounded-end level hid)))))
+
+(defun anvil-org-index--immediate-children-titles (db parent-hid)
+  "Return list of titles for headlines whose parent_id is PARENT-HID."
+  (mapcar #'car
+          (anvil-org-index--select
+           db
+           "SELECT title FROM headline
+             WHERE parent_id = ? ORDER BY position"
+           (list parent-hid))))
+
+(defun anvil-org-index-read-by-id (org-id &optional max-depth)
+  "Return the text of the subtree whose :ID: property is ORG-ID.
+Uses the index to locate (file, line-range) in one SELECT, then reads
+only that line range of the file.  MAX-DEPTH, when a positive integer,
+caps the depth of included headings (MAX-DEPTH=1 means the heading and
+its body only, no child subtrees).  nil or non-positive MAX-DEPTH
+returns the full subtree (backwards-compatible default).  Signals
+`user-error' if ORG-ID is not in the index."
   (unless anvil-org-index--db (anvil-org-index-enable))
-  (let ((loc (anvil-org-index--lookup-id-subtree
-              anvil-org-index--db org-id)))
+  (let ((loc (if (and max-depth (integerp max-depth) (> max-depth 0))
+                 (anvil-org-index--lookup-id-bounded
+                  anvil-org-index--db org-id max-depth)
+               (anvil-org-index--lookup-id-subtree
+                anvil-org-index--db org-id))))
     (unless loc
       (user-error "anvil-org-index: ID %s not found in index" org-id))
-    (apply #'anvil-org-index--read-file-region loc)))
+    (apply #'anvil-org-index--read-file-region (seq-take loc 3))))
+
+(defun anvil-org-index-read-by-id-with-children (org-id &optional max-depth)
+  "Return a plist describing ORG-ID's bounded subtree plus its child titles.
+Keys: :body (bounded subtree text), :children (immediate child
+headline titles, in order), :level (target heading level), :truncated
+(non-nil when MAX-DEPTH cut content off the full subtree)."
+  (unless anvil-org-index--db (anvil-org-index-enable))
+  (let ((loc (anvil-org-index--lookup-id-bounded
+              anvil-org-index--db org-id max-depth)))
+    (unless loc
+      (user-error "anvil-org-index: ID %s not found in index" org-id))
+    (pcase-let* ((`(,path ,line-start ,bounded-end ,level ,hid) loc)
+                 (full-loc (anvil-org-index--lookup-id-subtree
+                            anvil-org-index--db org-id))
+                 (full-end (and full-loc (nth 2 full-loc)))
+                 (children (anvil-org-index--immediate-children-titles
+                            anvil-org-index--db hid)))
+      (list :body (anvil-org-index--read-file-region
+                   path line-start bounded-end)
+            :children children
+            :level level
+            :truncated (and max-depth (integerp max-depth)
+                            (> max-depth 0)
+                            full-end
+                            (< bounded-end full-end))))))
 
 ;;;###autoload
 (defun anvil-org-index-read-headline (file headline-path)
