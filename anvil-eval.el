@@ -83,7 +83,16 @@ Set automatically for the duration of each MCP tool call.")
 
 (defun anvil-eval--org-mode-fast-advice (orig-fn &rest args)
   "Make `org-mode' setup minimal when called inside an MCP tool."
-  (if (and anvil-eval-org-fast-mode anvil-eval--in-org-fast-mode)
+  (if (and anvil-eval-org-fast-mode anvil-eval--in-org-fast-mode
+           ;; Skip the fast path for user agenda files: those buffers
+           ;; outlive the MCP tool call, and `(font-lock-mode -1)' on
+           ;; them sets `font-lock-mode-set-explicitly' so
+           ;; `global-font-lock-mode' never re-enables fontification —
+           ;; the buffer stays uncoloured for the rest of the session.
+           (not (and buffer-file-name
+                     (member (expand-file-name buffer-file-name)
+                             (mapcar #'expand-file-name
+                                     (org-agenda-files t t))))))
       (progn
         ;; setq-local, not let: Emacs 30's define-derived-mode calls
         ;; (make-local-variable 'delay-mode-hooks) inside org-mode, which
