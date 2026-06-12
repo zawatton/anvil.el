@@ -1661,8 +1661,15 @@ virtual server-ids share the same handler pool."
                           (signal
                            'anvil-server-invalid-params
                            (list
-                            (format "Missing required parameter: %s"
-                                    required)))))
+                            (format
+                             (concat
+                              "Missing required parameter: %s. "
+                              "Each parameter must be a separate field "
+                              "in the JSON input object — do not embed "
+                              "XML-style tags such as </%s> or "
+                              "<parameter name=\"%s\"> inside another "
+                              "parameter's string value.")
+                             required required required)))))
                       ;; Check for unexpected parameters.  `_'-prefixed
                       ;; names are silently accepted even when not in
                       ;; `expected-params' — a stale client that still has
@@ -1913,7 +1920,8 @@ See also: `anvil-server-tool-throw'"
        (progn
          ,@body)
      (quit
-      (anvil-server-tool-throw (format "Quit: %S" err)))
+      (anvil-server-tool-throw
+       "Interrupted (quit) — the user pressed C-g.  Avoid running code that blocks the Emacs UI."))
      (error
       (anvil-server--run-tool-error-hook
        err anvil-server--current-tool-name 'tool-body)
