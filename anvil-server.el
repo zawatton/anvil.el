@@ -1010,11 +1010,19 @@ normally while standalone silently no-ops."
   (declare (debug t))
   `(condition-case nil (cl-incf ,place) (error nil)))
 
+(defvar anvil-server--current-request-id nil
+  "Request id of the JSON-RPC message currently being dispatched.
+Bound by `anvil-server-process-jsonrpc' around request dispatch so
+that fallback error responses can carry the id of the request that
+failed.  JSON-RPC 2.0 requires error responses to echo the request
+id; a client cannot match an `id: null' error against its pending
+request and may wait forever.")
+
 (defun anvil-server--handle-error (err)
   "Handle error ERR in MCP process by logging and creating an error response.
 Returns a JSON-RPC error response string for internal errors."
   (anvil-server--jsonrpc-error
-   nil
+   anvil-server--current-request-id
    anvil-server-jsonrpc-error-internal
    (format "Internal error: %s" (error-message-string err))))
 
@@ -2026,14 +2034,16 @@ See also: `anvil-server-process-jsonrpc-parsed'"
       (let ((t0 (float-time)))
         (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
           (nelisp--write-stderr-line "[PJ] dispatch-start"))
-        (condition-case err
-            (setq response
-                  (anvil-server--validate-and-dispatch-request
-                   json-object server-id))
-          (quit
-           (setq response (anvil-server--handle-error err)))
-          (error
-           (setq response (anvil-server--handle-error err))))
+        (let ((anvil-server--current-request-id
+               (when json-object (cdr (assq 'id json-object)))))
+          (condition-case err
+              (setq response
+                    (anvil-server--validate-and-dispatch-request
+                     json-object server-id))
+            (quit
+             (setq response (anvil-server--handle-error err)))
+            (error
+             (setq response (anvil-server--handle-error err)))))
         (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
           (nelisp--write-stderr-line
            (format "[PJ] validate+dispatch %.4fs resp-len=%d"
