@@ -410,6 +410,24 @@ while IFS= read -r line; do
 			# Legacy line-delimited output (dev / test mode).
 			echo "$formatted_response"
 		fi
+	else
+		# VAL-PATCH-ALWAYS-REPLY: empty daemon output for a
+		# request-with-id would otherwise hang the MCP client
+		# forever.  Synthesise a JSON-RPC error so the client
+		# can match the id and move on.  Notifications (no id)
+		# stay silent as the protocol expects.
+		_anvil_id_field=$(printf '%s' "$line" \
+			| sed -nE 's/.*"id"[[:space:]]*:[[:space:]]*([0-9]+|"[^"]*"|null).*/\1/p' \
+			| head -1)
+		if [ -n "$_anvil_id_field" ] && [ "$_anvil_id_field" != "null" ]; then
+			_anvil_synth=$(printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"Bridge synthetic error: daemon returned empty response (emacsclient rc=%s)"}}' "$_anvil_id_field" "${_anvil_client_rc:-?}")
+			mcp_debug_log "SYNTH-ERROR" "id=$_anvil_id_field rc=${_anvil_client_rc:-?}"
+			if [ "$_anvil_framed" = "1" ]; then
+				anvil_mcp_emit_framed_response "$_anvil_synth"
+			else
+				echo "$_anvil_synth"
+			fi
+		fi
 	fi
 done
 
