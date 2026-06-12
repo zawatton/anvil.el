@@ -268,6 +268,11 @@ Hand-built to avoid `json-encode' cumulative degradation."
                 (push ":" parts)
                 (push (anvil-server--js-schema (cdr prop)) parts)))
             (push "}" parts))
+           ((and (consp val) (consp (car val)))
+            ;; Nested schema alist (e.g. an array's `items') — recurse.
+            ;; Provided :schema values reach here; the generator's own
+            ;; bounded shape never nests below `properties'.
+            (push (anvil-server--js-schema val) parts))
            (t
             ;; Fallback: stringify
             (push (anvil-server--js-string (format "%s" val)) parts)))))
