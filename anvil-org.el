@@ -345,7 +345,14 @@ variables."
          (unwind-protect
              (progn
                (insert-file-contents ,file-path)
-               (set-visited-file-name ,file-path t)
+               ;; Associate the temp buffer with the file for org/id
+               ;; machinery without `set-visited-file-name', which
+               ;; renames the buffer to "<basename><2>" when the file
+               ;; is already visited and assigns an auto-save file
+               ;; name to a buffer that lives for one tool call.
+               (setq buffer-file-name ,file-path
+                     buffer-file-truename (file-truename ,file-path)
+                     default-directory (file-name-directory ,file-path))
                (set-buffer-modified-p nil)
                (org-mode)
                (goto-char (point-min))
