@@ -828,7 +828,13 @@ Parameters prefixed with `_' (the Elisp unused-arg convention) are
 hidden from the client-facing schema — `anvil-server--handle-tools-call'
 fills them with nil at dispatch time.
 If ARGLIST is provided, reuse it instead of calling
-`help-function-arglist'."
+`help-function-arglist'.
+
+A description in the docstring's \"MCP Parameters:\" section may start
+with a \"(TYPE) \" prefix — one of (boolean), (integer), (number),
+(array), (object) — to set the parameter's JSON schema type.  The
+prefix is stripped from the client-facing description.  Without a
+recognised prefix the type defaults to \"string\"."
   (let ((arglist (or arglist (help-function-arglist func t))))
     (when (memq '&rest arglist)
       (error "MCP tool handlers do not support &rest parameters"))
@@ -851,9 +857,26 @@ If ARGLIST is provided, reuse it instead of calling
                     ;; Mark that we've seen &optional
                     (setq seen-optional t)
                   ;; Regular parameter - add to properties
-                  (let* ((description
+                  (let* ((raw-description
                           (cdr (assoc param-name param-descriptions)))
-                         (property-schema `((type . "string"))))
+                         ;; Infer the JSON type from a "(TYPE) ..." prefix
+                         ;; in the docstring description.  Recognised:
+                         ;; boolean integer number array object.  Absent
+                         ;; or unrecognised prefixes keep type "string".
+                         (type-match
+                          (and raw-description
+                               (string-match
+                                "\\`(\\(boolean\\|integer\\|number\\|array\\|object\\)) "
+                                raw-description)))
+                         (json-type
+                          (if type-match
+                              (match-string 1 raw-description)
+                            "string"))
+                         (description
+                          (if type-match
+                              (substring raw-description (match-end 0))
+                            raw-description))
+                         (property-schema `((type . ,json-type))))
                     ;; Add description if provided
                     (when description
                       (setq property-schema
