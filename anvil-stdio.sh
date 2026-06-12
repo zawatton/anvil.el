@@ -90,7 +90,23 @@ anvil_emacsclient_retry() {
 	local attempt=0 out="" rc=0
 	while :; do
 		set +e
-		out=$(emacsclient "$@" 2>"$stderr_file")
+		# VAL-PATCH-TIMEOUT-V2: hard wall-clock cap on emacsclient.
+		# Default 330s (daemon's `with-timeout' is 300s — we sit
+		# slightly above so the daemon can return a richer error
+		# first when possible).  Set ANVIL_EMACSCLIENT_TIMEOUT=0
+		# to disable.  Prefer GNU timeout(1); fall back to perl
+		# alarm() since perl is universally pre-installed.
+		_anvil_tmo="${ANVIL_EMACSCLIENT_TIMEOUT:-330}"
+		if [ "$_anvil_tmo" = "0" ]; then
+			out=$(emacsclient "$@" 2>"$stderr_file")
+		elif command -v timeout >/dev/null 2>&1; then
+			out=$(timeout "$_anvil_tmo" emacsclient "$@" 2>"$stderr_file")
+		elif command -v perl >/dev/null 2>&1; then
+			out=$(perl -e 'alarm shift @ARGV; exec @ARGV' \
+				"$_anvil_tmo" emacsclient "$@" 2>"$stderr_file")
+		else
+			out=$(emacsclient "$@" 2>"$stderr_file")
+		fi
 		rc=$?
 		set -e
 		if [ "$rc" -eq 0 ]; then
