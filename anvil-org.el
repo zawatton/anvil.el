@@ -228,7 +228,7 @@ Preserves narrowing state across the refresh operation."
   (dolist (buf (buffer-list))
     (with-current-buffer buf
       (when-let* ((buf-file (buffer-file-name)))
-        (when (string= buf-file file-path)
+        (when (anvil-org--paths-equal-p buf-file file-path)
           (let ((was-narrowed (buffer-narrowed-p))
                 (narrow-start nil)
                 (narrow-end nil))
@@ -286,7 +286,7 @@ only be saved if the buffer was clean beforehand."
     (dolist (buf (buffer-list))
       (with-current-buffer buf
         (when (and (buffer-file-name)
-                   (string= (buffer-file-name) file-path)
+                   (anvil-org--paths-equal-p (buffer-file-name) file-path)
                    (buffer-modified-p))
           (anvil-org--tool-validation-error
            "Cannot %s: file has unsaved changes in buffer"
