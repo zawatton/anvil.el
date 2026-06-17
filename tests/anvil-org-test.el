@@ -381,8 +381,14 @@ no-ops in that case; the tool must detect the no-op and throw."
    (lambda (path)
      (let ((anvil-org-allowed-files (list path))
            (anvil-org-allowed-files-enabled t)
-           (org-log-done 'time))
-       (let* ((response
+           (org-log-done 'time)
+           (fixed-now (date-to-time "2026-05-25 12:00:00")))
+       ;; org-habit reads the wall clock internally (display window, urgency),
+       ;; so pin `current-time' to the test's reference day to keep this
+       ;; deterministic regardless of the real date.
+       (cl-letf (((symbol-function 'current-time)
+                  (lambda (&rest _) fixed-now)))
+        (let* ((response
                (json-parse-string
                 (anvil-org--tool-habit-summary nil "2026-05-25")
                 :object-type 'alist
@@ -394,6 +400,6 @@ no-ops in that case; the tool must detect the no-op and throw."
          (should (equal "habit-id" (alist-get 'id habit)))
          (should (= 2 (alist-get 'streak habit)))
          (should (equal "alert" (alist-get 'status habit)))
-         (should (> (alist-get 'completion_ratio habit) 0.0)))))))
+         (should (> (alist-get 'completion_ratio habit) 0.0))))))))
 
 ;;; anvil-org-test.el ends here
