@@ -96,6 +96,29 @@ Defaults to `user-emacs-directory' but can be customized."
   :type 'file
   :group 'anvil-server)
 
+(defcustom anvil-server-autostart-on-request nil
+  "When non-nil, restart a stopped server instead of erroring.
+If `anvil-server-process-jsonrpc' is reached while
+`anvil-server--running' is nil (the server was stopped for any
+reason), call `anvil-server-start' transparently rather than
+signalling.  For stdio transports the signalled error surfaces as
+empty emacsclient output, which clients cannot match to their
+request — effectively a hang.  Nil preserves the historical
+behaviour of signalling an error."
+  :type 'boolean
+  :group 'anvil-server)
+
+(defcustom anvil-server-dispatch-timeout nil
+  "Seconds before an in-flight request is answered with a timeout error.
+When non-nil, request dispatch in `anvil-server-process-jsonrpc' is
+wrapped in `with-timeout': a handler that exceeds the limit yields a
+proper JSON-RPC internal error (carrying the request id) instead of
+blocking the transport indefinitely.  Note `with-timeout' only fires
+while the Emacs event loop is processing; it cannot interrupt a
+tight non-yielding loop.  Nil (default) imposes no limit."
+  :type '(choice (const :tag "No timeout" nil) number)
+  :group 'anvil-server)
+
 ;;; Public Constants
 
 (defconst anvil-server-name "anvil"
@@ -1956,8 +1979,10 @@ emacsclient -e \\='(anvil-server-process-jsonrpc
 
 See also: `anvil-server-process-jsonrpc-parsed'"
   (unless anvil-server--running
-    (error
-     "No active MCP server, start server with `anvil-server-start' first"))
+    (if anvil-server-autostart-on-request
+        (anvil-server-start)
+      (error
+       "No active MCP server, start server with `anvil-server-start' first")))
 
   (anvil-server--log-json-rpc "in" json-string server-id)
 
@@ -2044,15 +2069,28 @@ See also: `anvil-server-process-jsonrpc-parsed'"
         (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
           (nelisp--write-stderr-line "[PJ] dispatch-start"))
         (let ((anvil-server--current-request-id
-               (when json-object (cdr (assq 'id json-object)))))
-          (condition-case err
-              (setq response
-                    (anvil-server--validate-and-dispatch-request
-                     json-object server-id))
-            (quit
-             (setq response (anvil-server--handle-error err)))
-            (error
-             (setq response (anvil-server--handle-error err)))))
+               (when json-object (cdr (assq 'id json-object))))
+              (dispatch
+               (lambda ()
+                 (condition-case err
+                     (setq response
+                           (anvil-server--validate-and-dispatch-request
+                            json-object server-id))
+                   (quit
+                    (setq response (anvil-server--handle-error err)))
+                   (error
+                    (setq response (anvil-server--handle-error err)))))))
+          (if anvil-server-dispatch-timeout
+              (with-timeout (anvil-server-dispatch-timeout
+                             (setq response
+                                   (anvil-server--jsonrpc-error
+                                    (when json-object
+                                      (cdr (assq 'id json-object)))
+                                    anvil-server-jsonrpc-error-internal
+                                    (format "Request timed out after %s seconds"
+                                            anvil-server-dispatch-timeout))))
+                (funcall dispatch))
+            (funcall dispatch)))
         (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
           (nelisp--write-stderr-line
            (format "[PJ] validate+dispatch %.4fs resp-len=%d"
