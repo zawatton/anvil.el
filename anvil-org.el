@@ -1594,7 +1594,7 @@ MCP Parameters:
 
 ;; PHASE-C-IDE-SPLIT-CANDIDATE: narrows body + org-end-of-meta-data + buffer mutation
 (defun anvil-org--tool-edit-body
-    (resource_uri old_body new_body replace_all)
+    (resource_uri old_body new_body &optional replace_all)
   "Edit body content of an Org node using partial string replacement.
 RESOURCE_URI is the URI of the node to edit.
 OLD_BODY is the substring to search for within the node's body.
@@ -1610,7 +1610,9 @@ MCP Parameters:
   old_body - Substring to replace within the body (must be unique
              unless replace_all).  Use \"\" to add to empty nodes
   new_body - Replacement text
-  replace_all - Replace all occurrences (optional, default false)"
+  replace_all - (boolean) Replace all occurrences; default false when
+                omitted.  When false, old_body must be unique in the
+                body."
   ;; Normalize JSON false to nil for proper boolean handling
   ;; JSON false can arrive as :false (keyword) or "false" (string)
   (let ((replace_all
