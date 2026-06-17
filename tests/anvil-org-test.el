@@ -176,7 +176,7 @@ no-ops in that case; the tool must detect the no-op and throw."
             (response
              (json-parse-string
               (anvil-org--tool-add-todo
-               "Child" "TODO" "" "Child body." parent-uri)
+               "Child" "TODO" parent-uri "Child body." nil "")
               :object-type 'alist))
             (content (anvil-org-test--read path)))
        (should (eq t (alist-get 'success response)))
@@ -218,8 +218,8 @@ no-ops in that case; the tool must detect the no-op and throw."
             (response
              (json-parse-string
               (anvil-org--tool-add-todo
-               "Child" "TODO" "[\"work\",\"urgent\"]"
-               "Child body." parent-uri)
+               "Child" "TODO" parent-uri "Child body."
+               nil "[\"work\",\"urgent\"]")
               :object-type 'alist))
             (content (anvil-org-test--read path)))
        (should (eq t (alist-get 'success response)))
