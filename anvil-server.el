@@ -158,6 +158,10 @@ definitions in the parser state machine.")
 (defvar anvil-server--running nil
   "Whether the MCP server is currently running.")
 
+(defun anvil-server-running-p ()
+  "Return non-nil if the Anvil MCP server is currently running."
+  (bound-and-true-p anvil-server--running))
+
 (defvar anvil-server--tools (make-hash-table :test 'equal)
   "Hash table of registered MCP tools by server.
 Keys are server-id strings, values are hash tables of tool-id to tool-data.")
