@@ -228,7 +228,7 @@ Preserves narrowing state across the refresh operation."
   (dolist (buf (buffer-list))
     (with-current-buffer buf
       (when-let* ((buf-file (buffer-file-name)))
-        (when (string= buf-file file-path)
+        (when (anvil-org--paths-equal-p buf-file file-path)
           (let ((was-narrowed (buffer-narrowed-p))
                 (narrow-start nil)
                 (narrow-end nil))
@@ -286,7 +286,7 @@ only be saved if the buffer was clean beforehand."
     (dolist (buf (buffer-list))
       (with-current-buffer buf
         (when (and (buffer-file-name)
-                   (string= (buffer-file-name) file-path)
+                   (anvil-org--paths-equal-p (buffer-file-name) file-path)
                    (buffer-modified-p))
           (anvil-org--tool-validation-error
            "Cannot %s: file has unsaved changes in buffer"
@@ -345,7 +345,14 @@ variables."
          (unwind-protect
              (progn
                (insert-file-contents ,file-path)
-               (set-visited-file-name ,file-path t)
+               ;; Associate the temp buffer with the file for org/id
+               ;; machinery without `set-visited-file-name', which
+               ;; renames the buffer to "<basename><2>" when the file
+               ;; is already visited and assigns an auto-save file
+               ;; name to a buffer that lives for one tool call.
+               (setq buffer-file-name ,file-path
+                     buffer-file-truename (file-truename ,file-path)
+                     default-directory (file-name-directory ,file-path))
                (set-buffer-modified-p nil)
                (org-mode)
                (goto-char (point-min))
@@ -1370,31 +1377,32 @@ MCP Parameters:
 
 ;; PHASE-C-IDE-SPLIT-CANDIDATE: inserts heading + ID + tags + body in real buffer
 (defun anvil-org--tool-add-todo
-    (title todo_state tags body parent_uri &optional after_uri)
+    (title todo_state parent_uri &optional body after_uri tags)
   "Add a new TODO item to an Org file.
 Creates an Org ID for the new headline and returns its ID-based URI.
 TITLE is the headline text.
 TODO_STATE is the TODO state from `org-todo-keywords'.
-TAGS is a single tag string, a list/vector of tag strings, or a JSON
-array literal string (e.g. \"[\\\"a\\\",\\\"b\\\"]\") for the MCP wire form;
-empty string means no tags.
-BODY is optional body text.
 PARENT_URI is the URI of the parent item.
+BODY is optional body text.
 AFTER_URI is optional URI of sibling to insert after.
+TAGS is optional: a single tag string, a list/vector of tag strings,
+a JSON array literal string (e.g. \"[\\\"a\\\",\\\"b\\\"]\") for the MCP
+wire form, or empty string for no tags.
 
 MCP Parameters:
   title - The headline text
   todo_state - TODO state from `org-todo-keywords'
-  tags - Tags to add (single string, JSON array string, or empty for none)
-  body - Optional body text content
   parent_uri - Parent item URI
                Formats:
                  - org-headline://{absolute-path}#{headline-path}
                  - org-id://{id}
+  body - Optional body text content
   after_uri - Sibling to insert after (optional)
               Formats:
                 - org-headline://{absolute-path}#{headline-path}
-                - org-id://{id}"
+                - org-id://{id}
+  tags - Tags to add (single string, JSON array string, or empty for
+         none; optional)"
   (anvil-org--validate-headline-title title)
   (anvil-org--validate-todo-state todo_state)
   (let* ((tag-list (anvil-org--validate-and-normalize-tags tags))
@@ -1464,18 +1472,33 @@ MCP Parameters:
         (if body
             (progn
               (end-of-line)
-              (insert "\n" body)
-              (unless (string-suffix-p "\n" body)
-                (insert "\n"))
-              ;; Move back to the heading for org-id-get-create
-              ;; org-id-get-create requires point to be on a heading
+              ;; Child headings have a trailing \n; top-level ones don't.
+              ;; Skip past it so the drawer (inserted at the heading line
+              ;; by org-id-get-create) ends up before our blank line.
+              (let* ((has-nl (looking-at "\n"))
+                     (before (if has-nl "\n" "\n\n")))
+                (when has-nl (forward-char 1))
+                ;; Remove any blank lines already at insertion point so
+                ;; existing spacing doesn't stack with ours.
+                (delete-region
+                 (point)
+                 (progn (skip-chars-forward "\n") (point)))
+                ;; Normalise body: strip boundary newlines, collapse
+                ;; internal runs of 3+ \n so the result never exceeds \n\n.
+                (let* ((trimmed (string-trim body "\n+" "\n+"))
+                       (clean (replace-regexp-in-string
+                               "\n\n\n+" "\n\n" trimmed)))
+                  (insert before clean "\n\n")))
+              ;; Step back inside the new entry: the insert can leave
+              ;; point at the beginning of the next heading, where
+              ;; org-back-to-heading stays put and org-id-get-create
+              ;; would return (or mint) the neighbouring heading's ID.
+              (skip-chars-backward "\n")
               (org-back-to-heading t))
           ;; No body - ensure newline after heading
           (end-of-line)
           (unless (looking-at "\n")
             (insert "\n")))))))
-
-;; Resource handlers
 
 (defun anvil-org--handle-outline-resource (params)
   "Handler for org://{filename}/outline template.
@@ -1571,7 +1594,7 @@ MCP Parameters:
 
 ;; PHASE-C-IDE-SPLIT-CANDIDATE: narrows body + org-end-of-meta-data + buffer mutation
 (defun anvil-org--tool-edit-body
-    (resource_uri old_body new_body replace_all)
+    (resource_uri old_body new_body &optional replace_all)
   "Edit body content of an Org node using partial string replacement.
 RESOURCE_URI is the URI of the node to edit.
 OLD_BODY is the substring to search for within the node's body.
@@ -1587,7 +1610,9 @@ MCP Parameters:
   old_body - Substring to replace within the body (must be unique
              unless replace_all).  Use \"\" to add to empty nodes
   new_body - Replacement text
-  replace_all - Replace all occurrences (optional, default false)"
+  replace_all - (boolean) Replace all occurrences; default false when
+                omitted.  When false, old_body must be unique in the
+                body."
   ;; Normalize JSON false to nil for proper boolean handling
   ;; JSON false can arrive as :false (keyword) or "false" (string)
   (let ((replace_all

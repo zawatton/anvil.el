@@ -181,6 +181,10 @@ definitions in the parser state machine.")
 (defvar anvil-server--running nil
   "Whether the MCP server is currently running.")
 
+(defun anvil-server-running-p ()
+  "Return non-nil if the Anvil MCP server is currently running."
+  (bound-and-true-p anvil-server--running))
+
 (defvar anvil-server--tools (make-hash-table :test 'equal)
   "Hash table of registered MCP tools by server.
 Keys are server-id strings, values are hash tables of tool-id to tool-data.")
@@ -291,6 +295,11 @@ Hand-built to avoid `json-encode' cumulative degradation."
                 (push ":" parts)
                 (push (anvil-server--js-schema (cdr prop)) parts)))
             (push "}" parts))
+           ((and (consp val) (consp (car val)))
+            ;; Nested schema alist (e.g. an array's `items') — recurse.
+            ;; Provided :schema values reach here; the generator's own
+            ;; bounded shape never nests below `properties'.
+            (push (anvil-server--js-schema val) parts))
            (t
             ;; Fallback: stringify
             (push (anvil-server--js-string (format "%s" val)) parts)))))
@@ -1033,11 +1042,19 @@ normally while standalone silently no-ops."
   (declare (debug t))
   `(condition-case nil (cl-incf ,place) (error nil)))
 
+(defvar anvil-server--current-request-id nil
+  "Request id of the JSON-RPC message currently being dispatched.
+Bound by `anvil-server-process-jsonrpc' around request dispatch so
+that fallback error responses can carry the id of the request that
+failed.  JSON-RPC 2.0 requires error responses to echo the request
+id; a client cannot match an `id: null' error against its pending
+request and may wait forever.")
+
 (defun anvil-server--handle-error (err)
   "Handle error ERR in MCP process by logging and creating an error response.
 Returns a JSON-RPC error response string for internal errors."
   (anvil-server--jsonrpc-error
-   nil
+   anvil-server--current-request-id
    anvil-server-jsonrpc-error-internal
    (format "Internal error: %s" (error-message-string err))))
 
@@ -2051,7 +2068,9 @@ See also: `anvil-server-process-jsonrpc-parsed'"
       (let ((t0 (float-time)))
         (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
           (nelisp--write-stderr-line "[PJ] dispatch-start"))
-        (let ((dispatch
+        (let ((anvil-server--current-request-id
+               (when json-object (cdr (assq 'id json-object))))
+              (dispatch
                (lambda ()
                  (condition-case err
                      (setq response

@@ -1,0 +1,111 @@
+#+title: anvil CLI pkg dispatcher
+#+date: 2026-06-13
+#+author: zawatton
+#+property: status SHIPPED
+
+* STATUS
+
+~SHIPPED~ (2026-06-13, =feat/anvil-cli-pkg=)
+
+Delivered:
+
+- =bin/anvil= shell entry point with subcommand dispatch
+- =anvil-cli.el= pure elisp dispatcher + batch entry
+- =anvil pkg <verb> [args] [--json]= bridge to the separate
+  =anvil-pkg= public API
+- =tests/anvil-cli-test.el= ERT coverage with mocked =pkg-*= functions
+
+* Goal
+
+Provide a stable shell-facing command:
+
+#+begin_example
+anvil pkg <verb> [args] [--json]
+#+end_example
+
+without coupling anvil.el to the separate =anvil-pkg= repository at
+load time.
+
+* Execution model
+
+The launcher prefers an already-running Emacs daemon:
+
+1. =emacsclient --eval= against the default server, or the server named
+   by =ANVIL_EMACS_SERVER=.
+2. If =emacsclient= is missing or cannot connect, fall back to
+   =emacs --batch=.
+
+Argument values are escaped one-by-one in the shell wrapper and emitted
+as Elisp string literals, so spaces, quotes, backslashes, and newlines
+survive without shell or Elisp injection.
+
+The batch fallback deliberately does *not* use =-Q= or =-q=.  That lets
+the user's normal init extend =load-path= so the separate =anvil-pkg=
+package can be found.  When init is not sufficient, =ANVIL_PKG_DIR=
+adds an explicit path to =load-path= before dispatch.
+
+* Dispatch contract
+
+=anvil-cli-dispatch= takes a list of strings whose first element is the
+top-level subcommand.  It is intentionally side-effect free with
+respect to printing and process exit:
+
+- parses and strips =--json=
+- routes the remaining argv
+- lazily requires =anvil-pkg= only inside the =pkg= handler
+- returns a formatted string
+- signals =user-error= on invalid input
+
+Printing to stdout / stderr and =kill-emacs= live in =anvil-cli-main= so
+ERT can exercise dispatch directly.
+
+* Verb table
+
+| Verb        | Public function  | Args        |
+|-------------+------------------+-------------|
+| =install=   | =pkg-install=    | =NAME=      |
+| =search=    | =pkg-search=     | =QUERY=     |
+| =list=      | =pkg-list=       | none        |
+| =uninstall= | =pkg-uninstall=  | =NAME=      |
+| =upgrade=   | =pkg-upgrade=    | =[NAME]=    |
+| =info=      | =pkg-info=       | =NAME=      |
+| =pin=       | =pkg-pin=        | =NAME=      |
+| =unpin=     | =pkg-unpin=      | =NAME=      |
+| =list-pins= | =pkg-list-pins=  | none        |
+| =doctor=    | =pkg-doctor=     | none        |
+
+Unknown verbs and wrong arity signal clear =user-error= messages.
+
+* Output
+
+Default output is human-readable:
+
+- strings pass through unchanged
+- non-strings are pretty-printed
+
+When =--json= is present, dispatch serializes the raw return value via
+=json-serialize= (or =json-encode= fallback) after removing the flag
+from argv.
+
+* Decoupling from anvil-pkg
+
+anvil.el stays decoupled from =anvil-pkg=:
+
+- =anvil-cli.el= does not require =anvil-pkg= at file load time
+- missing =anvil-pkg= produces an actionable error message
+- outdated installs missing a public =pkg-*= symbol also produce a
+  clear error, never a bare =void-function=
+
+This keeps the main package independently loadable while still giving a
+shell user a direct bridge into the optional package manager repo.
+
+* ERT coverage
+
+=tests/anvil-cli-test.el= covers:
+
+- top-level subcommand routing
+- full verb-to-function mapping for every supported =pkg= verb
+- arity and argument coercion
+- human vs =--json= formatting
+- actionable errors when =anvil-pkg= is absent or incomplete
+- emacsclient entry-string behaviour

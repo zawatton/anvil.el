@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# anvil — command-line dispatcher for anvil.el helpers.
+#
+# Routes `anvil pkg ...` into `anvil-cli.el`, preferring a running
+# Emacs daemon via emacsclient and falling back to `emacs --batch`.
+# The batch path intentionally avoids -Q / -q so the user's normal init
+# can extend `load-path` for the separate `anvil-pkg` checkout.  When
+# that is not enough, set ANVIL_PKG_DIR=/path/to/anvil-pkg; both the
+# daemon and batch paths add it to `load-path` before dispatch.
+
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ANVIL_EL_DIR="${ANVIL_EL_DIR:-$(cd "$script_dir/.." && pwd)}"
+
+tmp_files=()
+
+cleanup() {
+    local path
+    for path in "${tmp_files[@]}"; do
+        rm -f "$path"
+    done
+}
+
+trap cleanup EXIT
+
+make_tmp() {
+    local path
+    path="$(mktemp)"
+    tmp_files+=("$path")
+    printf '%s' "$path"
+}
+
+usage() {
+    cat <<EOF
+usage: anvil <subcommand> [args...]
+
+Subcommands:
+  pkg      Drive the separate anvil-pkg public API
+
+Environment:
+  ANVIL_EMACS_SERVER  Emacs server name for emacsclient
+  ANVIL_PKG_DIR       Path added to load-path before requiring anvil-pkg
+EOF
+}
+
+elisp_string() {
+    local s="$1"
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\n'/\\n}
+    s=${s//$'\t'/\\t}
+    s=${s//$'\r'/\\r}
+    s=${s//$'\f'/\\f}
+    s=${s//$'\b'/\\b}
+    printf '"%s"' "$s"
+}
+
+elisp_list() {
+    local out="(list"
+    local arg
+    for arg in "$@"; do
+        out+=" $(elisp_string "$arg")"
+    done
+    out+=")"
+    printf '%s' "$out"
+}
+
+build_emacsclient_form() {
+    local args_form="$1"
+    local repo_form
+    repo_form="$(elisp_string "$ANVIL_EL_DIR")"
+    cat <<EOF
+(let ((pkg-dir (getenv "ANVIL_PKG_DIR")))
+  (when (and pkg-dir (> (length pkg-dir) 0))
+    (add-to-list 'load-path pkg-dir))
+  (add-to-list 'load-path $repo_form)
+  (require 'anvil-pkg nil t)
+  (require 'anvil-cli)
+  (princ (anvil-cli-emacsclient-entry $args_form)))
+EOF
+}
+
+build_batch_form() {
+    local args_form="$1"
+    local repo_form
+    repo_form="$(elisp_string "$ANVIL_EL_DIR")"
+    cat <<EOF
+(let ((pkg-dir (getenv "ANVIL_PKG_DIR")))
+  (when (and pkg-dir (> (length pkg-dir) 0))
+    (add-to-list 'load-path pkg-dir))
+  (add-to-list 'load-path $repo_form)
+  (require 'anvil-pkg nil t)
+  (require 'anvil-cli)
+  (anvil-cli-main $args_form))
+EOF
+}
+
+emacsclient_connection_error() {
+    local stderr_file="$1"
+    grep -Eq "No socket or alternate editor|can't find socket|Connection refused|error accessing server|timed out waiting for reply" "$stderr_file"
+}
+
+run_emacsclient() {
+    local form="$1"
+    local stdout_file stderr_file status
+    local -a cmd=(emacsclient -u -q)
+
+    if ! command -v emacsclient >/dev/null 2>&1; then
+        return 125
+    fi
+
+    if [ -n "${ANVIL_EMACS_SERVER:-}" ]; then
+        cmd+=(-s "$ANVIL_EMACS_SERVER")
+    fi
+    cmd+=(--eval "$form")
+
+    stdout_file="$(make_tmp)"
+    stderr_file="$(make_tmp)"
+
+    if "${cmd[@]}" >"$stdout_file" 2>"$stderr_file"; then
+        cat "$stdout_file"
+        return 0
+    fi
+
+    status=$?
+    if emacsclient_connection_error "$stderr_file"; then
+        return 125
+    fi
+
+    cat "$stdout_file"
+    cat "$stderr_file" >&2
+    return "$status"
+}
+
+run_batch() {
+    local form="$1"
+
+    if ! command -v emacs >/dev/null 2>&1; then
+        echo "anvil: emacs not found on PATH" >&2
+        return 127
+    fi
+
+    emacs --batch -L "$ANVIL_EL_DIR" --eval "$form"
+}
+
+if [ "$#" -eq 0 ]; then
+    usage
+    exit 0
+fi
+
+case "$1" in
+    --help|-h)
+        usage
+        exit 0
+        ;;
+    pkg)
+        ;;
+    *)
+        echo "anvil: unknown subcommand '$1'" >&2
+        usage >&2
+        exit 2
+        ;;
+esac
+
+args_form="$(elisp_list "$@")"
+emacsclient_form="$(build_emacsclient_form "$args_form")"
+
+if run_emacsclient "$emacsclient_form"; then
+    exit 0
+else
+    status=$?
+fi
+
+if [ "$status" -ne 125 ]; then
+    exit "$status"
+fi
+
+batch_form="$(build_batch_form "$args_form")"
+run_batch "$batch_form"

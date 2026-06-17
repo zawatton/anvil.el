@@ -297,33 +297,40 @@ Starts the server, sends initialize request, then runs BODY.
 TOOLS and RESOURCES are booleans indicating expected capabilities.
 
 This macro:
-1. Starts the MCP server with `anvil-server-start'
+1. Starts the MCP server with `anvil-server-start' — unless one is
+   already running (`anvil-server-running-p'), in which case the
+   running server is reused and left running afterwards
 2. Sends and validates the initialize request
 3. Sends the initialized notification
 4. Executes BODY
-5. Stops the server with `anvil-server-stop'
+5. Stops the server with `anvil-server-stop' only when step 1
+   started it
 
 Arguments:
   TOOLS - If non-nil, expects server to have tools capability
   RESOURCES - If non-nil, expects server to have resources capability
   BODY - Forms to execute with server running"
  (declare (indent defun) (debug t))
- `(unwind-protect
-      (progn
-        (anvil-server-start)
-        (anvil-server-ert-assert-initialize-result
-         (anvil-server-ert--get-initialize-result)
-         ,tools
-         ,resources)
-        ;; Send initialized notification - should return nil
-        (should-not
-         (anvil-server-process-jsonrpc
-          (json-encode
-           '(("jsonrpc" . "2.0")
-             ("method" . "notifications/initialized")))
-          anvil-server-ert-server-id))
-        ,@body)
-    (anvil-server-stop)))
+ `(let ((anvil-server-ert--started-here-p
+         (not (anvil-server-running-p))))
+    (unwind-protect
+        (progn
+          (when anvil-server-ert--started-here-p
+            (anvil-server-start))
+          (anvil-server-ert-assert-initialize-result
+           (anvil-server-ert--get-initialize-result)
+           ,tools
+           ,resources)
+          ;; Send initialized notification - should return nil
+          (should-not
+           (anvil-server-process-jsonrpc
+            (json-encode
+             '(("jsonrpc" . "2.0")
+               ("method" . "notifications/initialized")))
+            anvil-server-ert-server-id))
+          ,@body)
+      (when anvil-server-ert--started-here-p
+        (anvil-server-stop)))))
 
 (defun anvil-server-ert-check-error-object
     (response expected-code expected-message)
