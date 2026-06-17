@@ -41,7 +41,13 @@
 (declare-function anvil-memory-add "anvil-memory"
                   (name type body &rest args))
 
-(defvar anvil-orchestrator--tasks nil
+;; Initialise to an empty hash table rather than nil.  This symbol is owned by
+;; anvil-orchestrator, which defvars it to a hash table.  Declaring it nil here
+;; clobbers that canonical table to nil whenever anvil-autoresearch loads first
+;; (the later orchestrator defvar then no-ops), which breaks every orchestrator
+;; caller that copy-hash-table's it.  An empty table is a safe shared default in
+;; any load order and the dashboard's hash-table-p guard still reads it fine.
+(defvar anvil-orchestrator--tasks (make-hash-table :test 'equal)
   "Orchestrator task table, read opportunistically by the dashboard.")
 
 
