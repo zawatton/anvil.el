@@ -324,6 +324,34 @@ Return a plist (:root ROOT :muhome MUHOME)."
                "Hello!"
                (with-temp-buffer (insert-file-contents path) (buffer-string)))))))
 
+(ert-deftest anvil-mu4e-test-compose-rescues-literal-newline-escapes ()
+  "A body sent with literal \\n / \\t escapes is decoded into real newlines.
+Agents frequently pass backslash-n rather than real newlines (issue #50);
+the draft must contain real line breaks, not a literal \"\\n\"."
+  (anvil-mu4e-test--with-drafts
+    (let* ((d (anvil-mu4e-test--parse
+               (anvil-mu4e--tool-compose-draft
+                "alice@example.com" nil "Esc"
+                "Line1\\nLine2\\n\\nSaludos,\\nBob" nil)))
+           (path (alist-get 'draft_id d))
+           (content (with-temp-buffer
+                      (insert-file-contents path) (buffer-string))))
+      ;; Real line breaks are present ...
+      (should (string-match-p "Line1\nLine2\n\nSaludos,\nBob" content))
+      ;; ... and no literal backslash-n leaked into the message.
+      (should-not (string-match-p "\\\\n" content)))))
+
+(ert-deftest anvil-mu4e-test-compose-preserves-real-newlines ()
+  "A body that already uses real newlines is left untouched (no rescue)."
+  (anvil-mu4e-test--with-drafts
+    (let* ((d (anvil-mu4e-test--parse
+               (anvil-mu4e--tool-compose-draft
+                "alice@example.com" nil "Plain" "Para1\n\nPara2" nil)))
+           (path (alist-get 'draft_id d))
+           (content (with-temp-buffer
+                      (insert-file-contents path) (buffer-string))))
+      (should (string-match-p "Para1\n\nPara2" content)))))
+
 (ert-deftest anvil-mu4e-test-compose-reply-sets-threading ()
   "A reply sets In-Reply-To and References even when the parent is unknown."
   (anvil-mu4e-test--with-drafts

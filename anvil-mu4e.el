@@ -497,6 +497,24 @@ MCP Parameters:
       (error "anvil-mu4e: set `anvil-mu4e-drafts-dir' to a maildir before composing"))
     (expand-file-name d)))
 
+(defun anvil-mu4e--rescue-escapes (s)
+  "Decode literal C-style escapes in S, but only when it has no real newline.
+Agents commonly pass a body holding the two-character sequences \\n /
+\\t / \\r (a literal backslash followed by a letter) instead of the real
+control characters, so the sent mail shows a literal \"\\n\" rather than
+breaking lines (issue #50).  Only rescue when S contains no real newline
+yet does contain such a sequence, leaving a body that already uses real
+newlines completely untouched."
+  (if (and (stringp s)
+           (not (string-search "\n" s))
+           (string-match-p "\\\\[nrt]" s))
+      (replace-regexp-in-string
+       "\\\\n" "\n"
+       (replace-regexp-in-string
+        "\\\\t" "\t"
+        (replace-regexp-in-string "\\\\r" "\r" s)))
+    s))
+
 (defun anvil-mu4e--build-message (from to cc subject body irt refs message-id date)
   "Assemble an RFC822 message string from the given header parts and BODY."
   (concat
@@ -512,7 +530,7 @@ MCP Parameters:
    "Content-Type: text/plain; charset=utf-8\n"
    "Content-Transfer-Encoding: 8bit\n"
    "\n"
-   (let ((b (or body "")))
+   (let ((b (anvil-mu4e--rescue-escapes (or body ""))))
      (if (or (string-empty-p b) (string-suffix-p "\n" b)) b (concat b "\n")))))
 
 (defun anvil-mu4e--write-draft (drafts-dir message)
