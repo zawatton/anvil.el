@@ -1,12 +1,23 @@
 #+title: anvil-mu4e — Structured MCP tools for mu4e (e-mail)
 #+date: 2026-06-19
 #+author: zawatton
-#+property: status DRAFT
+#+property: status PHASE-1-IMPLEMENTED
 #+property: scope GENERIC
 
 * STATUS
 
-~DRAFT~ (2026-06-19).
+~Phase 1 IN-PROGRESS~ (2026-06-19, =feat/mu4e-tools=).  Phase 2
+(compose/send) remains ~DRAFT~.
+
+Delivered (Phase 1, read/search):
+
+- =anvil-mu4e.el= — opt-in module backing read/search with the
+  synchronous =mu= CLI; tools =mu4e-search=, =mu4e-list-mails=,
+  =mu4e-read-mail= (all =:read-only=).
+- =tests/anvil-mu4e-test.el= — 8 ERT that index a throwaway maildir with
+  the *real* =mu= binary and shape-lock the JSON output (=skip-unless= mu
+  is installed, so CI without mu skips cleanly).  Full suite stays at 0
+  unexpected; release-audit surfaces no hazards.
 
 Origin: external feature request
 [[https://github.com/zawatton/anvil.el/issues/50][#50]] (shackra / Jorge
