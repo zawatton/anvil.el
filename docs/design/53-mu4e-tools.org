@@ -1,0 +1,267 @@
+#+title: anvil-mu4e — Structured MCP tools for mu4e (e-mail)
+#+date: 2026-06-19
+#+author: zawatton
+#+property: status DRAFT
+#+property: scope GENERIC
+
+* STATUS
+
+~DRAFT~ (2026-06-19).
+
+Origin: external feature request
+[[https://github.com/zawatton/anvil.el/issues/50][#50]] (shackra / Jorge
+Araya Navarro), filed while testing the OpenClaw agent against a live
+mu4e setup.  The request: let an AI agent *read*, *search*, and (gated)
+*compose / send* mail through structured MCP tools instead of guessing
+raw mu4e Elisp.
+
+Module placement: =anvil-optional-modules= (opt-in).  Phase 1 requires
+only the external =mu= binary + an existing maildir index.  Phase 2
+additionally needs a working =message-mode= / =smtpmail= (or mu4e)
+sending setup.
+
+* Motivation
+
+Quoting #50: an agent talking to Emacs through anvil.el currently has no
+way to work with mu4e without writing raw Elisp.  Every operation —
+reading, replying, searching — means guessing expressions like
+
+#+begin_example
+(require 'mu4e)
+(mu4e-headers-search "subject:\"hello\"")
+#+end_example
+
+sending them through an eval tool, then *text-scraping the resulting
+buffer*.  One missing quote breaks the whole interaction.  This is the
+exact opposite of what MCP is for: structured, re-usable, typed tools.
+
+The request is squarely in anvil's wheelhouse — anvil-org, anvil-file,
+anvil-shell-filter all turn fragile inline Elisp into typed MCP tools.
+mu4e is a natural next module, and =GENERIC= in scope (valuable to any
+Emacs + AI user, not coupled to operator-specific conventions).
+
+* Design principle: back read/search with the =mu= CLI, not mu4e's async UI
+
+This is the crux of the design.
+
+mu4e is built around an asynchronous =mu server= subprocess that
+populates interactive buffers (=*mu4e-headers*=, =*mu4e-view*=) via
+callbacks.  Driving that from a *synchronous* MCP tool handler is
+exactly the failure mode anvil's architecture warns about:
+
+- A single daemon serializes tool calls, and =accept-process-output=
+  does *not* yield to a fresh server eval
+  (Doc 09 concurrency model; =feedback_emacs_accept_process_output_no_server_yield=).
+  Blocking inside a handler while waiting for mu4e's header/view
+  callbacks is fragile and can stall the whole daemon.
+- Re-parsing mu4e's =*-mode= buffer text back into structure is the
+  brittle text-scraping #50 explicitly wants to eliminate.
+
+Instead, *Phase 1 (read/search) shells out to the =mu= CLI directly*:
+
+- =mu find QUERY --format=sexp --fields=...= → a structured result set,
+  synchronous, no buffers, no callbacks.
+- =mu view <docid|message-id|path> --format=sexp= → the full message as
+  a plist (headers + body + parts).
+
+Benefits:
+
+1. Synchronous =call-process= — the dominant anvil pattern
+   (cf. =anvil-clipboard=, =anvil-dev=), so it sidesteps the
+   async-yield constraint entirely.
+2. =--format=sexp= returns data Emacs can =read= directly into a plist;
+   no text scraping.
+3. Does *not* require mu4e to be loaded or a mu4e UI session to be
+   open — only the same =mu= index mu4e itself maintains.
+4. Read/search become *side-effect free*, which is the safe majority of
+   the request.
+
+mu4e proper is only *required* for Phase 2 (compose / send), where
+=message-mode= + =smtpmail= (or =mu4e='s own send path) are genuinely
+needed.
+
+* Tools
+
+** Phase 1 — read & search (synchronous, side-effect-free)
+
+| Tool             | Params                              | Returns                                  |
+|------------------+-------------------------------------+------------------------------------------|
+| =mu4e-search=    | =query=, =[max_results]=, =[sort]=  | JSON array of message summaries          |
+| =mu4e-list-mails=| =[query]=, =[max_results]=          | alias of search with an inbox default    |
+| =mu4e-read-mail= | =message_id= (or =docid=), =[html]= | JSON: headers + plain body (+ parts list)|
+| =mu4e-list-maildirs= | none                            | JSON array of maildir folders            |
+
+=mu4e-list-mails= is a thin convenience over =mu4e-search= whose default
+query is the user's inbox (=anvil-mu4e-inbox-query=, default
+=maildir:/INBOX=).
+
+** Phase 2 — compose & send (opt-in, gated, irreversible)
+
+| Tool                 | Params                                       | Effect                                  |
+|----------------------+----------------------------------------------+-----------------------------------------|
+| =mu4e-compose-draft= | =to=, =[cc]=, =[subject]=, =[body]=, =[in_reply_to]= | Writes a *saved draft*; never sends     |
+| =mu4e-send=          | =draft_id=, =confirm= (boolean)              | Sends an existing draft, gated (below)  |
+
+A reply is just =mu4e-compose-draft= with =in_reply_to= set to a
+message-id; the handler copies =References= / =In-Reply-To= and a
+=Re:= subject from the parent so threading is preserved.
+
+* Tool definitions (parameters)
+
+Each tool follows the house docstring convention (=MCP Parameters:=
+section, =(TYPE)= prefixes once Doc/PR #40 lands), schema generated by
+=anvil-server-register-tool=.
+
+- =mu4e-search=
+  - =query= (string, required) — a mu query string, e.g.
+    =from:alice subject:invoice date:1w..now=.
+  - =max_results= (integer, optional) — cap, default
+    =anvil-mu4e-max-results= (50).
+  - =sort= (string, optional) — one of =date=, =subject=, =from=
+    (maps to =mu find --sortfield --reverse=); default =date= desc.
+- =mu4e-read-mail=
+  - =message_id= (string, required) — the RFC Message-ID, or a numeric
+    =docid= (resolved via =mu find=).
+  - =html= (boolean, optional) — if true include the HTML part text;
+    default false (plain text only, smaller).
+- =mu4e-compose-draft=
+  - =to= (string, required), =cc= (string, optional),
+    =subject= (string, optional), =body= (string, optional),
+    =in_reply_to= (string, optional message-id for replies).
+- =mu4e-send=
+  - =draft_id= (string, required) — id returned by =mu4e-compose-draft=.
+  - =confirm= (boolean, required) — must be =true=; the draft is
+    returned for inspection when =false=.
+
+* Data shapes
+
+Message summary (=mu4e-search=, one element):
+
+#+begin_src json
+{
+  "message_id": "<abc@example.com>",
+  "docid": 12345,
+  "date": "2026-06-18T09:31:00+0900",
+  "from": [{"name": "Alice", "email": "alice@example.com"}],
+  "to":   [{"name": "Bob",   "email": "bob@example.com"}],
+  "subject": "Invoice for May",
+  "flags": ["unread", "attach"],
+  "maildir": "/INBOX",
+  "size": 8423
+}
+#+end_src
+
+Full message (=mu4e-read-mail=) adds =cc=, =reply_to=, =body_plain=
+(and =body_html= when requested), and a =parts= array of
+={filename, mime_type, size}= for attachments (content is *not*
+inlined; an agent asks for a specific part by name in a later
+iteration if needed).
+
+* Phase 2 safety model
+
+An AI agent sending e-mail is *high-stakes, outward-facing, and
+irreversible* — the same class of action anvil treats with care
+elsewhere.  The defaults are conservative:
+
+1. *Draft-first by default.*  =mu4e-compose-draft= only ever writes a
+   saved draft into the drafts maildir; it never sends.  This alone
+   covers most "help me write a reply" workflows safely.
+2. *Send is triple-gated.*  =mu4e-send= refuses unless *all* hold:
+   - =anvil-mu4e-allow-send= is non-nil (defcustom, default =nil=);
+   - every recipient matches =anvil-mu4e-send-allowlist= (a list of
+     regexps; default empty = nothing allowed);
+   - the call passes =confirm=true= (so a model can't fire it as a
+     side effect of a vaguer instruction).
+3. *Audited.*  Each send appends a line (recipients, subject, draft id,
+   timestamp) to =anvil-mu4e-send-log= for after-the-fact review.
+4. *No silent auto-send.*  There is deliberately no "compose and send in
+   one call" tool; composing and sending are always two steps.
+
+This keeps Phase 1 immediately useful and lets an operator opt into
+sending only after configuring the allowlist.
+
+* Configuration (defcustoms)
+
+| Variable                    | Default                         | Purpose                              |
+|-----------------------------+---------------------------------+--------------------------------------|
+| =anvil-mu4e-mu-bin=         | =(executable-find "mu")=        | path to the =mu= binary              |
+| =anvil-mu4e-max-results=    | =50=                            | default result cap                   |
+| =anvil-mu4e-inbox-query=    | ="maildir:/INBOX"=              | default for =mu4e-list-mails=        |
+| =anvil-mu4e-allow-send=     | =nil=                           | master switch for =mu4e-send=        |
+| =anvil-mu4e-send-allowlist= | =nil=                           | recipient regexps permitted to send  |
+| =anvil-mu4e-send-log=       | =nil= (→ =anvil-state= when set)| audit destination for sends          |
+
+The module registers nothing and errors loudly when =mu= is absent
+(=executable-find= guard, like =anvil-clipboard=), so adding it to
+=anvil-optional-modules= on a machine without =mu= is harmless.
+
+* Error handling (LLM-facing)
+
+- =mu= not found → actionable error: "mu binary not found; install mu
+  and/or set =anvil-mu4e-mu-bin=" (per #44's instruction-style errors).
+- empty / missing index → "mu index is empty or not initialised; run
+  =mu index= first" rather than a bare non-zero exit.
+- =mu4e-send= blocked → states exactly which gate failed
+  (allow-send / allowlist / confirm).
+
+* Testing strategy
+
+- *Phase 1 needs no real maildir.*  Stub =call-process= (or point
+  =anvil-mu4e-mu-bin= at a tiny fake =mu= script) to return canned
+  =--format=sexp= fixtures, then shape-lock the JSON output — the same
+  pattern =anvil-shell-filter= uses for command fixtures.  Covers query
+  construction, sexp→JSON mapping, =max_results= capping, sort flags,
+  and message-id↔docid resolution.
+- *Phase 2 stubs the send path.*  =cl-letf= =message-send= / smtp so no
+  mail leaves; assert (a) =mu4e-compose-draft= writes a well-formed
+  draft with correct =In-Reply-To= / =References= on replies, and
+  (b) =mu4e-send= refuses without each of allow-send / allowlist /
+  confirm, and succeeds (stubbed) when all three hold.
+- New file =tests/anvil-mu4e-test.el= (matches the =anvil-*-test.el=
+  glob → auto-collected by the batch/full-suite runner).
+- Module carries the =;;; anvil-audit: tools-wrapped-at-registration=
+  header (=feedback_anvil_audit_header_required=) so release-audit
+  passes.
+
+* Primitive vs Convention
+
+Overall =GENERIC=.  The only external coupling is the user's own mu /
+maildir / smtp configuration, which is *standard mu4e setup*, not an
+anvil-operator-specific convention.  The doc/README will state the
+required external setup (=mu index= populated, smtp configured for
+Phase 2).  No journal/init.org/business assumptions leak in.
+
+* Dependencies & open questions
+
+1. =mu= version target.  =mu find --format=sexp= is stable on mu 1.8+;
+   confirm the minimum we support.  *Need shackra's =mu= and =mu4e=
+   versions* (asked on #50).
+2. Identifier stability.  =docid= is index-local and changes on
+   re-index; the public, stable handle is the RFC =Message-ID=.  Tools
+   accept either but prefer message-id in returned data.
+3. Reply threading.  Verify =References= chaining for multi-hop
+   threads, not just =In-Reply-To=.
+4. Attachment retrieval.  Out of scope for v1 (parts are *listed*, not
+   inlined); a future =mu4e-extract-part= tool can use
+   =mu extract= if needed.
+5. HTML→text.  Decide whether to shell to =mu= 's own text rendering or
+   reuse Emacs' =shr=/=html2text= for =body_plain= when only HTML
+   exists.
+
+* Order of work
+
+1. *Phase 1 (read/search)* — high value, low risk, fully testable
+   without live mail.  Ship first as =anvil-mu4e.el= + tests.
+2. *Phase 2 (compose/send, gated)* — after Phase 1, behind the safety
+   model above.
+3. *Co-develop with shackra*, who has the live mu4e environment and the
+   real need, to validate against a real index (they offered on #50).
+
+* Relationship to other docs
+
+- Concurrency rationale: Doc 09 (process model) — why we avoid driving
+  mu4e's async server from a handler.
+- Module/opt-in pattern: Doc 27 (=anvil-shell-filter=,
+  =anvil-optional-modules=, fixture-based ERT) is the closest template.
+- Error-message style: PR #44 (actionable, instruction-shaped errors).
+- Schema typing: PR #40 ((TYPE) docstring prefixes) once landed.
