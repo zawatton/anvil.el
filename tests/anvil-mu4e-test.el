@@ -426,5 +426,26 @@ Return a plist (:root ROOT :muhome MUHOME)."
           (anvil-mu4e-send-function (lambda (_p) t)))
       (should-error (anvil-mu4e--tool-send "/etc/hostname" t) :type 'error))))
 
+(ert-deftest anvil-mu4e-test-msmtp-sender-invokes-msmtp-with-t ()
+  "anvil-mu4e-send-with-msmtp pipes the draft to `msmtp -t' and succeeds."
+  (let ((calls '())
+        (anvil-mu4e-msmtp-bin "msmtp"))
+    (cl-letf (((symbol-function 'executable-find) (lambda (_) "/usr/bin/msmtp"))
+              ((symbol-function 'call-process)
+               (lambda (prog infile _buffer _display &rest args)
+                 (push (list prog infile args) calls) 0)))
+      (should (anvil-mu4e-send-with-msmtp "/tmp/draft.eml"))
+      (let ((c (car calls)))
+        (should (string-match-p "msmtp" (nth 0 c)))
+        (should (equal "/tmp/draft.eml" (nth 1 c)))
+        (should (member "-t" (nth 2 c)))))))
+
+(ert-deftest anvil-mu4e-test-msmtp-sender-errors-on-nonzero-exit ()
+  "A non-zero msmtp exit raises rather than silently dropping the mail."
+  (let ((anvil-mu4e-msmtp-bin "msmtp"))
+    (cl-letf (((symbol-function 'executable-find) (lambda (_) "/usr/bin/msmtp"))
+              ((symbol-function 'call-process) (lambda (&rest _) 1)))
+      (should-error (anvil-mu4e-send-with-msmtp "/tmp/draft.eml") :type 'error))))
+
 (provide 'anvil-mu4e-test)
 ;;; anvil-mu4e-test.el ends here

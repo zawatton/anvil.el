@@ -26,7 +26,10 @@ Delivered (=anvil-mu4e.el=, opt-in module):
   never sends; threads replies) and =mu4e-send= (triple gate —
   =anvil-mu4e-allow-send= + recipient =anvil-mu4e-send-allowlist= +
   =confirm=true=; audited; path-injection guarded).  All gates default to
-  inert, so the module sends nothing until explicitly configured.
+  inert, so the module sends nothing until explicitly configured.  A
+  ready-made =anvil-mu4e-send-with-msmtp= transport (pipes the draft to
+  =msmtp -t=) is provided for the common msmtp setup; the default transport
+  still routes through Emacs' =message-send-mail-function=.
 
 Tests: =tests/anvil-mu4e-test.el= — 16 ERT.  Read/search index a
 throwaway maildir with the *real* =mu= binary and shape-lock the JSON

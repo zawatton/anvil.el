@@ -139,6 +139,11 @@ specific transport (msmtp, a mu4e helper, etc.)."
   :type '(choice (const :tag "no audit log" nil) file)
   :group 'anvil-mu4e)
 
+(defcustom anvil-mu4e-msmtp-bin (or (executable-find "msmtp") "msmtp")
+  "Path to the msmtp binary used by `anvil-mu4e-send-with-msmtp'."
+  :type 'string
+  :group 'anvil-mu4e)
+
 ;;;; --- mu CLI invocation ---------------------------------------------------
 
 (defun anvil-mu4e--program ()
@@ -630,6 +635,23 @@ your own mail environment before relying on it."
     (message-mode)
     (message-send)
     t))
+
+(defun anvil-mu4e-send-with-msmtp (path)
+  "Send the RFC822 message at PATH via msmtp; return non-nil on success.
+Pipes the draft to `msmtp -t' (recipients are read from the To/Cc/Bcc
+headers).  Set `anvil-mu4e-send-function' to this to route sending
+through msmtp instead of Emacs' message machinery.  Signals on failure."
+  (let ((bin (or anvil-mu4e-msmtp-bin "msmtp")))
+    (unless (or (and (file-name-absolute-p bin) (file-executable-p bin))
+                (executable-find bin))
+      (error "anvil-mu4e: msmtp not found (looked for %S); install msmtp \
+or set `anvil-mu4e-msmtp-bin'" bin))
+    (with-temp-buffer
+      (let ((rc (call-process bin path (current-buffer) nil "-t")))
+        (unless (eq rc 0)
+          (error "anvil-mu4e: msmtp failed (exit %s): %s"
+                 rc (string-trim (buffer-string))))
+        t))))
 
 (defun anvil-mu4e--tool-send (draft_id confirm)
   "Send a previously composed draft, subject to safety gates.  Returns JSON.
