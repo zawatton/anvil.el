@@ -1,23 +1,35 @@
 #+title: anvil-mu4e — Structured MCP tools for mu4e (e-mail)
 #+date: 2026-06-19
 #+author: zawatton
-#+property: status PHASE-1-IMPLEMENTED
+#+property: status PHASE-1-2-IMPLEMENTED
 #+property: scope GENERIC
 
 * STATUS
 
-~Phase 1 IN-PROGRESS~ (2026-06-19, =feat/mu4e-tools=).  Phase 2
-(compose/send) remains ~DRAFT~.
+~Phase 1 + 2 IN-PROGRESS~ (2026-06-19, =feat/mu4e-tools=).
 
-Delivered (Phase 1, read/search):
+Delivered (=anvil-mu4e.el=, opt-in module):
 
-- =anvil-mu4e.el= — opt-in module backing read/search with the
-  synchronous =mu= CLI; tools =mu4e-search=, =mu4e-list-mails=,
-  =mu4e-read-mail= (all =:read-only=).
-- =tests/anvil-mu4e-test.el= — 8 ERT that index a throwaway maildir with
-  the *real* =mu= binary and shape-lock the JSON output (=skip-unless= mu
-  is installed, so CI without mu skips cleanly).  Full suite stays at 0
-  unexpected; release-audit surfaces no hazards.
+- *Phase 1 — read/search* (=:read-only=, backed by the synchronous =mu=
+  CLI): =mu4e-search=, =mu4e-list-mails=, =mu4e-read-mail=.
+- *Phase 2 — compose/send* (gated): =mu4e-compose-draft= (draft-first,
+  never sends; threads replies) and =mu4e-send= (triple gate —
+  =anvil-mu4e-allow-send= + recipient =anvil-mu4e-send-allowlist= +
+  =confirm=true=; audited; path-injection guarded).  All gates default to
+  inert, so the module sends nothing until explicitly configured.
+
+Tests: =tests/anvil-mu4e-test.el= — 16 ERT.  Read/search index a
+throwaway maildir with the *real* =mu= binary and shape-lock the JSON
+(=skip-unless= mu present).  Compose/send tests stub the transport (with a
+hard "real send attempted" safety net) and assert each gate; *no test
+ever transmits mail*.  Full suite 0 unexpected; byte-compile clean;
+release-audit no hazards.
+
+*Known limitation:* the live SMTP transport
+(=anvil-mu4e--message-send-file=, the default =anvil-mu4e-send-function=)
+is environment-dependent and intentionally NOT exercised by CI; it should
+be validated in a real mail setup (ideally with shackra, per #50) before
+relying on actual delivery.
 
 Origin: external feature request
 [[https://github.com/zawatton/anvil.el/issues/50][#50]] (shackra / Jorge

@@ -81,8 +81,28 @@ Return a plist (:root ROOT :muhome MUHOME)."
        (ignore-errors (delete-directory (plist-get ctx :root) t)))))
 
 (defun anvil-mu4e-test--parse (json)
-  "Parse JSON into alists/lists for assertion."
-  (json-parse-string json :object-type 'alist :array-type 'list))
+  "Parse JSON into alists/lists for assertion (false/null -> nil)."
+  (json-parse-string json :object-type 'alist :array-type 'list
+                     :false-object nil :null-object nil))
+
+(defmacro anvil-mu4e-test--with-drafts (&rest body)
+  "Run BODY with a throwaway drafts maildir and inert send defaults.
+Binds `anvil-mu4e-drafts-dir', `anvil-mu4e-from', and resets every send
+gate so no test can ever transmit mail unless it opts in explicitly."
+  (declare (indent 0))
+  `(let* ((dir (make-temp-file "anvil-mu4e-drafts-" t))
+          (anvil-mu4e-drafts-dir dir)
+          (anvil-mu4e-from "Bob User <bob@example.com>")
+          (anvil-mu4e-allow-send nil)
+          (anvil-mu4e-send-allowlist nil)
+          (anvil-mu4e-send-log nil)
+          ;; Hard safety net: even if a test forgets to stub it, the
+          ;; transport raises instead of sending.
+          (anvil-mu4e-send-function
+           (lambda (&rest _)
+             (error "anvil-mu4e-test: real send attempted"))))
+     (unwind-protect (progn ,@body)
+       (ignore-errors (delete-directory dir t)))))
 
 (ert-deftest anvil-mu4e-test-search-returns-structured-results ()
   "mu4e-search returns typed message summaries from the index."
@@ -172,6 +192,132 @@ Return a plist (:root ROOT :muhome MUHOME)."
                             :type 'error)))
     (should (string-match-p "mu binary not found"
                             (error-message-string err)))))
+
+;;;; --- Phase 2: compose / send --------------------------------------------
+
+(ert-deftest anvil-mu4e-test-compose-draft-writes-draft ()
+  "mu4e-compose-draft saves a well-formed draft and never sends."
+  (anvil-mu4e-test--with-drafts
+    (let* ((d (anvil-mu4e-test--parse
+               (anvil-mu4e--tool-compose-draft
+                "alice@example.com" "carol@example.com" "Hi there"
+                "Hello!\n" nil)))
+           (path (alist-get 'draft_id d)))
+      (should (eq t (alist-get 'saved d)))
+      (should-not (alist-get 'sent d))
+      (should (file-exists-p path))
+      (should (file-in-directory-p path (expand-file-name anvil-mu4e-drafts-dir)))
+      (should (string-match-p ":2,D\\'" path))
+      (should (equal "Hi there" (anvil-mu4e--header-value path "Subject")))
+      (should (equal "alice@example.com" (anvil-mu4e--header-value path "To")))
+      (should (equal "carol@example.com" (anvil-mu4e--header-value path "Cc")))
+      (should (string-match-p "bob@example.com"
+                              (anvil-mu4e--header-value path "From")))
+      (should (string-match-p
+               "Hello!"
+               (with-temp-buffer (insert-file-contents path) (buffer-string)))))))
+
+(ert-deftest anvil-mu4e-test-compose-reply-sets-threading ()
+  "A reply sets In-Reply-To and References even when the parent is unknown."
+  (anvil-mu4e-test--with-drafts
+    (let* ((d (anvil-mu4e-test--parse
+               (anvil-mu4e--tool-compose-draft
+                "alice@example.com" nil "Re: x" "ok"
+                "ghost-msg@nowhere.example")))
+           (path (alist-get 'draft_id d)))
+      (should (equal "<ghost-msg@nowhere.example>"
+                     (anvil-mu4e--header-value path "In-Reply-To")))
+      (should (string-match-p "ghost-msg@nowhere.example"
+                              (anvil-mu4e--header-value path "References"))))))
+
+(ert-deftest anvil-mu4e-test-compose-reply-to-indexed-message ()
+  "Replying to an indexed message inherits its Re: subject and references."
+  (skip-unless (executable-find "mu"))
+  (anvil-mu4e-test--with-index
+    (anvil-mu4e-test--with-drafts
+      (let* ((d (anvil-mu4e-test--parse
+                 (anvil-mu4e--tool-compose-draft
+                  "alice@example.com" nil nil "thanks"
+                  "inv-may-2026@example.com")))
+             (path (alist-get 'draft_id d)))
+        (should (equal "Re: Invoice for May" (alist-get 'subject d)))
+        (should (string-match-p "inv-may-2026@example.com"
+                                (anvil-mu4e--header-value path "References")))))))
+
+(ert-deftest anvil-mu4e-test-send-previews-without-confirm ()
+  "Without confirm=true, mu4e-send previews and does not call the transport."
+  (anvil-mu4e-test--with-drafts
+    (let* ((calls '())
+           (anvil-mu4e-send-function (lambda (p) (push p calls) t))
+           (anvil-mu4e-allow-send t)
+           (anvil-mu4e-send-allowlist '("@example\\.com\\'"))
+           (d (anvil-mu4e-test--parse
+               (anvil-mu4e--tool-compose-draft "alice@example.com" nil "Hi" "yo" nil)))
+           (did (alist-get 'draft_id d))
+           (r (anvil-mu4e-test--parse (anvil-mu4e--tool-send did :json-false))))
+      (should-not (alist-get 'sent r))
+      (should (string-match-p "confirm" (alist-get 'reason r)))
+      (should (null calls)))))
+
+(ert-deftest anvil-mu4e-test-send-refused-when-disabled ()
+  "With confirm but `anvil-mu4e-allow-send' nil, send is refused, no transport."
+  (anvil-mu4e-test--with-drafts
+    (let* ((calls '())
+           (anvil-mu4e-send-function (lambda (p) (push p calls) t))
+           (anvil-mu4e-allow-send nil)
+           (anvil-mu4e-send-allowlist '(".*"))
+           (d (anvil-mu4e-test--parse
+               (anvil-mu4e--tool-compose-draft "alice@example.com" nil "Hi" "yo" nil)))
+           (did (alist-get 'draft_id d))
+           (r (anvil-mu4e-test--parse (anvil-mu4e--tool-send did t))))
+      (should-not (alist-get 'sent r))
+      (should (string-match-p "disabled" (alist-get 'reason r)))
+      (should (null calls)))))
+
+(ert-deftest anvil-mu4e-test-send-refused-for-disallowed-recipient ()
+  "A recipient outside the allowlist blocks the send."
+  (anvil-mu4e-test--with-drafts
+    (let* ((calls '())
+           (anvil-mu4e-send-function (lambda (p) (push p calls) t))
+           (anvil-mu4e-allow-send t)
+           (anvil-mu4e-send-allowlist '("@trusted\\.example\\'"))
+           (d (anvil-mu4e-test--parse
+               (anvil-mu4e--tool-compose-draft "alice@example.com" nil "Hi" "yo" nil)))
+           (did (alist-get 'draft_id d))
+           (r (anvil-mu4e-test--parse (anvil-mu4e--tool-send did t))))
+      (should-not (alist-get 'sent r))
+      (should (string-match-p "allowlist" (alist-get 'reason r)))
+      (should (null calls)))))
+
+(ert-deftest anvil-mu4e-test-send-succeeds-when-gates-open ()
+  "With all three gates satisfied, send calls the transport once and audits."
+  (anvil-mu4e-test--with-drafts
+    (let* ((calls '())
+           (anvil-mu4e-send-function (lambda (p) (push p calls) t))
+           (anvil-mu4e-allow-send t)
+           (anvil-mu4e-send-allowlist '("@example\\.com\\'"))
+           (anvil-mu4e-send-log (expand-file-name "send.log" anvil-mu4e-drafts-dir))
+           (d (anvil-mu4e-test--parse
+               (anvil-mu4e--tool-compose-draft "alice@example.com" nil "Hi" "yo" nil)))
+           (did (alist-get 'draft_id d))
+           (r (anvil-mu4e-test--parse (anvil-mu4e--tool-send did t))))
+      (should (eq t (alist-get 'sent r)))
+      (should (= 1 (length calls)))
+      (should (equal did (car calls)))
+      (should (file-exists-p anvil-mu4e-send-log))
+      (should (string-match-p
+               "alice@example.com"
+               (with-temp-buffer
+                 (insert-file-contents anvil-mu4e-send-log)
+                 (buffer-string)))))))
+
+(ert-deftest anvil-mu4e-test-send-rejects-path-outside-drafts ()
+  "A draft_id outside the drafts directory is rejected (path-injection guard)."
+  (anvil-mu4e-test--with-drafts
+    (let ((anvil-mu4e-allow-send t)
+          (anvil-mu4e-send-allowlist '(".*"))
+          (anvil-mu4e-send-function (lambda (_p) t)))
+      (should-error (anvil-mu4e--tool-send "/etc/hostname" t) :type 'error))))
 
 (provide 'anvil-mu4e-test)
 ;;; anvil-mu4e-test.el ends here

@@ -31,8 +31,13 @@
 
 (require 'cl-lib)
 (require 'subr-x)
+(require 'seq)
 (require 'json)
 (require 'anvil-server)
+
+;; message.el is loaded lazily only on the (opt-in) send path.
+(declare-function message-mode "message" ())
+(declare-function message-send "message" (&optional arg))
 
 (defconst anvil-mu4e--server-id "emacs-eval"
   "MCP server id the mu4e tools register under (the main eval server).")
@@ -62,6 +67,48 @@ index a throwaway maildir; production normally leaves this nil."
 (defcustom anvil-mu4e-inbox-query "maildir:/INBOX"
   "Default mu query used by `mu4e-list-mails' when no query is given."
   :type 'string
+  :group 'anvil-mu4e)
+
+;;;; Phase 2 (compose/send) configuration --- all defaults are inert.
+
+(defcustom anvil-mu4e-from nil
+  "From header for composed drafts.
+When nil, `user-mail-address' is used; composing errors if neither is set."
+  :type '(choice (const :tag "user-mail-address" nil) string)
+  :group 'anvil-mu4e)
+
+(defcustom anvil-mu4e-drafts-dir nil
+  "Maildir directory where `mu4e-compose-draft' writes drafts.
+Must be set before composing; drafts are written under its `cur/'."
+  :type '(choice (const :tag "unset" nil) directory)
+  :group 'anvil-mu4e)
+
+(defcustom anvil-mu4e-allow-send nil
+  "Master switch for `mu4e-send'.
+When nil (the default), `mu4e-send' refuses to send anything.  An AI
+agent sending mail is irreversible and outward-facing, so this is
+opt-in."
+  :type 'boolean
+  :group 'anvil-mu4e)
+
+(defcustom anvil-mu4e-send-allowlist nil
+  "List of regexps; a draft may only be sent if EVERY recipient matches one.
+Empty (the default) means no recipient is allowed, so `mu4e-send'
+refuses every send until you configure this."
+  :type '(repeat regexp)
+  :group 'anvil-mu4e)
+
+(defcustom anvil-mu4e-send-function #'anvil-mu4e--message-send-file
+  "Function called with a draft file PATH to actually send it.
+Must return non-nil on success.  The default hands the message to
+Emacs' configured `message-send-mail-function'.  Override to plug in a
+specific transport (msmtp, a mu4e helper, etc.)."
+  :type 'function
+  :group 'anvil-mu4e)
+
+(defcustom anvil-mu4e-send-log nil
+  "Optional file path; when set, every successful send appends an audit line."
+  :type '(choice (const :tag "no audit log" nil) file)
   :group 'anvil-mu4e)
 
 ;;;; --- mu CLI invocation ---------------------------------------------------
@@ -229,13 +276,16 @@ MCP Parameters:
 ;;;; --- read ----------------------------------------------------------------
 
 (defun anvil-mu4e--resolve (message-id)
-  "Return the mu message plist for MESSAGE-ID (Message-ID or numeric docid)."
-  (let* ((raw (string-trim (format "%s" message-id)))
-         (clean (replace-regexp-in-string "\\`<\\|>\\'" "" raw))
-         (query (if (string-match-p "\\`[0-9]+\\'" clean)
-                    (format "docid:%s" clean)
-                  (format "msgid:%s" clean))))
-    (car (anvil-mu4e--find query 1 nil))))
+  "Return the mu message plist for MESSAGE-ID (Message-ID or numeric docid).
+Returns nil if the index is unavailable or nothing matches, so callers
+\(e.g. reply composition) can degrade gracefully."
+  (ignore-errors
+    (let* ((raw (string-trim (format "%s" message-id)))
+           (clean (replace-regexp-in-string "\\`<\\|>\\'" "" raw))
+           (query (if (string-match-p "\\`[0-9]+\\'" clean)
+                      (format "docid:%s" clean)
+                    (format "msgid:%s" clean))))
+      (car (anvil-mu4e--find query 1 nil)))))
 
 (defun anvil-mu4e--strip-headers (text)
   "Drop the leading header block `mu view' prints before the body."
@@ -276,6 +326,228 @@ MCP Parameters:
           (body_plain . ,(anvil-mu4e--body path nil)))
         (when want-html
           `((body_html . ,(anvil-mu4e--body path t)))))))))
+
+;;;; --- compose (Phase 2) ---------------------------------------------------
+
+(defun anvil-mu4e--from-domain (from)
+  "Extract the domain from a FROM header value, or a fallback."
+  (if (string-match "@\\([[:alnum:].-]+\\)" (or from ""))
+      (match-string 1 from)
+    "anvil.local"))
+
+(defun anvil-mu4e--gen-message-id (from)
+  "Generate a fresh Message-ID (with angle brackets) for FROM."
+  (format "<anvil-%s-%d@%s>"
+          (format-time-string "%Y%m%d%H%M%S")
+          (random 1000000)
+          (anvil-mu4e--from-domain from)))
+
+(defun anvil-mu4e--angle (id)
+  "Return ID wrapped in angle brackets, normalizing existing ones; \"\" if empty."
+  (let ((s (string-trim (replace-regexp-in-string "[<>]" "" (format "%s" (or id ""))))))
+    (if (string-empty-p s) "" (format "<%s>" s))))
+
+(defun anvil-mu4e--re-subject (subject)
+  "Return SUBJECT prefixed with \"Re: \" unless it already is."
+  (let ((s (or subject "")))
+    (if (string-match-p "\\`[ \t]*[Rr][Ee]:" s) s (concat "Re: " s))))
+
+(defun anvil-mu4e--from ()
+  "Return the configured From header, or signal an actionable error."
+  (or (and anvil-mu4e-from (not (string-empty-p anvil-mu4e-from)) anvil-mu4e-from)
+      (and user-mail-address (not (string-empty-p user-mail-address)) user-mail-address)
+      (error "anvil-mu4e: set `anvil-mu4e-from' (or `user-mail-address') before composing")))
+
+(defun anvil-mu4e--drafts-dir ()
+  "Return the configured drafts maildir, or signal an actionable error."
+  (let ((d anvil-mu4e-drafts-dir))
+    (unless (and d (not (string-empty-p d)))
+      (error "anvil-mu4e: set `anvil-mu4e-drafts-dir' to a maildir before composing"))
+    (expand-file-name d)))
+
+(defun anvil-mu4e--build-message (from to cc subject body irt refs message-id date)
+  "Assemble an RFC822 message string from the given header parts and BODY."
+  (concat
+   (format "From: %s\n" from)
+   (format "To: %s\n" to)
+   (when (and cc (not (string-empty-p cc))) (format "Cc: %s\n" cc))
+   (format "Subject: %s\n" (or subject ""))
+   (format "Date: %s\n" date)
+   (format "Message-ID: %s\n" message-id)
+   (when (and irt (not (string-empty-p irt))) (format "In-Reply-To: %s\n" irt))
+   (when (and refs (not (string-empty-p refs))) (format "References: %s\n" refs))
+   "MIME-Version: 1.0\n"
+   "Content-Type: text/plain; charset=utf-8\n"
+   "Content-Transfer-Encoding: 8bit\n"
+   "\n"
+   (let ((b (or body "")))
+     (if (or (string-empty-p b) (string-suffix-p "\n" b)) b (concat b "\n")))))
+
+(defun anvil-mu4e--write-draft (drafts-dir message)
+  "Write MESSAGE into DRAFTS-DIR/cur as a maildir draft; return its path."
+  (let* ((cur (expand-file-name "cur" drafts-dir))
+         (name (format "%d.%d_%d.%s:2,D"
+                       (truncate (float-time)) (emacs-pid)
+                       (random 100000) (system-name)))
+         (path (expand-file-name name cur)))
+    (make-directory cur t)
+    (let ((coding-system-for-write 'utf-8-unix))
+      (with-temp-file path (insert message)))
+    path))
+
+(defun anvil-mu4e--tool-compose-draft (to &optional cc subject body in_reply_to)
+  "Compose a message and save it as a draft (never sends).  Returns JSON.
+
+MCP Parameters:
+  to - Recipient address(es), e.g. \"alice@example.com\".
+  cc - Optional Cc address(es).
+  subject - Optional subject; for a reply, defaults to the parent's
+            \"Re: \" subject.
+  body - Optional plain-text body.
+  in_reply_to - Optional Message-ID being replied to; sets In-Reply-To
+                and References (threading) and a Re: subject."
+  (let* ((from (anvil-mu4e--from))
+         (drafts (anvil-mu4e--drafts-dir))
+         (reply-id (and in_reply_to (stringp in_reply_to)
+                        (not (string-empty-p (string-trim in_reply_to)))
+                        (string-trim in_reply_to)))
+         (parent (and reply-id (anvil-mu4e--resolve reply-id)))
+         (irt (and reply-id (anvil-mu4e--angle reply-id)))
+         (subj (cond ((and subject (not (string-empty-p subject))) subject)
+                     (parent (anvil-mu4e--re-subject (plist-get parent :subject)))
+                     (t "")))
+         (refs (when reply-id
+                 (let ((parent-refs (and parent (plist-get parent :references)))
+                       (parent-mid (or (and parent (plist-get parent :message-id))
+                                       reply-id)))
+                   (string-join
+                    (mapcar #'anvil-mu4e--angle (append parent-refs (list parent-mid)))
+                    " "))))
+         (mid (anvil-mu4e--gen-message-id from))
+         (date (format-time-string "%a, %d %b %Y %H:%M:%S %z"))
+         (msg (anvil-mu4e--build-message from to cc subj body irt refs mid date))
+         (path (anvil-mu4e--write-draft drafts msg)))
+    (json-encode
+     `((draft_id . ,path)
+       (message_id . ,mid)
+       (from . ,from)
+       (to . ,to)
+       (cc . ,(or cc ""))
+       (subject . ,subj)
+       (in_reply_to . ,(or irt ""))
+       (saved . t)
+       (sent . :json-false)))))
+
+;;;; --- send (Phase 2, gated) -----------------------------------------------
+
+(defun anvil-mu4e--header-value (path header)
+  "Return the unfolded value of HEADER from the RFC822 file at PATH, or nil."
+  (with-temp-buffer
+    (insert-file-contents path)
+    (goto-char (point-min))
+    (let ((end (save-excursion
+                 (if (re-search-forward "^$" nil t) (point) (point-max)))))
+      (goto-char (point-min))
+      (when (re-search-forward
+             (format "^%s:[ \t]*\\(.*\\(?:\n[ \t].*\\)*\\)" (regexp-quote header))
+             end t)
+        (string-trim (replace-regexp-in-string "\n[ \t]+" " " (match-string 1)))))))
+
+(defun anvil-mu4e--extract-emails (s)
+  "Return all e-mail addresses found in string S, lower-cased."
+  (let ((emails '()) (start 0))
+    (while (string-match
+            "[[:alnum:]._%+-]+@[[:alnum:].-]+\\.[[:alpha:]]\\{2,\\}" s start)
+      (push (downcase (match-string 0 s)) emails)
+      (setq start (match-end 0)))
+    (nreverse emails)))
+
+(defun anvil-mu4e--parse-recipients (path)
+  "Return the de-duplicated recipient addresses (To/Cc/Bcc) of the file at PATH."
+  (let ((emails '()))
+    (dolist (h '("To" "Cc" "Bcc"))
+      (let ((v (anvil-mu4e--header-value path h)))
+        (when v (setq emails (append emails (anvil-mu4e--extract-emails v))))))
+    (delete-dups emails)))
+
+(defun anvil-mu4e--recipient-allowed-p (email)
+  "Return non-nil when EMAIL matches some `anvil-mu4e-send-allowlist' regexp."
+  (seq-some (lambda (re) (string-match-p re email)) anvil-mu4e-send-allowlist))
+
+(defun anvil-mu4e--audit-send (recipients subject path)
+  "Append an audit line for a send of SUBJECT to RECIPIENTS (draft PATH)."
+  (when (and anvil-mu4e-send-log (not (string-empty-p anvil-mu4e-send-log)))
+    (let ((line (format "%s\tsent\t%s\t%s\t%s\n"
+                        (format-time-string "%Y-%m-%dT%H:%M:%S%z")
+                        (string-join recipients ",")
+                        (or subject "")
+                        path))
+          (coding-system-for-write 'utf-8-unix))
+      (write-region line nil (expand-file-name anvil-mu4e-send-log) 'append 'silent))))
+
+(defun anvil-mu4e--message-send-file (path)
+  "Default `anvil-mu4e-send-function': send the RFC822 file at PATH.
+Hands the message to Emacs' configured `message-send-mail-function'
+\(the same transport mu4e/message already use); returns non-nil on
+success.  NOTE: this live transport is intentionally NOT exercised by
+the test suite (tests stub `anvil-mu4e-send-function'); validate it in
+your own mail environment before relying on it."
+  (require 'message)
+  (with-temp-buffer
+    (insert-file-contents path)
+    (goto-char (point-min))
+    (if (re-search-forward "^$" nil t)
+        (replace-match mail-header-separator t t)
+      (goto-char (point-max))
+      (insert "\n" mail-header-separator))
+    (message-mode)
+    (message-send)
+    t))
+
+(defun anvil-mu4e--tool-send (draft_id confirm)
+  "Send a previously composed draft, subject to safety gates.  Returns JSON.
+
+Sending requires ALL of: `anvil-mu4e-allow-send' non-nil, every
+recipient matching `anvil-mu4e-send-allowlist', and CONFIRM true.  When
+CONFIRM is not true the draft is previewed without sending.
+
+MCP Parameters:
+  draft_id - The draft_id returned by mu4e-compose-draft (a file path
+             inside `anvil-mu4e-drafts-dir').
+  confirm - Boolean; must be true to actually send."
+  (let* ((path (expand-file-name (string-trim (format "%s" draft_id))))
+         (drafts (anvil-mu4e--drafts-dir)))
+    (unless (file-in-directory-p path drafts)
+      (error "anvil-mu4e: draft_id %S is outside `anvil-mu4e-drafts-dir'" draft_id))
+    (unless (file-readable-p path)
+      (error "anvil-mu4e: draft not found: %S" path))
+    (let* ((recipients (anvil-mu4e--parse-recipients path))
+           (subject (anvil-mu4e--header-value path "Subject"))
+           (disallowed (seq-remove #'anvil-mu4e--recipient-allowed-p recipients)))
+      (cond
+       ((not (anvil-mu4e--truthy confirm))
+        (json-encode `((sent . :json-false)
+                       (reason . "confirm=true is required to send")
+                       (recipients . ,(vconcat recipients))
+                       (subject . ,(or subject "")))))
+       ((null recipients)
+        (json-encode `((sent . :json-false)
+                       (reason . "draft has no recipients (To/Cc/Bcc)"))))
+       ((not anvil-mu4e-allow-send)
+        (json-encode `((sent . :json-false)
+                       (reason . "sending is disabled; set `anvil-mu4e-allow-send' to t"))))
+       (disallowed
+        (json-encode `((sent . :json-false)
+                       (reason . ,(format "recipient(s) not in `anvil-mu4e-send-allowlist': %s"
+                                          (string-join disallowed ", ")))
+                       (recipients . ,(vconcat recipients)))))
+       (t
+        (funcall anvil-mu4e-send-function path)
+        (anvil-mu4e--audit-send recipients subject path)
+        (json-encode `((sent . t)
+                       (recipients . ,(vconcat recipients))
+                       (subject . ,(or subject ""))
+                       (draft_id . ,path))))))))
 
 ;;;; --- module lifecycle ----------------------------------------------------
 
@@ -331,11 +603,52 @@ Parameters:
   html - Optional boolean; when true also include the HTML body.
 
 Returns JSON object: the message summary fields plus in_reply_to,
-references (array), body_plain, and body_html when requested."))
+references (array), body_plain, and body_html when requested.")
+
+  (anvil-server-register-tool
+   #'anvil-mu4e--tool-compose-draft
+   :id "mu4e-compose-draft"
+   :intent '(mail compose draft)
+   :layer 'workflow
+   :server-id anvil-mu4e--server-id
+   :description
+   "Compose a message and save it as a draft.  NEVER sends; use mu4e-send
+to send the resulting draft.
+
+Parameters:
+  to - Recipient address(es).
+  cc - Optional Cc address(es).
+  subject - Optional subject (a reply defaults to the parent's Re: subject).
+  body - Optional plain-text body.
+  in_reply_to - Optional Message-ID being replied to; sets threading
+                headers and a Re: subject.
+
+Returns JSON: draft_id (pass to mu4e-send), message_id, from, to, cc,
+subject, in_reply_to, saved=true, sent=false.")
+
+  (anvil-server-register-tool
+   #'anvil-mu4e--tool-send
+   :id "mu4e-send"
+   :intent '(mail send)
+   :layer 'workflow
+   :server-id anvil-mu4e--server-id
+   :description
+   "Send a previously composed draft.  Gated for safety: sending requires
+ALL of `anvil-mu4e-allow-send' enabled, every recipient matching
+`anvil-mu4e-send-allowlist', and confirm=true.  With confirm omitted/false
+the draft is previewed (recipients + subject) without sending.
+
+Parameters:
+  draft_id - The draft_id from mu4e-compose-draft.
+  confirm - Boolean; must be true to actually send.
+
+Returns JSON: sent (true/false); when false, a reason; when previewing,
+the recipients and subject."))
 
 (defun anvil-mu4e-disable ()
   "Unregister the anvil-mu4e MCP tools."
-  (dolist (id '("mu4e-search" "mu4e-list-mails" "mu4e-read-mail"))
+  (dolist (id '("mu4e-search" "mu4e-list-mails" "mu4e-read-mail"
+                "mu4e-compose-draft" "mu4e-send"))
     (anvil-server-unregister-tool id anvil-mu4e--server-id)))
 
 (provide 'anvil-mu4e)
