@@ -1,0 +1,233 @@
+#+TITLE: Doc 54 — anvil-fusion: Fusion ハーネスで Fable 5 性能を再現する
+#+AUTHOR: zawatton + Claude
+#+DATE: <2026-06-15>
+#+STATUS: Phase 1-5 SHIPPED (全 Phase 完了 / live スモーク + 実モデル選定が残)
+#+OPTIONS: toc:2 num:t
+
+* 0. エグゼクティブサマリ
+
+** 背景 / 制約
+- 米政府命令により *Fable 5 / Mythos 5 の米国外利用が禁止*。最上位モデルへの直接アクセスが断たれた。
+- 目的: 禁止モデルに **触れずに**、その *性能* を利用可能モデルのアンサンブルで再現する。
+- 不採用: 禁止モデルへのアクセス回避(jailbreak / 流出 system prompt 依存。X #11 ecommartinez)。
+  規約回避・流出物依存であり、本設計の射程外。本設計は「access の回復」ではなく「capability の再現」。
+
+** 中核命題
+- 外部調査(Fusion / fusion-fable スキル)が示す通り、*複数モデルを fan-out → judge が統合* する
+  アンサンブルは、安価/非最上位モデルの組合せで Fable 5 級スコアに到達しうる
+  (Fusion 主張: budget パネルが Fable 5 の 1% 以内。改善の 3/4 が synthesis、1/4 が diversity)。
+- *anvil-orchestrator は既にこの機構の 8 割を実装済み*(X #12 enhanced_jp「機構の 8 割は普段のシステムと同じ」
+  の裏付け)。本 repo `anvil-fusion` は残り 2 割 = judge 合成の強化・パネル定義・loop ハーネス・主権パネルを
+  `anvil-orchestrator` の薄い上層として足す。
+
+** 設計の重心(user 決定 2026-06-15)
+- *quality パネルと sovereign(ローカル)パネルを同格の第一級市民として設計する*。
+  - quality = 最高性能(US ベンダ依存だが Fable 5 不使用)
+  - sovereign = 主権完全保持(ローカル/OSS のみ、外部送出ゼロ、いかなる遮断にも不依存)
+- どちらも `anvil-fusion-ask` の単一 API から preset 切替で呼べる。
+
+* 1. 設計の根拠 — 要約 → 部品マッピング
+
+| 出典(要約アーカイブ) | 設計への寄与 |
+|----------------------+-------------|
+| Fusion YT (capture/yt/yt_20260615_fusion_model_panels.org) | 中核構造 fan-out→judge。3/4 synthesis : 1/4 diversity → judge 強化を最優先 |
+| X #12 enhanced_jp (fusion-fable「8割同じ」) | Layer 0 は既存で足りる外部裏付け。新規は 2 割のみ |
+| X #7 nicos_ai (プロンプト→loop) | Layer 2 批評ループ |
+| X #3 ClaudeCode_love (人間の頭がボトルネック / 役割と境界をエージェント側に固定) | judge は 1 答だけ返す + panel 各員に固定 role-lens |
+| X #9 swarm_japan (5役構成) / Fusion (quality・budget パネル) | named panel(defcustom) |
+| X #4 AYi (Agent Reach = ネット接続) | panel 員の web 調査(anvil http/browser で代替済)。ただし sovereign では外部送出させない |
+| X #13 monokern (MiMo) / Fusion budget パネル | sovereign / budget パネルの OSS 構成員候補 |
+| X #11 ecommartinez (jailbreak) | 不採用。記録のみ |
+
+参照要約: =capture/web/web_20260615_x_ai_claudecode_batch.org=, =capture/yt/yt_20260615_fusion_model_panels.org=
+
+* 2. Layer 0 — 既存の土台(anvil-orchestrator、触らない)
+
+=dev/anvil.el/anvil-orchestrator.el= (4,441 LOC) に実装済み:
+
+- =orchestrator-consensus-submit= — 同一 prompt を ≥2 provider に fan-out(claude/codex/gemini/ollama)
+- =orchestrator-consensus-collect= — pairwise Jaccard 類似度で verdict(unanimous/divergent、既定 threshold 0.5、
+  =anvil-orchestrator-consensus-threshold=)
+- =orchestrator-judge-consensus= (Phase 4b) — メタ LLM judge。原問 + 各候補要約 →
+  =anvil-orchestrator-judge-prompt-template= で prompt 生成 → judge provider
+  (=anvil-orchestrator-judge-default-provider=, 既定 'claude)へ submit → 融合答 1 つ
+- =orchestrator-judge-collect= — judge 結果回収
+- =orchestrator-routing-select= + Doc 43 autoresearch routing (Phase 3a–3e SHIPPED) —
+  policy(speed/cost/balanced/quality)で provider 選択、latency 学習
+- Doc 43 standalone-orchestrator — NeLisp standalone でも動作(Emacs daemon 非依存)。
+  → anvil-fusion も自動的に dual-target(architecture α)を継承
+
+結論: *Fusion の "panel + judge + routing" は既に全部ある*。anvil-fusion はゼロからではなく上層。
+
+* 3. Gap 分析 — 現 judge が Fusion に届いていない 4 点
+
+現 judge テンプレ(=anvil-orchestrator-judge-prompt-template=, L2697):
+#+begin_quote
+"Produce a single synthesized answer that captures the best of these candidates.
+Begin with the answer itself, then add a brief rationale (max 3 sentences) noting
+agreement and disagreement between candidates."
+#+end_quote
+
+1. *合成が浅い*。Fusion の judge は「合意点 / 矛盾 / 部分カバー / 独自洞察 / 見落とし」を抽出してから統合。
+   現状は「best of + 同意/相違 3 文」止まり。← 3/4 の lift を取りこぼしている。
+2. *judge に渡すのが =:summary=(要約)だけ*(L2723)。コード・報告書など長文では本文が落ちる。
+3. *single-shot*(loop 無し)。Fusion / X #7 の「loop で精緻化」が無い。
+4. *panel が毎回手動 provider 指定*。named panel(quality/budget/sovereign)が無く diversity も無保証
+   (同型モデル 3 つでも通る)。
+
+* 4. anvil-fusion の設計(追加する 2 割)
+
+** モジュール構成
+- =anvil-fusion.el= — 本体。=(require 'anvil-orchestrator)=(macro/関数の defining module を明示 require)。
+  architecture α(runtime-detect)で Emacs / NeLisp 両対応。
+- =anvil-fusion-panels.el= — named panel 定義(defcustom)。
+- =anvil-fusion-judge.el= — Fusion 構造化 judge テンプレ + full-output モード。
+- =anvil-fusion-eval.el= — ローカル eval ハーネス(Layer 3 検証)。
+- =tests/= — ERT。=;;; anvil-audit: tools-wrapped-at-registration= header を各 module 先頭に付与
+  (memory feedback_anvil_audit_header_required)。
+
+** Layer 1 — judge 合成の強化【最優先 = 3/4 の lift】
+- *Fusion 構造化 judge テンプレ*(新 defcustom =anvil-fusion-judge-template=、既存は温存):
+  原問 → (1)合意点 (2)矛盾点 (3)部分カバー (4)独自洞察 (5)見落とし → 最終統合答、の順で出力させる。
+- *full-output モード*: judge に =:summary= でなく本文を渡す =:fidelity 'full= オプション。
+  コード/報告書系で必須(現 judge の弱点 #2 を解消)。
+- judge provider は利用可能最上位(既定 Opus 4.8 = 'claude)。
+
+** Layer 2 — loop ハーネス + 1-call ラッパ
+- *=anvil-fusion-ask=* (本体 API): =consensus-submit → collect(:wait) → judge → judge-collect= を 1 呼び出しに集約。
+  返すのは *融合答 1 つ*(X #3「人間の頭を守る」)。
+  signature 案: =(anvil-fusion-ask PROMPT &key panel fidelity max-rounds judge)=。
+- *批評ループ*(X #7): verdict が divergent かつ min-similarity < threshold のとき、judge 草案を panel に
+  *1 周だけ* 差し戻して critique → 再 judge。=anvil-fusion-max-rounds= で cap(暴走防止)。
+- *role-lens 注入*(X #3「役割を固定」): panel 各員に固定レンズ(正確性 / 網羅性 / ドメイン専門=電気法令)を
+  prompt 接頭辞で付与。diversity をモデル差 + 役割差の両輪で稼ぐ。
+- 利用面: =/fusion=(または =/fable=)skill で薄く包む(fusion-fable / Fusion boardroom 相当)。
+
+** Layer 3 — named パネル(quality と sovereign を同格に)
+defcustom =anvil-fusion-panels= に preset を定義。両者を第一級市民として並置:
+
+#+begin_src elisp
+(setq anvil-fusion-panels
+  '((quality   . ((members . ((claude . "claude-opus-4-8")
+                              (codex  . "gpt-5.5")
+                              (gemini . "gemini-3.1-pro")))
+                  (judge   . (claude . "claude-opus-4-8"))
+                  (egress  . external)))   ; US ベンダ依存・最高性能・Fable 5 不使用
+    (sovereign . ((members . ((ollama . "qwen3")      ; 例: ローカル/自己ホスト
+                              (ollama . "deepseek-v4")
+                              (ollama . "kimi-k2.6")))
+                  (judge   . (ollama . "qwen3"))
+                  (egress  . local-only)))  ; 外部送出ゼロ・主権完全保持・content 非流出方針に合致
+    (budget    . ((members . (...))         ; 安価/OSS 混成
+                  (judge   . (claude . "claude-opus-4-8"))
+                  (egress  . external)))))
+#+end_src
+
+- =egress= フラグで *content 外部送出の有無を型として持つ*。=local-only= の panel は http/browser tool を
+  無効化し、ローカル provider 以外を弾く(user 既定の「content を外部に出さない」方針を機構で強制)。
+- ban シナリオの既定推奨 = =sovereign=。性能が不足する非機密タスクのみ =quality= を明示選択。
+
+* 5. 主権(sovereignty)— ban への本命対策
+
+- 禁止は *主権リスク*。最上位を 1 ベンダ / 1 国に依存する限り次の cutoff でまた詰む。
+- =sovereign= panel = ローカル/自己ホストモデル(anvil 既存 =ollama= provider 経由)+ ローカル judge。
+  - 外部送出ゼロ → どのベンダ/政府の遮断にも影響されない。
+  - user の「content を外部に出さない」既定方針(notes 検索のローカル化方針と同根)に合致。
+  - Fusion 主張(budget パネルが Fable 5 の 1% 以内)が正しければ、ローカルアンサンブルで
+    *単体ローカルモデルを大きく上回りつつ主権を保持* できる。← これが本設計の戦略的核心。
+- quality panel は「主権を一部譲ってでも最高性能が要る非機密タスク」用の同格オプションとして残す。
+
+* 6. 検証(マーケ数値を信じない)
+
+memory =feedback_tool_count_must_validate= に従い、Fusion の「Fable 級」主張は自前数値で裏取りする。
+- Fusion が使った Perplexity Draco(100 deep-research タスク)の代わりに、*user 実タスクの小規模ローカル
+  eval セット* を作る(法令調査 / 報告書セクション生成 / org 要約 各 10–20 問、正解 or rubric 付き)。
+- 既存 =autoresearch-routing-*= を流用し、panel 構成(quality/sovereign/budget)を実測比較・自動チューニング。
+- 指標: 単体 Opus 4.8 vs 各 panel の 正答 / 網羅 / 再現性 / レイテンシ / (sovereign は)外部送出量=0 検証。
+
+* 7. 段階(各 Phase 独立に ship 可能)
+
+| Phase | 内容 | 規模 |
+|-------+------+------|
+| 1 | Fusion 構造化 judge テンプレ + full-output モード(Layer 1) ✅ SHIPPED 2026-06-15 | 小 |
+| 2 | named panel defcustom(quality + sovereign を同格、egress フラグ)(Layer 3) ✅ SHIPPED 2026-06-15 | 小 |
+| 3 | =anvil-fusion-ask= 1-call ラッパ + =/fusion= skill(loop 無し版)(Layer 2) ✅ SHIPPED 2026-06-15 | 中 |
+| 4 | 批評ループ + role-lens(Layer 2 完全版) ✅ SHIPPED 2026-06-15 | 中 |
+| 5 | ローカル eval セット + autoresearch チューニング(Layer 3 検証) ✅ SHIPPED 2026-06-15 | 中 |
+
+Phase 1+2 だけで「Fusion 同等 judge + ワンショット quality/sovereign パネル」が成立。
+
+* 8. 設計上の制約・既知の落とし穴(memory 由来)
+
+- =(require 'anvil-orchestrator)= を必ず明示(feedback_anvil_macro_require)。
+- 各 module 先頭に =;;; anvil-audit:= header(feedback_anvil_audit_header_required)。
+- dual-target は anvil-orchestrator の Doc 43 standalone を継承するので新規分岐は最小
+  (feedback_anvil_uses_nelisp_architecture / feedback_anvil_module_dual_target_categorization)。
+- ファイル編集は anvil file-* tool 経由(feedback_anvil_mandatory_for_edits)。
+- 金銭/価格/Pro tier 等は書かない(feedback_no_personal_money_in_anvil の精神を本 repo にも適用)。
+- jailbreak / 禁止モデルアクセス回避は実装しない(本 Doc §0)。
+
+* 9. 実機検証 (live スモーク 2026-06-15)
+
+stub だけだった全コードを稼働中 daemon にロードし、実 provider で検証した。
+
+** 検証環境
+- GTX 1060 6GB VRAM (CUDA 6.1, 約5.6GiB 利用可) / 62GB RAM。Ollama 稼働。
+- Ollama 導入済: =llama3.2:3b= (2.0GB) / =llama3.1:8b= (4.9GB) / =gemma4:e4b= (9.6GB)。
+- codex provider: 既定 model =gpt-5.4= (ChatGPT OAuth, per-token 課金なし)。
+
+** 結果 (全て実 LLM、async job + poll で実行)
+- 単一 codex 探査: "2+3" → "5" (10.5s)。provider + eval single-ask-fn 動作。
+- 単一 ollama 探査 (llama3.2:3b): "2+3" → "5です。" (6.5s)。
+- *codex-smoke パネル* (codex×2 + lens + codex judge, max-rounds 0): 234s で完走。
+  judge が Fusion 構造化 (分析: 合意/矛盾/部分カバー/独自洞察/見落とし → 最終回答) で
+  月次点検3項目を合成。**片方の member が空回答でも judge が割り引いて統合** = robustness 実証。
+- *sovereign-smoke パネル* (llama3.1:8b + llama3.2:3b ローカル + lens + ollama judge,
+  local-only): *30s* で完走。Fusion 構造化合成をローカルのみで生成、*=:egress local-only=
+  を確認 = ゼロ egress 保証が実機で成立*。codex の約 1/8 の所要時間。
+
+** 検出・修正したバグ
+- member タスクに =:name= が無く orchestrator が拒否 (stub では未検出)。
+  =anvil-fusion-panel-tasks= に =:name= 付与 + 回帰テスト追加で修正。
+
+** 既知の軽微な課題 (今後)
+- Ollama 出力捕捉に ANSI =[K= (erase-line) 制御コードが混入 (orchestrator 側の parser、
+  anvil-fusion 側で sanitize するか要検討)。
+- =anvil-fusion-eval-single-ask-fn= は egress を一律 =external= とラベルする (baseline 用、
+  ollama では不正確)。provider から推定するよう改善余地。
+
+** sovereign 実モデル選定 (解決済)
+- 6GB VRAM 箱の既定: members =llama3.1:8b= + =llama3.2:3b= + =gemma4:e4b=、judge
+  =llama3.1:8b=。8b/3b は VRAM 内、gemma4:e4b は CPU spill (遅いが 62GB RAM で可)。
+- 速度重視なら gemma4 を外し 8b+3b の 2 枚 (実測 30s)。
+
+* 10. MCP tool 化 (SHIPPED 2026-06-15)
+
+anvil-fusion-ask は数十秒〜数分ブロックする (sovereign ~30-60s, codex ~230s) ため、
+同期 MCP tool では dispatch timeout を超える。orchestrator と同じ *async submit + poll*
+方式で実装した。
+
+- =anvil-fusion-async.el= — 非ブロッキング状態機械。=anvil-fusion-ask-async= が member を
+  submit して即 job-id 返却、=anvil-fusion-result= が members→judging→done を 1 段ずつ
+  前進 (各 poll は terminal 判定のみで非ブロッキング)。v1 は単一 round (loop なしは
+  blocking 版 anvil-fusion-ask を使う)。orchestrator public API のみ依存、ERT 5 件。
+- =anvil-fusion-mcp.el= (daemon 専用、anvil-server 依存) — MCP tool =fusion-ask= /
+  =fusion-result= を server-id "emacs-eval" に登録。自己完結 JSON encoder、
+  "MCP Parameters:" docstring、=anvil-fusion-enable= / =-disable= ライフサイクル。
+- live 往復検証 (ollama local パネル): fusion-ask → 即 job-id、fusion-result poll で
+  members→judging→done、=:answer= に Fusion 構造化合成、=:egress local-only=。各 poll が
+  高速で MCP 30s timeout を回避。
+- Claude Code から =mcp__emacs-eval__fusion-ask= として見えるのは MCP client 再接続後。
+
+* 11. 完了済 (フォローアップ)
+- daemon 起動時の =anvil-fusion-enable= 自動化 ✅ (init.el my-start-anvil-after-server に
+  load-path 追加 + 防御的 require + enable、2026-06-15)。
+- Ollama =[K= (ANSI erase-line) sanitize ✅ (anvil-orchestrator--ollama-strip-ansi を
+  追加し --ollama-parse-output で除去。anvil.el commit 67e62b6。dev と external-packages は
+  symlink 同一ファイルのため 1 修正で両方反映。live で ESC/[K 消失確認、ERT +2)。
+
+* 12. 残課題
+- =anvil-fusion= を anvil.el 本体に取り込むか、独立 repo のまま依存させるか(現状: 独立 repo)。
+- =anvil-fusion-eval-single-ask-fn= の egress を provider から推定 (現状一律 external ラベル)。
+- async MCP path への批評ループ取り込み (現状 single-round)。
+- Phase 5 eval を実タスクで回し panel 構成を実数で確定。

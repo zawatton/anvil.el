@@ -1,0 +1,104 @@
+#+TITLE: Doc 55 — anvil-fusion-longrun: 長期タスク遂行 + コンテキスト隔離
+#+AUTHOR: zawatton + Claude
+#+DATE: 2026-06-15
+
+* 目的
+Fable 5 的な「長期(多段)タスク遂行」能力を、利用可能なモデル + anvil の既存
+部品で再現する。核心は *本体 Claude セッションのコンテキストを一切汚さずに*、
+長期タスクを多段で走らせること。
+
+* 問題: 9割超がオーバーヘッド
+- capture/yt/yt_20260527_claude_token_10habits.org: 100 メッセージの会話で
+  新規出力(価値ある推敲)は全体の ~1.5%、*98.5% は履歴の再読込* に消える。
+- capture/web/web_20260404_claude_code_token_saving.org: トークンの 99.4% は
+  入力(読込)、実作業は 0.6% 未満。
+- 帰結: タスクが長くなるほど「履歴を毎ターン読み直すコスト」が支配的になる。
+  長期タスクを *本体の会話履歴の上で* 回すと、この再読込コストが線形〜二乗で
+  膨らむ。
+
+* 解決の核心: 履歴ではなく「蒸留状態」を持ち回る
+- *quest* は全履歴ではなく、有界サイズの *蒸留状態 digest* (= ワーキングメモリ)
+  を持ち回る。
+- ステップ N が見るのは ~(goal + digest_{N-1}) だけ。digest は毎ステップ
+  =digest-max-chars= に圧縮されるので、*1 ステップあたりのコンテキストは
+  タスク長に依らず O(1)*。これが 98.5% 再読込問題を構造的に潰す。
+  (RNN の固定長 hidden state に近い。LLM agent ループ版)
+- 本体は =longrun-start= と =longrun-result= だけを叩く。中間ステップ出力は
+  本体コンテキストに *一度も入らない*。
+
+* 既存部品の再利用 (8 割は既にある)
+| 部品 | 役割 | 状態 | 設計書 |
+|------+------+------+--------|
+| anvil-orchestrator | サブプロセス隔離実行・summary only 返却 | SHIPPED | Doc 10 |
+| anvil-compact | 45% 閾値 /compact + snapshot 復元 | Ph1-3a SHIPPED | Doc 36 |
+| anvil-session | snapshot/resume・FTS5 イベント索引 | SHIPPED | Doc 17 |
+| progressive disclosure | 3 層読込 (~1/10 token) | SHIPPED | Doc 28 |
+| anvil-worklog | DB-primary + FTS5 横断検索 | SHIPPED | Doc 42 |
+
+longrun が新規実装するのは *「蒸留状態を持ち回る多段ループ」だけ*。各ステップの
+隔離は orchestrator、蒸留は compact 流の要約、永続(Phase 2+)は worklog DB を
+流用する。
+
+* データモデル
+- *quest*: (goal, provider, max-steps, digest-max-chars, cwd)。
+- *state* (ループ内): plist (:goal :digest :step :done)。
+  - =digest=: 有界サイズの蒸留ワーキングメモリ(文字列)。
+- *step*: 1 段 = [step 実行] → [蒸留]。
+  - step 実行: prompt = (goal + digest_{N-1} + 進捗指示)。orchestrator で 1 タスク
+    隔離実行 (=:cwd /tmp= で hermetic、本体 hook 非継承)。
+  - 蒸留: prompt = (goal + digest_{N-1} + 今 step 出力)。digest_N (≤ max-chars) +
+    末尾に =STATUS: DONE|CONTINUE= を返す。
+- *終了*: hard = step ≥ max-steps、soft = 蒸留が STATUS: DONE。
+
+* API (Phase で段階導入)
+- =anvil-fusion-longrun-build-step-prompt (goal digest step-n max-steps)= — 純
+- =anvil-fusion-longrun-build-distill-prompt (goal prev-digest output max-chars)= — 純
+- =anvil-fusion-longrun--parse-distill (text max-chars)= → (DIGEST . DONE-P)
+- =anvil-fusion-longrun-run (goal &key provider model distill-provider max-steps
+  digest-max-chars cwd timeout-sec max-wait-sec step-fn distill-fn keep-trace)=
+  - step-fn / distill-fn は注入可 (ERT は orchestrator 非依存で stub)。
+  - 戻り値 plist: =:goal :answer :digest :steps :stopped :provider :trace=。
+    :trace は各 step の *メタ情報のみ* (output-chars / digest-chars / digest-head)
+    で、全出力は持たない = 戻り値も小さい。
+
+* Phase 計画
+- *Phase 1 (SHIPPED)*: 純 builder + parse + run ループ + 注入 step/
+  distill-fn + live runner(orchestrator 単発)。ERT で純部分と handoff 不変条件
+  (step N が digest_{N-1} を受ける)を検証。live で隔離 quest を実行し、本体が
+  start+result のみ見たことを実証。
+- *Phase 2 (SHIPPED)*: quest 状態の SQLite 永続 (独立 WAL DB quest/quest_step) +
+  中断/再開 (=anvil-fusion-longrun-resume=、毎 step checkpoint)。live で
+  中断→DBクローズ→再オープン→保存 digest seed で resume を実証。
+- *Phase 3 (SHIPPED)*: MCP tool 化 (=longrun-start= / =longrun-resume= /
+  =longrun-status=、async submit+poll = fable-async と同形の非ブロッキング SM。
+  dispatch timeout 回避)。start は即 job-id 返却、status が 1 poll で 1 sub-stage
+  前進。ERT 6 + live(ollama 3 step)で実証。
+- *Phase 4 (SHIPPED, 収束検出)*: digest 停滞検出による早期 DONE。
+  jaccard(prev,new) >= =converge-threshold= (既定0.9) が =converge-patience=
+  (既定2) 回連続なら stopped=converged で停止し、無駄な step/トークンを削る。
+  run ループ + async SM 両対応、純ヘルパ --streak / --converged-p、ERT 7。
+  step 内 anvil tool の hermetic 利用 (Phase 4b): =:hermetic= で step を read-only
+  progressive-disclosure ツール (=anvil-fusion-longrun-disclosure-tools=) のみへ
+  =--allowedTools= 制限 + 段階取得を促す instruction を付与 (write/shell/native Read 不可)。
+  capability 制限の配線は完成 (ERT)。ただし /tmp child は project の =.mcp.json= を
+  読まないため disclosure tool を *実際に呼ぶ* には =anvil-orchestrator-manifest-profile=
+  (read-only profile) で emacs-eval を =--mcp-config= 注入する設定が必要。未設定だと
+  child にツールが無く「未承認」になる (live 実測 2026-06-16)。
+- *Phase 5 (SHIPPED)*: 実タスク eval (3記事横断要約)。eval/results-longrun-2026-06-15.org。
+  claude で本体は記事7296字でなく蒸留1183字(16.2%)のみ受領を実証。小型ローカルは品質不足。
+
+* 主権 / egress
+- provider が local (ollama 等) のみなら egress local-only として扱う。Phase 4 で
+  anvil-fusion-panels の egress 検査と同じ機構的強制を入れる。
+
+* オープン課題
+- 蒸留の品質が弱い provider だと状態が劣化する → *測定済 (2026-06-16)*:
+  eval/results-longrun-weakdistill-2026-06-16.org。distill 段だけ tier 横断で統制比較、
+  recall(gold fact 12) = sonnet/haiku 1.00 → gemma4:e4b/llama3.1:8b 0.58 → llama3.2:3b 0.42。
+  劣化機序 = 弱 provider は「選別圧縮」でなく「冒頭引き写し+有界 digest 末尾切り捨て」に退化。
+  指針: distill provider は haiku 以上を最低線、step は安価 provider でも distill は capable を
+  当てる非対称配備が費用対効果良。
+- digest 圧縮の停滞(同じ状態を繰り返す)検出 → 早期 DONE 判定。
+- step を fusion panel (anvil-fusion-ask) にする「deep × wide」合成は Phase 4+ 検討。
+
+関連: Doc 54 (fusion-harness)、Doc 10/36/17/28/42。
