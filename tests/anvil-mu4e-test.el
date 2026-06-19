@@ -193,6 +193,113 @@ gate so no test can ever transmit mail unless it opts in explicitly."
     (should (string-match-p "mu binary not found"
                             (error-message-string err)))))
 
+;;;; --- Phase 1.1: CJK substring fallback -----------------------------------
+
+(defun anvil-mu4e-test--build-cjk-index ()
+  "Create a throwaway maildir with CJK messages and index it with mu.
+Return a plist (:root ROOT :muhome MUHOME)."
+  (let* ((root (make-temp-file "anvil-mu4e-cjk-" t))
+         (md (expand-file-name "Maildir" root))
+         (mh (expand-file-name "muhome" root))
+         (inbox (expand-file-name "INBOX" md)))
+    (dolist (d '("cur" "new" "tmp"))
+      (make-directory (expand-file-name d inbox) t))
+    (anvil-mu4e-test--write
+     (expand-file-name "cur/c1:2,S" inbox)
+     "From: Alice Tanaka <alice@example.com>\nTo: You <you@example.com>\nSubject: 5月分の請求書\nDate: Mon, 15 Jun 2026 09:31:00 +0900\nMessage-ID: <c1@example.com>\n\n請求書の件、ご確認ください。\n")
+    (anvil-mu4e-test--write
+     (expand-file-name "new/c2" inbox)
+     "From: 電力会社 <info@power.example>\nTo: You <you@example.com>\nSubject: 定期点検のお知らせ\nDate: Wed, 10 Jun 2026 08:00:00 +0900\nMessage-ID: <c2@power.example>\n\n点検日程をお知らせします。\n")
+    (anvil-mu4e-test--write
+     (expand-file-name "new/c3" inbox)
+     "From: Dave <dave@example.com>\nTo: You <you@example.com>\nSubject: Weekly report\nDate: Tue, 16 Jun 2026 10:00:00 +0900\nMessage-ID: <c3@example.com>\n\n領収書を添付します。\n")
+    (anvil-mu4e-test--write
+     (expand-file-name "new/c4" inbox)
+     "From: Bob <bob@example.com>\nTo: You <you@example.com>\nSubject: Lunch\nDate: Tue, 16 Jun 2026 12:00:00 +0900\nMessage-ID: <c4@example.com>\n\nlunch tomorrow?\n")
+    (unless (= 0 (call-process "mu" nil nil nil "init"
+                               (concat "--maildir=" md)
+                               (concat "--muhome=" mh)
+                               "--my-address=you@example.com"))
+      (error "anvil-mu4e-test: `mu init' (cjk) failed"))
+    (unless (= 0 (call-process "mu" nil nil nil "index"
+                               (concat "--muhome=" mh)))
+      (error "anvil-mu4e-test: `mu index' (cjk) failed"))
+    (list :root root :muhome mh)))
+
+(defmacro anvil-mu4e-test--with-cjk-index (&rest body)
+  "Build a throwaway CJK mu index, bind module vars, run BODY, clean up."
+  (declare (indent 0))
+  `(let* ((ctx (anvil-mu4e-test--build-cjk-index))
+          (anvil-mu4e-muhome (plist-get ctx :muhome))
+          (anvil-mu4e-mu-bin (or (executable-find "mu") "mu"))
+          (anvil-mu4e-cjk-fallback t)
+          (anvil-mu4e-cjk-search-body nil))
+     (unwind-protect (progn ,@body)
+       (ignore-errors (delete-directory (plist-get ctx :root) t)))))
+
+(ert-deftest anvil-mu4e-test-cjk-bare-term-matches-subject ()
+  "A bare CJK term mu cannot tokenize is matched via the substring fallback."
+  (skip-unless (executable-find "mu"))
+  (anvil-mu4e-test--with-cjk-index
+    (let* ((resp (anvil-mu4e-test--parse (anvil-mu4e--tool-search "請求書" nil nil)))
+           (subjects (mapcar (lambda (m) (alist-get 'subject m))
+                             (alist-get 'messages resp))))
+      (should (eq t (alist-get 'cjk_fallback resp)))
+      (should (= 1 (alist-get 'count resp)))
+      (should (member "5月分の請求書" subjects)))))
+
+(ert-deftest anvil-mu4e-test-cjk-field-term-matches-from ()
+  "A field term with a CJK value (from:電力) filters on that field."
+  (skip-unless (executable-find "mu"))
+  (anvil-mu4e-test--with-cjk-index
+    (let ((resp (anvil-mu4e-test--parse (anvil-mu4e--tool-search "from:電力" nil nil))))
+      (should (eq t (alist-get 'cjk_fallback resp)))
+      (should (= 1 (alist-get 'count resp)))
+      (should (equal "定期点検のお知らせ"
+                     (alist-get 'subject (car (alist-get 'messages resp))))))))
+
+(ert-deftest anvil-mu4e-test-cjk-mixed-query-narrows-then-filters ()
+  "A mixed query lets mu narrow (from:) and the fallback filter the CJK term."
+  (skip-unless (executable-find "mu"))
+  (anvil-mu4e-test--with-cjk-index
+    (let ((resp (anvil-mu4e-test--parse
+                 (anvil-mu4e--tool-search "from:info@power.example 点検" nil nil))))
+      (should (= 1 (alist-get 'count resp)))
+      (should (equal "定期点検のお知らせ"
+                     (alist-get 'subject (car (alist-get 'messages resp))))))))
+
+(ert-deftest anvil-mu4e-test-cjk-no-match ()
+  "A CJK term present nowhere returns an empty result (still via fallback)."
+  (skip-unless (executable-find "mu"))
+  (anvil-mu4e-test--with-cjk-index
+    (let ((resp (anvil-mu4e-test--parse
+                 (anvil-mu4e--tool-search "存在しない語" nil nil))))
+      (should (eq t (alist-get 'cjk_fallback resp)))
+      (should (= 0 (alist-get 'count resp))))))
+
+(ert-deftest anvil-mu4e-test-cjk-body-scan-is-opt-in ()
+  "A CJK term only in the body matches only when body scanning is enabled."
+  (skip-unless (executable-find "mu"))
+  (anvil-mu4e-test--with-cjk-index
+    ;; 領収書 appears only in c3's body (subject is ASCII "Weekly report").
+    (let ((off (anvil-mu4e-test--parse (anvil-mu4e--tool-search "領収書" nil nil))))
+      (should (= 0 (alist-get 'count off))))
+    (let* ((anvil-mu4e-cjk-search-body t)
+           (on (anvil-mu4e-test--parse (anvil-mu4e--tool-search "領収書" nil nil))))
+      (should (= 1 (alist-get 'count on)))
+      (should (equal "Weekly report"
+                     (alist-get 'subject (car (alist-get 'messages on))))))))
+
+(ert-deftest anvil-mu4e-test-ascii-query-skips-fallback ()
+  "A pure-ASCII query uses mu directly (no cjk_fallback flag)."
+  (skip-unless (executable-find "mu"))
+  (anvil-mu4e-test--with-cjk-index
+    (let ((resp (anvil-mu4e-test--parse (anvil-mu4e--tool-search "from:bob" nil nil))))
+      (should-not (alist-get 'cjk_fallback resp))
+      (should (= 1 (alist-get 'count resp)))
+      (should (equal "Lunch"
+                     (alist-get 'subject (car (alist-get 'messages resp))))))))
+
 ;;;; --- Phase 2: compose / send --------------------------------------------
 
 (ert-deftest anvil-mu4e-test-compose-draft-writes-draft ()

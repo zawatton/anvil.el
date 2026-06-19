@@ -12,6 +12,16 @@ Delivered (=anvil-mu4e.el=, opt-in module):
 
 - *Phase 1 — read/search* (=:read-only=, backed by the synchronous =mu=
   CLI): =mu4e-search=, =mu4e-list-mails=, =mu4e-read-mail=.
+- *Phase 1.1 — CJK substring fallback* (=anvil-mu4e-cjk-fallback=, default
+  on): mu's Xapian index cannot tokenize CJK on common builds (verified:
+  =mu find 請求書= returns 0 even with =XAPIAN_CJK_NGRAM=1=), so a bare CJK
+  term silently misses.  =mu4e-search= now detects CJK terms (bare or in a
+  field), hands mu only what it can match, pulls candidates (capped by
+  =anvil-mu4e-cjk-candidate-limit=, default 2000; result flags
+  =candidates_truncated= when hit), and substring-filters subject/from/to/cc
+  — body too when =anvil-mu4e-cjk-search-body= is on.  Responses carry
+  =cjk_fallback=true=.  Mixed queries (=from:alice 請求書=) let mu narrow
+  first, then the fallback filters.
 - *Phase 2 — compose/send* (gated): =mu4e-compose-draft= (draft-first,
   never sends; threads replies) and =mu4e-send= (triple gate —
   =anvil-mu4e-allow-send= + recipient =anvil-mu4e-send-allowlist= +

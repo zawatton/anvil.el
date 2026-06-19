@@ -69,6 +69,34 @@ index a throwaway maildir; production normally leaves this nil."
   :type 'string
   :group 'anvil-mu4e)
 
+(defcustom anvil-mu4e-cjk-fallback t
+  "When non-nil, `mu4e-search' substring-filters CJK terms in Emacs.
+mu's Xapian index frequently cannot tokenize CJK, so a bare CJK term
+returns nothing.  With this enabled, a query's CJK terms (bare or in a
+field, e.g. \"請求書\" or \"subject:請求書\") are stripped from the mu
+query, mu is asked only for what it can match (Latin terms, field ops),
+and the candidates are substring-filtered on subject/from/to/cc."
+  :type 'boolean
+  :group 'anvil-mu4e)
+
+(defcustom anvil-mu4e-cjk-candidate-limit 2000
+  "Max messages pulled from mu as candidates for CJK substring filtering.
+If a CJK search hits this cap the result carries `candidates_truncated'."
+  :type 'integer
+  :group 'anvil-mu4e)
+
+(defcustom anvil-mu4e-cjk-search-body nil
+  "When non-nil, an any-field CJK term also matches message bodies.
+Body scanning runs `mu view' per candidate, so it only engages when the
+candidate set is at most `anvil-mu4e-cjk-body-scan-limit'."
+  :type 'boolean
+  :group 'anvil-mu4e)
+
+(defcustom anvil-mu4e-cjk-body-scan-limit 200
+  "Upper bound on candidates whose body is scanned for CJK terms."
+  :type 'integer
+  :group 'anvil-mu4e)
+
 ;;;; Phase 2 (compose/send) configuration --- all defaults are inert.
 
 (defcustom anvil-mu4e-from nil
@@ -247,19 +275,118 @@ empty list, not an error."
      (t (error "anvil-mu4e: mu find failed (exit %d): %s"
                exit (string-trim (or err "")))))))
 
+;;;; --- CJK substring fallback ----------------------------------------------
+
+(defun anvil-mu4e--has-cjk-p (s)
+  "Return non-nil when string S contains a Han/Kana/Hangul character."
+  (and (stringp s)
+       (seq-some (lambda (c)
+                   (memq (aref char-script-table c)
+                         '(han kana hangul cjk-misc bopomofo)))
+                 s)))
+
+(defun anvil-mu4e--analyze-query (query)
+  "Split QUERY into a mu-handleable query and CJK filters.
+Returns (MU-QUERY . FILTERS) where FILTERS is a list of (FIELD . VALUE);
+FIELD is a lowercase field string (\"subject\", \"from\", ...) or nil for
+an any-field term, and VALUE is the CJK substring to match."
+  (let (mu-terms filters)
+    (dolist (tok (split-string (or query "") "[ \t\n]+" t))
+      (if (string-match "\\`\\([a-zA-Z]+\\):\\(.*\\)\\'" tok)
+          (let ((field (downcase (match-string 1 tok)))
+                (val (match-string 2 tok)))
+            (if (anvil-mu4e--has-cjk-p val)
+                (push (cons field val) filters)
+              (push tok mu-terms)))
+        (if (anvil-mu4e--has-cjk-p tok)
+            (push (cons nil tok) filters)
+          (push tok mu-terms))))
+    (cons (string-join (nreverse mu-terms) " ")
+          (nreverse filters))))
+
+(defun anvil-mu4e--contacts-text (lst)
+  "Flatten contact plist LST into a searchable \"name email\" string."
+  (mapconcat (lambda (c)
+               (concat (or (plist-get c :name) "") " " (or (plist-get c :email) "")))
+             lst " "))
+
+(defun anvil-mu4e--field-text (pl field)
+  "Return the searchable text of PL for FIELD (\"subject\"/\"from\"/... or \"any\")."
+  (pcase field
+    ("subject" (or (plist-get pl :subject) ""))
+    ("from" (anvil-mu4e--contacts-text (plist-get pl :from)))
+    ("to" (anvil-mu4e--contacts-text (plist-get pl :to)))
+    ("cc" (anvil-mu4e--contacts-text (plist-get pl :cc)))
+    (_ (string-join
+        (list (or (plist-get pl :subject) "")
+              (anvil-mu4e--contacts-text (plist-get pl :from))
+              (anvil-mu4e--contacts-text (plist-get pl :to))
+              (anvil-mu4e--contacts-text (plist-get pl :cc)))
+        " "))))
+
+(defun anvil-mu4e--match-filter-p (pl field value scan-body)
+  "Return non-nil when message PL matches the CJK FILTER (FIELD . VALUE).
+SCAN-BODY, when non-nil, lets an any-field term also match the body."
+  (let ((needle (regexp-quote value)))
+    (cond
+     ((equal field "body")
+      (string-match-p needle (or (anvil-mu4e--body (plist-get pl :path) nil) "")))
+     (field
+      (string-match-p needle (anvil-mu4e--field-text pl field)))
+     (t
+      (or (string-match-p needle (anvil-mu4e--field-text pl "any"))
+          (and scan-body
+               (string-match-p needle
+                               (or (anvil-mu4e--body (plist-get pl :path) nil) ""))))))))
+
+(defun anvil-mu4e--cjk-search (mu-query filters maxnum sort)
+  "Fetch candidates for MU-QUERY and substring-filter them by FILTERS.
+Return (cons MESSAGES CANDIDATES-TRUNCATED-P), MESSAGES capped at MAXNUM."
+  (let* ((cap anvil-mu4e-cjk-candidate-limit)
+         (candidates (anvil-mu4e--find (if (string-empty-p mu-query) "" mu-query)
+                                       cap sort))
+         (truncated (>= (length candidates) cap))
+         (scan-body (and anvil-mu4e-cjk-search-body
+                         (<= (length candidates) anvil-mu4e-cjk-body-scan-limit)))
+         (matched (seq-filter
+                   (lambda (pl)
+                     (cl-every (lambda (f)
+                                 (anvil-mu4e--match-filter-p pl (car f) (cdr f) scan-body))
+                               filters))
+                   candidates)))
+    (cons (seq-take matched maxnum) truncated)))
+
 (defun anvil-mu4e--tool-search (query &optional max_results sort)
   "Search the mu index and return matching messages as JSON.
 
+When the query contains CJK terms and `anvil-mu4e-cjk-fallback' is on,
+those terms are matched by an in-Emacs substring filter (mu's index
+usually cannot tokenize CJK); the response then carries cjk_fallback=true.
+
 MCP Parameters:
   query - mu query string, e.g. \"from:alice subject:invoice date:1w..now\".
+          CJK terms (e.g. \"請求書\", \"from:田中\") are handled via fallback.
   max_results - Optional integer cap (default `anvil-mu4e-max-results').
   sort - Optional sort field: date (default, newest first), subject, from,
          to, or size."
-  (let ((msgs (anvil-mu4e--find query max_results sort)))
-    (json-encode
-     `((query . ,(or query ""))
-       (count . ,(length msgs))
-       (messages . ,(vconcat (mapcar #'anvil-mu4e--summary msgs)))))))
+  (let* ((maxn (anvil-mu4e--coerce-int max_results anvil-mu4e-max-results))
+         (analysis (anvil-mu4e--analyze-query query))
+         (filters (and anvil-mu4e-cjk-fallback (cdr analysis))))
+    (if filters
+        (let* ((r (anvil-mu4e--cjk-search (car analysis) filters maxn sort))
+               (msgs (car r)) (truncated (cdr r)))
+          (json-encode
+           (append
+            `((query . ,(or query ""))
+              (cjk_fallback . t)
+              (count . ,(length msgs))
+              (messages . ,(vconcat (mapcar #'anvil-mu4e--summary msgs))))
+            (when truncated '((candidates_truncated . t))))))
+      (let ((msgs (anvil-mu4e--find query maxn sort)))
+        (json-encode
+         `((query . ,(or query ""))
+           (count . ,(length msgs))
+           (messages . ,(vconcat (mapcar #'anvil-mu4e--summary msgs)))))))))
 
 (defun anvil-mu4e--tool-list-mails (&optional query max_results)
   "List recent mail, defaulting to the inbox, as JSON.
