@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # anvil-stdio.sh - Connect to Anvil MCP server via stdio transport
 #
 # Copyright (C) 2025 Laurynas Biveinis
