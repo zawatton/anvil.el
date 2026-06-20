@@ -21,6 +21,8 @@
 (declare-function anvil-server-unregister-tool "anvil-server")
 (declare-function eword-decode-string "eword-decode" (string &optional must-unfold))
 (declare-function eword-encode-string "eword-encode" (string &optional column mode))
+(declare-function anvil-wl-smtp-send "anvil-wl-smtp"
+                  (host port user pass from recipients message))
 
 (defconst anvil-wl--server-id "emacs-eval"
   "MCP server id the anvil-wl tools register under (the main eval server).")
@@ -57,6 +59,39 @@
 (defcustom anvil-wl-body-max-chars 100000
   "Cap on the number of body characters returned by `wl-read-mail'."
   :type 'integer :group 'anvil-wl)
+
+(defcustom anvil-wl-allow-send nil
+  "Master switch: when nil, `wl-send' refuses to transmit anything."
+  :type 'boolean :group 'anvil-wl)
+
+(defcustom anvil-wl-send-allowlist nil
+  "List of regexps; every recipient of a send must match one of them."
+  :type '(repeat regexp) :group 'anvil-wl)
+
+(defcustom anvil-wl-send-function #'anvil-wl-send-with-tunnel
+  "Function (PATH RECIPIENTS) used to actually send a draft file.
+Must signal on failure and return non-nil on success."
+  :type 'function :group 'anvil-wl)
+
+(defcustom anvil-wl-send-log nil
+  "When set to a file path, append an audit line per successful send."
+  :type '(choice (const nil) file) :group 'anvil-wl)
+
+(defcustom anvil-wl-smtp-host "smtp.gmail.com"
+  "SMTP server host for the default tunnel transport."
+  :type 'string :group 'anvil-wl)
+
+(defcustom anvil-wl-smtp-port 465
+  "SMTP server port (implicit-TLS SMTPS) for the default tunnel transport."
+  :type 'integer :group 'anvil-wl)
+
+(defcustom anvil-wl-smtp-user ""
+  "SMTP auth user for the default tunnel transport (often the From address)."
+  :type 'string :group 'anvil-wl)
+
+(defcustom anvil-wl-smtp-password-file ""
+  "Path to a file holding the SMTP app password (whitespace stripped)."
+  :type 'string :group 'anvil-wl)
 
 ;;;; --- coercion -------------------------------------------------------------
 
@@ -416,6 +451,134 @@ MCP Parameters:
        (saved . t)
        (sent . :json-false)))))
 
+;;;; --- tools: send (gated, irreversible) -----------------------------------
+
+(defun anvil-wl--header-value (path header)
+  "Return the unfolded value of HEADER from the RFC822 file at PATH, or nil."
+  (with-temp-buffer
+    (let ((coding-system-for-read 'utf-8))
+      (insert-file-contents path))
+    (goto-char (point-min))
+    (let ((end (save-excursion
+                 (if (re-search-forward "^$" nil t) (point) (point-max)))))
+      (goto-char (point-min))
+      (when (re-search-forward
+             (format "^%s:[ \t]*\\(.*\\(?:\n[ \t].*\\)*\\)" (regexp-quote header))
+             end t)
+        (string-trim (replace-regexp-in-string "\n[ \t]+" " " (match-string 1)))))))
+
+(defun anvil-wl--extract-emails (s)
+  "Return all e-mail addresses in string S, lower-cased, in order."
+  (let ((emails '()) (start 0))
+    (while (string-match
+            "[[:alnum:]._%+-]+@[[:alnum:].-]+\\.[[:alpha:]]\\{2,\\}" (or s "") start)
+      (push (downcase (match-string 0 s)) emails)
+      (setq start (match-end 0)))
+    (nreverse emails)))
+
+(defun anvil-wl--parse-recipients (path)
+  "Return the de-duplicated recipient addresses (To/Cc/Bcc) of the file at PATH."
+  (let ((emails '()))
+    (dolist (h '("To" "Cc" "Bcc"))
+      (let ((v (anvil-wl--header-value path h)))
+        (when v (setq emails (append emails (anvil-wl--extract-emails v))))))
+    (delete-dups emails)))
+
+(defun anvil-wl--recipient-allowed-p (email)
+  "Return non-nil when EMAIL matches some `anvil-wl-send-allowlist' regexp."
+  (seq-some (lambda (re) (string-match-p re email)) anvil-wl-send-allowlist))
+
+(defun anvil-wl--audit-send (recipients subject path)
+  "Append an audit line for a send of SUBJECT to RECIPIENTS (draft PATH)."
+  (when (and anvil-wl-send-log (not (string-empty-p anvil-wl-send-log)))
+    (let ((line (format "%s\tsent\t%s\t%s\t%s\n"
+                        (format-time-string "%Y-%m-%dT%H:%M:%S%z")
+                        (string-join recipients ",") (or subject "") path))
+          (coding-system-for-write 'utf-8-unix))
+      (write-region line nil (expand-file-name anvil-wl-send-log) 'append 'silent))))
+
+(defun anvil-wl--resolve-draft (drafts id)
+  "Return the absolute path of draft ID under DRAFTS (cur/ or new/), or nil.
+Guards path injection: the resolved file must live inside DRAFTS."
+  (let ((root (file-name-as-directory (expand-file-name drafts))))
+    (catch 'found
+      (dolist (sub '("cur" "new"))
+        (let ((p (expand-file-name (concat sub "/" id) drafts)))
+          (when (and (string-prefix-p root (expand-file-name p))
+                     (file-readable-p p))
+            (throw 'found p))))
+      nil)))
+
+(defun anvil-wl--smtp-password ()
+  "Read the SMTP app password from `anvil-wl-smtp-password-file', else signal."
+  (let ((f anvil-wl-smtp-password-file))
+    (unless (and f (not (string-empty-p f)) (file-readable-p (expand-file-name f)))
+      (error "anvil-wl: set `anvil-wl-smtp-password-file' to a readable app-password file"))
+    (with-temp-buffer
+      (let ((coding-system-for-read (or (and (coding-system-p 'binary) 'binary)
+                                        'no-conversion)))
+        (insert-file-contents-literally (expand-file-name f)))
+      (replace-regexp-in-string "[ \r\n]" "" (buffer-string)))))
+
+(defun anvil-wl-send-with-tunnel (path recipients)
+  "Default `anvil-wl-send-function': send the RFC822 file at PATH to RECIPIENTS.
+Uses the pure-Elisp SMTP-over-openssl-tunnel client (`anvil-wl-smtp').  NOTE:
+this live transport is intentionally NOT exercised by the test suite (tests
+stub `anvil-wl-send-function'); validate it in your own mail environment
+before relying on actual delivery."
+  (require 'anvil-wl-smtp)
+  (let* ((from (or (car (anvil-wl--extract-emails (or anvil-wl-from "")))
+                   anvil-wl-smtp-user))
+         (msg (with-temp-buffer
+                (let ((coding-system-for-read 'utf-8))
+                  (insert-file-contents path))
+                (buffer-string))))
+    (anvil-wl-smtp-send anvil-wl-smtp-host anvil-wl-smtp-port
+                        anvil-wl-smtp-user (anvil-wl--smtp-password)
+                        from recipients msg)))
+
+(defun anvil-wl--tool-send (draft_id &optional confirm)
+  "Send a previously composed draft, subject to safety gates.  Returns JSON.
+
+Sending requires ALL of: `anvil-wl-allow-send' non-nil, every recipient
+matching `anvil-wl-send-allowlist', and CONFIRM true.  When CONFIRM is not
+true the draft is previewed (recipients + subject) without sending.
+
+MCP Parameters:
+  draft_id - The draft_id returned by wl-compose-draft (a name under the
+             drafts folder).
+  confirm - Boolean; must be true to actually send."
+  (let* ((drafts (anvil-wl--folder-dir anvil-wl-drafts-folder))
+         (id (string-trim (format "%s" draft_id)))
+         (path (anvil-wl--resolve-draft drafts id)))
+    (unless path
+      (error "anvil-wl: draft %S not found under %s" draft_id drafts))
+    (let* ((recipients (anvil-wl--parse-recipients path))
+           (subject (anvil-wl--decode-hdr (anvil-wl--header-value path "Subject")))
+           (disallowed (seq-remove #'anvil-wl--recipient-allowed-p recipients)))
+      (cond
+       ((not (anvil-wl--truthy confirm))
+        (json-encode `((sent . :json-false)
+                       (reason . "confirm=true is required to send")
+                       (recipients . ,(vconcat recipients))
+                       (subject . ,(or subject "")))))
+       ((null recipients)
+        (json-encode `((sent . :json-false)
+                       (reason . "draft has no recipients (To/Cc/Bcc)"))))
+       ((not anvil-wl-allow-send)
+        (json-encode `((sent . :json-false)
+                       (reason . "sending is disabled; set `anvil-wl-allow-send' to t"))))
+       (disallowed
+        (json-encode `((sent . :json-false)
+                       (reason . "recipient(s) not in `anvil-wl-send-allowlist'")
+                       (disallowed . ,(vconcat disallowed)))))
+       (t
+        (funcall anvil-wl-send-function path recipients)
+        (anvil-wl--audit-send recipients subject path)
+        (json-encode `((sent . t)
+                       (recipients . ,(vconcat recipients))
+                       (subject . ,(or subject "")))))))))
+
 ;;;; --- module lifecycle -----------------------------------------------------
 
 (defun anvil-wl-enable ()
@@ -479,11 +642,29 @@ Parameters:
   in_reply_to - Optional Message-ID being replied to.
 
 Returns JSON: draft_id, message_id, from, to, cc, subject, in_reply_to,
-folder, saved=true, sent=false."))
+folder, saved=true, sent=false.")
+
+  (anvil-server-register-tool
+   #'anvil-wl--tool-send
+   :id "wl-send" :intent '(mail compose send) :layer 'workflow
+   :server-id anvil-wl--server-id
+   :description
+   "Send a previously composed draft, subject to safety gates.
+
+Sending requires ALL of: `anvil-wl-allow-send' non-nil, every recipient
+matching `anvil-wl-send-allowlist', and confirm=true.  With confirm
+omitted/false the draft is previewed (recipients + subject) without sending.
+
+Parameters:
+  draft_id - The draft_id returned by wl-compose-draft.
+  confirm - Boolean; must be true to actually send.
+
+Returns JSON: sent (true/false); when false, a reason; when previewing,
+the recipients and subject."))
 
 (defun anvil-wl-disable ()
   "Unregister the anvil-wl MCP tools."
-  (dolist (id '("wl-search" "wl-list-mails" "wl-read-mail" "wl-compose-draft"))
+  (dolist (id '("wl-search" "wl-list-mails" "wl-read-mail" "wl-compose-draft" "wl-send"))
     (anvil-server-unregister-tool id anvil-wl--server-id)))
 
 (provide 'anvil-wl)

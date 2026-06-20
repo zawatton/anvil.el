@@ -1,7 +1,7 @@
 #+title: anvil-wl — Structured MCP tools over a synced Maildir (Wanderlust)
 #+date: 2026-06-20
 #+author: zawatton
-#+property: status P0-P3-IMPLEMENTED
+#+property: status P0-P4-IMPLEMENTED
 #+property: scope GENERIC
 
 * STATUS
@@ -26,8 +26,11 @@ Delivered (opt-in module; add =wl= to =anvil-optional-modules=):
   local Maildir directly and decodes RFC2047 headers + MIME bodies with FLIM
   (=eword-decode=), so *CJK subjects and bodies come out correct* — unlike
   mu4e's Xapian index, which cannot tokenize CJK on common builds.
+- *P4 — send* (gated, =anvil-wl.el= + =anvil-wl-smtp.el=): =wl-send= behind a
+  triple gate (=anvil-wl-allow-send= + recipient allowlist + =confirm=true=),
+  with a pure-Elisp SMTP-over-openssl-tunnel transport.
 
-Tests: =tests/anvil-wl-test.el= — 16 ERT.  Fixtures are built
+Tests: =tests/anvil-wl-test.el= — 24 ERT.  Fixtures are built
 programmatically into a throwaway Maildir (no network, no real mail).
 CJK decode/encode tests =skip-unless= FLIM's =eword-decode-string= /
 =eword-encode-string= are present, so the suite still runs (degraded) on a
@@ -40,10 +43,10 @@ A match-data clobber in =anvil-wl--parse-ct= (an instance of the
 =string-match=-clobbers-=match-data= gotcha — =string-trim= called between two
 =match-string= reads) was found and fixed.
 
-*Known limitation:* read/search/compose are decode-only and never touch the
-network.  Live *send* (=P4=) is not implemented yet; =wl-compose-draft= only
-writes a draft into the Maildir.  The sync engine's live SMTP/IMAP paths are
-environment-dependent and intentionally NOT exercised by CI.
+*Known limitation:* the live network paths (the =anvil-wl-smtp= send transport
+and the IMAP sync engine) are environment-dependent and intentionally NOT
+exercised by CI.  The send *gates* and the SMTP reply/dot-stuff helpers are
+unit-tested, but actual delivery must be validated in a real mail setup.
 
 Module placement: =anvil-optional-modules= (opt-in).  The loader maps the
 symbol =wl= to =anvil-wl.el= by convention (=require 'anvil-wl= then
@@ -111,7 +114,7 @@ anvil-wl.el          daemon-side MCP tools (read/search/compose); FLIM decode
 anvil-wl-imap.el     pure-Elisp IMAP client over an openssl s_client tunnel
 anvil-wl-maildir.el  atomic tmp/->new/ Maildir delivery (binary writes)
 anvil-wl-sync.el     UID-based incremental sync driver (batch process)
-tests/anvil-wl-test.el  16 ERT (CJK tests skip-unless FLIM)
+tests/anvil-wl-test.el  24 ERT (CJK tests skip-unless FLIM)
 #+end_example
 
 Note: =anvil-wl.el= deliberately does *not* =require= the engine trio — the
@@ -131,11 +134,13 @@ is loaded by the separate sync process.
   *Never sends.*  RFC2047-encodes a non-ASCII subject; sets threading headers
   on reply.
 
-** P4 — send (planned, gated, irreversible)
+** P4 — send (implemented, gated, irreversible)
 
-A =wl-send= tool mirroring =anvil-mu4e='s triple gate (see "P4 safety model"):
-pure-Elisp SMTP (or msmtp pipe) behind =anvil-wl-allow-send= + recipient
-allowlist + =confirm=true=.  Not yet implemented.
+=wl-send= mirrors =anvil-mu4e='s triple gate (see "P4 safety model"): a
+pure-Elisp SMTP-over-openssl-tunnel transport (=anvil-wl-smtp.el=, the default
+=anvil-wl-send-function=) behind =anvil-wl-allow-send= + recipient allowlist +
+=confirm=true=.  All gates default to inert, so nothing is sent until
+configured.  =anvil-wl-send-function= is pluggable (swap in msmtp etc.).
 
 * Tool definitions (parameters)
 
@@ -165,9 +170,9 @@ A message summary:
 =wl-compose-draft= returns =draft_id=, =message_id=, =from=, =to=, =cc=,
 =subject=, =in_reply_to=, =folder=, =saved=true=, =sent=false=.
 
-* P4 safety model (planned)
+* P4 safety model
 
-When send lands it must be inert by default and require *all three*:
+Send is inert by default and requires *all three*:
 
 1. =anvil-wl-allow-send= non-nil (master switch, default off);
 2. every recipient matching =anvil-wl-send-allowlist=;
@@ -252,7 +257,8 @@ exposes the primitive; init/defcustoms own the convention.
 2. P1 IMAP→Maildir sync engine — DONE.
 3. P2 Wanderlust wiring + periodic sync — DONE.
 4. P3 anvil read/search/compose tools + CJK decode — DONE (this branch).
-5. P4 SMTP send — pure Elisp + triple gate (allow-send / allowlist / confirm),
+5. P4 SMTP send — DONE.  Pure-Elisp SMTP over an openssl tunnel
+   (=anvil-wl-smtp.el=) + triple gate (allow-send / allowlist / confirm),
    mirroring =anvil-mu4e=.
 6. Backfill — batched =FETCH= of mail older than the current newest-N window.
 7. NeLisp port — once NeLisp subprocess I/O lands, run the unchanged engine
