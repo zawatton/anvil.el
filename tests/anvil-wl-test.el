@@ -13,6 +13,7 @@
 (require 'ert)
 (require 'json)
 (require 'anvil-wl)
+(require 'anvil-wl-smtp)
 
 (defconst anvil-wl-test--cjk-subject "請求書 6月分"
   "CJK subject used to exercise RFC2047 header decode/encode.")
@@ -110,6 +111,11 @@ Binds `anvil-wl-maildir-root' to a fresh temp dir and the relevant defcustoms."
           (anvil-wl-search-body t)
           (anvil-wl-max-results 50)
           (anvil-wl-from "Tester <tester@example.com>")
+          (anvil-wl-allow-send nil)
+          (anvil-wl-send-allowlist nil)
+          (anvil-wl-send-log nil)
+          (anvil-wl-send-function
+           (lambda (&rest _) (error "anvil-wl-test: real send attempted")))
           (inbox (expand-file-name "INBOX" root)))
      (dolist (sub '("new" "cur")) (make-directory (expand-file-name sub inbox) t))
      (anvil-wl-test--populate inbox)
@@ -267,6 +273,89 @@ yield garbage (the original bug)."
            (content (anvil-wl-test--draft-content d)))
       (should (string-match-p "In-Reply-To: <parent@example.com>" content))
       (should (string-match-p "References: <parent@example.com>" content)))))
+
+;;;; --- send (gated; never transmits) ---------------------------------------
+
+(defun anvil-wl-test--draft-id (to &optional subject)
+  "Compose a draft to TO (subject SUBJECT) and return its draft_id."
+  (alist-get 'draft_id
+             (anvil-wl-test--parse
+              (anvil-wl--tool-compose-draft to nil (or subject "Hi") "body" nil))))
+
+(ert-deftest anvil-wl-test-send-previews-without-confirm ()
+  (anvil-wl-test--with-maildir
+    (let* ((id (anvil-wl-test--draft-id "alice@example.com"))
+           (r (anvil-wl-test--parse (anvil-wl--tool-send id nil))))
+      (should-not (alist-get 'sent r))
+      (should (string-match-p "confirm" (alist-get 'reason r)))
+      (should (equal ["alice@example.com"] (alist-get 'recipients r))))))
+
+(ert-deftest anvil-wl-test-send-refused-when-disabled ()
+  "With allow-send nil (the macro default) and confirm=t, the send is refused."
+  (anvil-wl-test--with-maildir
+    (let* ((id (anvil-wl-test--draft-id "alice@example.com"))
+           (r (anvil-wl-test--parse (anvil-wl--tool-send id t))))
+      (should-not (alist-get 'sent r))
+      (should (string-match-p "disabled" (alist-get 'reason r))))))
+
+(ert-deftest anvil-wl-test-send-refused-for-disallowed-recipient ()
+  (anvil-wl-test--with-maildir
+    (let ((anvil-wl-allow-send t)
+          (anvil-wl-send-allowlist '("@trusted\\.example\\'")))
+      (let* ((id (anvil-wl-test--draft-id "alice@example.com"))
+             (r (anvil-wl-test--parse (anvil-wl--tool-send id t))))
+        (should-not (alist-get 'sent r))
+        (should (string-match-p "allowlist" (alist-get 'reason r)))
+        (should (equal ["alice@example.com"] (alist-get 'disallowed r)))))))
+
+(ert-deftest anvil-wl-test-send-succeeds-when-gates-open ()
+  "All three gates open + a stub transport: sent=true and the stub is called."
+  (anvil-wl-test--with-maildir
+    (let* ((sent-calls '())
+           (anvil-wl-allow-send t)
+           (anvil-wl-send-allowlist '("@example\\.com\\'"))
+           (anvil-wl-send-function
+            (lambda (path recipients) (push (cons path recipients) sent-calls) t)))
+      (let* ((id (anvil-wl-test--draft-id "alice@example.com"))
+             (r (anvil-wl-test--parse (anvil-wl--tool-send id t))))
+        (should (eq t (alist-get 'sent r)))
+        (should (equal ["alice@example.com"] (alist-get 'recipients r)))
+        (should (= 1 (length sent-calls)))
+        (should (equal '("alice@example.com") (cdr (car sent-calls))))))))
+
+(ert-deftest anvil-wl-test-send-rejects-path-outside-drafts ()
+  (anvil-wl-test--with-maildir
+    (let ((anvil-wl-allow-send t))
+      (should-error (anvil-wl--tool-send "../../../../etc/passwd" t)))))
+
+(ert-deftest anvil-wl-test-send-audit-log-written ()
+  (anvil-wl-test--with-maildir
+    (let* ((logf (expand-file-name "send.log" anvil-wl-maildir-root))
+           (anvil-wl-allow-send t)
+           (anvil-wl-send-allowlist '("@example\\.com\\'"))
+           (anvil-wl-send-log logf)
+           (anvil-wl-send-function (lambda (&rest _) t)))
+      (anvil-wl--tool-send (anvil-wl-test--draft-id "alice@example.com" "Audit me") t)
+      (should (file-exists-p logf))
+      (let ((content (with-temp-buffer (insert-file-contents logf) (buffer-string))))
+        (should (string-match-p "alice@example.com" content))
+        (should (string-match-p "sent" content))))))
+
+;;;; --- SMTP helpers (pure, no network) -------------------------------------
+
+(ert-deftest anvil-wl-test-smtp-reply-complete ()
+  (should (equal "250" (anvil-wl-smtp--reply-complete "250-FOO\r\n250 OK\r\n")))
+  (should (equal "220" (anvil-wl-smtp--reply-complete "220 ready\r\n")))
+  ;; A lone continuation line is not yet complete.
+  (should-not (anvil-wl-smtp--reply-complete "250-still going\r\n"))
+  ;; No trailing newline = incomplete line.
+  (should-not (anvil-wl-smtp--reply-complete "250 OK")))
+
+(ert-deftest anvil-wl-test-smtp-dot-stuff ()
+  ;; A bare "." line becomes ".." so it can't end DATA early.
+  (should (equal "a\n..\nb" (anvil-wl-smtp--dot-stuff "a\n.\nb")))
+  ;; CRLF normalized to LF; a leading dot is doubled.
+  (should (equal "..hidden\nplain" (anvil-wl-smtp--dot-stuff ".hidden\r\nplain"))))
 
 (provide 'anvil-wl-test)
 ;;; anvil-wl-test.el ends here
