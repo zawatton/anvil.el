@@ -489,5 +489,91 @@ must not be counted as a reference.\"
       (when (file-directory-p dir) (delete-directory dir t)))))
 
 
+;;;; --- python (tree-sitter, Doc 57 Phase 3) -----------------------------
+
+(defvar anvil-defs-test--py-fixture "\
+def leaf():
+    return 1
+
+def mid():
+    return leaf()
+
+def top():
+    return mid()
+
+class Worker:
+    def run(self):
+        return mid()
+
+def main():
+    w = Worker()
+    return w.run()
+")
+
+(defun anvil-defs-test--with-py-fixture (fn)
+  "Index a temp Python fixture (python language enabled), call FN with dir."
+  (let* ((dir (make-temp-file "anvil-defs-py-" t))
+         (file (expand-file-name "fx.py" dir))
+         (db (expand-file-name "anvil-defs.db" dir))
+         (anvil-defs-index-db-path db)
+         (anvil-defs-paths (list dir))
+         (anvil-defs-languages '(python))
+         (anvil-defs--db nil)
+         (anvil-defs--backend nil))
+    (unwind-protect
+        (progn
+          (with-temp-file file (insert anvil-defs-test--py-fixture))
+          (anvil-defs-index-rebuild (list dir))
+          (funcall fn dir))
+      (when anvil-defs--db
+        (anvil-defs--close anvil-defs--db)
+        (setq anvil-defs--db nil))
+      (when (file-directory-p dir) (delete-directory dir t)))))
+
+(defmacro anvil-defs-test--skip-unless-python ()
+  "Inline guard: skip when tree-sitter / the python grammar is absent."
+  '(skip-unless (and (fboundp 'treesit-available-p) (treesit-available-p)
+                     (fboundp 'treesit-language-available-p)
+                     (treesit-language-available-p 'python))))
+
+(ert-deftest anvil-defs-test-py-rebuild-finds-defs ()
+  "The python scanner indexes functions, classes and methods by kind."
+  (anvil-defs-test--skip-unless-python)
+  (anvil-defs-test--with-py-fixture
+   (lambda (_dir)
+     (should (equal "function" (plist-get (car (anvil-defs-search "mid")) :kind)))
+     (should (equal "class" (plist-get (car (anvil-defs-search "Worker")) :kind)))
+     (should (equal "method" (plist-get (car (anvil-defs-search "run")) :kind))))))
+
+(ert-deftest anvil-defs-test-py-trace-callers ()
+  "Callers of mid are the top-level fn and the method that call it."
+  (anvil-defs-test--skip-unless-python)
+  (anvil-defs-test--with-py-fixture
+   (lambda (_dir)
+     (let ((names (anvil-defs-test--names
+                   (anvil-defs-trace-path "mid" :direction 'callers :depth 1))))
+       (should (member "top" names))
+       (should (member "run" names))))))
+
+(ert-deftest anvil-defs-test-py-attribute-call ()
+  "An attribute call `w.run()' is attributed to the run method."
+  (anvil-defs-test--skip-unless-python)
+  (anvil-defs-test--with-py-fixture
+   (lambda (_dir)
+     (let ((names (anvil-defs-test--names
+                   (anvil-defs-trace-path "run" :direction 'callers :depth 1))))
+       (should (member "main" names))))))
+
+(ert-deftest anvil-defs-test-py-trace-callees-transitive ()
+  "Callees of top reach mid then leaf across the call chain."
+  (anvil-defs-test--skip-unless-python)
+  (anvil-defs-test--with-py-fixture
+   (lambda (_dir)
+     (let ((names (anvil-defs-test--names
+                   (anvil-defs-trace-path "top" :direction 'callees :depth 2))))
+       (should (member "mid" names))
+       (should (member "leaf" names))))))
+
+
 (provide 'anvil-defs-test)
 ;;; anvil-defs-test.el ends here

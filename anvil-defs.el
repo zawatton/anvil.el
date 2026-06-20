@@ -70,6 +70,12 @@
 ;; (Doc 57 Phase 2) so the top-level keeps no build-time dep on it.
 (declare-function anvil-git--run "anvil-git" (args repo &optional opts))
 (declare-function anvil-git--check "anvil-git" (res context))
+;; anvil-treesit-backend is lazily required inside the Python scanner
+;; (Doc 57 Phase 3); the functional `…-with-root-fn' avoids a compile-time
+;; macro dependency so elisp-only builds never load the treesit backend.
+(declare-function anvil-treesit-with-root-fn "anvil-treesit-backend" (file lang fn))
+(declare-function anvil-treesit-compile-query "anvil-treesit-backend" (lang op source))
+(declare-function treesit-node-text "treesit" (node &optional no-property))
 (defvar anvil-sexp--function-defining-forms)
 (defvar anvil-sexp--defining-forms)
 
@@ -105,6 +111,17 @@ of `default-directory' via `anvil-sexp--project-root'."
     "\\.elc\\'")
   "Regexps for files that should not be indexed."
   :type '(repeat regexp)
+  :group 'anvil-defs)
+
+(defcustom anvil-defs-languages '(elisp)
+  "Languages whose files are collected and scanned into the index.
+Each symbol enables one extension + scanner:
+  `elisp'  -> .el  (the anvil-sexp reader)
+  `python' -> .py  (tree-sitter, Doc 57 Phase 3)
+Default is elisp-only so existing behavior is unchanged; add `python'
+to index Python call edges for `defs-trace-path' / `defs-detect-changes'.
+Python scanning needs a built-in tree-sitter with the python grammar."
+  :type '(set (const elisp) (const python))
   :group 'anvil-defs)
 
 (defconst anvil-defs-schema-version 1
@@ -277,18 +294,28 @@ extend)."
     (cl-some (lambda (re) (string-match-p re path))
              anvil-defs-exclude-patterns)))
 
+(defun anvil-defs--file-regexp ()
+  "Return a filename regexp matching files for `anvil-defs-languages'.
+Unknown language symbols are ignored; an empty set falls back to .el."
+  (let ((exts (delq nil (mapcar (lambda (l)
+                                  (pcase l ('elisp "el") ('python "py")))
+                                anvil-defs-languages))))
+    (format "\\.\\(?:%s\\)\\'"
+            (mapconcat #'regexp-quote (or exts '("el")) "\\|"))))
+
 (defun anvil-defs--collect-files (&optional paths)
-  "Return absolute .el paths under PATHS (default `anvil-defs-paths').
-Falls back to the nearest git ancestor of `default-directory' when
-both are unset."
+  "Return absolute source paths under PATHS (default `anvil-defs-paths').
+Extensions are those enabled by `anvil-defs-languages'.  Falls back to
+the nearest git ancestor of `default-directory' when both are unset."
   (require 'anvil-sexp)
   (let* ((roots (or paths anvil-defs-paths
                     (list (anvil-sexp--project-root))))
+         (regexp (anvil-defs--file-regexp))
          (acc nil))
     (dolist (root roots)
       (let ((abs (expand-file-name root)))
         (when (file-directory-p abs)
-          (dolist (f (directory-files-recursively abs "\\.el\\'" nil))
+          (dolist (f (directory-files-recursively abs regexp nil))
             (unless (anvil-defs--excluded-p f)
               (push (expand-file-name f) acc))))))
     (nreverse (delete-dups acc))))
@@ -512,8 +539,105 @@ line.  The walker records:
     (goto-char pos)
     (line-number-at-pos (point) t)))
 
+;;;; --- python scanner (Doc 57 Phase 3, tree-sitter) ----------------------
+
+(defun anvil-defs--ts-node-name (node)
+  "Return the `name' field text of tree-sitter NODE, or nil."
+  (let ((n (treesit-node-child-by-field-name node "name")))
+    (and n (treesit-node-text n t))))
+
+(defun anvil-defs--py-enclosing-class (node)
+  "Return the class name directly enclosing NODE (one block level), or nil."
+  (let ((parent (treesit-node-parent node)))
+    (when (and parent (string= (treesit-node-type parent) "block"))
+      (let ((grand (treesit-node-parent parent)))
+        (when (and grand (string= (treesit-node-type grand) "class_definition"))
+          (anvil-defs--ts-node-name grand))))))
+
+(defun anvil-defs--py-enclosing-defun (node)
+  "Return the name of the nearest function_definition ancestor of NODE, or nil."
+  (let ((p (treesit-node-parent node)) (res nil))
+    (while (and p (not res))
+      (when (string= (treesit-node-type p) "function_definition")
+        (setq res (anvil-defs--ts-node-name p)))
+      (setq p (treesit-node-parent p)))
+    res))
+
+(defun anvil-defs--py-callee (call-node)
+  "Return the callee symbol name of python CALL-NODE, or nil.
+A bare `f()' yields \"f\"; an attribute call `x.m()' yields the method
+name \"m\".  Resolution is syntactic — a same-named method on a
+different class produces a false edge (the Phase 3 textual caveat)."
+  (let ((fnode (treesit-node-child-by-field-name call-node "function")))
+    (when fnode
+      (pcase (treesit-node-type fnode)
+        ("identifier" (treesit-node-text fnode t))
+        ("attribute"
+         (let ((a (treesit-node-child-by-field-name fnode "attribute")))
+           (and a (treesit-node-text a t))))
+        (_ nil)))))
+
+(defun anvil-defs--scan-python-file (path)
+  "Parse Python PATH via tree-sitter; return (:defs :refs :features).
+Defs are function / method / class nodes; refs are call sites with
+`name' = callee and `context' = the enclosing def (caller), so the same
+`trace_path' / `detect_changes' queries span elisp and Python.  No
+type inference — cross-module same-named calls can produce false edges.
+Features are empty (require/provide is an elisp concept)."
+  (require 'anvil-treesit-backend)
+  (anvil-treesit-with-root-fn
+   path 'python
+   (lambda (root)
+     (let ((defs nil) (refs nil)
+           (fnq (anvil-treesit-compile-query
+                 'python 'anvil-defs-py-fn "(function_definition) @x"))
+           (clq (anvil-treesit-compile-query
+                 'python 'anvil-defs-py-cls "(class_definition) @x"))
+           (caq (anvil-treesit-compile-query
+                 'python 'anvil-defs-py-call "(call) @x")))
+       (dolist (cap (treesit-query-capture root fnq))
+         (let* ((node (cdr cap))
+                (name (anvil-defs--ts-node-name node)))
+           (when (and name (not (string-empty-p name)))
+             (push (list :kind (if (anvil-defs--py-enclosing-class node)
+                                   "method" "function")
+                         :name name
+                         :line (line-number-at-pos (treesit-node-start node))
+                         :end-line (line-number-at-pos (treesit-node-end node))
+                         :arity-min nil :arity-max nil
+                         :docstring-head nil :obsolete-p 0)
+                   defs))))
+       (dolist (cap (treesit-query-capture root clq))
+         (let* ((node (cdr cap))
+                (name (anvil-defs--ts-node-name node)))
+           (when (and name (not (string-empty-p name)))
+             (push (list :kind "class" :name name
+                         :line (line-number-at-pos (treesit-node-start node))
+                         :end-line (line-number-at-pos (treesit-node-end node))
+                         :arity-min nil :arity-max nil
+                         :docstring-head nil :obsolete-p 0)
+                   defs))))
+       (dolist (cap (treesit-query-capture root caq))
+         (let* ((node (cdr cap))
+                (callee (anvil-defs--py-callee node)))
+           (when (and callee (not (string-empty-p callee)))
+             (push (list :name callee
+                         :line (line-number-at-pos (treesit-node-start node))
+                         :context (anvil-defs--py-enclosing-defun node)
+                         :kind "call")
+                   refs))))
+       (list :defs (nreverse defs) :refs (nreverse refs) :features nil)))))
+
 (defun anvil-defs--scan-file (path)
-  "Parse PATH and return (:defs LIST :refs LIST :features LIST).
+  "Dispatch PATH to the matching language scanner by extension.
+.py -> the tree-sitter Python scanner; everything else -> the elisp
+reader.  Both return (:defs :refs :features) for the shared ingest path."
+  (if (equal (file-name-extension path) "py")
+      (anvil-defs--scan-python-file path)
+    (anvil-defs--scan-elisp-file path)))
+
+(defun anvil-defs--scan-elisp-file (path)
+  "Parse elisp PATH and return (:defs LIST :refs LIST :features LIST).
 All items are plists suitable for direct insertion by the ingest
 path.  Uses `anvil-sexp--read-file' so every caller shares the
 same top-level parser."
