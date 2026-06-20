@@ -260,7 +260,9 @@ exposes the primitive; init/defcustoms own the convention.
 5. P4 SMTP send — DONE.  Pure-Elisp SMTP over an openssl tunnel
    (=anvil-wl-smtp.el=) + triple gate (allow-send / allowlist / confirm),
    mirroring =anvil-mu4e=.
-6. Backfill — batched =FETCH= of mail older than the current newest-N window.
+6. Backfill — DONE.  =anvil-wl-sync-backfill= walks below the floor (the
+   lowest held UID) via batched UID FETCH, with Message-ID dedup; the floor is
+   persisted in sync state and preserved by the forward sync.
 7. NeLisp port — once NeLisp subprocess I/O lands, run the unchanged engine
    on the pure-NeLisp runtime.
 
