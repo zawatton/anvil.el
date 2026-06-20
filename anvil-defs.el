@@ -75,6 +75,7 @@
 ;; macro dependency so elisp-only builds never load the treesit backend.
 (declare-function anvil-treesit-with-root-fn "anvil-treesit-backend" (file lang fn))
 (declare-function anvil-treesit-compile-query "anvil-treesit-backend" (lang op source))
+(declare-function anvil-treesit-language-for-file "anvil-treesit-backend" (file))
 (declare-function treesit-node-text "treesit" (node &optional no-property))
 (defvar anvil-sexp--function-defining-forms)
 (defvar anvil-sexp--defining-forms)
@@ -116,12 +117,14 @@ of `default-directory' via `anvil-sexp--project-root'."
 (defcustom anvil-defs-languages '(elisp)
   "Languages whose files are collected and scanned into the index.
 Each symbol enables one extension + scanner:
-  `elisp'  -> .el  (the anvil-sexp reader)
-  `python' -> .py  (tree-sitter, Doc 57 Phase 3)
-Default is elisp-only so existing behavior is unchanged; add `python'
-to index Python call edges for `defs-trace-path' / `defs-detect-changes'.
-Python scanning needs a built-in tree-sitter with the python grammar."
-  :type '(set (const elisp) (const python))
+  `elisp'      -> .el        (the anvil-sexp reader)
+  `python'     -> .py        (tree-sitter, Doc 57 Phase 3)
+  `javascript' -> .js .jsx   (tree-sitter, Doc 57 Phase 3 JS/TS)
+  `typescript' -> .ts .tsx   (tree-sitter, Doc 57 Phase 3 JS/TS)
+Default is elisp-only so existing behavior is unchanged; add a language
+to index its call edges for `defs-trace-path' / `defs-detect-changes'.
+Non-elisp scanning needs a built-in tree-sitter with the matching grammar."
+  :type '(set (const elisp) (const python) (const javascript) (const typescript))
   :group 'anvil-defs)
 
 (defconst anvil-defs-schema-version 1
@@ -297,9 +300,16 @@ extend)."
 (defun anvil-defs--file-regexp ()
   "Return a filename regexp matching files for `anvil-defs-languages'.
 Unknown language symbols are ignored; an empty set falls back to .el."
-  (let ((exts (delq nil (mapcar (lambda (l)
-                                  (pcase l ('elisp "el") ('python "py")))
-                                anvil-defs-languages))))
+  (let ((exts (apply #'append
+                     (mapcar (lambda (l)
+                               ;; fresh `list' per call — never quoted literals,
+                               ;; which `append'/`nconc' could corrupt on reuse.
+                               (pcase l
+                                 ('elisp (list "el"))
+                                 ('python (list "py"))
+                                 ('javascript (list "js" "jsx"))
+                                 ('typescript (list "ts" "tsx"))))
+                             anvil-defs-languages))))
     (format "\\.\\(?:%s\\)\\'"
             (mapconcat #'regexp-quote (or exts '("el")) "\\|"))))
 
@@ -628,13 +638,129 @@ Features are empty (require/provide is an elisp concept)."
                    refs))))
        (list :defs (nreverse defs) :refs (nreverse refs) :features nil)))))
 
+;;;; --- javascript / typescript scanner (Doc 57 Phase 3 JS/TS) -----------
+
+(defun anvil-defs--ts-enclosing-class (node)
+  "Return the class name whose body directly contains NODE, or nil."
+  (let ((body (treesit-node-parent node)))
+    (when (and body (string= (treesit-node-type body) "class_body"))
+      (let ((cls (treesit-node-parent body)))
+        (when (and cls (string= (treesit-node-type cls) "class_declaration"))
+          (anvil-defs--ts-node-name cls))))))
+
+(defun anvil-defs--ts-enclosing-defun (node)
+  "Return the name of the nearest *named* JS/TS function enclosing NODE.
+Climbs through anonymous arrow / function expressions, picking up the
+name from an enclosing `variable_declarator' (=const f = () =>=) or
+object `pair' (={ f() {} }=) when the function node itself is unnamed."
+  (let ((p (treesit-node-parent node)) (res nil))
+    (while (and p (not res))
+      (let ((ty (treesit-node-type p)))
+        (cond
+         ((member ty '("function_declaration" "generator_function_declaration"
+                       "method_definition"))
+          (let ((nm (anvil-defs--ts-node-name p)))
+            (when (and nm (not (string-empty-p nm))) (setq res nm))))
+         ((member ty '("arrow_function" "function_expression"))
+          (let ((gp (treesit-node-parent p)))
+            (when gp
+              (pcase (treesit-node-type gp)
+                ("variable_declarator"
+                 (let ((nm (treesit-node-child-by-field-name gp "name")))
+                   (when nm (setq res (treesit-node-text nm t)))))
+                ("pair"
+                 (let ((k (treesit-node-child-by-field-name gp "key")))
+                   (when k (setq res (treesit-node-text k t)))))))))))
+      (setq p (treesit-node-parent p)))
+    res))
+
+(defun anvil-defs--ts-callee (call-node)
+  "Return the callee symbol name of a JS/TS CALL-NODE, or nil.
+A bare `f()' yields \"f\"; a member call `a.b()' yields \"b\" (the
+property).  Syntactic only — same-named methods collide (Phase 3 caveat)."
+  (let ((fnode (treesit-node-child-by-field-name call-node "function")))
+    (when fnode
+      (pcase (treesit-node-type fnode)
+        ("identifier" (treesit-node-text fnode t))
+        ("member_expression"
+         (let ((p (treesit-node-child-by-field-name fnode "property")))
+           (and p (treesit-node-text p t))))
+        (_ nil)))))
+
+(defun anvil-defs--scan-ts-file (path)
+  "Parse a JS/TS PATH via tree-sitter; return (:defs :refs :features).
+Defs: function declarations, named arrow / function-expression bindings
+(=const f = () =>=), classes and methods.  Refs: `call_expression' sites
+with `name' = callee and `context' = the nearest named enclosing
+function — same shape as elisp / Python, so `trace_path' /
+`detect_changes' span all three.  Resolution is syntactic (no type
+inference); features are empty."
+  (require 'anvil-treesit-backend)
+  (let ((lang (anvil-treesit-language-for-file path)))
+    (unless lang
+      (user-error "anvil-defs: no tree-sitter language for %s" path))
+    (anvil-treesit-with-root-fn
+     path lang
+     (lambda (root)
+       (let ((defs nil) (refs nil)
+             (fnq (anvil-treesit-compile-query
+                   lang 'anvil-defs-ts-fn
+                   "[(function_declaration) @x (generator_function_declaration) @x]"))
+             (clq (anvil-treesit-compile-query
+                   lang 'anvil-defs-ts-cls "(class_declaration) @x"))
+             (mq (anvil-treesit-compile-query
+                  lang 'anvil-defs-ts-method "(method_definition) @x"))
+             (dq (anvil-treesit-compile-query
+                  lang 'anvil-defs-ts-decl "(variable_declarator) @x"))
+             (caq (anvil-treesit-compile-query
+                   lang 'anvil-defs-ts-call "(call_expression) @x")))
+         (cl-flet ((emit-def (node kind name)
+                     (when (and name (not (string-empty-p name)))
+                       (push (list :kind kind :name name
+                                   :line (line-number-at-pos
+                                          (treesit-node-start node))
+                                   :end-line (line-number-at-pos
+                                              (treesit-node-end node))
+                                   :arity-min nil :arity-max nil
+                                   :docstring-head nil :obsolete-p 0)
+                             defs))))
+           (dolist (cap (treesit-query-capture root fnq))
+             (emit-def (cdr cap) "function" (anvil-defs--ts-node-name (cdr cap))))
+           (dolist (cap (treesit-query-capture root clq))
+             (emit-def (cdr cap) "class" (anvil-defs--ts-node-name (cdr cap))))
+           (dolist (cap (treesit-query-capture root mq))
+             (emit-def (cdr cap) "method" (anvil-defs--ts-node-name (cdr cap))))
+           ;; named arrow / function-expression bindings: per-declarator,
+           ;; avoiding the two-capture cross-match pairing hazard.
+           (dolist (cap (treesit-query-capture root dq))
+             (let* ((decl (cdr cap))
+                    (val (treesit-node-child-by-field-name decl "value"))
+                    (nm (treesit-node-child-by-field-name decl "name")))
+               (when (and val nm
+                          (member (treesit-node-type val)
+                                  '("arrow_function" "function_expression"))
+                          (string= (treesit-node-type nm) "identifier"))
+                 (emit-def val "function" (treesit-node-text nm t)))))
+           (dolist (cap (treesit-query-capture root caq))
+             (let* ((node (cdr cap))
+                    (callee (anvil-defs--ts-callee node)))
+               (when (and callee (not (string-empty-p callee)))
+                 (push (list :name callee
+                             :line (line-number-at-pos (treesit-node-start node))
+                             :context (anvil-defs--ts-enclosing-defun node)
+                             :kind "call")
+                       refs)))))
+         (list :defs (nreverse defs) :refs (nreverse refs) :features nil))))))
+
 (defun anvil-defs--scan-file (path)
   "Dispatch PATH to the matching language scanner by extension.
-.py -> the tree-sitter Python scanner; everything else -> the elisp
-reader.  Both return (:defs :refs :features) for the shared ingest path."
-  (if (equal (file-name-extension path) "py")
-      (anvil-defs--scan-python-file path)
-    (anvil-defs--scan-elisp-file path)))
+.py -> Python (tree-sitter); .js/.jsx/.ts/.tsx -> JS/TS (tree-sitter);
+everything else -> the elisp reader.  All return (:defs :refs :features)
+for the shared ingest path."
+  (pcase (downcase (or (file-name-extension path) ""))
+    ("py" (anvil-defs--scan-python-file path))
+    ((or "js" "jsx" "ts" "tsx") (anvil-defs--scan-ts-file path))
+    (_ (anvil-defs--scan-elisp-file path))))
 
 (defun anvil-defs--scan-elisp-file (path)
   "Parse elisp PATH and return (:defs LIST :refs LIST :features LIST).

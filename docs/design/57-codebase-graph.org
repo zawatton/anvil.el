@@ -66,6 +66,18 @@ HEAD= で dogfood — 2 files / 9 changed symbols を検出し、=detect-changes
 実 Python (=tools/semantic.py= 18 defs / 221 refs) で dogfood — 最頻
 internal callee =db= の callers (=cmd_index= 等) を正しく返却。
 
+*Phase 3 JS/TS サブフェーズ実装済み (2026-06-21、develop、未コミット):*
+同型に JavaScript / TypeScript を追加。=anvil-defs-languages= に
+=javascript= (=.js= / =.jsx=) / =typescript= (=.ts= / =.tsx=) を追加、
+=scan-file= dispatch を拡張。=anvil-defs--scan-ts-file= は
+function_declaration / 名前付き arrow・function-expression binding
+(=const f = () =>=) / class / method を defs に、call_expression を
+refs に投入。caller context は最寄りの *named* function を climb で解決
+(無名 arrow は親 variable_declarator / object pair から命名)。callee は
+bare =f()= と member =a.b()= (property) 両対応。ERT 5 件追加 (defs suite
+計 36 PASS、grammar guard は inline =skip-unless=)、実 =.ts= で dogfood。
+layering は anvil-treesit-backend のみ依存 (anvil-ts/anvil-py には未結合)。
+
 * Motivation
 
 codebase-memory-mcp の核心主張は「coding agent が repo を file
@@ -174,7 +186,14 @@ Doc 21 基盤 (=anvil-treesit-with-root-fn= / =anvil-treesit-compile-query=)
 callee は =(call)= の function フィールド (bare / attribute 両対応)、caller
 は enclosing function。syntactic 解決 (同名 cross-module は false edge)。
 features は空 (require/provide は elisp 概念)。ERT 4 件、実 .py で dogfood 済。
-JS/TS は anvil-ts 基盤があり同型で追加可能 (後続サブフェーズ)。
+
+*** Phase 3 JS/TS サブフェーズ (実装済み 2026-06-21)
+JavaScript (=.js= / =.jsx=) / TypeScript (=.ts= / =.tsx=) を同型追加。
+=anvil-defs--scan-ts-file= が function_declaration / 名前付き arrow・
+function-expression binding / class / method を defs、call_expression を
+refs に投入。caller は最寄り named function (無名 arrow は variable_declarator
+/ pair から命名)、callee は bare / member 両対応。anvil-treesit-backend
+のみ依存。ERT 5 件、実 .ts で dogfood。残: Rust / Go 等は同パターンで追加可。
 
 ** Phase 4 (optional) — dead-code 列挙 + degree フィルタ
 caller 数 0 の非 public シンボル列挙。Doc 16 (lint) に scanner として
@@ -222,8 +241,11 @@ dual-target (Emacs / NeLisp) 化候補 (=portable 機能=)。
   (git diff ハンク → 変更シンボル → blast-radius + risk)。git 依存部と
   DB 写像部を分離し override seam でテスト。ERT 27 PASS (git 統合含む)、
   dev/anvil.el 実 diff で dogfood。
-- 2026-06-21: Phase 3 実装 (develop、未コミット)。tree-sitter で Python の
+- 2026-06-21: Phase 3 実装 (develop、5193423)。tree-sitter で Python の
   defs + call-edge を同一 =defs=/=refs= に投入し trace/detect を多言語化。
   opt-in =anvil-defs-languages=、=scan-file= 拡張子 dispatch。ERT 31 PASS、
-  実 .py で dogfood。残: JS/TS サブフェーズ (anvil-ts 基盤で同型)、
-  Phase 4 (dead-code、optional)。
+  実 .py で dogfood。
+- 2026-06-21: Phase 3 JS/TS サブフェーズ実装 (develop、未コミット)。
+  JavaScript / TypeScript を同型追加 (arrow binding / member call 対応)。
+  anvil-treesit-backend のみ依存。ERT 36 PASS、実 .ts で dogfood。
+  残: Phase 4 (dead-code、optional)、他言語 (Rust/Go) は同パターンで追加可。

@@ -575,5 +575,117 @@ def main():
        (should (member "leaf" names))))))
 
 
+;;;; --- javascript / typescript (tree-sitter, Doc 57 Phase 3 JS/TS) ------
+
+(defmacro anvil-defs-test--skip-unless-grammar (lang)
+  "Inline guard: skip the test when tree-sitter LANG grammar is absent."
+  `(skip-unless (and (fboundp 'treesit-available-p) (treesit-available-p)
+                     (fboundp 'treesit-language-available-p)
+                     (treesit-language-available-p ,lang))))
+
+(defun anvil-defs-test--with-src-fixture (filename content languages fn)
+  "Index a temp FILENAME holding CONTENT with LANGUAGES enabled; call FN with dir."
+  (let* ((dir (make-temp-file "anvil-defs-src-" t))
+         (file (expand-file-name filename dir))
+         (db (expand-file-name "anvil-defs.db" dir))
+         (anvil-defs-index-db-path db)
+         (anvil-defs-paths (list dir))
+         (anvil-defs-languages languages)
+         (anvil-defs--db nil)
+         (anvil-defs--backend nil))
+    (unwind-protect
+        (progn
+          (with-temp-file file (insert content))
+          (anvil-defs-index-rebuild (list dir))
+          (funcall fn dir))
+      (when anvil-defs--db
+        (anvil-defs--close anvil-defs--db)
+        (setq anvil-defs--db nil))
+      (when (file-directory-p dir) (delete-directory dir t)))))
+
+(defvar anvil-defs-test--js-fixture "\
+function leaf() {
+  return 1;
+}
+
+const mid = () => {
+  return leaf();
+};
+
+function top() {
+  return mid();
+}
+
+class Worker {
+  run() {
+    return mid();
+  }
+}
+
+function main() {
+  const w = new Worker();
+  return w.run();
+}
+")
+
+(ert-deftest anvil-defs-test-js-rebuild-finds-defs ()
+  "The JS scanner indexes declarations, arrow bindings, classes and methods."
+  (anvil-defs-test--skip-unless-grammar 'javascript)
+  (anvil-defs-test--with-src-fixture
+   "fx.js" anvil-defs-test--js-fixture '(javascript)
+   (lambda (_dir)
+     (should (equal "function" (plist-get (car (anvil-defs-search "leaf")) :kind)))
+     (should (equal "function" (plist-get (car (anvil-defs-search "mid")) :kind))) ; arrow const
+     (should (equal "class" (plist-get (car (anvil-defs-search "Worker")) :kind)))
+     (should (equal "method" (plist-get (car (anvil-defs-search "run")) :kind))))))
+
+(ert-deftest anvil-defs-test-js-trace-callers ()
+  "Callers of mid are the top-level fn and the method that call it."
+  (anvil-defs-test--skip-unless-grammar 'javascript)
+  (anvil-defs-test--with-src-fixture
+   "fx.js" anvil-defs-test--js-fixture '(javascript)
+   (lambda (_dir)
+     (let ((names (anvil-defs-test--names
+                   (anvil-defs-trace-path "mid" :direction 'callers :depth 1))))
+       (should (member "top" names))
+       (should (member "run" names))))))
+
+(ert-deftest anvil-defs-test-js-arrow-context-and-member-call ()
+  "Arrow-binding callers and member-expression callees both resolve."
+  (anvil-defs-test--skip-unless-grammar 'javascript)
+  (anvil-defs-test--with-src-fixture
+   "fx.js" anvil-defs-test--js-fixture '(javascript)
+   (lambda (_dir)
+     ;; leaf is called only from inside the arrow `mid' -> caller "mid".
+     (should (member "mid" (anvil-defs-test--names
+                            (anvil-defs-trace-path "leaf" :direction 'callers :depth 1))))
+     ;; run is reached only via the member call `w.run()' in main.
+     (should (member "main" (anvil-defs-test--names
+                             (anvil-defs-trace-path "run" :direction 'callers :depth 1)))))))
+
+(ert-deftest anvil-defs-test-js-trace-callees-transitive ()
+  "Callees of top reach mid then leaf across the chain."
+  (anvil-defs-test--skip-unless-grammar 'javascript)
+  (anvil-defs-test--with-src-fixture
+   "fx.js" anvil-defs-test--js-fixture '(javascript)
+   (lambda (_dir)
+     (let ((names (anvil-defs-test--names
+                   (anvil-defs-trace-path "top" :direction 'callees :depth 2))))
+       (should (member "mid" names))
+       (should (member "leaf" names))))))
+
+(ert-deftest anvil-defs-test-ts-dispatch ()
+  "A .ts file routes through the typescript grammar and links calls."
+  (anvil-defs-test--skip-unless-grammar 'typescript)
+  (anvil-defs-test--with-src-fixture
+   "fx.ts"
+   "function tleaf(): number { return 1; }\nfunction tmid(): number { return tleaf(); }\n"
+   '(typescript)
+   (lambda (_dir)
+     (should (equal "function" (plist-get (car (anvil-defs-search "tleaf")) :kind)))
+     (should (member "tmid" (anvil-defs-test--names
+                             (anvil-defs-trace-path "tleaf" :direction 'callers :depth 1)))))))
+
+
 (provide 'anvil-defs-test)
 ;;; anvil-defs-test.el ends here
