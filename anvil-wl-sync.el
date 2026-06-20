@@ -88,11 +88,79 @@ MAX=0 means no cap.  Returns a summary plist."
                     (cl-incf delivered)
                     (setq newlast (max newlast (string-to-number u))))))
               (anvil-wl-sync--save-state
-               spath (list :uidvalidity uidvalidity :last-uid newlast))
+               spath (list :uidvalidity uidvalidity :last-uid newlast
+                           ;; Preserve the backfill floor so the 5-min forward
+                           ;; sync never clobbers `anvil-wl-sync-backfill' state.
+                           :floor-uid (plist-get state :floor-uid)))
               (list :exists (plist-get info :exists)
                     :uidnext uidnext :uidvalidity uidvalidity
                     :found (length uids) :delivered delivered
                     :last-uid newlast :maildir mdir))))
+      (when conn (ignore-errors (anvil-wl-imap-logout conn))))))
+
+(cl-defun anvil-wl-sync-backfill (&key host port user password-file root mailbox
+                                       (batch 200) (rounds 1))
+  "Backfill older messages (UIDs below the floor) into ROOT/<mailbox>.
+Forward `anvil-wl-sync-mailbox' tracks the newest mail; this walks DOWNWARD
+from the lowest UID held toward UID 1, fetching up to ROUNDS batches of at
+most BATCH messages each.  The floor (lowest UID held) is persisted; when it
+is not yet recorded it is estimated from the held message count (UIDs are
+roughly sequential), and Message-ID dedup makes any over-estimate harmless.
+Returns a summary plist."
+  (let* ((mdir (expand-file-name (anvil-wl-sync--folder-key mailbox) root))
+         (spath (anvil-wl-sync--state-path root mailbox))
+         (conn nil))
+    (anvil-wl-maildir-ensure mdir)
+    (unwind-protect
+        (progn
+          (setq conn (anvil-wl-imap-open-tunnel host port))
+          (anvil-wl-imap-login
+           conn user
+           (anvil-wl-imap-read-app-password (expand-file-name password-file)))
+          (let* ((info (anvil-wl-sync--select-info conn mailbox))
+                 (uidvalidity (plist-get info :uidvalidity))
+                 (state (anvil-wl-sync--load-state spath))
+                 (last-uid (or (plist-get state :last-uid) 0))
+                 (floor (or (and (equal (plist-get state :uidvalidity) uidvalidity)
+                                 (plist-get state :floor-uid))
+                            (max 1 (- (1+ last-uid) (anvil-wl-maildir-count mdir)))))
+                 (seen (anvil-wl-maildir-message-ids mdir))
+                 (delivered 0) (skipped 0) (fetched 0) (reached-bottom nil))
+            (cl-block rounds-loop
+              (dotimes (_ rounds)
+                (when (<= floor 1)
+                  (setq reached-bottom t)
+                  (cl-return-from rounds-loop))
+                (let* ((hi (1- floor))
+                       (lo (max 1 (- floor batch)))
+                       (raw-uids (anvil-wl-imap-uid-search
+                                  conn (format "UID %d:%d" lo hi)))
+                       (uids (sort (cl-remove-if-not
+                                    (lambda (u) (let ((n (string-to-number u)))
+                                                  (and (>= n lo) (<= n hi))))
+                                    raw-uids)
+                                   (lambda (a b) (< (string-to-number a)
+                                                    (string-to-number b))))))
+                  (dolist (u uids)
+                    (let ((bytes (anvil-wl-imap-uid-fetch-message conn u)))
+                      (when bytes
+                        (cl-incf fetched)
+                        (let ((mid (anvil-wl-maildir--extract-message-id bytes)))
+                          (if (and mid (gethash mid seen))
+                              (cl-incf skipped)
+                            (anvil-wl-maildir-deliver mdir bytes)
+                            (when mid (puthash mid t seen))
+                            (cl-incf delivered))))))
+                  (setq floor lo)
+                  (when (<= lo 1)
+                    (setq reached-bottom t)
+                    (cl-return-from rounds-loop)))))
+            (anvil-wl-sync--save-state
+             spath (list :uidvalidity uidvalidity :last-uid last-uid
+                         :floor-uid floor))
+            (list :uidvalidity uidvalidity :last-uid last-uid :floor floor
+                  :fetched fetched :delivered delivered :skipped skipped
+                  :reached-bottom reached-bottom :maildir mdir)))
       (when conn (ignore-errors (anvil-wl-imap-logout conn))))))
 
 (provide 'anvil-wl-sync)

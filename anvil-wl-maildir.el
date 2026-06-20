@@ -48,5 +48,39 @@ Writes to tmp/ then renames into new/ (atomic Maildir delivery)."
     (rename-file tmp new t)
     new))
 
+(defun anvil-wl-maildir--extract-message-id (raw)
+  "Return the Message-ID header value from RAW message bytes, or nil."
+  (let* ((sep (string-match "\r?\n\r?\n" raw))
+         (headers (if sep (substring raw 0 sep) raw)))
+    (when (string-match "^Message-I[Dd]:[ \t]*\\(.*\\)" headers)
+      (string-trim (match-string 1 headers)))))
+
+(defun anvil-wl-maildir-message-ids (mdir)
+  "Return a hash table whose keys are the Message-IDs present in MDIR.
+Only the first 8 KB of each file is read (enough to reach Message-ID)."
+  (let ((seen (make-hash-table :test 'equal)))
+    (dolist (sub '("new" "cur"))
+      (let ((d (expand-file-name sub mdir)))
+        (when (file-directory-p d)
+          (dolist (f (directory-files d t "^[^.]"))
+            (when (file-regular-p f)
+              (let* ((raw (with-temp-buffer
+                            (set-buffer-multibyte nil)
+                            (let ((coding-system-for-read 'binary))
+                              (insert-file-contents-literally f nil 0 8192))
+                            (buffer-string)))
+                     (mid (anvil-wl-maildir--extract-message-id raw)))
+                (when mid (puthash mid t seen))))))))
+    seen))
+
+(defun anvil-wl-maildir-count (mdir)
+  "Return the number of message files in MDIR's new/ and cur/."
+  (let ((n 0))
+    (dolist (sub '("new" "cur"))
+      (let ((d (expand-file-name sub mdir)))
+        (when (file-directory-p d)
+          (setq n (+ n (length (directory-files d nil "^[^.]")))))))
+    n))
+
 (provide 'anvil-wl-maildir)
 ;;; anvil-wl-maildir.el ends here
