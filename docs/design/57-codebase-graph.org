@@ -1,0 +1,179 @@
+#+title: anvil-codegraph — Call-Graph Index (trace_path + blast-radius)
+#+date: 2026-06-20
+#+author: zawatton
+#+property: status PHASE-1-IMPLEMENTED
+#+property: scope GENERIC
+
+* STATUS
+  :PROPERTIES:
+  :ID:       a1f3c0d7-57aa-4e21-9b30-codegraph-2026-06-20
+  :END:
+~DRAFT~ (2026-06-20) — 2026-06-20 の X 競合監査
+(=codebase-memory-mcp=, [[https://github.com/DeusData/codebase-memory-mcp][DeusData/codebase-memory-mcp]],
+C 88% / MIT / ~8.8k★ / active v0.8.1) からの取り込み提案。
+Doc 11 (=defs-index=, Ph1+2 SHIPPED) に *call-graph 層* を追加し、
+=trace_path= (誰が X を呼ぶ / X は何を呼ぶ) と =detect_changes=
+(git diff → 影響シンボル + blast-radius) を MCP tool 化する。
+Cypher query engine / Louvain community detection / 埋め込み
+semantic similarity は native (C/Go) 実装が前提のため *見送り*
+(nelisp 純 elisp 化方針とも矛盾)。
+
+Tier 1 (token 効率系)。Doc 26/28/29 と同じ「Claude Code セッション
+1 本あたりの token 効率」が主語。
+
+*Phase 1 実装済み (2026-06-20、develop、未コミット):* 実装着手時に
+*call-graph データは既に永続化されている* ことが判明した — defs-index
+の =refs= テーブルは各行 =context= = 呼び出し元 (enclosing def)、
+=name= = 呼び出し先、=kind='call'= を既に記録していた (Doc 11 の
+=anvil-defs--walk-form-refs= の副産物)。したがって Phase 1 は
+*新規 =call_edge= schema も新規抽出も不要* で、=refs= 上の BFS クエリ
++ tool 登録のみに縮小した。追加は: (1) =anvil-defs-trace-path= 公開
+関数 (=WITH RECURSIVE= で callers/callees を depth 1..5 BFS、
+=internal-only= で index 定義済みシンボルに限定)、(2) =defs-trace-path=
+MCP tool、(3) callees lookup 用の additive index
+=idx_refs_kind_context= (schema-version bump 不要)。ERT 7 件追加
+(defs suite 計 23 PASS)、byte-compile clean。実コードベース
+(601 files / 14,026 defs / 584,639 refs) で dogfood 検証済み。
+
+* Motivation
+
+codebase-memory-mcp の核心主張は「coding agent が repo を file
+ごとに grep/read して token を溶かす」問題を、コードベース全体を
+一度グラフ化し構造クエリ 1 発で置換する点にある (公称: 5 構造
+クエリが 3,400 tokens、従来 grep/read 連発で 412,000 tokens)。
+これは anvil の token-savior 思想 (Doc 26 manifest / Doc 28
+progressive disclosure / Doc 29 memory) と完全に同一線上にある。
+
+anvil 自身が =anvil*.el= + =dev/nelisp/= の巨大 codebase であり、
+Claude が毎セッション「この関数を誰が呼ぶか」「この helper は
+どこで定義されるか」「この変更の波及範囲は」を grep で何度も
+辿っている。call-graph をあらかじめ SQLite に持てば、この hop が
+構造クエリ 1 発に畳まれる。
+
+* Goals
+
+1. =defs-index= の SQLite schema に call-edge テーブル (=CALLS=) を
+   追加し、定義済みシンボル間の呼び出し関係を永続化する。
+2. =trace_path= MCP tool — あるシンボルを起点に BFS で「呼び出し元
+   (callers)」「呼び出し先 (callees)」を depth 指定で辿る。
+3. =detect_changes= MCP tool — git diff の変更行を defs-index に
+   マップし、変更シンボル + その逆参照 (blast-radius) を返す。
+4. =dead-code= 検出 — caller 数 0 の非 public シンボルを列挙
+   (=defs-index= の degree フィルタで実現)。
+5. 既存 =defs-search= / =defs-references= / =defs-signature= /
+   =defs-who-requires= は無改変。call-graph は opt-in の追加表。
+
+* Non-goals
+
+- *Cypher query engine* — read-only openCypher サブセットの再実装は
+  ROI が低い。実用クエリは SQLite =WITH RECURSIVE= CTE で代替する。
+- *Louvain / community detection / architecture clustering* — グラフ
+  アルゴリズムは SQL で自然に書けず、外部ライブラリか C 実装が要る。
+  見送り (=get_architecture= 相当は提供しない)。
+- *埋め込みベース semantic similarity (=SIMILAR_TO=)* — nomic-embed
+  を vendor する codebase-memory-mcp の方式は native binary 前提。
+  semantic 検索は Doc 18 (RAG) の所掌、本 doc では扱わない。
+- *HTTP route graph / IaC graph / cross-repo edges* — 事務所 + anvil
+  の用途に対し過剰。需要が出るまで保留。
+
+* 既存 anvil との接続マップ
+
+| codebase-memory-mcp 機能         | anvil 既存                       | 本 doc |
+|----------------------------------+----------------------------------+--------|
+| symbol 定義検索                  | =defs-search= (Doc 11)           | 既存   |
+| cross-file 参照                  | =defs-references= / =who-requires= | 既存   |
+| signature 取得                   | =defs-signature= (Doc 11)        | 既存   |
+| BM25 FTS grep                    | =defs-search= + Doc 28           | 既存   |
+| *call graph (=CALLS= edge)*      | *なし*                           | *新規* |
+| *=trace_path= (BFS traversal)*   | *なし*                           | *新規* |
+| *=detect_changes= (blast-radius)* | =anvil-git= diff はあるが symbol map なし | *新規* |
+| dead-code (zero-caller)          | なし                             | 新規   |
+| Cypher / clustering / embeddings | —                                | 見送り |
+
+* Architecture (案、議論前提)
+
+** call-edge 抽出
+入力ソースは 2 経路:
+1. *elisp* — Doc 12 の reader (sexp walk) を再利用。関数本体の
+   car が fboundp な symbol を call-site として収集。最も安価で、
+   anvil/nelisp 自身に即効。
+2. *brace/tree-sitter 言語* — Doc 21 (tree-sitter edits) の AST を
+   walk して call expression を収集。Python 先行。
+3. fallback — LSP (eglot) の =textDocument/callHierarchy= があれば
+   利用、無ければ textual match (同名関数の false edge に注意)。
+
+** schema 追加 (defs-index DB)
+=call_edge(caller_id, callee_id, file, line, lang, resolved)= の単一
+表。=resolved= は AST/LSP 解決か textual match かのフラグ
+(textual は false-positive 可能性を呼び出し側に開示)。
+
+** trace_path
+=WITH RECURSIVE= で caller/callee 方向の BFS。depth は 1–5 で
+hard cap (codebase-memory-mcp に倣う)。戻りは
+(:root SYM :direction callers/callees :depth N :paths (...))。
+
+** detect_changes
+=anvil-git= の diff から変更ファイル + 行範囲を取得 → defs-index で
+行範囲 → シンボル逆引き → 各シンボルの caller を =trace_path= で
+1–2 hop 展開 → risk 分類 (public API か / test 有無 / caller 数)。
+
+* Phase 分割案
+
+** Phase 1 — trace_path over existing refs edges (実装済み 2026-06-20)
+当初案 (=call_edge= schema + 新規抽出) は不要と判明: defs-index の
+=refs= が既に caller(=context=)→callee(=name=, =kind='call'=) を持つ。
+実装は =refs= 上の =WITH RECURSIVE= BFS (=anvil-defs-trace-path=) +
+=defs-trace-path= MCP tool + additive index =idx_refs_kind_context=。
+=internal-only= (既定 ON) で builtins/macros/third-party を除外し
+index 定義済みシンボルに限定。ERT 7 件、anvil.el 自身で dogfood 済。
+
+** Phase 2 — detect_changes (blast-radius)
+=anvil-git= diff → symbol map → caller 展開 + risk 分類。
+
+** Phase 3 — tree-sitter 言語 (Python 先行)
+Doc 21 の AST を入力に call-edge 抽出を多言語化。textual fallback
+の false-edge 開示を含む。
+
+** Phase 4 (optional) — dead-code 列挙 + degree フィルタ
+caller 数 0 の非 public シンボル列挙。Doc 16 (lint) に scanner として
+寄せる選択肢も検討。
+
+* Primitive vs Convention 分離
+本 doc は *GENERIC*。call-graph index は一般 Emacs+AI 開発者に汎用。
+運用者固有慣習の食い込みなし。将来公開時はそのまま切り出し可能。
+dual-target (Emacs / NeLisp) 化候補 (=portable 機能=)。
+
+* 既存 doc との関係
+- *Doc 11 (defs-index)* — 本 doc は Doc 11 の Phase 拡張として実装
+  しても良い (schema を共有)。独立 doc にしたのは多言語 (Doc 21) に
+  跨り、依存が Doc 11 単独でないため。
+- *Doc 12 (sexp edits)* — elisp call-site 抽出に reader を再利用。
+- *Doc 21 (tree-sitter edits)* — Phase 3 の AST 入力源。
+- *Doc 18 (RAG)* — semantic similarity は Doc 18 の所掌。本 doc は
+  構造 (構文的) グラフのみ。
+- *Doc 26/28/29* — token 効率 wave の延長。
+
+* Open Questions (要議論)
+1. Doc 11 の Phase として畳むか、独立 module (=anvil-codegraph=) に
+   するか。schema は defs-index DB に相乗りが自然。
+2. textual fallback の false-edge をどこまで許容するか
+   (resolved フラグ開示で足りるか)。
+3. call-edge の再構築 trigger — 既存 defs-index rebuild に相乗りか、
+   独立 incremental か。Doc 03 offload で重い rebuild を逃がす。
+4. detect_changes の risk 分類軸 (public/test/caller数) の具体閾値。
+
+* References
+- codebase-memory-mcp: [[https://github.com/DeusData/codebase-memory-mcp]]
+  (C/MIT、tree-sitter 158 文法 + 独自 LSP 9 言語、in-memory SQLite→disk、
+  openCypher、14 MCP tool: =trace_path= / =detect_changes= / =query_graph= 等)
+- 監査ソース: 2026-06-20 X 投稿バッチ (@seelffff / @Muhsingpt)
+- 関連: Doc 11 defs-index, Doc 21 treesit-edits, Doc 18 rag
+
+* Decision Log
+- 2026-06-20: DRAFT 起票。高価値サブセット (=trace_path= +
+  =detect_changes=) を純 elisp 再実装する方針。Cypher/clustering/
+  embeddings は native 前提のため見送り。
+- 2026-06-20: Phase 1 実装 (develop、未コミット)。既存 =refs.context=
+  エッジ再利用で新規 schema 不要と判明し scope 縮小。=trace_path=
+  (公開関数 + MCP tool) + additive index。ERT 23 PASS、dogfood 済。
+  残: Phase 2 (=detect_changes=)、Phase 3 (tree-sitter 多言語)。

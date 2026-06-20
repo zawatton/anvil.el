@@ -1,0 +1,132 @@
+#+title: anvil-office — OfficeCLI Wrapper (xlsx/docx/pptx via external binary)
+#+date: 2026-06-20
+#+author: zawatton
+#+property: status DRAFT
+#+property: scope CONVENTION-COUPLED
+
+* STATUS
+  :PROPERTIES:
+  :ID:       c3a5e2b9-59cc-4a12-bd52-officecli-2026-06-20
+  :END:
+~DRAFT~ (2026-06-20) — 2026-06-20 の X 監査
+(=OfficeCLI=, [[https://github.com/iOfficeAI/OfficeCLI][iOfficeAI/OfficeCLI]],
+C# / Apache-2.0 / ~7.4k★ / active v1.0.115) からの取り込み提案。
+*まず PILOT 検証が gate*。実ファイルで round-trip / 書式保持 /
+数式再計算 / 日本語縦書きレンダを確認してから wrapper 採否を決める。
+elisp ではなく外部自己完結バイナリのため、anvil は subprocess
+wrapper として MCP tool 化する (LibreOffice / openpyxl 呼び出しと
+同型)。
+
+Scope は CONVENTION-COUPLED (事務所 Excel 業務が動機) だが、
+primitive (Office 文書操作) 自体は GENERIC。
+
+* Motivation
+
+事務所業務は Excel 依存が重い: 見積書 (=estimates/=)、請求書
+(=invoices/=)、年次点検報告書 (現状 openpyxl + LibreOffice で生成)、
+マスター =物件管理台帳.xlsm=。現状の toolchain は
+- 編集: Python openpyxl (skill 経由)
+- PDF 化: LibreOffice headless
+の 2 本立てで、Python ランタイム + LibreOffice 依存がある。
+
+OfficeCLI は *単一自己完結バイナリ* (.NET 同梱、Office/LO/Python
+不要) で xlsx/docx/pptx の read/edit + HTML/PNG レンダを提供し、
+*MCP サーバモード* も持つ。openpyxl 編集レイヤを 1 バイナリで置換
+できる可能性がある。特に *行/列挿入時の数式自動書換* は数式多用の
+見積/請求テンプレで実利がある。
+
+* Goals (PILOT 通過が前提)
+
+1. =anvil-office= module — OfficeCLI バイナリを subprocess で呼ぶ
+   wrapper。=--json= 出力をパースして plist 返却。
+2. MCP tool: =office-get= (セル/範囲読取)、=office-set= (値注入)、
+   =office-render= (HTML/PNG)。命名は anvil 既存 (=file-*= 等) に合わせる。
+3. *テンプレ値注入* — 既存 xlsx テンプレの指定セルに値を流し込む
+   (全体再生成せず in-place)。=feedback_never_wholesale_rewrite= 厳守。
+4. 既存 Python/LibreOffice 経路は *温存* (置換でなく追加・選択)。
+
+* Non-goals
+
+- *openpyxl / LibreOffice の全置換* — 不可。理由は後述の制約
+  (=.xlsm= マクロ非対応 / 数式再計算なし / ネイティブ PDF なし)。
+- *バイナリの vendor 同梱* — anvil repo に C# binary は同梱しない。
+  user が別途 install し、anvil は path 経由で呼ぶ。
+- *.xlsm マクロ実行* — OfficeCLI は VBA 非対応。台帳は対象外。
+
+* PILOT 検証項目 (採否 gate)
+
+実ファイル 1–2 件 (見積テンプレ + 報告書テンプレ) で以下を確認:
+
+| # | 検証                                   | 合格条件                          |
+|---+----------------------------------------+-----------------------------------|
+| 1 | round-trip 書式保持                     | 未編集セル/結合/条件付き書式が不変 |
+| 2 | 値注入後の数式                          | 再計算挙動を把握 (静的化の影響)   |
+| 3 | 行/列挿入時の数式自動書換               | 期待通り参照が追従                |
+| 4 | 日本語縦書きレンダ (HTML/PNG)           | 報告書の縦書き「ー」等が崩れない  |
+| 5 | =.xlsm= 読み込み                        | マクロ drop の挙動を明示確認      |
+
+* 既存 anvil / toolchain との比較
+
+| 軸          | OfficeCLI                  | 現状 (openpyxl + LO)        |
+|-------------+----------------------------+-----------------------------|
+| 編集        | XML in-place (path/XPath)  | openpyxl (cell API)         |
+| 数式        | 150+、行挿入で自動書換     | openpyxl は数式文字列のみ   |
+| 再計算      | *なし* (再オープンまで静的) | なし (LO 再計算で対応)      |
+| PDF 出力    | *なし* (PNG のみ)          | LibreOffice (品質良)        |
+| =.xlsm= macro | *非対応*                   | openpyxl は keep_vba 可     |
+| ランタイム  | 単一バイナリ               | Python + LibreOffice        |
+| agent IF    | CLI + MCP サーバ           | Python script               |
+
+* 既知の制約 / caveat (監査結果)
+- *.xlsm マクロ非対応* → =物件管理台帳.xlsm= はハード・ブロッカー。
+  既存経路を維持。
+- *編集後の数式再計算なし* → 値が再オープンまで stale。数式多用
+  テンプレは PDF 化前に LibreOffice 再計算を挟む等の運用が要る。
+- *ネイティブ PDF 出力なし* (PNG per page のみ) → *PDF は
+  LibreOffice 継続*。OfficeCLI は xlsx 編集レイヤ専任とする。
+- *複雑書式 round-trip* — XML in-place 方式は構造上は保持寄りだが
+  公式ベンチ無し。PILOT #1 で要実測。
+- *日本語縦書きレンダ fidelity 未検証* → PILOT #4。
+
+* Architecture (案、PILOT 後)
+- =anvil-office.el= が =officecli= バイナリを =call-process= /
+  =anvil-offload= 経由で実行。重い render は Doc 03 offload で逃がす。
+- path 解決は =anvil-office-binary= defcustom + PATH 探索。不在時は
+  fail-loud で Python 経路を案内。
+- 既存 report パイプライン (Reports ワークスペース) との接続は
+  別途 (本 doc は anvil 側 primitive のみ)。
+
+* Primitive vs Convention 分離
+- *Primitive (GENERIC)*: =office-get/set/render= は汎用 Office 操作。
+- *Convention*: 見積/請求/報告書テンプレのセル位置・命名・縦書き
+  要件は事務所固有。テンプレ知識は skill 層 (estimate-workflow 等)
+  に残し、anvil-office は素の文書操作のみ提供する。
+
+* 既存 doc との関係
+- *Doc 03 (offload)* — 重い render を worker に逃がす。
+- *Doc 07 (browser framework)* — 外部プロセス + vision 出力 (PNG) の
+  扱いに先例。
+- *Doc 09 (http) / Doc 27 (shell-filter)* — subprocess 出力の filter
+  パターンを流用。
+- report パイプライン (別ワークスペース) — 消費側。
+
+* Open Questions (要議論)
+1. そもそも PILOT を通すか (=.xlsm= 不可・PDF 不可で価値が xlsx 値
+   注入に限定される。openpyxl で足りているなら見送りも合理的)。
+2. MCP サーバモードを使うか、CLI =--json= 単発呼びにするか。
+3. report パイプラインの openpyxl 前処理を OfficeCLI に寄せる価値が
+   あるか (縦書き「ー」置換などの既存 hack との兼ね合い)。
+
+* References
+- OfficeCLI: [[https://github.com/iOfficeAI/OfficeCLI]]
+  (C#/Apache-2.0、単一バイナリ、CLI + MCP、OOXML path/XPath in-place、
+  =view html= / =view screenshot= レンダ。VBA・PDF・数式再計算は非対応)
+- 監査ソース: 2026-06-20 X 投稿 (@trendtech33566)
+- 関連 skill: estimate-workflow, annual-inspection-report,
+  tsuneishi-monthly-pdf, bukken-ledger
+- 関連 feedback: [[feedback_never_wholesale_rewrite]] (全体再生成禁止)
+
+* Decision Log
+- 2026-06-20: DRAFT 起票。全置換は不可と判定。xlsx 値注入レイヤの
+  代替候補として PILOT 検証を gate に置く。=.xlsm= 台帳と PDF 出力は
+  既存経路を温存。

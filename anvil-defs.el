@@ -207,6 +207,12 @@ availability (see memory feedback_sqlite_with_transaction_not_portable)."
     "CREATE INDEX IF NOT EXISTS idx_refs_name ON refs(name)"
     "CREATE INDEX IF NOT EXISTS idx_refs_file ON refs(file_id)"
     "CREATE INDEX IF NOT EXISTS idx_refs_kind_name ON refs(kind, name)"
+    ;; refs.context is the caller (enclosing def); index it so the
+    ;; callees-direction trace-path lookups (WHERE context = ?) and the
+    ;; recursive JOIN ON r.context = t.node do not full-scan refs.
+    ;; Additive `IF NOT EXISTS' index — applied on every open, so existing
+    ;; DBs gain it without a schema-version bump or rebuild.
+    "CREATE INDEX IF NOT EXISTS idx_refs_kind_context ON refs(kind, context)"
 
     "CREATE TABLE IF NOT EXISTS features (
        id       INTEGER PRIMARY KEY,
@@ -825,6 +831,76 @@ When multiple definitions exist the first encountered is returned."
               ORDER BY f.path"
              (list feat)))))
 
+(defun anvil-defs-trace-path (symbol &rest plist)
+  "Trace the elisp call graph around SYMBOL over the indexed call edges.
+
+The defs index already stores caller->callee edges implicitly: every
+`refs' row of kind `call' has `context' = the enclosing definition (the
+caller) and `name' = the called symbol (the callee).  This walks that
+relation with a bounded breadth-first search, so one call answers \"who
+(transitively) calls X\" or \"what does X (transitively) call\" instead of
+the agent issuing one `anvil-defs-references' hop per level.
+
+PLIST keys:
+  :direction      `callers' (who calls SYMBOL — the default, for
+                  blast-radius) or `callees' (what SYMBOL calls).
+  :depth          Maximum BFS depth, clamped to 1..5 (default 3).
+  :internal-only  When non-nil (the default) only symbols that are
+                  themselves defined in the index are traversed and
+                  returned — drops builtins, special forms, macros and
+                  third-party calls.  nil returns the raw graph.
+  :limit          Maximum nodes, clamped to 1..2000 (default 200).
+
+Returns a list of plists (:name :depth :defined), nearest depth first
+then by name; SYMBOL itself is never included.  :defined is non-nil when
+the node resolves to a definition in the index."
+  (let* ((db (anvil-defs--ensure-db))
+         (name (if (symbolp symbol) (symbol-name symbol) symbol))
+         (callees (eq (or (plist-get plist :direction) 'callers) 'callees))
+         (internal (if (plist-member plist :internal-only)
+                       (plist-get plist :internal-only)
+                     t))
+         (depth (max 1 (min 5 (or (plist-get plist :depth) 3))))
+         (limit (max 1 (min 2000 (or (plist-get plist :limit) 200))))
+         ;; refs.context = caller, refs.name = callee.  callees expand on
+         ;; context=node -> name; callers on name=node -> context.
+         (seed-col   (if callees "name" "context"))
+         (seed-key   (if callees "context" "name"))
+         (step-match (if callees "r.context = t.node" "r.name = t.node"))
+         (step-col   (if callees "r.name" "r.context"))
+         ;; callers additionally require the enclosing context be non-null.
+         (seed-notnull (if callees "" " AND context IS NOT NULL"))
+         (step-notnull (if callees "" " AND r.context IS NOT NULL"))
+         (seed-internal (if internal
+                            (format " AND %s IN (SELECT name FROM defs)" seed-col)
+                          ""))
+         (step-internal (if internal
+                            (format " AND %s IN (SELECT name FROM defs)" step-col)
+                          ""))
+         (sql (format "WITH RECURSIVE trace(node, depth) AS (
+  SELECT DISTINCT %s, 1 FROM refs
+   WHERE %s = ? AND kind = 'call'%s%s
+  UNION
+  SELECT %s, t.depth + 1
+    FROM refs r JOIN trace t ON %s
+   WHERE r.kind = 'call' AND t.depth < ?%s%s
+)
+SELECT x.node, x.d,
+       (SELECT COUNT(*) FROM defs d WHERE d.name = x.node)
+  FROM (SELECT node, MIN(depth) AS d FROM trace
+         WHERE node IS NOT NULL GROUP BY node) x
+ WHERE x.node <> ?
+ ORDER BY x.d, x.node
+ LIMIT ?"
+                      seed-col seed-key seed-notnull seed-internal
+                      step-col step-match step-notnull step-internal))
+         (params (list name depth name limit)))
+    (mapcar (lambda (row)
+              (list :name (nth 0 row)
+                    :depth (nth 1 row)
+                    :defined (> (or (nth 2 row) 0) 0)))
+            (anvil-defs--select db sql params))))
+
 (defun anvil-defs-index-status ()
   "Return (:db-path :files :defs :refs :features :schema-version)."
   (let* ((db (anvil-defs--ensure-db))
@@ -895,6 +971,34 @@ MCP Parameters:
   feature - Feature name (string)."
   (anvil-server-with-error-handling
    (anvil-defs-who-requires feature)))
+
+(defun anvil-defs--tool-trace-path (symbol &optional direction depth internal limit)
+  "Trace the elisp call graph around SYMBOL over indexed call edges.
+
+MCP Parameters:
+  symbol    - Symbol name (string).
+  direction - \"callers\" (who calls SYMBOL — default) or \"callees\"
+              (what SYMBOL calls).
+  depth     - Max BFS depth 1..5 (string or integer); default 3.
+  internal  - Truthy by default: traverse only symbols defined in the
+              index, dropping builtins / special forms / macros /
+              third-party calls.  Pass \"nil\" / \"false\" / \"0\" to include
+              them.
+  limit     - Maximum nodes (string or integer); default 200."
+  (anvil-server-with-error-handling
+   (require 'anvil-sexp)
+   (let* ((dir (if (and (stringp direction)
+                        (member (downcase (string-trim direction))
+                                '("callees" "callee" "out" "down")))
+                   'callees 'callers))
+          ;; internal-only defaults ON; only an explicit falsey string
+          ;; disables it (omitted => arg is nil => keep default).
+          (internal-only (if (null internal) t (anvil-sexp--truthy internal))))
+     (anvil-defs-trace-path symbol
+                            :direction dir
+                            :depth (anvil-defs--coerce-int depth 3)
+                            :internal-only internal-only
+                            :limit (anvil-defs--coerce-int limit 200)))))
 
 (defun anvil-defs--tool-index-rebuild (&optional paths)
   "Rebuild the defs index.
@@ -972,6 +1076,22 @@ reverse-dependency questions."
    :read-only t)
 
   (anvil-server-register-tool
+   #'anvil-defs--tool-trace-path
+   :id "defs-trace-path"
+   :intent '(elisp-read)
+   :layer 'core
+   :server-id anvil-defs--server-id
+   :description
+   "Walk the elisp call graph from a symbol over the indexed call edges
+(refs.context -> refs.name).  direction=callers answers \"who
+(transitively) calls X?\" (blast-radius); direction=callees answers
+\"what does X call?\".  Bounded BFS, depth 1..5.  Collapses what would be
+one defs-references hop per level into a single call.  internal (default
+on) limits results to symbols defined in the index, hiding builtins /
+macros / third-party calls."
+   :read-only t)
+
+  (anvil-server-register-tool
    #'anvil-defs--tool-index-rebuild
    :id "defs-index-rebuild"
    :intent '(elisp-read admin)
@@ -998,6 +1118,7 @@ feature counts.  Fast."
                 "defs-references"
                 "defs-signature"
                 "defs-who-requires"
+                "defs-trace-path"
                 "defs-index-rebuild"
                 "defs-index-status"))
     (anvil-server-unregister-tool id anvil-defs--server-id)))

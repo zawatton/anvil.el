@@ -265,5 +265,140 @@ must not be counted as a reference.\"
        (should (anvil-defs-signature "fx-brand-new"))))))
 
 
+;;;; --- trace-path (call graph) ------------------------------------------
+
+(defvar anvil-defs-test--trace-fixture "\
+;;; tc.el --- trace fixture -*- lexical-binding: t; -*-
+
+;;; Commentary:
+;; call chain: tc-a -> tc-b -> tc-c (leaf); tc-d -> tc-b (2nd caller).
+
+;;; Code:
+
+(defun tc-c ()
+  \"Leaf — only calls a builtin.\"
+  (+ 1 2))
+
+(defun tc-b ()
+  \"Mid — calls the leaf.\"
+  (tc-c))
+
+(defun tc-a ()
+  \"Top — calls the mid.\"
+  (tc-b))
+
+(defun tc-d ()
+  \"Second caller of tc-b.\"
+  (tc-b))
+
+(provide 'tc)
+;;; tc.el ends here
+")
+
+(defun anvil-defs-test--with-trace-fixture (fn)
+  "Create a temp dir with tc.el (a small call chain), rebuild, call FN with dir."
+  (let* ((dir (make-temp-file "anvil-defs-trace-" t))
+         (file (expand-file-name "tc.el" dir))
+         (db (expand-file-name "anvil-defs.db" dir))
+         (anvil-defs-index-db-path db)
+         (anvil-defs-paths (list dir))
+         (anvil-defs--db nil)
+         (anvil-defs--backend nil))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert anvil-defs-test--trace-fixture))
+          (anvil-defs-index-rebuild (list dir))
+          (funcall fn dir))
+      (when anvil-defs--db
+        (anvil-defs--close anvil-defs--db)
+        (setq anvil-defs--db nil))
+      (when (file-directory-p dir)
+        (delete-directory dir t)))))
+
+(defun anvil-defs-test--names (rows)
+  "Return the :name strings from trace ROWS."
+  (mapcar (lambda (r) (plist-get r :name)) rows))
+
+(defun anvil-defs-test--depth-of (rows name)
+  "Return the :depth of the row in ROWS whose :name equals NAME."
+  (plist-get (cl-find name rows
+                      :key (lambda (r) (plist-get r :name)) :test #'equal)
+             :depth))
+
+(ert-deftest anvil-defs-test-trace-callers-direct ()
+  "Direct callers of the leaf is the mid only; self is excluded."
+  (anvil-defs-test--with-trace-fixture
+   (lambda (_dir)
+     (let ((names (anvil-defs-test--names
+                   (anvil-defs-trace-path "tc-c" :direction 'callers :depth 1))))
+       (should (member "tc-b" names))
+       (should-not (member "tc-a" names))
+       (should-not (member "tc-c" names))))))
+
+(ert-deftest anvil-defs-test-trace-callers-transitive ()
+  "Transitive callers of the leaf cover the whole upstream chain with depths."
+  (anvil-defs-test--with-trace-fixture
+   (lambda (_dir)
+     (let* ((rows (anvil-defs-trace-path "tc-c" :direction 'callers :depth 3))
+            (names (anvil-defs-test--names rows)))
+       (should (member "tc-b" names))
+       (should (member "tc-a" names))
+       (should (member "tc-d" names))
+       (should (= 1 (anvil-defs-test--depth-of rows "tc-b")))
+       (should (= 2 (anvil-defs-test--depth-of rows "tc-a")))
+       (should (= 2 (anvil-defs-test--depth-of rows "tc-d")))))))
+
+(ert-deftest anvil-defs-test-trace-depth-cap ()
+  "Depth 1 does not reach grand-callers."
+  (anvil-defs-test--with-trace-fixture
+   (lambda (_dir)
+     (let ((names (anvil-defs-test--names
+                   (anvil-defs-trace-path "tc-c" :direction 'callers :depth 1))))
+       (should (member "tc-b" names))
+       (should-not (member "tc-a" names))))))
+
+(ert-deftest anvil-defs-test-trace-callees ()
+  "Callees of the top reach the mid then the leaf; all are index-defined."
+  (anvil-defs-test--with-trace-fixture
+   (lambda (_dir)
+     (let* ((rows (anvil-defs-trace-path "tc-a" :direction 'callees :depth 3))
+            (names (anvil-defs-test--names rows)))
+       (should (member "tc-b" names))
+       (should (member "tc-c" names))
+       (should (cl-every (lambda (r) (plist-get r :defined)) rows))))))
+
+(ert-deftest anvil-defs-test-trace-internal-only-hides-builtins ()
+  "internal-only drops builtin callees; nil includes them."
+  (anvil-defs-test--with-trace-fixture
+   (lambda (_dir)
+     (let ((internal (anvil-defs-test--names
+                      (anvil-defs-trace-path "tc-c" :direction 'callees
+                                             :internal-only t)))
+           (raw (anvil-defs-test--names
+                 (anvil-defs-trace-path "tc-c" :direction 'callees
+                                        :internal-only nil))))
+       (should (null internal))           ; tc-c only calls `+'
+       (should (member "+" raw))))))
+
+(ert-deftest anvil-defs-test-trace-tool-wrapper ()
+  "The MCP wrapper parses string args and returns caller rows."
+  (anvil-defs-test--with-trace-fixture
+   (lambda (_dir)
+     (let ((names (anvil-defs-test--names
+                   (anvil-defs--tool-trace-path "tc-b" "callers" "2"))))
+       (should (member "tc-a" names))
+       (should (member "tc-d" names))))))
+
+(ert-deftest anvil-defs-test-trace-unknown-symbol ()
+  "Tracing an unindexed symbol yields nil in both directions."
+  (anvil-defs-test--with-trace-fixture
+   (lambda (_dir)
+     (should (null (anvil-defs-trace-path "no-such-symbol-xyz"
+                                          :direction 'callers)))
+     (should (null (anvil-defs-trace-path "no-such-symbol-xyz"
+                                          :direction 'callees))))))
+
+
 (provide 'anvil-defs-test)
 ;;; anvil-defs-test.el ends here

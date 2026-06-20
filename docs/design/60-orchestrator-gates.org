@@ -1,0 +1,94 @@
+#+title: anvil-orchestrator gates — retry cap + INNOVATE compare (vibecode audit)
+#+date: 2026-06-20
+#+author: zawatton
+#+property: status DRAFT
+#+property: scope GENERIC
+
+* STATUS
+  :PROPERTIES:
+  :ID:       d4b6f3ca-60dd-4b23-ce63-orchgates-2026-06-20
+  :END:
+~DRAFT~ (2026-06-20) — 2026-06-20 の X 監査
+(=vibecode-pro-max-kit=, [[https://github.com/withkynam/vibecode-pro-max-kit][withkynam/vibecode-pro-max-kit]],
+Markdown 60% + JS 40% / MIT / ~957★ / 2 contributors / 初期段階)
+からの *小改良メモ*。本体 (curl|bash で =.claude/agents,skills,hooks=
++ Markdown を撒く prompt/process フレームワーク) は anvil の
+orchestrator + openspec + memory に対し下位互換のため *コードは
+見送り*。採用するのは概念 2 点のみ。
+
+INFORMATIONAL 寄りの軽量 doc。Doc 10 (orchestrator) の小さな refine。
+
+* Motivation
+
+vibecode-pro-max-kit は RIPER-5+2 の 7 段ゲート
+(RESEARCH / SPEC / INNOVATE / PLAN / VALIDATE / EXECUTE /
+UPDATE-PROCESS) と PVL/EVL ループ (最大 10 サイクル) を謳う。実体は
+「plan-before-act」の再パッケージで、anvil-orchestrator
+(claude=設計 / codex=実装) + openspec-pilot + plan-mode で思想は
+既に網羅済み。「自己改善コンテキストメモリ」も md 手編集に過ぎず、
+anvil の DB-primary memory が厳密に上位互換。
+
+ただし 2 点、anvil orchestrator に *明示的に欠けている gate* がある:
+
+1. *リトライ上限* — PVL/EVL は最大 10 サイクルと数値で打ち切る。
+   anvil-orchestrator の検証/再投げに明示的な収束上限が無い。
+2. *INNOVATE ゲート* — PLAN 前に「2–3 案を出して trade-off 比較」を
+   必須化している。anvil-orchestrator には PLAN 前の「案比較」ゲートが
+   無い (consensus preset は実装案の合議だが、設計の代替案列挙とは別)。
+
+* Goals
+1. orchestrator のループ系 tool に *retry / cycle 上限* を defcustom で
+   導入し、超過時は fail-loud で停止 + レポート (無限ループ防止)。
+2. *INNOVATE preset* — PLAN 前に「N 案 + trade-off 表」を 1 ステップ
+   挟む orchestrator preset / 規約。Doc 19 (peer review) /
+   Doc 23 (consensus preset) の延長で実装。
+
+* Non-goals
+- vibecode の =.claude/agents,skills,hooks= / install スクリプト /
+  context-group Markdown の移植 — *一切しない*。anvil の DB / MCP が
+  上位互換。
+- 7 段ゲートの full 採用 — anvil の orchestrator role-split + openspec
+  で足りる。採るのは上記 2 概念のみ。
+
+* 既存 anvil との接続マップ
+| vibecode 要素                  | anvil 既存                       | 本 doc |
+|--------------------------------+----------------------------------+--------|
+| RIPER-5 (plan-before-act)      | orchestrator + plan-mode         | 既存   |
+| SPEC ゲート                    | openspec-pilot                   | 既存   |
+| context groups (md router)     | org-index / memory (DB 上位)     | 既存   |
+| self-improving memory          | anvil-memory (DB)                | 既存   |
+| model routing (Sonnet/Opus)    | Doc 22 provider routing          | 既存   |
+| *PVL/EVL 10-cycle 上限*        | *収束上限なし*                   | *採用* |
+| *INNOVATE (2–3 案比較)*        | *PLAN 前 gate なし*              | *採用* |
+
+* Phase 分割案
+** Phase 1 — retry/cycle 上限 defcustom
+orchestrator のループ tool に max-cycles を導入 + 超過時 fail-loud。
+** Phase 2 — INNOVATE preset
+PLAN 前の「N 案 + trade-off」ステップを preset 化。
+
+* Primitive vs Convention 分離
+*GENERIC*。retry 上限・案比較ゲートは汎用 orchestration 改善。
+
+* 既存 doc との関係
+- *Doc 10 (orchestrator)* — 本 doc は Doc 10 の小 refine。Phase として
+  畳んでも良い。
+- *Doc 19 (peer review)* / *Doc 23 (consensus presets)* — INNOVATE は
+  これらの仕組みで実装可能。
+- *Doc 43 (autoresearch)* — ループ収束 / holdout の設計を流用。
+
+* Open Questions (要議論)
+1. そもそも独立 doc にせず Doc 10 の Phase 追記で足りるか。
+2. INNOVATE を必須ゲートにするか opt-in preset に留めるか
+   (小タスクで overhead になる、=feedback_orchestrator_when_to_use= 参照)。
+3. retry 上限のデフォルト値 (vibecode は 10、anvil の実コストで再算定)。
+
+* References
+- vibecode-pro-max-kit: [[https://github.com/withkynam/vibecode-pro-max-kit]]
+- 監査ソース: 2026-06-20 X 投稿 (@GitHub_Daily)
+- 関連: Doc 10 orchestrator, Doc 19 pair, Doc 23 consensus-presets, Doc 43 autoresearch
+- 関連 feedback: [[feedback_orchestrator_when_to_use]], [[feedback_orchestrator_role_split]]
+
+* Decision Log
+- 2026-06-20: DRAFT 起票。本体コードは下位互換のため見送り。
+  retry 上限 + INNOVATE ゲートの 2 概念のみ orchestrator に採用候補。

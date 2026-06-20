@@ -1,0 +1,142 @@
+#+title: anvil-llm-wiki — KB Synthesis + Scheduled Lint Loop
+#+date: 2026-06-20
+#+author: zawatton
+#+property: status DRAFT
+#+property: scope CONVENTION-COUPLED
+
+* STATUS
+  :PROPERTIES:
+  :ID:       b2e4d1a8-58bb-4f30-ac41-llmwiki-2026-06-20
+  :END:
+~DRAFT~ (2026-06-20) — 2026-06-20 の X 監査
+(Karpathy "LLM Wiki" gist + Stanford STORM) からの取り込み提案。
+*核心は「anvil は既に DB 版 LLM Wiki である」という認識* で、
+追加するのは 2 機能のみ:
+(1) =memory-synthesize-topic= — STORM 風に関連 memory + web ソースを
+    fan-out し、引用付き合成ページを org KB / memory に *書き戻す*
+    (=deep-research= skill の出力を KB に永続化する導線)。
+(2) *定期 lint ループ* — 既存 =memory-audit= /
+    =memory-contradictions= / =memory-duplicates= /
+    =memory-lint-index= を cron 配線し、孤立 memory・リンク欠落・
+    陳腐化を週次レポート化する。
+
+Tier 2。Doc 29 (memory engine)・Doc 02 (org-index)・Doc 18 (RAG)・
+Doc 43 (autoresearch) の上に乗る薄い追加。
+
+* Motivation
+
+Karpathy の gist は *概念ノート 1 枚* (コードでなくパターン)。要旨:
+- RAG の問題は「nothing accumulates」— 合成がクエリごとに消える。
+- LLM Wiki = LLM が raw ソースから wiki ページを *インクリメンタルに
+  コンパイルし維持* する。3 層 (=raw/= 不変ソース / =wiki/= LLM 所有
+  md / schema=CLAUDE.md) + 3 操作 (ingest / query / lint)。
+- コンパイラ比喩: raw = source、LLM = compiler、wiki = executable、
+  lint = tests、query = runtime。知識が再発見でなく蓄積される。
+
+Stanford STORM = 多視点 Q&A → アウトライン → 引用付き記事生成の
+バッチパイプライン。「STORM → LLM Wiki」は「一発生成」から
+「常時維持」への進化を指す。
+
+anvil はこの大半を *既に DB で体現している*。本 doc の主眼は重複の
+再実装ではなく、欠落している 2 つの輪 (合成→KB書き戻し / 定期 lint)
+を閉じること。
+
+* Goals
+
+1. =memory-synthesize-topic TOPIC= — 関連 memory (=memory-search=) +
+   任意 web ソースを集約し、引用付きの合成ページ (org or memory
+   entry) を生成して KB に *永続化* する。
+2. *scheduled lint* — =anvil-cron= に週次ジョブを配線し、
+   孤立・矛盾・重複・stale・リンク欠落を 1 レポートに集約する
+   (=memory-lint-index= の出力 + =memory-contradictions= 等を統合)。
+3. 「良回答の自動ファイリング」hook (optional) — 高品質回答を
+   =memory-add= 候補として提示する PostToolUse/Stop hook。
+4. (optional) =[[name]]= リンクのグラフ export — 既存リンクの
+   可視化 (HTML/dot)。Doc 29 の =memory-export-html= 拡張。
+
+* Non-goals
+
+- *新規 memory store の構築* — anvil-memory (Doc 29) が wiki 層。
+  raw/wiki/schema の 3 層は anvil-memory + capture/web + CLAUDE.md に
+  既にマップ済み。再実装しない。
+- *Obsidian 連携* — gist は Obsidian を IDE/viewer に使うが、anvil の
+  viewer は Emacs + =memory-export-html=。Obsidian 取り込みは扱わない。
+- *STORM 本体の移植* — multi-perspective 会話シミュレーションの
+  full pipeline は不要。=deep-research= skill が既に fan-out→検証→
+  引用合成を担う。本 doc はその出力を KB に繋ぐだけ。
+
+* 既存 anvil との接続マップ
+
+| LLM Wiki / STORM 要素        | anvil 既存                          | 本 doc |
+|------------------------------+-------------------------------------+--------|
+| wiki/ (LLM 所有ページ)       | anvil-memory (Doc 29) =.md=+DB      | 既存   |
+| schema (CLAUDE.md)           | CLAUDE.md メモリー管理節            | 既存   |
+| index.md                     | =MEMORY.md= 自動生成 / org-index    | 既存   |
+| log.md (変更ジャーナル)      | worklog (Doc 42)                    | 既存   |
+| ingest (source→ページ)       | web-summarizer skill → capture/web/ | 既存   |
+| query (引用付き合成)         | =deep-research= skill (fan-out)     | 部分   |
+| *合成結果の KB 書き戻し*     | *なし (手動 memory-add)*            | *新規* |
+| *定期 lint (孤立/陳腐化)*    | tool はあるが *cron 未配線*         | *新規* |
+| 良回答の自動ファイリング     | なし                                | 新規   |
+| =[[link]]= グラフ可視化      | リンクはあるが graph export なし    | optional |
+
+* Architecture (案)
+
+** memory-synthesize-topic
+1. =memory-search TOPIC= + (optional) web fetch でソース収集。
+2. =deep-research= skill (or orchestrator consensus) で多視点合成 +
+   引用。
+3. 出力を (a) org KB ページ (=capture/web/= or 専用 =capture/wiki/=)
+   か (b) memo-type memory entry として =memory-add=。frontmatter に
+   sources / created / tags。既存 =[[name]]= リンクを張る。
+4. =memory-regenerate-index= で MEMORY.md / org-index を更新。
+
+** scheduled lint loop
+=anvil-cron= 週次ジョブ → =memory-lint-index= +
+=memory-contradictions= + =memory-duplicates= +
+reference-row の =with_urls= 404 検知 を 1 レポート org に集約 →
+worklog or 専用 lint レポートに append。fix は提案のみ (非破壊)。
+
+* Phase 分割案
+** Phase 1 — memory-synthesize-topic (KB 書き戻し導線)
+=deep-research= 出力 → =memory-add= / org ページ化。最小実用。
+** Phase 2 — scheduled lint 配線
+=anvil-cron= 週次 + レポート集約。既存 lint tool の orchestration のみ。
+** Phase 3 (optional) — 良回答 auto-file hook + graph export
+
+* Primitive vs Convention 分離
+*CONVENTION-COUPLED*。
+- *Primitive (GENERIC)*: 合成→store 書き戻しの仕組み、定期 lint
+  orchestration は汎用。
+- *Convention*: 書き戻し先 (=capture/wiki/= or memory memo type)、
+  org KB レイアウト、CLAUDE.md schema は運用者固有。公開時は
+  store backend を差し替え可能にする。
+
+* 既存 doc との関係
+- *Doc 29 (memory-engine)* — wiki 層そのもの。本 doc は Phase 5
+  (DB-primary) の上に「合成書き戻し」を足す。
+- *Doc 02 (org-index)* — index.md 相当。合成ページを索引に載せる。
+- *Doc 18 (RAG)* — query の semantic 検索。合成のソース収集に利用。
+- *Doc 43 (autoresearch)* — 自己最適化ループ。知識合成ループとは
+  直交だが state machine / worktree-safety の設計を流用可能。
+- *Doc 16 (lint)* — repo hygiene。本 doc の lint は memory/KB 対象で
+  別系統だが、cron 配線パターンを共有。
+
+* Open Questions (要議論)
+1. 合成ページの置き場 — memory memo type か、新 =capture/wiki/= dir か。
+2. STORM 風 multi-perspective を =deep-research= で足りるとするか、
+   orchestrator consensus preset を別途組むか。
+3. 定期 lint の cron 頻度と「fix 提案」を自動 PR 化するか手動か。
+4. 良回答 auto-file の hook は煩わしくないか (opt-in 既定)。
+
+* References
+- Karpathy "LLM Wiki" gist:
+  [[https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f]]
+- Stanford STORM: [[https://github.com/stanford-oval/storm]]
+- 監査ソース: 2026-06-20 X 投稿 (@lucas_flatwhite, 引用元 @heynavtoor)
+- 関連: Doc 29 memory-engine, Doc 02 org-index, Doc 18 rag, Doc 43 autoresearch
+
+* Decision Log
+- 2026-06-20: DRAFT 起票。「anvil は既に DB 版 LLM Wiki」と認識し、
+  欠落 2 機能 (合成→KB 書き戻し / 定期 lint 配線) のみ追加する方針。
+  STORM 本体・新 store・Obsidian 連携は見送り。
