@@ -66,6 +66,10 @@
 (declare-function anvil-sexp--read-current-buffer "anvil-sexp" ())
 (declare-function anvil-sexp--project-root "anvil-sexp" (&optional hint))
 (declare-function anvil-sexp--truthy "anvil-sexp" (v))
+;; anvil-git is lazily required inside `anvil-defs--git-changed-lines'
+;; (Doc 57 Phase 2) so the top-level keeps no build-time dep on it.
+(declare-function anvil-git--run "anvil-git" (args repo &optional opts))
+(declare-function anvil-git--check "anvil-git" (res context))
 (defvar anvil-sexp--function-defining-forms)
 (defvar anvil-sexp--defining-forms)
 
@@ -901,6 +905,155 @@ SELECT x.node, x.d,
                     :defined (> (or (nth 2 row) 0) 0)))
             (anvil-defs--select db sql params))))
 
+(defun anvil-defs--git-changed-lines (repo rev)
+  "Return ((ABS-PATH (S . E) ...) ...) of new-side changed line ranges.
+Runs `git diff -U0 REV' in REPO (REV diffed against the working tree)
+via `anvil-git--run' and parses the hunk headers.  Deleted files
+(+++ /dev/null) are dropped; a zero-count hunk maps to its single
+anchor line."
+  (require 'anvil-git)
+  (let* ((res (anvil-git--run
+               (format "diff -U0 %s" (shell-quote-argument (or rev "HEAD")))
+               repo '(:max-output 1048576)))
+         (_ (anvil-git--check res "diff -U0"))
+         (out (or (plist-get res :stdout) ""))
+         (root (expand-file-name repo))
+         (acc (make-hash-table :test 'equal))
+         (order nil)
+         (cur nil))
+    (dolist (line (split-string out "\n"))
+      (cond
+       ((string-prefix-p "+++ " line)
+        (let ((p (string-trim (substring line 4))))
+          (setq cur (cond ((string= p "/dev/null") nil)
+                          ((string-prefix-p "b/" p)
+                           (expand-file-name (substring p 2) root))
+                          (t (expand-file-name p root))))
+          (when (and cur (not (gethash cur acc)))
+            (puthash cur t acc) (push cur order))))
+       ((and cur (string-prefix-p "@@ " line)
+             (string-match
+              "\\`@@ -[0-9]+\\(?:,[0-9]+\\)? \\+\\([0-9]+\\)\\(?:,\\([0-9]+\\)\\)? @@"
+              line))
+        (let* ((s (string-to-number (match-string 1 line)))
+               (cnt (if (match-string 2 line)
+                        (string-to-number (match-string 2 line))
+                      1))
+               (e (if (<= cnt 0) s (+ s (1- cnt)))))
+          (push (cons s e) (gethash (concat "R:" cur) acc))))))
+    (mapcar (lambda (path)
+              (cons path (nreverse (gethash (concat "R:" path) acc))))
+            (nreverse order))))
+
+(defun anvil-defs--defs-in-range (db file-id s e)
+  "Return def plists in FILE-ID whose [line, end_line] overlaps [S, E]."
+  (mapcar (lambda (row)
+            (list :name (nth 0 row) :kind (nth 1 row)
+                  :line (nth 2 row) :end-line (nth 3 row)))
+          (anvil-defs--select
+           db "SELECT DISTINCT name, kind, line, end_line FROM defs
+                WHERE file_id = ? AND line <= ?
+                  AND (end_line IS NULL OR end_line >= ?)"
+           (list file-id e s))))
+
+(defun anvil-defs--direct-caller-count (db name)
+  "Return the number of distinct indexed definitions that call NAME."
+  (or (caar (anvil-defs--select
+             db "SELECT COUNT(DISTINCT context) FROM refs
+                  WHERE name = ? AND kind = 'call' AND context IS NOT NULL
+                    AND context IN (SELECT name FROM defs)"
+             (list name)))
+      0))
+
+(defun anvil-defs--tested-p (db name)
+  "Return non-nil when NAME is referenced from a test file."
+  (> (or (caar (anvil-defs--select
+                db "SELECT COUNT(*) FROM refs r JOIN file f ON r.file_id = f.id
+                     WHERE r.name = ?
+                       AND (f.path LIKE '%-test.el'
+                            OR f.path LIKE '%/tests/%'
+                            OR f.path LIKE '%/test/%')"
+                (list name)))
+        0)
+     0))
+
+(defun anvil-defs-detect-changes (&rest plist)
+  "Map git changes to the indexed definitions they touch (blast-radius).
+
+For every changed line range, the enclosing indexed definition(s) are
+the \"changed symbols\"; their transitive callers (via
+`anvil-defs-trace-path') are the blast-radius.  Each changed symbol
+carries a coarse risk plist so an agent can triage what a diff endangers
+before it edits — one call in place of a diff read plus N
+`defs-references' hops.
+
+PLIST keys:
+  :repo    Repo directory (default: the git project root).
+  :rev     Revision diffed against the working tree (default \"HEAD\",
+           i.e. uncommitted changes).  E.g. \"HEAD~3\", a branch, a SHA.
+  :depth   Caller-expansion depth for blast-radius, 1..5 (default 1).
+  :limit   Max changed symbols reported (default 100).
+  :changes Pre-parsed ((ABS-PATH (S . E) ...) ...) override; when given,
+           git is not invoked and the index is not refreshed (test seam).
+
+Risk per changed symbol: `high' = public (no `--') with >=1 caller and
+no test reference; `medium' = public, or >=3 callers; `low' otherwise.
+
+Returns (:repo :rev :files N :changed (PLIST...) :total-impacted N),
+each changed PLIST being (:name :kind :file :public :direct-callers
+:impacted :tested :risk :callers-sample)."
+  (let* ((db (anvil-defs--ensure-db))
+         (override (plist-member plist :changes))
+         (repo (or (plist-get plist :repo)
+                   (progn (require 'anvil-sexp) (anvil-sexp--project-root))))
+         (rev (or (plist-get plist :rev) "HEAD"))
+         (depth (max 1 (min 5 (or (plist-get plist :depth) 1))))
+         (limit (max 1 (min 1000 (or (plist-get plist :limit) 100))))
+         (changes (if override (plist-get plist :changes)
+                    (anvil-defs--git-changed-lines repo rev)))
+         (impacted-set (make-hash-table :test 'equal))
+         (seen (make-hash-table :test 'equal))
+         (changed nil))
+    ;; Re-ingest changed files so def line ranges match the diffed state.
+    (unless override
+      (dolist (entry changes)
+        (when (car entry) (ignore-errors (anvil-defs-refresh-if-stale (car entry))))))
+    (dolist (entry changes)
+      (let* ((path (car entry))
+             (file-id (caar (and path (anvil-defs--select
+                                       db "SELECT id FROM file WHERE path = ?"
+                                       (list path))))))
+        (when file-id
+          (dolist (r (cdr entry))
+            (dolist (d (anvil-defs--defs-in-range db file-id (car r) (cdr r)))
+              (let ((nm (plist-get d :name)))
+                (when (and (not (gethash nm seen)) (< (length changed) limit))
+                  (puthash nm t seen)
+                  (let* ((public (not (string-match-p "--" nm)))
+                         (callers (anvil-defs--direct-caller-count db nm))
+                         (tested (anvil-defs--tested-p db nm))
+                         (blast (anvil-defs-trace-path nm :direction 'callers
+                                                       :depth depth :limit limit))
+                         (risk (cond
+                                ((and public (>= callers 1) (not tested)) "high")
+                                ((or public (>= callers 3)) "medium")
+                                (t "low"))))
+                    (dolist (b blast)
+                      (puthash (plist-get b :name) t impacted-set))
+                    (push (list :name nm :kind (plist-get d :kind)
+                                :file path :public public
+                                :direct-callers callers
+                                :impacted (length blast)
+                                :tested tested :risk risk
+                                :callers-sample
+                                (mapcar (lambda (b) (plist-get b :name))
+                                        (seq-take blast 8)))
+                          changed)))))))))
+    (list :repo (expand-file-name repo) :rev rev
+          :files (length changes)
+          :changed (nreverse changed)
+          :total-impacted (hash-table-count impacted-set))))
+
 (defun anvil-defs-index-status ()
   "Return (:db-path :files :defs :refs :features :schema-version)."
   (let* ((db (anvil-defs--ensure-db))
@@ -1000,6 +1153,24 @@ MCP Parameters:
                             :internal-only internal-only
                             :limit (anvil-defs--coerce-int limit 200)))))
 
+(defun anvil-defs--tool-detect-changes (&optional repo rev depth limit)
+  "Map a git diff to the indexed symbols it touches + their callers.
+
+MCP Parameters:
+  repo   - Repo directory (string).  Default: the git project root.
+  rev    - Revision diffed against the working tree (default \"HEAD\" =
+           uncommitted changes).  E.g. \"HEAD~3\", a branch, a SHA.
+  depth  - Blast-radius caller depth 1..5 (string or integer); default 1.
+  limit  - Max changed symbols (string or integer); default 100."
+  (anvil-server-with-error-handling
+   (require 'anvil-sexp)
+   (apply #'anvil-defs-detect-changes
+          (append
+           (and (stringp repo) (not (string-empty-p repo)) (list :repo repo))
+           (and (stringp rev) (not (string-empty-p rev)) (list :rev rev))
+           (list :depth (anvil-defs--coerce-int depth 1)
+                 :limit (anvil-defs--coerce-int limit 100))))))
+
 (defun anvil-defs--tool-index-rebuild (&optional paths)
   "Rebuild the defs index.
 
@@ -1092,6 +1263,21 @@ macros / third-party calls."
    :read-only t)
 
   (anvil-server-register-tool
+   #'anvil-defs--tool-detect-changes
+   :id "defs-detect-changes"
+   :intent '(elisp-read)
+   :layer 'core
+   :server-id anvil-defs--server-id
+   :description
+   "Map a git diff to the indexed definitions it touches and their
+transitive callers (blast-radius).  rev (default HEAD = uncommitted
+changes) is diffed against the working tree; each changed symbol comes
+back with direct-caller count, test-coverage flag and a coarse
+high/medium/low risk.  Answers \"what does this diff endanger?\" in one
+call instead of reading the diff and chasing defs-references per symbol."
+   :read-only t)
+
+  (anvil-server-register-tool
    #'anvil-defs--tool-index-rebuild
    :id "defs-index-rebuild"
    :intent '(elisp-read admin)
@@ -1119,6 +1305,7 @@ feature counts.  Fast."
                 "defs-signature"
                 "defs-who-requires"
                 "defs-trace-path"
+                "defs-detect-changes"
                 "defs-index-rebuild"
                 "defs-index-status"))
     (anvil-server-unregister-tool id anvil-defs--server-id)))

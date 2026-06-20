@@ -1,7 +1,7 @@
 #+title: anvil-codegraph — Call-Graph Index (trace_path + blast-radius)
 #+date: 2026-06-20
 #+author: zawatton
-#+property: status PHASE-1-IMPLEMENTED
+#+property: status PHASE-1-2-IMPLEMENTED
 #+property: scope GENERIC
 
 * STATUS
@@ -34,6 +34,20 @@ MCP tool、(3) callees lookup 用の additive index
 =idx_refs_kind_context= (schema-version bump 不要)。ERT 7 件追加
 (defs suite 計 23 PASS)、byte-compile clean。実コードベース
 (601 files / 14,026 defs / 584,639 refs) で dogfood 検証済み。
+
+*Phase 2 実装済み (2026-06-21、develop、未コミット):* =detect_changes=
+= =anvil-defs-detect-changes= + =defs-detect-changes= MCP tool。
+=git diff -U0 REV= (REV を working tree と diff、既定 =HEAD= = 未コミット
+変更) のハンク行範囲を defs の =[line, end_line]= に重ねて *変更シンボル*
+を特定し、その caller を Phase 1 =trace_path= で展開して *blast-radius*
+を返す。各変更シンボルに coarse risk (public=非 =--= かつ caller>=1 かつ
+test 参照無し → =high=、public or caller>=3 → =medium=、他 =low=) と
+=tested= フラグ (=*-test.el= / =/tests/= / =/test/= からの参照有無) を付与。
+git 依存部 (=anvil-defs--git-changed-lines=) と DB 写像部を分離し、
+=:changes= override seam でテスト可能。ERT 4 件追加 (defs suite 計
+27 PASS、git 統合含む)、byte-compile clean。dev/anvil.el の実 =git diff
+HEAD= で dogfood — 2 files / 9 changed symbols を検出し、=detect-changes=
+自身を tested=t (テストファイル参照) と正しく判定。
 
 * Motivation
 
@@ -127,8 +141,13 @@ hard cap (codebase-memory-mcp に倣う)。戻りは
 =internal-only= (既定 ON) で builtins/macros/third-party を除外し
 index 定義済みシンボルに限定。ERT 7 件、anvil.el 自身で dogfood 済。
 
-** Phase 2 — detect_changes (blast-radius)
-=anvil-git= diff → symbol map → caller 展開 + risk 分類。
+** Phase 2 — detect_changes (blast-radius) (実装済み 2026-06-21)
+=anvil-defs-detect-changes= + =defs-detect-changes= MCP tool。
+=git diff -U0 REV= のハンク行範囲 → defs の =[line, end_line]= 重なりで
+変更シンボル特定 → caller を =trace_path= で展開 (blast-radius) →
+risk 分類 (public / test 参照 / caller 数)。git 依存部と DB 写像部を分離
+(=:changes= override seam でテスト可能)、anvil-git は遅延 require。
+ERT 4 件、dev/anvil.el 実 diff で dogfood 済。
 
 ** Phase 3 — tree-sitter 言語 (Python 先行)
 Doc 21 の AST を入力に call-edge 抽出を多言語化。textual fallback
@@ -173,7 +192,11 @@ dual-target (Emacs / NeLisp) 化候補 (=portable 機能=)。
 - 2026-06-20: DRAFT 起票。高価値サブセット (=trace_path= +
   =detect_changes=) を純 elisp 再実装する方針。Cypher/clustering/
   embeddings は native 前提のため見送り。
-- 2026-06-20: Phase 1 実装 (develop、未コミット)。既存 =refs.context=
+- 2026-06-20: Phase 1 実装 (develop、e8869d7)。既存 =refs.context=
   エッジ再利用で新規 schema 不要と判明し scope 縮小。=trace_path=
   (公開関数 + MCP tool) + additive index。ERT 23 PASS、dogfood 済。
-  残: Phase 2 (=detect_changes=)、Phase 3 (tree-sitter 多言語)。
+- 2026-06-21: Phase 2 実装 (develop、未コミット)。=detect_changes=
+  (git diff ハンク → 変更シンボル → blast-radius + risk)。git 依存部と
+  DB 写像部を分離し override seam でテスト。ERT 27 PASS (git 統合含む)、
+  dev/anvil.el 実 diff で dogfood。残: Phase 3 (tree-sitter 多言語)、
+  Phase 4 (dead-code、optional)。

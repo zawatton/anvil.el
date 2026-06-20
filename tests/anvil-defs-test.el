@@ -400,5 +400,94 @@ must not be counted as a reference.\"
                                           :direction 'callees))))))
 
 
+;;;; --- detect-changes (blast-radius) ------------------------------------
+
+(defun anvil-defs-test--range-of (name)
+  "Return (LINE . END-LINE) of the indexed definition NAME."
+  (let ((h (car (anvil-defs-search name))))
+    (cons (plist-get h :line) (plist-get h :end-line))))
+
+(ert-deftest anvil-defs-test-detect-changes-maps-and-risks ()
+  "A change inside tc-b maps to tc-b, finds its 2 callers, scores high."
+  (anvil-defs-test--with-trace-fixture
+   (lambda (dir)
+     (let* ((file (expand-file-name "tc.el" dir))
+            (res (anvil-defs-detect-changes
+                  :changes (list (cons file (list (anvil-defs-test--range-of "tc-b"))))))
+            (tcb (cl-find "tc-b" (plist-get res :changed)
+                          :key (lambda (c) (plist-get c :name)) :test #'equal)))
+       (should tcb)
+       (should (plist-get tcb :public))
+       (should (= 2 (plist-get tcb :direct-callers)))
+       (should (equal "high" (plist-get tcb :risk)))   ; public + callers + untested
+       (should (member "tc-a" (plist-get tcb :callers-sample)))
+       (should (member "tc-d" (plist-get tcb :callers-sample)))
+       (should (>= (plist-get res :total-impacted) 2))))))
+
+(ert-deftest anvil-defs-test-detect-changes-blast-depth ()
+  "Editing the leaf propagates up the chain at depth 2."
+  (anvil-defs-test--with-trace-fixture
+   (lambda (dir)
+     (let* ((file (expand-file-name "tc.el" dir))
+            (res (anvil-defs-detect-changes
+                  :changes (list (cons file (list (anvil-defs-test--range-of "tc-c"))))
+                  :depth 2))
+            (tcc (cl-find "tc-c" (plist-get res :changed)
+                          :key (lambda (c) (plist-get c :name)) :test #'equal)))
+       (should tcc)
+       ;; callers of tc-c within depth 2: tc-b (d1) + tc-a + tc-d (d2).
+       (should (>= (plist-get tcc :impacted) 3))
+       (should (>= (plist-get res :total-impacted) 3))))))
+
+(ert-deftest anvil-defs-test-detect-changes-no-def-in-range ()
+  "A change touching only the header comment maps to no symbol."
+  (anvil-defs-test--with-trace-fixture
+   (lambda (dir)
+     (let* ((file (expand-file-name "tc.el" dir))
+            (res (anvil-defs-detect-changes :changes (list (cons file '((1 . 1)))))))
+       (should (null (plist-get res :changed)))
+       (should (= 0 (plist-get res :total-impacted)))))))
+
+(ert-deftest anvil-defs-test-detect-changes-git ()
+  "End-to-end: a real `git diff' maps the edited body to its definition."
+  (skip-unless (executable-find "git"))
+  (let* ((dir (make-temp-file "anvil-defs-git-" t))
+         (file (expand-file-name "tc.el" dir))
+         (db (expand-file-name "anvil-defs.db" dir))
+         (anvil-defs-index-db-path db)
+         (anvil-defs-paths (list dir))
+         (anvil-defs--db nil)
+         (anvil-defs--backend nil)
+         (default-directory (file-name-as-directory dir))
+         (process-environment
+          (append '("GIT_AUTHOR_NAME=t" "GIT_AUTHOR_EMAIL=t@t"
+                    "GIT_COMMITTER_NAME=t" "GIT_COMMITTER_EMAIL=t@t")
+                  process-environment)))
+    (unwind-protect
+        (progn
+          (with-temp-file file (insert anvil-defs-test--trace-fixture))
+          (call-process "git" nil nil nil "init" "-q")
+          (call-process "git" nil nil nil "add" "tc.el")
+          (call-process "git" nil nil nil "commit" "-q" "-m" "init")
+          (anvil-defs-index-rebuild (list dir))
+          ;; Edit tc-b's body, then bump mtime so refresh re-ingests.
+          (with-temp-buffer
+            (insert-file-contents file)
+            (goto-char (point-min))
+            (re-search-forward "(tc-c)")
+            (replace-match "(tc-c) (ignore 1)")
+            (write-region (point-min) (point-max) file nil 'silent))
+          (set-file-times file (time-add (current-time) 5))
+          (let ((names (mapcar (lambda (c) (plist-get c :name))
+                               (plist-get (anvil-defs-detect-changes
+                                           :repo dir :rev "HEAD")
+                                          :changed))))
+            (should (member "tc-b" names))))
+      (when anvil-defs--db
+        (anvil-defs--close anvil-defs--db)
+        (setq anvil-defs--db nil))
+      (when (file-directory-p dir) (delete-directory dir t)))))
+
+
 (provide 'anvil-defs-test)
 ;;; anvil-defs-test.el ends here

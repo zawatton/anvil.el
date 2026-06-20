@@ -170,7 +170,7 @@ Phase A / B / C の 3 段、Phase A は単独 ship 可能。
 
 | #  | Doc                                                          | 依存       | 想定工数 | 判定                | 状態  |
 |----+--------------------------------------------------------------+------------+----------+---------------------+-------|
-| 57 | [[file:57-codebase-graph.org][Codebase Call-Graph Index]]    | 11, 21     | 中       | 部分採用◎ (最有力)  | Ph1 実装済 (未commit) |
+| 57 | [[file:57-codebase-graph.org][Codebase Call-Graph Index]]    | 11, 21     | 中       | 部分採用◎ (最有力)  | Ph1+2 実装済 |
 | 58 | [[file:58-llm-wiki.org][LLM Wiki — KB Synthesis + Lint]]   | 29, 02, 18 | 小-中    | 部分採用○           | DRAFT |
 | 59 | [[file:59-office-cli.org][Office Document Tools (OfficeCLI)]] | 03, 07     | 中       | 条件付き (PILOT gate) | DRAFT |
 | 60 | [[file:60-orchestrator-gates.org][Orchestrator Gates]]       | 10, 19, 23 | 小       | コード見送り / 概念2点 | DRAFT |
