@@ -1,0 +1,268 @@
+#+title: anvil-wl — Structured MCP tools over a synced Maildir (Wanderlust)
+#+date: 2026-06-20
+#+author: zawatton
+#+property: status P0-P3-IMPLEMENTED
+#+property: scope GENERIC
+
+* STATUS
+
+~P0–P3 IMPLEMENTED~ (2026-06-20, =feat/anvil-wl=).
+
+Delivered (opt-in module; add =wl= to =anvil-optional-modules=):
+
+- *P0 — substrate probe.*  Validated that the heavy mail-sync work can run
+  in a process *separate* from the interactive Emacs.  Surfaced that the
+  pure-NeLisp runtime still lacks the subprocess I/O needed to host the
+  engine (tracked as the NeLisp follow-up), so the engine targets host
+  =emacs --batch= today while staying NeLisp-portable by construction.
+- *P1 — IMAP→Maildir sync engine* (=anvil-wl-imap.el= + =anvil-wl-maildir.el=
+  + =anvil-wl-sync.el=): a substrate-agnostic IMAP client over an =openssl
+  s_client= TLS tunnel, UID-based incremental fetch, atomic =tmp/→new/=
+  Maildir delivery.  Runs out-of-process so syncing never freezes the editor.
+- *P2 — Wanderlust wiring + periodic sync*: the synced Maildir is a normal
+  Wanderlust folder; a 5-minute timer drives incremental sync.
+- *P3 — anvil integration* (=anvil-wl.el=, =:read-only= except compose):
+  =wl-search=, =wl-list-mails=, =wl-read-mail=, =wl-compose-draft=.  Reads the
+  local Maildir directly and decodes RFC2047 headers + MIME bodies with FLIM
+  (=eword-decode=), so *CJK subjects and bodies come out correct* — unlike
+  mu4e's Xapian index, which cannot tokenize CJK on common builds.
+
+Tests: =tests/anvil-wl-test.el= — 16 ERT.  Fixtures are built
+programmatically into a throwaway Maildir (no network, no real mail).
+CJK decode/encode tests =skip-unless= FLIM's =eword-decode-string= /
+=eword-encode-string= are present, so the suite still runs (degraded) on a
+minimal image without FLIM.  With FLIM: 16/16.  Clean =-Q= batch (no FLIM):
+13 passed, 3 skipped, 0 unexpected.  Byte-compile clean.
+
+Validated against a *real ~200-message Maildir* (=~/Mail-wl=): =請求= → 6
+hits, =の= → 115+ hits, Japanese body decode, CJK subject draft — all green.
+A match-data clobber in =anvil-wl--parse-ct= (an instance of the
+=string-match=-clobbers-=match-data= gotcha — =string-trim= called between two
+=match-string= reads) was found and fixed.
+
+*Known limitation:* read/search/compose are decode-only and never touch the
+network.  Live *send* (=P4=) is not implemented yet; =wl-compose-draft= only
+writes a draft into the Maildir.  The sync engine's live SMTP/IMAP paths are
+environment-dependent and intentionally NOT exercised by CI.
+
+Module placement: =anvil-optional-modules= (opt-in).  The loader maps the
+symbol =wl= to =anvil-wl.el= by convention (=require 'anvil-wl= then
+=anvil-wl-enable=), so no central registration is needed.
+
+* Motivation
+
+anvil already ships =anvil-mu4e= (Doc 53) for agents that drive a mu4e +
+=mu= setup.  Two gaps motivate a parallel Wanderlust/Maildir path:
+
+1. *CJK search actually works.*  mu's Xapian index cannot tokenize CJK on
+   common builds (=mu find 請求書= returns 0 even with =XAPIAN_CJK_NGRAM=1=).
+   anvil-wl sidesteps the index entirely: it scans the Maildir and decodes
+   each candidate's headers/body with FLIM before matching, so a bare CJK
+   substring (=請求=) matches the way a human reader expects.
+
+2. *No dependence on a mail UI session or its async server.*  The agent-facing
+   tools only *read local files*; fetching is done by a separate sync
+   process.  Nothing in the request path blocks on network or on anvil's
+   single-thread / =accept-process-output=-does-not-yield constraint.
+
+The user runs Wanderlust with an IMAP account; this module makes that mailbox
+agent-addressable with correct Japanese handling.
+
+* Design principle: out-of-process sync + decode-at-read (Strategy B)
+
+Two independent halves with a Maildir as the contract between them:
+
+** The sync engine runs out-of-process
+
+=anvil-wl-sync.el= is designed to run under host =emacs --batch= (and, later,
+pure NeLisp) — *not* inside the interactive daemon.  IMAP fetch is I/O-bound
+and bursty; running it in the daemon would stall =emacsclient= during the
+non-yielding stretches.  Out-of-process, the daemon only ever reads finished
+files.
+
+To keep the engine portable to a future NeLisp runtime it uses *only*
+standard process primitives — =make-process= / =process-send-string= /
+=accept-process-output= (via =:filter=) — and *no* =make-network-process=, no
+gnutls, no coding-system machinery.  TLS is delegated to a generic external
+tunnel (=openssl s_client -crlf=), so the mail logic stays pure Elisp and the
+transport owns the line terminator.  Bytes are read in binary so IMAP ={N}=
+literal byte-counts are exact and bodies reach the Maildir unmangled.
+
+** Read/search decode CJK at read time (FLIM)
+
+The agent-facing tools (=anvil-wl.el=) read the Maildir directly
+(=insert-file-contents-literally=, binary) and decode on demand: RFC2047
+headers via =eword-decode-string=, MIME bodies via charset +
+transfer-encoding decode (base64 / quoted-printable), multipart split with
+text/plain preferred, HTML stripped as a fallback.  Decoding *before*
+matching is what makes CJK search correct.
+
+** Maildir is the contract
+
+The engine writes; the tools (and Wanderlust) read.  Sync state
+(=UIDVALIDITY= + highest UID seen) is persisted next to the Maildir in
+=.anvil-wl-state-<folder>.epl=, so incremental fetch resumes cleanly and a
+server-side =UIDVALIDITY= change forces a clean re-sync.
+
+* Architecture (files)
+
+#+begin_example
+anvil-wl.el          daemon-side MCP tools (read/search/compose); FLIM decode
+anvil-wl-imap.el     pure-Elisp IMAP client over an openssl s_client tunnel
+anvil-wl-maildir.el  atomic tmp/->new/ Maildir delivery (binary writes)
+anvil-wl-sync.el     UID-based incremental sync driver (batch process)
+tests/anvil-wl-test.el  16 ERT (CJK tests skip-unless FLIM)
+#+end_example
+
+Note: =anvil-wl.el= deliberately does *not* =require= the engine trio — the
+daemon never loads the IMAP/sync code, only the local-read tools.  The engine
+is loaded by the separate sync process.
+
+* Tools
+
+** P3 — read & search & compose (implemented)
+
+- =wl-search= (=:read-only=) — substring search over decoded
+  subject/from/to/cc and (by default) body; ALL terms must match.
+- =wl-list-mails= (=:read-only=) — newest-first listing of a folder.
+- =wl-read-mail= (=:read-only=) — one message: decoded headers + plain-text
+  body.
+- =wl-compose-draft= — assemble a message and save it as a Maildir draft.
+  *Never sends.*  RFC2047-encodes a non-ASCII subject; sets threading headers
+  on reply.
+
+** P4 — send (planned, gated, irreversible)
+
+A =wl-send= tool mirroring =anvil-mu4e='s triple gate (see "P4 safety model"):
+pure-Elisp SMTP (or msmtp pipe) behind =anvil-wl-allow-send= + recipient
+allowlist + =confirm=true=.  Not yet implemented.
+
+* Tool definitions (parameters)
+
+#+begin_example
+wl-search       query [max_results] [folder]
+wl-list-mails   [folder] [max_results]
+wl-read-mail    message_id [folder]
+wl-compose-draft to [cc] [subject] [body] [in_reply_to]
+#+end_example
+
+=message_id= is the Maildir base name returned by =wl-list-mails= /
+=wl-search= (the filename with its =:2,FLAGS= info section stripped).
+
+* Data shapes
+
+A message summary:
+
+#+begin_example
+{ "message_id": "<maildir-base>", "date": "...", "from": "...",
+  "to": "...", "cc": "...", "subject": "<decoded>", "flags": "S",
+  "folder": "INBOX", "file": "/abs/path" }
+#+end_example
+
+=wl-search= / =wl-list-mails= return =count=, =total= (or =matched=),
+=folder=, and a =messages= array of the above.  =wl-read-mail= adds
+=message_id_header=, =in_reply_to=, =references=, =body_plain=.
+=wl-compose-draft= returns =draft_id=, =message_id=, =from=, =to=, =cc=,
+=subject=, =in_reply_to=, =folder=, =saved=true=, =sent=false=.
+
+* P4 safety model (planned)
+
+When send lands it must be inert by default and require *all three*:
+
+1. =anvil-wl-allow-send= non-nil (master switch, default off);
+2. every recipient matching =anvil-wl-send-allowlist=;
+3. an explicit =confirm=true= argument on the call.
+
+Plus: audit each send, and guard the draft path against injection (only files
+under the drafts Maildir may be sent).  Same shape as =anvil-mu4e= so the two
+modules are predictable for an agent.
+
+* Configuration (defcustoms)
+
+#+begin_example
+anvil-wl-maildir-root    "~/Mail-wl"   root holding synced Maildir folders
+anvil-wl-inbox-folder    "INBOX"       default folder for listing/search
+anvil-wl-drafts-folder   "Drafts"      folder where drafts are written
+anvil-wl-max-results     50            default cap on returned messages
+anvil-wl-from            ""            default From: when composing
+anvil-wl-search-body     t             also match the decoded body in search
+anvil-wl-body-max-chars  100000        cap on body chars from wl-read-mail
+#+end_example
+
+Engine knobs (defvars in =anvil-wl-imap.el=): =anvil-wl-imap-openssl-program=,
+=anvil-wl-imap-default-timeout=.  =anvil-wl-sync-mailbox= takes =:host=
+=:port= =:user= =:password-file= =:root= =:mailbox= =:max=.
+
+* Error handling (LLM-facing)
+
+Tools error loudly with an actionable message (e.g. "no message %S in folder
+%s") so the agent can correct course rather than receive a silent empty
+result.  Decode failures degrade gracefully: a header that FLIM cannot decode
+is returned raw; an undecodable body part is skipped rather than aborting the
+read.
+
+* Testing strategy
+
+=tests/anvil-wl-test.el= builds a throwaway Maildir from in-Elisp fixtures
+(ASCII, CJK base64-subject + base64 body, multipart/alternative,
+quoted-printable) and shape-locks the JSON.  Coverage:
+
+- =anvil-wl--parse-ct= match-data regression (the clobber fix) + empty/boundary cases;
+- =wl-list-mails= structure + newest-first sort + =max_results=;
+- =wl-search= ASCII, ALL-terms semantics, and CJK (=skip-unless= FLIM);
+- =wl-read-mail= base64 CJK body, decoded CJK subject (=skip-unless= FLIM),
+  multipart prefers text/plain, quoted-printable, unknown-id errors;
+- =wl-compose-draft= writes-and-never-sends, CJK subject RFC2047-encoded
+  (=skip-unless= FLIM), threading headers.
+
+No test touches the network; compose tests assert =sent=false=.
+
+* Sync engine details
+
+- *Transport:* =openssl s_client -quiet -crlf -ign_eof -connect host:port=;
+  wait for the =* OK= greeting before issuing commands.
+- *Framing:* responses are scanned line-by-line honoring IMAP ={N}= literals,
+  so tag-like bytes inside a literal never false-match a completion.
+- *Incremental:* =SELECT= reports =UIDNEXT= / =UIDVALIDITY=; the driver
+  =UID SEARCH UID (last+1):*=, fetches each new UID with =BODY.PEEK[]=
+  (exact literal byte count), delivers, and persists the new high-water UID.
+  A =:max= cap seeds =last-uid= so a first bounded run grabs ~the newest N.
+
+* Primitive vs Convention
+
+Primitive (must be code): the IMAP wire protocol, literal-accurate byte
+reads, atomic Maildir delivery, RFC2047/MIME decode.  Convention (config):
+which folders to sync, the periodic-sync cadence, the send gates.  The engine
+exposes the primitive; init/defcustoms own the convention.
+
+* Dependencies & open questions
+
+- *FLIM* (=eword-decode= / =eword-encode=) for CJK headers.  Present in the
+  user's setup; CI lacks it, so CJK tests skip there.  Open: ship a non-FLIM
+  RFC2047 fallback so CJK headers decode without FLIM?
+- *openssl* for the TLS tunnel.  Open: a raw =make-network-process= + gnutls
+  transport for hosts without openssl (would set the terminator to CRLF
+  directly) — but that breaks NeLisp portability, so keep it optional.
+- *NeLisp subprocess I/O* — the blocker for running the same engine under
+  pure NeLisp (the original vision).
+
+* Order of work
+
+1. P0 substrate probe — DONE.
+2. P1 IMAP→Maildir sync engine — DONE.
+3. P2 Wanderlust wiring + periodic sync — DONE.
+4. P3 anvil read/search/compose tools + CJK decode — DONE (this branch).
+5. P4 SMTP send — pure Elisp + triple gate (allow-send / allowlist / confirm),
+   mirroring =anvil-mu4e=.
+6. Backfill — batched =FETCH= of mail older than the current newest-N window.
+7. NeLisp port — once NeLisp subprocess I/O lands, run the unchanged engine
+   on the pure-NeLisp runtime.
+
+* Relationship to other docs
+
+- *Doc 53* (=anvil-mu4e=) — the sibling mail module.  anvil-wl is the
+  Wanderlust/Maildir counterpart with FLIM-based CJK decode and an
+  out-of-process sync engine instead of the =mu= CLI.  P4 deliberately copies
+  Doc 53's send safety model.
+- NeLisp dual-target architecture — the engine's "standard process primitives
+  only" constraint exists so the same code can later run on NeLisp.
