@@ -687,5 +687,69 @@ function main() {
                              (anvil-defs-trace-path "tleaf" :direction 'callers :depth 1)))))))
 
 
+;;;; --- Phase 4: dead-code / caller-rank / import graph ------------------
+
+(ert-deftest anvil-defs-test-dead-code ()
+  "Unreferenced defuns are reported; referenced ones are not."
+  (anvil-defs-test--with-trace-fixture
+   (lambda (_dir)
+     (let ((names (anvil-defs-test--names (anvil-defs-dead-code))))
+       (should (member "tc-a" names))      ; nothing calls tc-a
+       (should (member "tc-d" names))      ; nothing calls tc-d
+       (should-not (member "tc-b" names))  ; called by tc-a / tc-d
+       (should-not (member "tc-c" names)))))) ; called by tc-b
+
+(ert-deftest anvil-defs-test-dead-code-name-pattern ()
+  "A name-pattern narrows dead-code to matching defs."
+  (anvil-defs-test--with-trace-fixture
+   (lambda (_dir)
+     (let ((names (anvil-defs-test--names
+                   (anvil-defs-dead-code :name-pattern "tc-a"))))
+       (should (member "tc-a" names))
+       (should-not (member "tc-d" names))))))
+
+(ert-deftest anvil-defs-test-callers-rank-desc ()
+  "Hotspot ranking puts the most-called def first."
+  (anvil-defs-test--with-trace-fixture
+   (lambda (_dir)
+     (let ((top (car (anvil-defs-callers-rank :order 'desc :limit 2))))
+       (should (equal "tc-b" (plist-get top :name)))   ; 2 callers
+       (should (= 2 (plist-get top :callers)))))))
+
+(ert-deftest anvil-defs-test-callers-rank-bounds ()
+  "min / max bound the in-degree window."
+  (anvil-defs-test--with-trace-fixture
+   (lambda (_dir)
+     (let ((min2 (anvil-defs-test--names (anvil-defs-callers-rank :min 2)))
+           (zero (anvil-defs-test--names (anvil-defs-callers-rank :max 0))))
+       (should (equal '("tc-b") min2))
+       (should (member "tc-a" zero))
+       (should (member "tc-d" zero))
+       (should-not (member "tc-b" zero))))))
+
+(ert-deftest anvil-defs-test-py-import-graph ()
+  "Python imports populate `requires' features for who-requires."
+  (anvil-defs-test--skip-unless-python)
+  (anvil-defs-test--with-src-fixture
+   "imp.py"
+   "import os\nimport sys as system\nfrom collections import OrderedDict\n"
+   '(python)
+   (lambda (_dir)
+     (should (= 1 (length (anvil-defs-who-requires "os"))))
+     (should (= 1 (length (anvil-defs-who-requires "collections")))))))
+
+(ert-deftest anvil-defs-test-js-import-graph ()
+  "JS import specifiers populate `requires' features for who-requires."
+  (anvil-defs-test--skip-unless-grammar 'javascript)
+  (anvil-defs-test--with-src-fixture
+   "imp.js"
+   "import fs from \"fs\";\nimport { join } from \"path\";\nimport \"./side\";\n"
+   '(javascript)
+   (lambda (_dir)
+     (should (= 1 (length (anvil-defs-who-requires "fs"))))
+     (should (= 1 (length (anvil-defs-who-requires "path"))))
+     (should (= 1 (length (anvil-defs-who-requires "./side")))))))
+
+
 (provide 'anvil-defs-test)
 ;;; anvil-defs-test.el ends here

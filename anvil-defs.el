@@ -593,18 +593,25 @@ Defs are function / method / class nodes; refs are call sites with
 `name' = callee and `context' = the enclosing def (caller), so the same
 `trace_path' / `detect_changes' queries span elisp and Python.  No
 type inference — cross-module same-named calls can produce false edges.
-Features are empty (require/provide is an elisp concept)."
+import / from-import module names become `requires' features, so
+`defs-who-requires' answers \"who imports module M\" for Python too."
   (require 'anvil-treesit-backend)
   (anvil-treesit-with-root-fn
    path 'python
    (lambda (root)
-     (let ((defs nil) (refs nil)
+     (let ((defs nil) (refs nil) (features nil)
            (fnq (anvil-treesit-compile-query
                  'python 'anvil-defs-py-fn "(function_definition) @x"))
            (clq (anvil-treesit-compile-query
                  'python 'anvil-defs-py-cls "(class_definition) @x"))
            (caq (anvil-treesit-compile-query
-                 'python 'anvil-defs-py-call "(call) @x")))
+                 'python 'anvil-defs-py-call "(call) @x"))
+           (impq (anvil-treesit-compile-query
+                  'python 'anvil-defs-py-import
+                  "[(import_statement name: (dotted_name) @m)
+                    (import_statement name: (aliased_import name: (dotted_name) @m))
+                    (import_from_statement module_name: (dotted_name) @m)
+                    (import_from_statement module_name: (relative_import) @m)]")))
        (dolist (cap (treesit-query-capture root fnq))
          (let* ((node (cdr cap))
                 (name (anvil-defs--ts-node-name node)))
@@ -636,7 +643,14 @@ Features are empty (require/provide is an elisp concept)."
                          :context (anvil-defs--py-enclosing-defun node)
                          :kind "call")
                    refs))))
-       (list :defs (nreverse defs) :refs (nreverse refs) :features nil)))))
+       ;; imports -> features (kind "requires"), so `defs-who-requires'
+       ;; answers "who imports module M" for Python too.
+       (dolist (cap (treesit-query-capture root impq))
+         (let ((m (treesit-node-text (cdr cap) t)))
+           (when (and m (not (string-empty-p m)))
+             (push (list :feature m :kind "requires") features))))
+       (list :defs (nreverse defs) :refs (nreverse refs)
+             :features (nreverse features))))))
 
 ;;;; --- javascript / typescript scanner (Doc 57 Phase 3 JS/TS) -----------
 
@@ -694,7 +708,8 @@ Defs: function declarations, named arrow / function-expression bindings
 with `name' = callee and `context' = the nearest named enclosing
 function — same shape as elisp / Python, so `trace_path' /
 `detect_changes' span all three.  Resolution is syntactic (no type
-inference); features are empty."
+inference); import specifiers become `requires' features (so
+`defs-who-requires' answers \"who imports module M\")."
   (require 'anvil-treesit-backend)
   (let ((lang (anvil-treesit-language-for-file path)))
     (unless lang
@@ -702,7 +717,7 @@ inference); features are empty."
     (anvil-treesit-with-root-fn
      path lang
      (lambda (root)
-       (let ((defs nil) (refs nil)
+       (let ((defs nil) (refs nil) (features nil)
              (fnq (anvil-treesit-compile-query
                    lang 'anvil-defs-ts-fn
                    "[(function_declaration) @x (generator_function_declaration) @x]"))
@@ -713,7 +728,10 @@ inference); features are empty."
              (dq (anvil-treesit-compile-query
                   lang 'anvil-defs-ts-decl "(variable_declarator) @x"))
              (caq (anvil-treesit-compile-query
-                   lang 'anvil-defs-ts-call "(call_expression) @x")))
+                   lang 'anvil-defs-ts-call "(call_expression) @x"))
+             (imq (anvil-treesit-compile-query
+                   lang 'anvil-defs-ts-import
+                   "(import_statement source: (string) @m)")))
          (cl-flet ((emit-def (node kind name)
                      (when (and name (not (string-empty-p name)))
                        (push (list :kind kind :name name
@@ -749,8 +767,19 @@ inference); features are empty."
                              :line (line-number-at-pos (treesit-node-start node))
                              :context (anvil-defs--ts-enclosing-defun node)
                              :kind "call")
-                       refs)))))
-         (list :defs (nreverse defs) :refs (nreverse refs) :features nil))))))
+                       refs))))
+           ;; import specifiers -> features (kind "requires"); the module
+           ;; string is stored with surrounding quotes stripped.
+           (dolist (cap (treesit-query-capture root imq))
+             (let* ((raw (treesit-node-text (cdr cap) t))
+                    (m (if (and (>= (length raw) 2)
+                                (memq (aref raw 0) '(?\" ?\' ?\`)))
+                           (substring raw 1 (1- (length raw)))
+                         raw)))
+               (when (and m (not (string-empty-p m)))
+                 (push (list :feature m :kind "requires") features)))))
+         (list :defs (nreverse defs) :refs (nreverse refs)
+               :features (nreverse features)))))))
 
 (defun anvil-defs--scan-file (path)
   "Dispatch PATH to the matching language scanner by extension.
@@ -1304,6 +1333,108 @@ each changed PLIST being (:name :kind :file :public :direct-callers
           :changed (nreverse changed)
           :total-impacted (hash-table-count impacted-set))))
 
+;;;; --- dead-code + caller-rank (Doc 57 Phase 4) -------------------------
+
+(defconst anvil-defs--callable-kinds
+  '("defun" "defmacro" "defsubst" "cl-defun" "cl-defmacro" "cl-defsubst"
+    "cl-defmethod" "cl-defgeneric" "define-minor-mode" "define-derived-mode"
+    "function" "method")
+  "Def kinds treated as callable for dead-code / caller-rank queries.")
+
+(defun anvil-defs--kinds-sql (kinds)
+  "Return (SQL-PLACEHOLDERS . PARAMS) for an `IN (...)' over KINDS.
+PARAMS is a fresh list so callers may `append' it without aliasing."
+  (cons (format "(%s)" (mapconcat (lambda (_) "?") kinds ","))
+        (copy-sequence kinds)))
+
+(defun anvil-defs-dead-code (&rest plist)
+  "Return callable definitions with no reference anywhere in the index.
+A def is reported when no `refs' row names it from *outside itself*
+(call / quote / value reference; the name token inside its own defining
+form is ignored) — nothing in the indexed tree uses it.  Use outside the
+indexed paths is invisible, so results are *candidates*, not proof:
+public API, entry points and dynamically dispatched names may appear
+\(filter with :name-pattern, e.g. \"%--%\" for elisp privates).
+
+PLIST keys:
+  :kind          List of def kinds (default `anvil-defs--callable-kinds').
+  :name-pattern  Optional SQL LIKE pattern on the def name.
+  :limit         Maximum rows, clamped 1..5000 (default 200).
+
+Returns plists (:name :kind :file :line :public), file/line order."
+  (let* ((db (anvil-defs--ensure-db))
+         (kinds (or (plist-get plist :kind) anvil-defs--callable-kinds))
+         (pattern (plist-get plist :name-pattern))
+         (limit (max 1 (min 5000 (or (plist-get plist :limit) 200))))
+         (kspec (anvil-defs--kinds-sql kinds))
+         (sql (format "SELECT d.kind, d.name, f.path, d.line
+                       FROM defs d JOIN file f ON d.file_id = f.id
+                       WHERE d.kind IN %s AND d.obsolete_p = 0%s
+                         AND NOT EXISTS (
+                           SELECT 1 FROM refs r
+                            WHERE r.name = d.name
+                              -- ignore the def's own name token inside its
+                              -- defining form (elisp records it as a symbol
+                              -- ref with context = the def itself).
+                              AND (r.context IS NULL OR r.context <> d.name))
+                       ORDER BY f.path, d.line
+                       LIMIT ?"
+                      (car kspec)
+                      (if pattern " AND d.name LIKE ?" "")))
+         (params (append (cdr kspec) (and pattern (list pattern)) (list limit))))
+    (mapcar (lambda (row)
+              (list :kind (nth 0 row) :name (nth 1 row)
+                    :file (nth 2 row) :line (nth 3 row)
+                    :public (not (string-match-p "--" (nth 1 row)))))
+            (anvil-defs--select db sql params))))
+
+(defun anvil-defs-callers-rank (&rest plist)
+  "Rank callable definitions by call in-degree (distinct callers).
+Use for hotspots (high in-degree) or under-used code (low).  In-degree
+counts distinct enclosing definitions that *call* the name (kind=call),
+matching `defs-trace-path' direction=callers.
+
+PLIST keys:
+  :min    Minimum caller count, inclusive (default 0).
+  :max    Maximum caller count, inclusive (default: no upper bound).
+  :kind   List of def kinds (default `anvil-defs--callable-kinds').
+  :order  `desc' (default, hotspots first) or `asc'.
+  :limit  Maximum rows, clamped 1..2000 (default 50).
+
+Returns plists (:name :kind :file :line :callers :public)."
+  (let* ((db (anvil-defs--ensure-db))
+         (kinds (or (plist-get plist :kind) anvil-defs--callable-kinds))
+         (minc (max 0 (or (plist-get plist :min) 0)))
+         (maxc (plist-get plist :max))
+         (order (if (eq (plist-get plist :order) 'asc) "ASC" "DESC"))
+         (limit (max 1 (min 2000 (or (plist-get plist :limit) 50))))
+         (kspec (anvil-defs--kinds-sql kinds))
+         ;; in-degree is per-name, so collapse multi-site defs to one row
+         ;; per symbol (GROUP BY name) — ranking is a per-symbol view.
+         (sql (format "SELECT MIN(kind) AS kind, name, MIN(path) AS path,
+                              MIN(line) AS line, callers FROM (
+                         SELECT d.kind AS kind, d.name AS name, f.path AS path,
+                                d.line AS line,
+                                (SELECT COUNT(DISTINCT r.context) FROM refs r
+                                  WHERE r.name = d.name AND r.kind = 'call'
+                                    AND r.context IS NOT NULL) AS callers
+                         FROM defs d JOIN file f ON d.file_id = f.id
+                         WHERE d.kind IN %s AND d.obsolete_p = 0)
+                       WHERE callers >= ?%s
+                       GROUP BY name
+                       ORDER BY callers %s, name
+                       LIMIT ?"
+                      (car kspec)
+                      (if maxc " AND callers <= ?" "")
+                      order))
+         (params (append (cdr kspec) (list minc) (and maxc (list maxc)) (list limit))))
+    (mapcar (lambda (row)
+              (list :kind (nth 0 row) :name (nth 1 row)
+                    :file (nth 2 row) :line (nth 3 row)
+                    :callers (nth 4 row)
+                    :public (not (string-match-p "--" (nth 1 row)))))
+            (anvil-defs--select db sql params))))
+
 (defun anvil-defs-index-status ()
   "Return (:db-path :files :defs :refs :features :schema-version)."
   (let* ((db (anvil-defs--ensure-db))
@@ -1421,6 +1552,48 @@ MCP Parameters:
            (list :depth (anvil-defs--coerce-int depth 1)
                  :limit (anvil-defs--coerce-int limit 100))))))
 
+(defun anvil-defs--tool-dead-code (&optional kind pattern limit)
+  "List callable defs with no reference anywhere in the index.
+
+MCP Parameters:
+  kind    - Optional comma-separated def kinds (default: callable kinds —
+            defun / cl-defun / defmacro / ... / function / method).
+  pattern - Optional SQL LIKE on the name, e.g. \"%--%\" for elisp privates.
+  limit   - Maximum rows (string or integer); default 200.
+
+Results are dead-code *candidates*: external / dynamic use is invisible."
+  (anvil-server-with-error-handling
+   (let ((k (and (stringp kind) (not (string-empty-p kind))
+                 (split-string kind "[ ,]+" t))))
+     (anvil-defs-dead-code
+      :kind k
+      :name-pattern (and (stringp pattern) (not (string-empty-p pattern)) pattern)
+      :limit (anvil-defs--coerce-int limit 200)))))
+
+(defun anvil-defs--tool-callers-rank (&optional min max kind order limit)
+  "Rank callable defs by call in-degree (hotspots / under-used code).
+
+MCP Parameters:
+  min   - Minimum caller count, inclusive (string or integer); default 0.
+  max   - Maximum caller count, inclusive; default unbounded.  Pass 0 with
+          a 0 max for dead-ish (use defs-dead-code for true zero-reference).
+  kind  - Optional comma-separated def kinds.
+  order - \"desc\" (default, hotspots first) or \"asc\".
+  limit - Maximum rows (string or integer); default 50."
+  (anvil-server-with-error-handling
+   (let ((k (and (stringp kind) (not (string-empty-p kind))
+                 (split-string kind "[ ,]+" t))))
+     (anvil-defs-callers-rank
+      :min (anvil-defs--coerce-int min 0)
+      :max (and (or (integerp max)
+                    (and (stringp max) (not (string-empty-p max))))
+                (anvil-defs--coerce-int max 0))
+      :kind k
+      :order (if (and (stringp order)
+                      (string= (downcase (string-trim order)) "asc"))
+                 'asc 'desc)
+      :limit (anvil-defs--coerce-int limit 50)))))
+
 (defun anvil-defs--tool-index-rebuild (&optional paths)
   "Rebuild the defs index.
 
@@ -1528,6 +1701,32 @@ call instead of reading the diff and chasing defs-references per symbol."
    :read-only t)
 
   (anvil-server-register-tool
+   #'anvil-defs--tool-dead-code
+   :id "defs-dead-code"
+   :intent '(elisp-read)
+   :layer 'core
+   :server-id anvil-defs--server-id
+   :description
+   "List callable definitions with zero references anywhere in the index
+\(dead-code candidates).  Filter with a name pattern (e.g. \"%--%\" for
+elisp private functions).  External / dynamic use is invisible, so treat
+hits as candidates — public API and entry points may surface."
+   :read-only t)
+
+  (anvil-server-register-tool
+   #'anvil-defs--tool-callers-rank
+   :id "defs-callers-rank"
+   :intent '(elisp-read)
+   :layer 'core
+   :server-id anvil-defs--server-id
+   :description
+   "Rank callable definitions by call in-degree (distinct callers).
+order=desc surfaces hotspots (most-called); min/max bound the count for
+\"used by >= N\" or low-use sweeps.  Complements defs-dead-code and
+defs-trace-path with a whole-index degree view."
+   :read-only t)
+
+  (anvil-server-register-tool
    #'anvil-defs--tool-index-rebuild
    :id "defs-index-rebuild"
    :intent '(elisp-read admin)
@@ -1556,6 +1755,8 @@ feature counts.  Fast."
                 "defs-who-requires"
                 "defs-trace-path"
                 "defs-detect-changes"
+                "defs-dead-code"
+                "defs-callers-rank"
                 "defs-index-rebuild"
                 "defs-index-status"))
     (anvil-server-unregister-tool id anvil-defs--server-id)))

@@ -1,7 +1,7 @@
 #+title: anvil-codegraph — Call-Graph Index (trace_path + blast-radius)
 #+date: 2026-06-20
 #+author: zawatton
-#+property: status PHASE-1-2-3-IMPLEMENTED
+#+property: status PHASE-1-4-IMPLEMENTED
 #+property: scope GENERIC
 
 * STATUS
@@ -195,9 +195,21 @@ refs に投入。caller は最寄り named function (無名 arrow は variable_d
 / pair から命名)、callee は bare / member 両対応。anvil-treesit-backend
 のみ依存。ERT 5 件、実 .ts で dogfood。残: Rust / Go 等は同パターンで追加可。
 
-** Phase 4 (optional) — dead-code 列挙 + degree フィルタ
-caller 数 0 の非 public シンボル列挙。Doc 16 (lint) に scanner として
-寄せる選択肢も検討。
+** Phase 4 — dead-code + degree-filter + import graph (実装済み 2026-06-21)
+3 点セットで実装:
+1. *dead-code* (=defs-dead-code=) — 自己参照を除外した「index 内で
+   どこからも参照されない callable 定義」列挙。=:name-pattern= で
+   =%--%= 等に絞れる。外部/動的使用は不可視なので *候補* 扱い。
+2. *degree-filter* (=defs-callers-rank=) — callable 定義を call in-degree
+   (distinct caller 数) でランク。=:min=/=:max=/=:order= で hotspot 抽出
+   や低使用 sweep。name で dedup (per-symbol view)。
+3. *Py/JS/TS import graph* — Python の import / from-import、JS/TS の
+   import specifier を =requires= feature として投入。=defs-who-requires=
+   が elisp の require/provide に加え「誰がモジュール M を import するか」を
+   多言語で答える。
+ERT 6 件 (defs suite 計 42 PASS)、byte-compile clean。実 anvil.el で
+dogfood — hotspot top (=anvil-server-with-error-handling= 249 callers 等)、
+private dead-code 71 件を検出。
 
 * Primitive vs Convention 分離
 本 doc は *GENERIC*。call-graph index は一般 Emacs+AI 開発者に汎用。
@@ -245,7 +257,20 @@ dual-target (Emacs / NeLisp) 化候補 (=portable 機能=)。
   defs + call-edge を同一 =defs=/=refs= に投入し trace/detect を多言語化。
   opt-in =anvil-defs-languages=、=scan-file= 拡張子 dispatch。ERT 31 PASS、
   実 .py で dogfood。
-- 2026-06-21: Phase 3 JS/TS サブフェーズ実装 (develop、未コミット)。
+- 2026-06-21: Phase 3 JS/TS サブフェーズ実装 (develop、cac6701)。
   JavaScript / TypeScript を同型追加 (arrow binding / member call 対応)。
   anvil-treesit-backend のみ依存。ERT 36 PASS、実 .ts で dogfood。
-  残: Phase 4 (dead-code、optional)、他言語 (Rust/Go) は同パターンで追加可。
+- 2026-06-21: Phase 4 実装 (develop、未コミット)。dead-code +
+  degree-filter (=defs-dead-code= / =defs-callers-rank=) + Py/JS/TS import
+  graph (scanner が import を =requires= feature 化)。dead-code は elisp が
+  defun フォーム内で自名を symbol 参照する罠を =context <> 自名= 除外で
+  解決。callers-rank は name dedup。ERT 42 PASS、実 anvil.el で dogfood。
+- 2026-06-21 (方針): *nelisp-emacs の tree-sitter/eglot 連携 + eglot/LSP に
+  よる CALLS 精度向上は将来へ棚上げ* (user 指示)。監査で anvil-treesit-backend
+  の subprocess(=nelisp 寄せ) backend が Doc 38 Phase G の stub
+  (=:not-implemented-yet=) と判明、土台未整備のため。nelisp-emacs が
+  ライブラリとして体系化された時点で再開。それまで builtin tree-sitter を
+  使い、anvil-ts / anvil-py は廃止しない。
+  *見送り群* (Cypher / Louvain clustering / embeddings / HTTP・IaC graph /
+  cross-repo) も user 希望あり、別フェーズ群として後続予定 (純 elisp 実現性 +
+  embeddings はローカル model のみ = content 非外部送出の制約遵守)。
