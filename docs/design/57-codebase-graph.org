@@ -1,7 +1,7 @@
 #+title: anvil-codegraph — Call-Graph Index (trace_path + blast-radius)
 #+date: 2026-06-20
 #+author: zawatton
-#+property: status PHASE-1-4-IMPLEMENTED
+#+property: status PHASE-1-5-IMPLEMENTED
 #+property: scope GENERIC
 
 * STATUS
@@ -78,6 +78,17 @@ bare =f()= と member =a.b()= (property) 両対応。ERT 5 件追加 (defs suite
 計 36 PASS、grammar guard は inline =skip-unless=)、実 =.ts= で dogfood。
 layering は anvil-treesit-backend のみ依存 (anvil-ts/anvil-py には未結合)。
 
+*Phase 4 実装済み (2026-06-21):* =defs-dead-code= (参照ゼロの callable、
+自己参照除外) + =defs-callers-rank= (call in-degree ランク、hotspot/低使用)
++ Py/JS/TS import graph (import を =requires= feature 化し =defs-who-requires=
+を多言語化)。
+
+*Phase 5 実装済み (2026-06-21):* 見送り群の最初の取り込み = clustering /
+architecture。純 elisp single-level Louvain を *ファイル単位* call graph に
+適用 (=defs-clusters= / =defs-architecture=)。symbol 単位は elisp で重すぎる
+ため file 単位に限定。同時に Phase 4 =callers-rank= の実 index ~597s 性能 bug
+を 1-pass 集計 JOIN で 289ms に修正。
+
 * Motivation
 
 codebase-memory-mcp の核心主張は「coding agent が repo を file
@@ -110,9 +121,11 @@ Claude が毎セッション「この関数を誰が呼ぶか」「この helper
 
 - *Cypher query engine* — read-only openCypher サブセットの再実装は
   ROI が低い。実用クエリは SQLite =WITH RECURSIVE= CTE で代替する。
-- *Louvain / community detection / architecture clustering* — グラフ
-  アルゴリズムは SQL で自然に書けず、外部ライブラリか C 実装が要る。
-  見送り (=get_architecture= 相当は提供しない)。
+- *Louvain / community detection / architecture clustering* —
+  /当初見送り → Phase 5 で実装/。純 elisp の single-level Louvain を
+  *ファイル単位*の call graph (数百ノード) に適用 (=defs-clusters= /
+  =defs-architecture=)。symbol 単位 (O(10k) ノード) は elisp で重すぎる
+  ため file 単位に限定。=get_architecture= 相当を提供する。
 - *埋め込みベース semantic similarity (=SIMILAR_TO=)* — nomic-embed
   を vendor する codebase-memory-mcp の方式は native binary 前提。
   semantic 検索は Doc 18 (RAG) の所掌、本 doc では扱わない。
@@ -211,6 +224,23 @@ ERT 6 件 (defs suite 計 42 PASS)、byte-compile clean。実 anvil.el で
 dogfood — hotspot top (=anvil-server-with-error-handling= 249 callers 等)、
 private dead-code 71 件を検出。
 
+** Phase 5 — clustering / architecture (実装済み 2026-06-21)
+見送り群の最初の取り込み。純 elisp の single-level Louvain を
+*ファイル単位の call graph* に適用し、モジュール/サブシステムを推定:
+1. =defs-clusters= — file 間 call で密結合なファイル群を community 化
+   (=:file-pattern= で範囲限定、=:min-size=)。:members は basename。
+2. =defs-architecture= — 総数 + hotspots (=callers-rank= 再利用) +
+   community 数 + 上位クラスタ を 1 コール。
+graph は =refs.file_id= (caller file) → callee def の file の cross-file
+edge を重み集計。symbol 単位 (14k ノード) は elisp Louvain で ~590s と
+重すぎたため *file 単位* (~500 ノード、graph 264ms + Louvain 321ms) に
+確定。Louvain は決定的 (sort 順 + strict-gain move)。
+*同時に Phase 4 の =callers-rank= 性能 bug 修正*: per-def 相関サブクエリが
+SQLite に full-scan され実 index で ~597s → in-degree を 1 pass 集計して
+LEFT JOIN する形に変更し *289ms* に。
+ERT 3 件 (defs suite 計 45 PASS)、実 anvil.el で dogfood (architecture
+608ms、74 communities、最大クラスタ 86 files)。
+
 * Primitive vs Convention 分離
 本 doc は *GENERIC*。call-graph index は一般 Emacs+AI 開発者に汎用。
 運用者固有慣習の食い込みなし。将来公開時はそのまま切り出し可能。
@@ -265,6 +295,13 @@ dual-target (Emacs / NeLisp) 化候補 (=portable 機能=)。
   graph (scanner が import を =requires= feature 化)。dead-code は elisp が
   defun フォーム内で自名を symbol 参照する罠を =context <> 自名= 除外で
   解決。callers-rank は name dedup。ERT 42 PASS、実 anvil.el で dogfood。
+- 2026-06-21: Phase 5 実装 (develop、未コミット)。見送り群の最初 =
+  clustering/architecture。純 elisp single-level Louvain を *file 単位*
+  call graph に適用 (=defs-clusters= / =defs-architecture=)。symbol 単位は
+  elisp で ~590s と重く file 単位 (~500 ノード、<1s) に確定。同時に Phase 4
+  =callers-rank= の per-def 相関サブクエリ full-scan bug (実 index ~597s) を
+  1-pass 集計 LEFT JOIN に修正 → 289ms。ERT 45 PASS、architecture 608ms で
+  dogfood (74 communities)。
 - 2026-06-21 (方針): *nelisp-emacs の tree-sitter/eglot 連携 + eglot/LSP に
   よる CALLS 精度向上は将来へ棚上げ* (user 指示)。監査で anvil-treesit-backend
   の subprocess(=nelisp 寄せ) backend が Doc 38 Phase G の stub

@@ -751,5 +751,75 @@ function main() {
      (should (= 1 (length (anvil-defs-who-requires "./side")))))))
 
 
+;;;; --- Phase 5: clustering / architecture -------------------------------
+
+(defun anvil-defs-test--with-cluster-fixture (fn)
+  "Index a temp 6-file fixture forming two file communities; call FN with dir.
+Files a1/a2/a3 call each other (triangle); b1/b2/b3 likewise; one bridge
+call fa1 -> fb1 (a1.el -> b1.el) joins them."
+  (let* ((dir (make-temp-file "anvil-defs-cl-" t))
+         (files '(("a1.el" . "(defun fa1 () (fa2) (fa3) (fb1))\n")
+                  ("a2.el" . "(defun fa2 () (fa1) (fa3))\n")
+                  ("a3.el" . "(defun fa3 () (fa1) (fa2))\n")
+                  ("b1.el" . "(defun fb1 () (fb2) (fb3))\n")
+                  ("b2.el" . "(defun fb2 () (fb1) (fb3))\n")
+                  ("b3.el" . "(defun fb3 () (fb1) (fb2))\n")))
+         (db (expand-file-name "anvil-defs.db" dir))
+         (anvil-defs-index-db-path db)
+         (anvil-defs-paths (list dir))
+         (anvil-defs--db nil)
+         (anvil-defs--backend nil))
+    (unwind-protect
+        (progn
+          (dolist (f files)
+            (with-temp-file (expand-file-name (car f) dir) (insert (cdr f))))
+          (anvil-defs-index-rebuild (list dir))
+          (funcall fn dir))
+      (when anvil-defs--db
+        (anvil-defs--close anvil-defs--db)
+        (setq anvil-defs--db nil))
+      (when (file-directory-p dir) (delete-directory dir t)))))
+
+(defun anvil-defs-test--cluster-of (clusters name)
+  "Return the cluster id whose members include NAME, or nil."
+  (catch 'hit
+    (dolist (cl clusters)
+      (when (member name (plist-get cl :members))
+        (throw 'hit (plist-get cl :id))))
+    nil))
+
+(ert-deftest anvil-defs-test-clusters-separates-communities ()
+  "Community detection splits the two triangles despite the bridge."
+  (anvil-defs-test--with-cluster-fixture
+   (lambda (_dir)
+     (let* ((clusters (anvil-defs-clusters :min-size 2))
+            (ca (anvil-defs-test--cluster-of clusters "a1.el"))
+            (ca2 (anvil-defs-test--cluster-of clusters "a2.el"))
+            (cb (anvil-defs-test--cluster-of clusters "b1.el")))
+       (should ca)
+       (should cb)
+       (should (equal ca ca2))          ; a1.el and a2.el cluster together
+       (should-not (equal ca cb))))))   ; a-side and b-side are distinct
+
+(ert-deftest anvil-defs-test-clusters-size ()
+  "Each detected cluster spans the three files of its triangle."
+  (anvil-defs-test--with-cluster-fixture
+   (lambda (_dir)
+     (let ((clusters (anvil-defs-clusters :min-size 2)))
+       (should (= 2 (length clusters)))
+       (dolist (cl clusters)
+         (should (= 3 (plist-get cl :size))))))))
+
+(ert-deftest anvil-defs-test-architecture-summary ()
+  "The architecture overview reports totals, hotspots and >=2 clusters."
+  (anvil-defs-test--with-cluster-fixture
+   (lambda (_dir)
+     (let ((arch (anvil-defs-architecture)))
+       (should (>= (plist-get (plist-get arch :totals) :defs) 6))
+       (should (>= (plist-get arch :cluster-count) 2))
+       (should (>= (length (plist-get arch :hotspots)) 1))
+       (should (>= (length (plist-get arch :clusters)) 2))))))
+
+
 (provide 'anvil-defs-test)
 ;;; anvil-defs-test.el ends here

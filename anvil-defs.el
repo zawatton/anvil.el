@@ -1409,19 +1409,25 @@ Returns plists (:name :kind :file :line :callers :public)."
          (order (if (eq (plist-get plist :order) 'asc) "ASC" "DESC"))
          (limit (max 1 (min 2000 (or (plist-get plist :limit) 50))))
          (kspec (anvil-defs--kinds-sql kinds))
-         ;; in-degree is per-name, so collapse multi-site defs to one row
-         ;; per symbol (GROUP BY name) — ranking is a per-symbol view.
-         (sql (format "SELECT MIN(kind) AS kind, name, MIN(path) AS path,
-                              MIN(line) AS line, callers FROM (
-                         SELECT d.kind AS kind, d.name AS name, f.path AS path,
-                                d.line AS line,
-                                (SELECT COUNT(DISTINCT r.context) FROM refs r
-                                  WHERE r.name = d.name AND r.kind = 'call'
-                                    AND r.context IS NOT NULL) AS callers
-                         FROM defs d JOIN file f ON d.file_id = f.id
-                         WHERE d.kind IN %s AND d.obsolete_p = 0)
+         ;; Pre-aggregate in-degree per callee name in ONE pass, then LEFT
+         ;; JOIN to defs — a correlated per-def subquery makes SQLite
+         ;; full-scan refs once per def (O(defs*refs); ~10 min on a large
+         ;; index).  GROUP BY d.name collapses multi-site defs (in-degree
+         ;; is per-name), the outer wrap applies the min/max window.
+         (sql (format "SELECT kind, name, path, line, callers FROM (
+                         SELECT MIN(d.kind) AS kind, d.name AS name,
+                                MIN(f.path) AS path, MIN(d.line) AS line,
+                                COALESCE(rc.callers, 0) AS callers
+                         FROM defs d
+                         JOIN file f ON d.file_id = f.id
+                         LEFT JOIN (SELECT name, COUNT(DISTINCT context) AS callers
+                                      FROM refs
+                                     WHERE kind = 'call' AND context IS NOT NULL
+                                     GROUP BY name) rc
+                           ON rc.name = d.name
+                         WHERE d.kind IN %s AND d.obsolete_p = 0
+                         GROUP BY d.name)
                        WHERE callers >= ?%s
-                       GROUP BY name
                        ORDER BY callers %s, name
                        LIMIT ?"
                       (car kspec)
@@ -1434,6 +1440,172 @@ Returns plists (:name :kind :file :line :callers :public)."
                     :callers (nth 4 row)
                     :public (not (string-match-p "--" (nth 1 row)))))
             (anvil-defs--select db sql params))))
+
+;;;; --- clustering / architecture (Doc 57 Phase 5) -----------------------
+
+(defun anvil-defs--call-graph (db file-pattern)
+  "Build the inter-file call graph as undirected weighted adjacency.
+A node is a FILE path; edge A--B is weighted by the number of calls from
+a def in file A to a def in file B (the caller file is the ref's own
+file, the callee file is where its target is defined; intra-file calls
+are dropped).  Returns (:adj HASH :deg HASH :nodes LIST :m2 FLOAT) — ADJ
+maps node -> hash(neighbor -> weight), DEG node -> weighted degree, NODES
+the sorted file list, M2 twice the total edge weight.  Operating at file
+granularity keeps the graph small (hundreds of nodes) so single-level
+Louvain stays sub-second — symbol granularity is O(10k) nodes and far too
+slow in elisp.  With FILE-PATTERN both endpoint files must match."
+  (let* ((fclause (if file-pattern " AND cf.path LIKE ? AND nf.path LIKE ?" ""))
+         (sql (concat
+               "SELECT cf.path, nf.path, COUNT(*)
+                  FROM refs r
+                  JOIN file cf ON cf.id = r.file_id
+                  JOIN defs nd ON nd.name = r.name
+                  JOIN file nf ON nf.id = nd.file_id
+                 WHERE r.kind='call' AND r.context IS NOT NULL
+                   AND r.context <> r.name
+                   AND r.file_id <> nd.file_id"
+               fclause
+               " GROUP BY cf.path, nf.path"))
+         (params (and file-pattern (list file-pattern file-pattern)))
+         (rows (anvil-defs--select db sql params))
+         (adj (make-hash-table :test 'equal))
+         (deg (make-hash-table :test 'equal)))
+    (cl-flet ((edge (a b w)
+                (let ((h (or (gethash a adj)
+                             (puthash a (make-hash-table :test 'equal) adj))))
+                  (puthash b (+ (or (gethash b h) 0) w) h))
+                (puthash a (+ (or (gethash a deg) 0) w) deg)))
+      (dolist (row rows)
+        (let ((a (nth 0 row)) (b (nth 1 row)) (w (nth 2 row)))
+          (edge a b w)
+          (edge b a w))))
+    (let (nodes (m2 0))
+      (maphash (lambda (k v) (push k nodes) (setq m2 (+ m2 v))) deg)
+      (list :adj adj :deg deg :nodes (sort nodes #'string<) :m2 (float m2)))))
+
+(defun anvil-defs--louvain (graph &optional max-pass)
+  "Single-level Louvain community detection on GRAPH (`anvil-defs--call-graph').
+Returns a hash node -> community-id (a representative node name).
+Deterministic: nodes are visited in sorted order and a node only moves
+on a *strictly* greater modularity gain (ties keep the current
+community), so the partition is reproducible and convergent."
+  (let* ((adj (plist-get graph :adj))
+         (deg (plist-get graph :deg))
+         (nodes (plist-get graph :nodes))
+         (m2 (plist-get graph :m2))
+         (comm (make-hash-table :test 'equal))
+         (ctot (make-hash-table :test 'equal))
+         (maxp (or max-pass 30)))
+    (when (> m2 0)
+      (dolist (n nodes)
+        (puthash n n comm)
+        (puthash n (gethash n deg) ctot))
+      (let ((pass 0) (moved t))
+        (while (and moved (< pass maxp))
+          (setq moved nil pass (1+ pass))
+          (dolist (n nodes)
+            (let* ((cn (gethash n comm))
+                   (kn (gethash n deg))
+                   (nbc (make-hash-table :test 'equal)))
+              (puthash cn (- (gethash cn ctot) kn) ctot)
+              (when (gethash n adj)
+                (maphash (lambda (nb w)
+                           (let ((c (gethash nb comm)))
+                             (when c
+                               (puthash c (+ (or (gethash c nbc) 0) w) nbc))))
+                         (gethash n adj)))
+              (let ((best-c cn)
+                    (best-gain (- (or (gethash cn nbc) 0)
+                                  (/ (* (gethash cn ctot) kn) m2))))
+                (maphash (lambda (c kin)
+                           (let ((gain (- kin (/ (* (gethash c ctot) kn) m2))))
+                             (when (> gain best-gain)
+                               (setq best-c c best-gain gain))))
+                         nbc)
+                (puthash n best-c comm)
+                (puthash best-c (+ (gethash best-c ctot) kn) ctot)
+                (unless (equal best-c cn) (setq moved t))))))))
+    comm))
+
+(defun anvil-defs--cluster-list (db file-pattern min-size)
+  "Return communities of the call graph as (ID . SORTED-MEMBERS) pairs,
+largest first.  Communities smaller than MIN-SIZE are dropped."
+  (let* ((comm (anvil-defs--louvain (anvil-defs--call-graph db file-pattern)))
+         (groups (make-hash-table :test 'equal))
+         clusters)
+    (maphash (lambda (n c) (push n (gethash c groups))) comm)
+    (maphash (lambda (c members)
+               (when (>= (length members) min-size)
+                 (push (cons c (sort members #'string<)) clusters)))
+             groups)
+    (sort clusters (lambda (a b)
+                     (let ((la (length (cdr a))) (lb (length (cdr b))))
+                       (if (= la lb) (string< (car a) (car b)) (> la lb)))))))
+
+(defun anvil-defs-clusters (&rest plist)
+  "Detect modules / subsystems via community detection on the inter-file
+call graph (single-level Louvain).  Files that call into each other
+densely cluster together — an approximate module map.  Only files with at
+least one cross-file call edge participate.
+
+PLIST keys:
+  :file-pattern  Optional SQL LIKE on file path to scope the graph.
+  :min-size      Drop clusters smaller than this many files (default 2).
+  :members       File basenames sampled per cluster (default 12).
+  :limit         Max clusters returned (default 50).
+
+Returns plists (:id :size :members), largest first; :id and :members are
+file basenames, :size is the file count."
+  (let* ((db (anvil-defs--ensure-db))
+         (min-size (or (plist-get plist :min-size) 2))
+         (members-n (or (plist-get plist :members) 12))
+         (limit (max 1 (min 5000 (or (plist-get plist :limit) 50))))
+         (clusters (anvil-defs--cluster-list
+                    db (plist-get plist :file-pattern) min-size)))
+    (mapcar (lambda (cl)
+              (let ((members (cdr cl)))
+                (list :id (file-name-nondirectory (car cl))
+                      :size (length members)
+                      :members (seq-take
+                                (mapcar #'file-name-nondirectory members)
+                                members-n))))
+            (seq-take clusters limit))))
+
+(defun anvil-defs-architecture (&rest plist)
+  "Return a one-call architecture overview of the indexed call graph.
+Combines index totals, the busiest symbols (hotspots, by call in-degree),
+the call-graph community count, and the largest clusters.
+
+PLIST keys:
+  :file-pattern  Optional SQL LIKE to scope clusters to a subtree.
+  :hotspots      Number of top hotspots (default 10).
+  :clusters      Number of top clusters detailed (default 10).
+
+Returns (:totals :hotspots :cluster-count :clusters)."
+  (let* ((db (anvil-defs--ensure-db))
+         (status (anvil-defs-index-status))
+         (hot-n (or (plist-get plist :hotspots) 10))
+         (clu-n (or (plist-get plist :clusters) 10))
+         (clusters (anvil-defs--cluster-list
+                    db (plist-get plist :file-pattern) 2)))
+    (list :totals (list :files (plist-get status :files)
+                        :defs (plist-get status :defs)
+                        :refs (plist-get status :refs)
+                        :features (plist-get status :features))
+          :cluster-count (length clusters)
+          :hotspots (mapcar (lambda (h)
+                              (list :name (plist-get h :name)
+                                    :callers (plist-get h :callers)))
+                            (anvil-defs-callers-rank :order 'desc :limit hot-n))
+          :clusters (mapcar (lambda (cl)
+                              (let ((members (cdr cl)))
+                                (list :id (file-name-nondirectory (car cl))
+                                      :size (length members)
+                                      :members (seq-take
+                                                (mapcar #'file-name-nondirectory
+                                                        members)
+                                                8))))
+                            (seq-take clusters clu-n)))))
 
 (defun anvil-defs-index-status ()
   "Return (:db-path :files :defs :refs :features :schema-version)."
@@ -1594,6 +1766,32 @@ MCP Parameters:
                  'asc 'desc)
       :limit (anvil-defs--coerce-int limit 50)))))
 
+(defun anvil-defs--tool-clusters (&optional pattern min_size limit)
+  "Detect modules / subsystems via call-graph community detection.
+
+MCP Parameters:
+  pattern  - Optional SQL LIKE on file path to scope the graph.
+  min_size - Drop clusters smaller than this (default 2).
+  limit    - Max clusters (string or integer); default 50."
+  (anvil-server-with-error-handling
+   (anvil-defs-clusters
+    :file-pattern (and (stringp pattern) (not (string-empty-p pattern)) pattern)
+    :min-size (anvil-defs--coerce-int min_size 2)
+    :limit (anvil-defs--coerce-int limit 50))))
+
+(defun anvil-defs--tool-architecture (&optional pattern hotspots clusters)
+  "One-call architecture overview: totals, hotspots, clusters.
+
+MCP Parameters:
+  pattern  - Optional SQL LIKE on file path to scope clusters.
+  hotspots - Top hotspots to include (string or integer); default 10.
+  clusters - Top clusters to detail (string or integer); default 10."
+  (anvil-server-with-error-handling
+   (anvil-defs-architecture
+    :file-pattern (and (stringp pattern) (not (string-empty-p pattern)) pattern)
+    :hotspots (anvil-defs--coerce-int hotspots 10)
+    :clusters (anvil-defs--coerce-int clusters 10))))
+
 (defun anvil-defs--tool-index-rebuild (&optional paths)
   "Rebuild the defs index.
 
@@ -1727,6 +1925,31 @@ defs-trace-path with a whole-index degree view."
    :read-only t)
 
   (anvil-server-register-tool
+   #'anvil-defs--tool-clusters
+   :id "defs-clusters"
+   :intent '(elisp-read)
+   :layer 'core
+   :server-id anvil-defs--server-id
+   :description
+   "Group files that call into each other densely into communities
+(single-level Louvain over the inter-file call graph) — an approximate
+module / subsystem map.  Each cluster reports its file count and a
+basename sample.  Scope with a file-path pattern."
+   :read-only t)
+
+  (anvil-server-register-tool
+   #'anvil-defs--tool-architecture
+   :id "defs-architecture"
+   :intent '(elisp-read)
+   :layer 'core
+   :server-id anvil-defs--server-id
+   :description
+   "One-call architecture overview of the indexed code: totals, the
+busiest symbols (call in-degree hotspots), the call-graph community
+count and the largest clusters.  A fast orient-yourself snapshot."
+   :read-only t)
+
+  (anvil-server-register-tool
    #'anvil-defs--tool-index-rebuild
    :id "defs-index-rebuild"
    :intent '(elisp-read admin)
@@ -1757,6 +1980,8 @@ feature counts.  Fast."
                 "defs-detect-changes"
                 "defs-dead-code"
                 "defs-callers-rank"
+                "defs-clusters"
+                "defs-architecture"
                 "defs-index-rebuild"
                 "defs-index-status"))
     (anvil-server-unregister-tool id anvil-defs--server-id)))
