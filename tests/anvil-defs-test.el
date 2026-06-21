@@ -821,5 +821,64 @@ call fa1 -> fb1 (a1.el -> b1.el) joins them."
        (should (>= (length (plist-get arch :clusters)) 2))))))
 
 
+;;;; --- graph-exclude (plumbing skip-set) + auto-roots ------------------
+
+(defvar anvil-defs-test--exclude-fixture
+  (concat "(defun when (x) x)\n"          ; self-defined core form (nelisp-like)
+          "(defun unless (x) x)\n"        ; self-defined, never called
+          "(defun sf-user () (when 1) (sf-helper))\n"
+          "(defun sf-helper () (when 2))\n"
+          "(defun sf-dead () 42)\n")      ; real unused def
+  "Fixture where core forms `when'/`unless' are redefined, as NeLisp does.")
+
+(ert-deftest anvil-defs-test-graph-exclude-callers-rank ()
+  "Self-defined plumbing (`when') is excluded from caller ranking."
+  (anvil-defs-test--with-src-fixture
+   "sf.el" anvil-defs-test--exclude-fixture '(elisp)
+   (lambda (_dir)
+     (let ((names (anvil-defs-test--names (anvil-defs-callers-rank :order 'desc))))
+       (should (member "sf-helper" names))
+       (should-not (member "when" names))))))   ; despite having the most callers
+
+(ert-deftest anvil-defs-test-graph-exclude-trace ()
+  "Plumbing callees are dropped from trace results."
+  (anvil-defs-test--with-src-fixture
+   "sf.el" anvil-defs-test--exclude-fixture '(elisp)
+   (lambda (_dir)
+     (let ((names (anvil-defs-test--names
+                   (anvil-defs-trace-path "sf-user" :direction 'callees :depth 1))))
+       (should (member "sf-helper" names))
+       (should-not (member "when" names))))))
+
+(ert-deftest anvil-defs-test-graph-exclude-dead-code ()
+  "Plumbing names are never flagged dead; real unused defs still are."
+  (anvil-defs-test--with-src-fixture
+   "sf.el" anvil-defs-test--exclude-fixture '(elisp)
+   (lambda (_dir)
+     (let ((names (anvil-defs-test--names (anvil-defs-dead-code))))
+       (should (member "sf-dead" names))
+       (should-not (member "unless" names))))))  ; excluded despite being unused
+
+(ert-deftest anvil-defs-test-auto-roots ()
+  "auto-roots returns the git repos directly under <project-root>/dev."
+  (let* ((base (make-temp-file "anvil-defs-auto-" t))
+         (default-directory (file-name-as-directory base)))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name ".git" base))
+          (dolist (r '("repo1" "repo2"))
+            (make-directory (expand-file-name (format "dev/%s/.git" r) base) t))
+          (make-directory (expand-file-name "dev/notgit" base) t) ; no .git -> skipped
+          (make-directory (expand-file-name "dev/repo1.wt-x/.git" base) t) ; backup name -> skipped
+          (let ((roots (mapcar (lambda (p)
+                                 (file-name-nondirectory (directory-file-name p)))
+                               (anvil-defs--auto-roots))))
+            (should (member "repo1" roots))
+            (should (member "repo2" roots))
+            (should-not (member "notgit" roots))
+            (should-not (member "repo1.wt-x" roots))))
+      (when (file-directory-p base) (delete-directory base t)))))
+
+
 (provide 'anvil-defs-test)
 ;;; anvil-defs-test.el ends here

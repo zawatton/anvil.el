@@ -302,6 +302,17 @@ dual-target (Emacs / NeLisp) 化候補 (=portable 機能=)。
   =callers-rank= の per-def 相関サブクエリ full-scan bug (実 index ~597s) を
   1-pass 集計 LEFT JOIN に修正 → 289ms。ERT 45 PASS、architecture 608ms で
   dogfood (74 communities)。
+- 2026-06-21: 実運用投入 (A) + 2 改良 (develop)。nelisp 開発で日常使用する
+  ため実 index を dev repo 群に投入。(1) *auto-derive*: =anvil-defs-paths=
+  nil 時に <project-root>/dev/ 下の実 git clone を自動採用 (worktree =
+  =.git= がファイル / backup・snapshot 名 =anvil-defs-auto-root-exclude= は
+  除外)。絶対パス不要で cross-PC portable、init 編集不要。(2) *skip-set*
+  =anvil-defs-graph-exclude-names=: nelisp が自前定義する core form
+  (defun/when/quote 等) を trace/callers-rank/clusters/dead-code から除外
+  (refs は不変)。(3) 既定 exclude に =/vendor/= 追加 (=/node_modules/= と
+  同種)。実 index = 8 repo / 1,232 files / 20,903 defs / 1.1M refs / 汚染 0
+  (26s)。hotspots は control 系除去後 plist-get/=/stringp 等の実 primitive
+  に (nelisp の移植優先度 signal として有用)。ERT 49 PASS。
 - 2026-06-21 (方針): *nelisp-emacs の tree-sitter/eglot 連携 + eglot/LSP に
   よる CALLS 精度向上は将来へ棚上げ* (user 指示)。監査で anvil-treesit-backend
   の subprocess(=nelisp 寄せ) backend が Doc 38 Phase G の stub

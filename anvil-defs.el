@@ -105,6 +105,7 @@ of `default-directory' via `anvil-sexp--project-root'."
   '("/\\.git/"
     "/\\.claude/"
     "/node_modules/"
+    "/vendor/"
     "/tests/fixtures/"
     "/worktrees/"
     "/\\.worktrees/"
@@ -127,6 +128,26 @@ Default is elisp-only so existing behavior is unchanged; add a language
 to index its call edges for `defs-trace-path' / `defs-detect-changes'.
 Non-elisp scanning needs a built-in tree-sitter with the matching grammar."
   :type '(set (const elisp) (const python) (const javascript) (const typescript))
+  :group 'anvil-defs)
+
+(defcustom anvil-defs-graph-exclude-names
+  '("if" "when" "unless" "cond" "and" "or" "not" "while" "progn" "prog1" "prog2"
+    "let" "let*" "letrec" "setq" "setq-default" "quote" "function" "lambda"
+    "catch" "unwind-protect" "condition-case" "save-excursion" "save-restriction"
+    "save-current-buffer" "with-current-buffer" "interactive" "declare"
+    "defun" "defmacro" "defvar" "defconst" "defsubst" "defcustom" "defgroup"
+    "defface" "define-minor-mode" "define-derived-mode" "cl-defun" "cl-defmacro"
+    "require" "provide" "dolist" "dotimes" "push" "pop" "pcase" "cl-loop"
+    "ignore" "ignore-errors" "list" "cons" "car" "cdr" "append" "nconc"
+    "nreverse" "eq" "eql" "equal" "null" "memq" "member" "funcall" "apply"
+    "mapcar" "mapc" "format" "message" "error" "user-error" "concat")
+  "Symbol names treated as language / stdlib plumbing in call-graph analytics.
+Excluded from `defs-trace-path', `defs-callers-rank', `defs-clusters' /
+`defs-architecture' and `defs-dead-code', so a self-hosted runtime that
+*defines* core forms (e.g. NeLisp defining `defun' / `when' / `quote')
+does not drown the graph in plumbing.  The `refs' table is untouched —
+`defs-references' still finds every mention.  Set to nil to disable."
+  :type '(repeat string)
   :group 'anvil-defs)
 
 (defconst anvil-defs-schema-version 1
@@ -315,13 +336,46 @@ Unknown language symbols are ignored; an empty set falls back to .el."
     (format "\\.\\(?:%s\\)\\'"
             (mapconcat #'regexp-quote (or exts '("el")) "\\|"))))
 
+(defcustom anvil-defs-auto-root-exclude
+  "\\(?:\\.wt-\\|\\.pre-\\|\\.bak\\|-backup\\|-bak\\|-old\\|-cut\\|-spike\\|-snapshot\\)"
+  "Regexp matched against dev-repo basenames in `anvil-defs--auto-roots'.
+Matching dirs (backups, experiment cuts, snapshots) are skipped so the
+auto-derived index is not polluted by duplicate trees.  Git worktrees are
+also dropped structurally — their `.git' is a file, not a directory."
+  :type 'regexp
+  :group 'anvil-defs)
+
+(defun anvil-defs--auto-roots ()
+  "Default index roots used when `anvil-defs-paths' is nil.
+If <project-root>/dev/ exists, return the real git clones directly under
+it — scoping the index to the active dev repos with no hardcoded absolute
+paths (portable across machines).  Skips git worktrees (their `.git' is a
+file) and dirs matching `anvil-defs-auto-root-exclude' (backups /
+snapshots), both of which are duplicate trees that pollute the graph.
+Falls back to the project root itself when there is no dev/ dir."
+  (require 'anvil-sexp)
+  (let* ((root (anvil-sexp--project-root))
+         (dev (and root (expand-file-name "dev" root))))
+    (or (and dev (file-directory-p dev)
+             (let (repos)
+               (dolist (d (directory-files dev t "\\`[^.]" t))
+                 (when (and (file-directory-p d)
+                            ;; a real clone keeps `.git' as a directory;
+                            ;; a worktree's `.git' is a gitdir-pointer file.
+                            (file-directory-p (expand-file-name ".git" d))
+                            (not (string-match-p anvil-defs-auto-root-exclude
+                                                 (file-name-nondirectory d))))
+                   (push d repos)))
+               (nreverse repos)))
+        (and root (list root)))))
+
 (defun anvil-defs--collect-files (&optional paths)
   "Return absolute source paths under PATHS (default `anvil-defs-paths').
-Extensions are those enabled by `anvil-defs-languages'.  Falls back to
-the nearest git ancestor of `default-directory' when both are unset."
+Extensions are those enabled by `anvil-defs-languages'.  When both PATHS
+and `anvil-defs-paths' are nil, falls back to `anvil-defs--auto-roots'
+(the dev repos under the project root, else the project root)."
   (require 'anvil-sexp)
-  (let* ((roots (or paths anvil-defs-paths
-                    (list (anvil-sexp--project-root))))
+  (let* ((roots (or paths anvil-defs-paths (anvil-defs--auto-roots)))
          (regexp (anvil-defs--file-regexp))
          (acc nil))
     (dolist (root roots)
@@ -1162,6 +1216,7 @@ the node resolves to a definition in the index."
          (step-internal (if internal
                             (format " AND %s IN (SELECT name FROM defs)" step-col)
                           ""))
+         (xspec (anvil-defs--graph-exclude-sql "x.node"))
          (sql (format "WITH RECURSIVE trace(node, depth) AS (
   SELECT DISTINCT %s, 1 FROM refs
    WHERE %s = ? AND kind = 'call'%s%s
@@ -1174,12 +1229,13 @@ SELECT x.node, x.d,
        (SELECT COUNT(*) FROM defs d WHERE d.name = x.node)
   FROM (SELECT node, MIN(depth) AS d FROM trace
          WHERE node IS NOT NULL GROUP BY node) x
- WHERE x.node <> ?
+ WHERE x.node <> ?%s
  ORDER BY x.d, x.node
  LIMIT ?"
                       seed-col seed-key seed-notnull seed-internal
-                      step-col step-match step-notnull step-internal))
-         (params (list name depth name limit)))
+                      step-col step-match step-notnull step-internal
+                      (car xspec)))
+         (params (append (list name depth name) (cdr xspec) (list limit))))
     (mapcar (lambda (row)
               (list :name (nth 0 row)
                     :depth (nth 1 row)
@@ -1349,6 +1405,17 @@ PARAMS is a fresh list so callers may `append' it without aliasing."
   (cons (format "(%s)" (mapconcat (lambda (_) "?") kinds ","))
         (copy-sequence kinds)))
 
+(defun anvil-defs--graph-exclude-sql (col)
+  "Return (SQL-FRAGMENT . PARAMS) excluding plumbing names on COL.
+COL is a SQL column/expression; the fragment is empty (and PARAMS nil)
+when `anvil-defs-graph-exclude-names' is nil.  PARAMS is a fresh list."
+  (if anvil-defs-graph-exclude-names
+      (cons (format " AND %s NOT IN (%s)" col
+                    (mapconcat (lambda (_) "?")
+                               anvil-defs-graph-exclude-names ","))
+            (copy-sequence anvil-defs-graph-exclude-names))
+    (cons "" nil)))
+
 (defun anvil-defs-dead-code (&rest plist)
   "Return callable definitions with no reference anywhere in the index.
 A def is reported when no `refs' row names it from *outside itself*
@@ -1369,9 +1436,10 @@ Returns plists (:name :kind :file :line :public), file/line order."
          (pattern (plist-get plist :name-pattern))
          (limit (max 1 (min 5000 (or (plist-get plist :limit) 200))))
          (kspec (anvil-defs--kinds-sql kinds))
+         (xspec (anvil-defs--graph-exclude-sql "d.name"))
          (sql (format "SELECT d.kind, d.name, f.path, d.line
                        FROM defs d JOIN file f ON d.file_id = f.id
-                       WHERE d.kind IN %s AND d.obsolete_p = 0%s
+                       WHERE d.kind IN %s AND d.obsolete_p = 0%s%s
                          AND NOT EXISTS (
                            SELECT 1 FROM refs r
                             WHERE r.name = d.name
@@ -1382,8 +1450,10 @@ Returns plists (:name :kind :file :line :public), file/line order."
                        ORDER BY f.path, d.line
                        LIMIT ?"
                       (car kspec)
-                      (if pattern " AND d.name LIKE ?" "")))
-         (params (append (cdr kspec) (and pattern (list pattern)) (list limit))))
+                      (if pattern " AND d.name LIKE ?" "")
+                      (car xspec)))
+         (params (append (cdr kspec) (and pattern (list pattern))
+                         (cdr xspec) (list limit))))
     (mapcar (lambda (row)
               (list :kind (nth 0 row) :name (nth 1 row)
                     :file (nth 2 row) :line (nth 3 row)
@@ -1411,6 +1481,7 @@ Returns plists (:name :kind :file :line :callers :public)."
          (order (if (eq (plist-get plist :order) 'asc) "ASC" "DESC"))
          (limit (max 1 (min 2000 (or (plist-get plist :limit) 50))))
          (kspec (anvil-defs--kinds-sql kinds))
+         (xspec (anvil-defs--graph-exclude-sql "d.name"))
          ;; Pre-aggregate in-degree per callee name in ONE pass, then LEFT
          ;; JOIN to defs — a correlated per-def subquery makes SQLite
          ;; full-scan refs once per def (O(defs*refs); ~10 min on a large
@@ -1427,15 +1498,17 @@ Returns plists (:name :kind :file :line :callers :public)."
                                      WHERE kind = 'call' AND context IS NOT NULL
                                      GROUP BY name) rc
                            ON rc.name = d.name
-                         WHERE d.kind IN %s AND d.obsolete_p = 0
+                         WHERE d.kind IN %s AND d.obsolete_p = 0%s
                          GROUP BY d.name)
                        WHERE callers >= ?%s
                        ORDER BY callers %s, name
                        LIMIT ?"
                       (car kspec)
+                      (car xspec)
                       (if maxc " AND callers <= ?" "")
                       order))
-         (params (append (cdr kspec) (list minc) (and maxc (list maxc)) (list limit))))
+         (params (append (cdr kspec) (cdr xspec)
+                         (list minc) (and maxc (list maxc)) (list limit))))
     (mapcar (lambda (row)
               (list :kind (nth 0 row) :name (nth 1 row)
                     :file (nth 2 row) :line (nth 3 row)
@@ -1457,6 +1530,8 @@ granularity keeps the graph small (hundreds of nodes) so single-level
 Louvain stays sub-second — symbol granularity is O(10k) nodes and far too
 slow in elisp.  With FILE-PATTERN both endpoint files must match."
   (let* ((fclause (if file-pattern " AND cf.path LIKE ? AND nf.path LIKE ?" ""))
+         (xname (anvil-defs--graph-exclude-sql "r.name"))
+         (xctx (anvil-defs--graph-exclude-sql "r.context"))
          (sql (concat
                "SELECT cf.path, nf.path, COUNT(*)
                   FROM refs r
@@ -1466,9 +1541,11 @@ slow in elisp.  With FILE-PATTERN both endpoint files must match."
                  WHERE r.kind='call' AND r.context IS NOT NULL
                    AND r.context <> r.name
                    AND r.file_id <> nd.file_id"
+               (car xname) (car xctx)
                fclause
                " GROUP BY cf.path, nf.path"))
-         (params (and file-pattern (list file-pattern file-pattern)))
+         (params (append (cdr xname) (cdr xctx)
+                         (and file-pattern (list file-pattern file-pattern))))
          (rows (anvil-defs--select db sql params))
          (adj (make-hash-table :test 'equal))
          (deg (make-hash-table :test 'equal)))
