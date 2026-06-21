@@ -107,8 +107,10 @@ of `default-directory' via `anvil-sexp--project-root'."
     "/node_modules/"
     "/tests/fixtures/"
     "/worktrees/"
+    "/\\.worktrees/"
     "/dist/"
     "/build/"
+    "/target/"
     "\\.elc\\'")
   "Regexps for files that should not be indexed."
   :type '(repeat regexp)
