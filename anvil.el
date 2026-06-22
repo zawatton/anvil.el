@@ -416,7 +416,25 @@ These are not loaded by default.  Available modules:
                 eval (Phase C), rationale auto-record (Phase D),
                 NeLisp execute path (Phase E), and ephemeral /
                 permanent promotion (Phase F) stay DRAFT until
-                Doc 35 reaches LOCKED."
+                Doc 35 reaches LOCKED.
+- `semantic'  — Local search over a configurable corpus of org / text
+                / code files, backed by built-in SQLite FTS5 (trigram
+                tokenizer for CJK substring matching).  Pure-Lisp and
+                fully local by default — content stays local; only the
+                caller reads excerpts.  Five MCP tools: `semantic-search'
+                (hybrid BM25 + lexical + optional embedding cosine, RRF),
+                `notes-lexical-search' (term-overlap + synonym expansion
+                for retrieve-then-read), `semantic-reindex',
+                `semantic-embed-index' and `semantic-status'.  Retrieval
+                unions an FTS5 MATCH pass (>=3-char terms; BM25-ranked)
+                with a LIKE-scan pass (2-char CJK compounds) so Japanese
+                recall is complete.  An opt-in vector layer
+                (`semantic-embed-index'; ollama-local by default,
+                gemini / openai opt-in cloud) adds true meaning-based
+                cosine via a `chunk_vec' table joined on `digest'.  Set
+                `anvil-semantic-roots' then run `semantic-reindex' once;
+                run `semantic-embed-index' to enable embeddings.  Doc 18;
+                requires Emacs 29+."
   :type '(repeat symbol)
   :group 'anvil)
 
