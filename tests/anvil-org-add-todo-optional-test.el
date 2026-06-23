@@ -94,5 +94,40 @@
       (should (string-match-p
                "\\*\\* TODO Child\n:PROPERTIES:\n:ID:" content)))))
 
+(ert-deftest anvil-org-add-todo-optional-test-position-first-prepends ()
+  "POSITION=\"first\" places the new heading before existing children."
+  (anvil-org-add-todo-optional-test--with-org
+      "* Parent\n:PROPERTIES:\n:ID: 33333333-aaaa-bbbb-cccc-000000000001\n:END:\n** Existing child\n"
+    (anvil-org--tool-add-todo
+     "New first" "TODO"
+     "org-id://33333333-aaaa-bbbb-cccc-000000000001"
+     nil nil nil "first")
+    (should (string-match-p
+             "\\*\\* TODO New first[^\n]*\n[^*]*\\*\\* Existing child"
+             (anvil-org-add-todo-optional-test--read path)))))
+
+(ert-deftest anvil-org-add-todo-optional-test-position-first-rejects-after-uri ()
+  "POSITION=\"first\" combined with after_uri is a validation error."
+  (anvil-org-add-todo-optional-test--with-org
+      "* Parent\n:PROPERTIES:\n:ID: 33333333-aaaa-bbbb-cccc-000000000002\n:END:\n** Sibling\n:PROPERTIES:\n:ID: 33333333-aaaa-bbbb-cccc-000000000003\n:END:\n"
+    (should-error
+     (anvil-org--tool-add-todo
+      "New" "TODO"
+      "org-id://33333333-aaaa-bbbb-cccc-000000000002"
+      nil
+      "org-id://33333333-aaaa-bbbb-cccc-000000000003"
+      nil "first"))))
+
+(ert-deftest anvil-org-add-todo-optional-test-position-omitted-defaults-to-last ()
+  "Omitting POSITION preserves the append-as-last-child default."
+  (anvil-org-add-todo-optional-test--with-org
+      "* Parent\n:PROPERTIES:\n:ID: 33333333-aaaa-bbbb-cccc-000000000004\n:END:\n** First\n** Middle\n"
+    (anvil-org--tool-add-todo
+     "Newcomer" "TODO"
+     "org-id://33333333-aaaa-bbbb-cccc-000000000004")
+    (should (string-match-p
+             "\\*\\* Middle\n[^*]*\\*\\* TODO Newcomer"
+             (anvil-org-add-todo-optional-test--read path)))))
+
 (provide 'anvil-org-add-todo-optional-test)
 ;;; anvil-org-add-todo-optional-test.el ends here
