@@ -1767,16 +1767,17 @@ the specific delegate they intend to call before invoking it."
        (boundp 'anvil-org-index--db)
        anvil-org-index--db))
 
-(defun anvil-org--try-index-read-by-id (uuid)
+(defun anvil-org--try-index-read-by-id (uuid &optional max-depth)
   "Try `anvil-org-index-read-by-id' for UUID; return the body or nil.
-A nil return means fall back to the org-element handler.
+A nil return means fall back to the org-element handler.  MAX-DEPTH,
+when a positive integer, caps the depth of included headings.
 
 Doc 38 Phase B4: :headline-only delegate — the index resolves
 ID→(file, line-range) without ever parsing the org tree."
   (when (and (anvil-org--index-available-p)
              (fboundp 'anvil-org-index-read-by-id))
     (condition-case _err
-        (anvil-org-index-read-by-id uuid)
+        (anvil-org-index-read-by-id uuid max-depth)
       (error nil))))
 
 (defun anvil-org--try-index-read-headline (file headline-path)
@@ -1831,15 +1832,106 @@ org-read-file tool to read entire files"))
       (let ((full-path (concat file "#" headline_path)))
         (anvil-org--handle-headline-resource `(("filename" . ,full-path))))))
 
-(defun anvil-org--tool-read-by-id (uuid)
+(defun anvil-org--try-index-read-by-id-with-children (uuid &optional max-depth)
+  "Try the with-children index variant; return a plist or nil on failure."
+  (when (and (anvil-org--index-available-p)
+             (fboundp 'anvil-org-index-read-by-id-with-children))
+    (condition-case _err
+        (anvil-org-index-read-by-id-with-children uuid max-depth)
+      (error nil))))
+
+
+(defun anvil-org--parse-max-depth (max_depth default)
+  "Parse a string MAX_DEPTH into an integer, falling back to DEFAULT.
+Returns nil (meaning: full subtree) for zero or negative values."
+  (let* ((s (and (stringp max_depth) (string-trim max_depth)))
+         (n (cond
+             ((null max_depth) default)
+             ((and s (string-empty-p s)) default)
+             ((stringp max_depth) (string-to-number max_depth))
+             ((integerp max_depth) max_depth)
+             (t default))))
+    (when (and (integerp n) (> n 0)) n)))
+
+
+(defun anvil-org--bounded-subtree-from-text (full-text max-depth)
+  "Truncate FULL-TEXT to the first MAX-DEPTH heading levels.
+Returns (BOUNDED-TEXT . CHILDREN-TITLES).  CHILDREN-TITLES are the
+titles of the target heading's immediate children, with trailing tag
+strings stripped."
+  (let ((children nil)
+        (target-level nil)
+        (cap-level (and max-depth (integerp max-depth) (> max-depth 0)
+                        max-depth)))
+    (with-temp-buffer
+      (insert full-text)
+      (goto-char (point-min))
+      (when (looking-at "^\\(\\*+\\) ")
+        (setq target-level (length (match-string 1))))
+      (forward-line 1)
+      (let ((cut-point nil))
+        (while (not (eobp))
+          (when (looking-at "^\\(\\*+\\) +\\(.*\\)$")
+            (let ((lv (length (match-string 1)))
+                  (title (match-string 2)))
+              (when (and target-level (= lv (1+ target-level)))
+                (push (replace-regexp-in-string
+                       "[ \t]+:[[:alnum:]_@:]+:[ \t]*$" "" title)
+                      children))
+              (when (and (not cut-point) cap-level target-level
+                         (> lv (+ target-level (1- cap-level))))
+                (setq cut-point (line-beginning-position)))))
+          (forward-line 1))
+        (cons (if cut-point
+                  (buffer-substring-no-properties (point-min) cut-point)
+                full-text)
+              (nreverse children))))))
+
+
+(defun anvil-org--format-read-by-id-result (body children max-depth truncated)
+  "Render BODY plus CHILDREN listing as the MCP tool's return text.
+MAX-DEPTH and TRUNCATED annotate the footer so the caller knows
+whether subtrees were cut off."
+  (let ((body-trimmed (or body ""))
+        (n (length children)))
+    (concat
+     body-trimmed
+     (unless (string-suffix-p "\n" body-trimmed) "\n")
+     "\n"
+     (format
+      "------ Child headlines (%d)%s ------\n"
+      n
+      (cond ((null max-depth) "")
+            (truncated (format ", max_depth=%d (subtrees truncated)" max-depth))
+            (t (format ", max_depth=%d" max-depth))))
+     (if (zerop n)
+         "(none)\n"
+       (mapconcat (lambda (title) (concat "- " title)) children "\n"))
+     (when (> n 0) "\n"))))
+
+
+(defun anvil-org--tool-read-by-id (uuid &optional max_depth)
   "Tool wrapper for Layer-3 Org ID reads.
-UUID is the UUID from a headline's ID property.  Accepts either the
-raw UUID or an `org://UUID' citation URI emitted by the
+UUID is the UUID from a headline's ID property.  Accepts either the raw
+UUID or an `org://UUID' citation URI emitted by the
 progressive-disclosure Layer-1 / Layer-2 tools.  The `org-id://UUID'
 form is the MCP resource URI and is not accepted here.
 
+MAX_DEPTH is an optional integer string capping the depth of headings
+included in the returned text, relative to the target heading.  \"1\"
+(the default) returns just the target heading and its body — no child
+subtrees.  \"2\" includes immediate children; \"3\" adds grandchildren;
+and so on.  Pass \"0\" or a negative number to request the full subtree.
+
+Regardless of MAX_DEPTH, the response always ends with a \"Child
+headlines\" listing that names the immediate children of the target
+heading so the caller knows which subtrees it could descend into next.
+
 MCP Parameters:
-  uuid - UUID (or org://UUID citation URI) from headline's ID property"
+  uuid - UUID (or org://UUID citation URI) from headline's ID property
+  max_depth - Optional integer string capping the included heading
+              depth, default \"1\".  Use \"0\" or a negative value for
+              the full subtree."
   (when-let* ((id-resource
                (and (stringp uuid)
                     (anvil-org--extract-uri-suffix
@@ -1847,12 +1939,26 @@ MCP Parameters:
     (anvil-org--tool-validation-error
      "Parameter uuid does not accept org-id:// resource URIs.  Use the raw UUID \"%s\" or the org:// citation URI \"org://%s\" instead"
      id-resource id-resource))
-  (let ((id (if (and (stringp uuid)
-                     (string-prefix-p "org://" uuid))
-                (substring uuid (length "org://"))
-              uuid)))
-    (or (anvil-org--try-index-read-by-id id)
-        (anvil-org--handle-id-resource `(("uuid" . ,id))))))
+  (let* ((id (if (and (stringp uuid)
+                      (string-prefix-p "org://" uuid))
+                 (substring uuid (length "org://"))
+               uuid))
+         (depth (anvil-org--parse-max-depth max_depth 1)))
+    (or
+     (when-let* ((plist (anvil-org--try-index-read-by-id-with-children
+                         id depth)))
+       (anvil-org--format-read-by-id-result
+        (plist-get plist :body)
+        (plist-get plist :children)
+        depth
+        (plist-get plist :truncated)))
+     (let* ((full (anvil-org--handle-id-resource `(("uuid" . ,id))))
+            (bc (anvil-org--bounded-subtree-from-text full depth))
+            (bounded (car bc))
+            (children (cdr bc))
+            (truncated (and depth (not (string= bounded full)))))
+       (anvil-org--format-read-by-id-result
+        bounded children depth truncated)))))
 
 (defun anvil-org-enable ()
   "Enable the anvil-org module."
@@ -2260,8 +2366,15 @@ be in anvil-org-allowed-files.
 Parameters:
   uuid - UUID (or org://UUID citation URI) from headline's ID
          property (string, required)
+  max_depth - Optional integer string capping the included heading
+              depth relative to the target heading.  \"1\" (default)
+              returns the heading and its body only; \"2\" adds
+              immediate children; \"0\" or negative returns the full
+              subtree.
 
-Returns: Plain text content of the headline and its subtree"
+Returns: Plain text content of the bounded subtree followed by a
+\"------ Child headlines (N) ------\" footer naming the immediate
+children, so the caller knows which subtrees to descend into next"
    :read-only t
    :server-id anvil-org--server-id)
 
