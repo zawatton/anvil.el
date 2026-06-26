@@ -1,20 +1,49 @@
 #+title: anvil-rag — Local Semantic Search over the Codebase
 #+date: 2026-04-19
 #+author: zawatton
-#+property: status DEFERRED
+#+property: status PARTIAL
 #+property: scope GENERIC
 
 * STATUS
   :PROPERTIES:
   :ID:       1ce1e487-24df-4388-8c2f-ace8928f4f0c
   :END:
-~DRAFT~ (2026-04-19) → ~DEFERRED~ (2026-04-22) — Implementation
-needs ollama install + nomic-embed-text model (~270 MB) + indexing
-pipeline + cosine-search hot path + filenotify watcher tie-in.
-Multi-day scope.  Existing keyword search (Grep, Doc 11 defs-search,
-Doc 02 org-index) already covers the queries the maintainer's
-own work surfaces; semantic-similarity gap is hypothetical, not
-observed.  Re-trigger criteria:
+~DRAFT~ (2026-04-19) → ~DEFERRED~ (2026-04-22) → ~PARTIAL~
+(2026-06-20, lexical core) → ~PARTIAL+EMBED~ (2026-06-20, opt-in
+embedding layer).
+
+*Lexical core shipped* (2026-06-20) as the optional ~semantic~
+module (~anvil-semantic.el~), replacing an earlier Python
+(~semantic.py~, Gemini/OpenAI embeddings) prototype.  It is a pure
+Emacs-Lisp retrieval engine over a configurable corpus of org /
+text / code files (~anvil-semantic-roots~), backed by the built-in
+SQLite *FTS5* index with the ~trigram~ tokenizer for CJK substring
+matching.  No Python, no embeddings, no cloud.  Tools:
+~semantic-search~ (FTS5 BM25 + lexical term-overlap, RRF-fused),
+~notes-lexical-search~ (term-overlap + caller synonym expansion for
+retrieve-then-read), ~semantic-reindex~, ~semantic-status~.
+
+Key implementation note: FTS5 trigram MATCH needs ≥3 characters, so
+retrieval *unions* an FTS5 MATCH pass (≥3-char terms; indexed,
+BM25-ranked) with a ~LIKE~-scan pass (2-char kanji compounds —
+整定/漏電/接地 — which trigram MATCH cannot reach), then ranks the
+merged candidate set in Lisp.  The root-prefix filter uses
+~instr(file, ?) = 1~ rather than ~LIKE~, because ~LIKE~/~GLOB~ do
+not match on FTS5 *UNINDEXED* columns (only ~=~ and ~instr~ do).
+
+The *embedding* layer (Option B) is now *shipped as an opt-in
+bolt-on* (2026-06-20): a ~chunk_vec~ table joins on the stored
+~digest~, built by the ~semantic-embed-index~ tool.  Provider
+~anvil-semantic-embed-provider~ defaults to *ollama* (local, zero
+egress); ~gemini~ / ~openai~ are opt-in cloud (API key via env or
+~<db-dir>/<provider>.key~).  Search fuses three signals — FTS5
+BM25, lexical overlap and embedding cosine — via RRF (modes:
+hybrid / semantic / lexical / vector).  With an empty ~chunk_vec~
+the engine is identical to the pure-FTS5 core, so the lexical
+substrate and the retrieve-then-read flow remain the default.
+Vectors are stored normalized as ~prin1~ float vectors in TEXT, so
+cosine is a plain Lisp dot product (no numpy / no f32 unpack).
+Original re-trigger criteria (now satisfied):
 
 1. The maintainer (or an external user) reports a concrete
    "find code that does X-ish" miss that grep / defs / org-index
