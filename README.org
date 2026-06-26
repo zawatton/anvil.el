@@ -39,6 +39,7 @@ v1.3.0 is focused on making Anvil useful beyond narrow file edits:
 | Area | What changed |
 |------+--------------|
 | Codebase graph | =anvil-defs= now indexes call edges for Elisp, Python, JavaScript, and TypeScript, traces caller/callee paths, detects blast radius from changed lines, and ranks architecture clusters. |
+| Semantic retrieval | =anvil-semantic= now lands on develop/master as a local-first FTS5 search module with optional vector embeddings through ollama-local by default, plus opt-in Gemini/OpenAI providers. |
 | Context compression | New =anvil-context= adds =context-compress= / =context-retrieve= / =context-stats= for JSON, diffs, logs, code excerpts, and prose. Raw text is stored by ccr-id so agents can recover exact context when needed. |
 | Mail workflows | =anvil-mu4e= and =anvil-wl= expose structured read/search/compose/send surfaces over local mail stores. The WL path is Maildir-first and CJK-friendly; sends are gated. |
 | CAD workflows | =anvil-cad= reads and edits ASCII DXF/SVG through a shared entity IR, with outline, extract, annotate, batch-update, and generate tools. |
@@ -282,6 +283,7 @@ sister package).  Highlights:
 | =anvil-memory-bridge= (2026-05) | Local JSON bridge in front of =anvil-memory= and =anvil-worklog=.  Adds read/write memory endpoints, event stream, read-replica pull, worklog search/list/get endpoints, configured-origin CORS, a side-load browser extension for Claude.ai / ChatGPT / Gemini, and a static mobile thin client with offline save queue |
 | =anvil-autoresearch= (2026-05) | Safe self-improvement primitives: scan local Web/X/YouTube/design notes for implementation candidates, rank weak MCP docstrings, propose / harvest / apply descriptions behind eval+holdout gates, route provider-mapping experiments through the orchestrator, scaffold NeLisp Phase 47 codegen tasks, and watch progress in a tabulated-list dashboard |
 | =anvil-defs= codebase graph (v1.3.0) | SQLite-backed definitions, references, call graph, change detection, trace path, callers/callees ranking, dead-code hints, and architecture clustering across Elisp / Python / JS / TS projects |
+| =anvil-semantic= (v1.3.0) | Local-first semantic retrieval over org/text/code.  FTS5 + CJK LIKE fallback stay fully local; optional =semantic-embed-index= adds cosine retrieval using ollama-local by default or opt-in Gemini/OpenAI providers |
 | =anvil-context= (v1.3.0) | Headroom-inspired reversible context compression.  Compress JSON / diff / log / code / prose before handing it back to the model; retrieve raw context later by =ccr-id= when exact wording matters |
 | =anvil-mu4e= / =anvil-wl= (v1.3.0) | Structured mail tools for local mu4e and Wanderlust/Maildir workflows.  Read/search/compose surfaces are structured; send tools are gated so agent-driven mail cannot transmit silently |
 | =anvil-cad= (v1.3.0) | DXF/SVG outline, extract, annotate, batch-update, and generate tools through a format-agnostic entity IR |
@@ -691,6 +693,7 @@ budget goes to reasoning about your code, not re-reading it.
 | =wl= (v1.3.0) | Wanderlust/Maildir tools: local Maildir read/search/compose/draft/send, RFC2047/CJK decoding, gated SMTP send path (opt.) | FLIM/Wanderlust-style mail stack |
 | =cad= (v1.3.0) | ASCII DXF/SVG read/edit/generate through a shared entity IR (opt.) | — |
 | =fusion= / =fusion-longrun= (v1.3.0) | Agent-output comparison, panels, async collection, long-run result store, MCP review surfaces (opt.) | =orchestrator= |
+| =semantic= (v1.3.0) | Local corpus search over org/text/code using SQLite FTS5, CJK LIKE fallback, hybrid RRF scoring, and optional vector embeddings via ollama/Gemini/OpenAI (opt.) | Emacs 29+, =sqlite=, optional =http= |
 | =session= (v0.4.0) | Session snapshot / resume + 5 Claude Code lifecycle hooks (opt.) | =state= |
 | =discovery= (v0.4.0) | Intent-based MCP tool discovery (=anvil-tools-by-intent=) + per-tool usage counter (opt.) | =state= |
 | =manifest= (v0.4.0 + 2026-05) | Per-session =tools/list= filter driven by =ANVIL_PROFILE=; dynamic Tool Attention adds query ranking, state filtering, schema trimming, warm LRU, and recovery hints (opt.) | — |

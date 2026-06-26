@@ -85,6 +85,7 @@ context 圧縮まで扱える AI workbench に広げます。
 | 領域 | 何が増えたか |
 |------+--------------|
 | コードベースグラフ | =anvil-defs= が Elisp / Python / JavaScript / TypeScript の call edge を index し、caller/callee trace、変更行からの blast radius、architecture cluster を返せるようになりました。 |
+| semantic retrieval | =anvil-semantic= が develop/master に入り、FTS5 + CJK LIKE fallback の local-first 検索に加えて、既定は ollama-local、任意で Gemini/OpenAI の vector embedding を使えるようになりました。 |
 | context 圧縮 | 新規 =anvil-context= が =context-compress= / =context-retrieve= / =context-stats= を提供。JSON、diff、log、code 断片、prose を圧縮し、必要なら ccr-id から raw 原文を復元できます。 |
 | メール workflow | =anvil-mu4e= と =anvil-wl= が、ローカルメールストアに対する構造化 read/search/compose/send surface を提供します。WL 経路は Maildir-first で CJK に強く、送信は gate 付きです。 |
 | CAD workflow | =anvil-cad= が ASCII DXF/SVG を共通 entity IR で読み書きし、outline、extract、annotate、batch-update、generate を提供します。 |
@@ -197,6 +198,7 @@ Anvil の default install は *約 40 個の MCP ツール* を提供します (
 | =anvil-memory-bridge= (2026-05) | =anvil-memory= / =anvil-worklog= の前段に置く localhost JSON bridge。memory read/write endpoint、event stream、read-replica pull、worklog search/list/get、CORS、Claude.ai / ChatGPT / Gemini 用 browser extension、offline queue 付き mobile thin client を提供 |
 | =anvil-autoresearch= (2026-05) | 安全な自己改善 primitive。ローカルの Web/X/YouTube/design note から実装候補を scan、弱い MCP docstring を rank、eval+holdout gate 越しに提案・harvest・apply、provider routing 実験、NeLisp codegen task scaffold、tabulated-list dashboard を提供 |
 | =anvil-defs= codebase graph (v1.3.0) | SQLite-backed definitions / references / call graph / change detection / trace path / callers-callees ranking / dead-code hint / architecture clustering を Elisp / Python / JS / TS project に提供 |
+| =anvil-semantic= (v1.3.0) | org/text/code の local-first semantic retrieval。FTS5 + CJK LIKE fallback は完全 local、任意の =semantic-embed-index= で ollama-local 既定または Gemini/OpenAI opt-in の cosine retrieval を追加 |
 | =anvil-context= (v1.3.0) | Headroom 風の可逆 context 圧縮。JSON / diff / log / code / prose を model に戻す前に圧縮し、厳密な文面が必要な時は =ccr-id= から raw context を復元 |
 | =anvil-mu4e= / =anvil-wl= (v1.3.0) | local mu4e と Wanderlust/Maildir 向けの構造化 mail tools。read/search/compose surface を提供し、send tool は gate 付きで無音送信を防ぐ |
 | =anvil-cad= (v1.3.0) | DXF/SVG の outline、extract、annotate、batch-update、generate を共通 entity IR 経由で提供 |
@@ -523,6 +525,7 @@ Anvil を使うと:
 | =wl= (v1.3.0) | Wanderlust/Maildir tools。local Maildir read/search/compose/draft/send、RFC2047/CJK decode、gated SMTP send path（オプション） | FLIM/Wanderlust 系 mail stack |
 | =cad= (v1.3.0) | ASCII DXF/SVG を共通 entity IR で read/edit/generate（オプション） | — |
 | =fusion= / =fusion-longrun= (v1.3.0) | agent output 比較、panel、async collect、long-run result store、MCP review surface（オプション） | =orchestrator= |
+| =semantic= (v1.3.0) | org/text/code corpus の local search。SQLite FTS5、CJK LIKE fallback、hybrid RRF scoring、任意の ollama/Gemini/OpenAI vector embedding を提供（オプション） | Emacs 29+, =sqlite=, optional =http= |
 | =session= (v0.4.0) | セッション snapshot / resume + Claude Code lifecycle hook 5 本 | =state= |
 | =discovery= (v0.4.0) | Intent-based tool discovery (=anvil-tools-by-intent=) + tool 毎 usage counter | =state= |
 | =manifest= (v0.4.0 + 2026-05) | =ANVIL_PROFILE= によるセッション別 =tools/list= フィルタ。dynamic Tool Attention で query ranking、state filtering、schema trimming、warm LRU、recovery hint を追加（オプション） | — |

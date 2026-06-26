@@ -18,6 +18,10 @@ read/edit tools, and long-running agent-output evaluation.
   TypeScript.  Adds trace-path, change blast-radius, caller/callee
   ranking, dead-code hints, file-level clustering, architecture summaries,
   and default exclusions for `.worktrees/` and `target/`.
+- **`anvil-semantic` (Doc 18)** — lands the local-first semantic search
+  module on develop/master.  Search combines SQLite FTS5, CJK LIKE
+  fallback, lexical overlap, and optional vector cosine retrieval.  The
+  embedding provider defaults to ollama-local, with Gemini/OpenAI opt-in.
 - **`anvil-context`** — Headroom-inspired reversible context compression
   for arbitrary JSON, diffs, logs, code excerpts, and prose.  Adds
   `context-compress`, `context-retrieve`, and `context-stats`; raw context
