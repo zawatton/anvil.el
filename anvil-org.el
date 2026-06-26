@@ -1030,6 +1030,12 @@ combining it with AFTER-URI is a validation error.
 Otherwise: if AFTER-URI is non-nil, positions after that sibling;
 if nil, positions at end of parent's subtree.
 Throws validation error if AFTER-URI is invalid or sibling not found."
+  (when (and position
+             (not (string-empty-p position))
+             (not (equal position "first")))
+    (anvil-org--tool-validation-error
+     "Field position must be \"first\" when provided: %s"
+     position))
   (when (and (equal position "first")
              after-uri
              (not (string-empty-p after-uri)))

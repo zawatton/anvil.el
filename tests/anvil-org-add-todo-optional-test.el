@@ -118,6 +118,16 @@
       "org-id://33333333-aaaa-bbbb-cccc-000000000003"
       nil "first"))))
 
+(ert-deftest anvil-org-add-todo-optional-test-position-rejects-unknown ()
+  "Unknown POSITION values are rejected instead of silently appending."
+  (anvil-org-add-todo-optional-test--with-org
+      "* Parent\n:PROPERTIES:\n:ID: 33333333-aaaa-bbbb-cccc-000000000005\n:END:\n"
+    (should-error
+     (anvil-org--tool-add-todo
+      "New" "TODO"
+      "org-id://33333333-aaaa-bbbb-cccc-000000000005"
+      nil nil nil "frist"))))
+
 (ert-deftest anvil-org-add-todo-optional-test-position-omitted-defaults-to-last ()
   "Omitting POSITION preserves the append-as-last-child default."
   (anvil-org-add-todo-optional-test--with-org

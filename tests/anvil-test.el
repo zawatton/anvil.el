@@ -410,7 +410,8 @@ MCP Parameters:
                (text (alist-get 'text
                                 (aref (alist-get 'content result) 0))))
           (should (eq t (alist-get 'isError result)))
-          (should (string-match-p "Quit: .*minibuffer-quit" text))))
+          (should (string-match-p "Interrupted (quit)" text))
+          (should (string-match-p "C-g" text))))
     (anvil-server-unregister-tool "anvil-test-tool-quit" "anvil-test")))
 
 (ert-deftest anvil-test-process-jsonrpc-catches-raw-quit ()
