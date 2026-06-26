@@ -25,6 +25,15 @@ SOCKET=""
 SERVER_ID=""
 EMACS_MCP_DEBUG_LOG=${EMACS_MCP_DEBUG_LOG:-""}
 
+# GNU base64 tolerates stray non-alphabet bytes with --ignore-garbage;
+# BSD/macOS base64 has no such flag.  Probe once at startup and pass
+# the flag only where supported.
+if printf 'Zg==' | base64 -d --ignore-garbage >/dev/null 2>&1; then
+	_anvil_b64_flags="--ignore-garbage"
+else
+	_anvil_b64_flags=""
+fi
+
 # Debug logging setup
 if [ -n "$EMACS_MCP_DEBUG_LOG" ]; then
 	# Verify log file is writable
@@ -90,7 +99,23 @@ anvil_emacsclient_retry() {
 	local attempt=0 out="" rc=0
 	while :; do
 		set +e
-		out=$(emacsclient "$@" 2>"$stderr_file")
+		# VAL-PATCH-TIMEOUT-V2: hard wall-clock cap on emacsclient.
+		# Default 330s (daemon's `with-timeout' is 300s — we sit
+		# slightly above so the daemon can return a richer error
+		# first when possible).  Set ANVIL_EMACSCLIENT_TIMEOUT=0
+		# to disable.  Prefer GNU timeout(1); fall back to perl
+		# alarm() since perl is universally pre-installed.
+		_anvil_tmo="${ANVIL_EMACSCLIENT_TIMEOUT:-330}"
+		if [ "$_anvil_tmo" = "0" ]; then
+			out=$(emacsclient "$@" 2>"$stderr_file")
+		elif command -v timeout >/dev/null 2>&1; then
+			out=$(timeout "$_anvil_tmo" emacsclient "$@" 2>"$stderr_file")
+		elif command -v perl >/dev/null 2>&1; then
+			out=$(perl -e 'alarm shift @ARGV; exec @ARGV' \
+				"$_anvil_tmo" emacsclient "$@" 2>"$stderr_file")
+		else
+			out=$(emacsclient "$@" 2>"$stderr_file")
+		fi
 		rc=$?
 		set -e
 		if [ "$rc" -eq 0 ]; then
@@ -375,7 +400,7 @@ while IFS= read -r line; do
 	# instead of silently killing the script under `set -e -o pipefail'.
 	_anvil_decode_err="/tmp/mcp-decode-err.$$-$(date +%s%N)"
 	set +e
-	formatted_response=$(printf '%s' "$base64_response" | base64 -d --ignore-garbage 2>"$_anvil_decode_err")
+	formatted_response=$(printf '%s' "$base64_response" | base64 -d $_anvil_b64_flags 2>"$_anvil_decode_err")
 	_anvil_decode_rc=$?
 	set -e
 	if [ "$_anvil_decode_rc" != 0 ]; then
@@ -393,6 +418,24 @@ while IFS= read -r line; do
 		else
 			# Legacy line-delimited output (dev / test mode).
 			echo "$formatted_response"
+		fi
+	else
+		# VAL-PATCH-ALWAYS-REPLY: empty daemon output for a
+		# request-with-id would otherwise hang the MCP client
+		# forever.  Synthesise a JSON-RPC error so the client
+		# can match the id and move on.  Notifications (no id)
+		# stay silent as the protocol expects.
+		_anvil_id_field=$(printf '%s' "$line" \
+			| sed -nE 's/.*"id"[[:space:]]*:[[:space:]]*([0-9]+|"[^"]*"|null).*/\1/p' \
+			| head -1)
+		if [ -n "$_anvil_id_field" ] && [ "$_anvil_id_field" != "null" ]; then
+			_anvil_synth=$(printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"Bridge synthetic error: daemon returned empty response (emacsclient rc=%s)"}}' "$_anvil_id_field" "${_anvil_client_rc:-?}")
+			mcp_debug_log "SYNTH-ERROR" "id=$_anvil_id_field rc=${_anvil_client_rc:-?}"
+			if [ "$_anvil_framed" = "1" ]; then
+				anvil_mcp_emit_framed_response "$_anvil_synth"
+			else
+				echo "$_anvil_synth"
+			fi
 		fi
 	fi
 done
