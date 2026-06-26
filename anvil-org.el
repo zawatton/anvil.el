@@ -1019,14 +1019,24 @@ Assumes point is in an Org buffer."
         (forward-line)))
     nil))
 
-(defun anvil-org--position-for-new-child (after-uri parent-end)
+(defun anvil-org--position-for-new-child (after-uri parent-end &optional position)
   "Position point for inserting a new child under current heading.
 AFTER-URI is an optional org-id:// URI of a sibling to insert after.
 PARENT-END is the end position of the parent's subtree.
 Assumes point is at parent heading.
-If AFTER-URI is non-nil, positions after that sibling.
-If nil, positions at end of parent's subtree.
+If POSITION is \"first\", positions point immediately after the parent's
+meta-data so a heading inserted here becomes the first child;
+combining it with AFTER-URI is a validation error.
+Otherwise: if AFTER-URI is non-nil, positions after that sibling;
+if nil, positions at end of parent's subtree.
 Throws validation error if AFTER-URI is invalid or sibling not found."
+  (when (and (equal position "first")
+             after-uri
+             (not (string-empty-p after-uri)))
+    (anvil-org--tool-validation-error
+     "position=\"first\" is mutually exclusive with after_uri"))
+  (if (equal position "first")
+      (progn (org-back-to-heading t) (org-end-of-meta-data t))
   (if (and after-uri (not (string-empty-p after-uri)))
       (progn
         ;; Parse afterUri to get the ID
@@ -1067,7 +1077,7 @@ Throws validation error if AFTER-URI is invalid or sibling not found."
     ;; If we're at the start of a sibling, go back one char
     ;; to be at the end of parent's content
     (when (looking-at "^\\*+ ")
-      (backward-char 1))))
+      (backward-char 1)))))
 
 (defun anvil-org--ensure-newline ()
   "Ensure there is a newline or buffer start before point."
@@ -1377,7 +1387,7 @@ MCP Parameters:
 
 ;; PHASE-C-IDE-SPLIT-CANDIDATE: inserts heading + ID + tags + body in real buffer
 (defun anvil-org--tool-add-todo
-    (title todo_state parent_uri &optional body after_uri tags)
+    (title todo_state parent_uri &optional body after_uri tags position)
   "Add a new TODO item to an Org file.
 Creates an Org ID for the new headline and returns its ID-based URI.
 TITLE is the headline text.
@@ -1402,7 +1412,9 @@ MCP Parameters:
                 - org-headline://{absolute-path}#{headline-path}
                 - org-id://{id}
   tags - Tags to add (single string, JSON array string, or empty for
-         none; optional)"
+         none; optional)
+  position - \"first\" to insert as parent's first child (optional;
+             mutually exclusive with after_uri)"
   (anvil-org--validate-headline-title title)
   (anvil-org--validate-todo-state todo_state)
   (let* ((tag-list (anvil-org--validate-and-normalize-tags tags))
@@ -1444,7 +1456,7 @@ MCP Parameters:
                  (save-excursion
                    (org-end-of-subtree t t)
                    (point))))
-            (anvil-org--position-for-new-child after_uri parent-end)))
+            (anvil-org--position-for-new-child after_uri parent-end position)))
 
         ;; Validate body before inserting heading
         ;; Calculate the target level for validation
@@ -2206,6 +2218,8 @@ Parameters:
   after_uri - Sibling to insert after (string, optional)
               Must be org-id://{uuid} format
               If omitted, appends as last child of parent
+  position - \"first\" inserts as parent's first child (string, optional)
+             Mutually exclusive with after_uri
 
 Returns JSON object:
   success - Always true on success (boolean)
