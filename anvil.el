@@ -4,7 +4,7 @@
 
 ;; Author: zawatton
 ;; Keywords: comm, tools, ai, mcp
-;; Version: 1.2.0
+;; Version: 1.3.0
 ;; Package-Requires: ((emacs "28.2"))
 ;; URL: https://github.com/zawatton21/anvil.el
 
@@ -314,6 +314,14 @@ These are not loaded by default.  Available modules:
                 `shell-tee' namespace with a TTL so callers can
                 recover the full output on demand.  Requires
                 `anvil-state' (Emacs 29+ SQLite).  Doc 27 Phase 1.
+- `context'   — Headroom-inspired reversible context compression for
+                arbitrary tool outputs / RAG snippets / JSON payloads /
+                diffs / logs / code excerpts / prose.  Adds
+                context-compress, context-retrieve, and context-stats.
+                A local content router picks json/diff/log/code/text
+                compressors; raw originals are stored in anvil-state
+                under a CCR-style namespace so agents can retrieve full
+                context on demand.  Requires `anvil-state' (Emacs 29+).
 - `sexp-cst'  — Tree-sitter CST + runtime `inspect-object' tool:
                 token-bounded JSON view of any live Lisp value.
                 Phase 1a ships 9 core types + record stub + truncation

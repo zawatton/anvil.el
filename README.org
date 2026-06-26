@@ -23,13 +23,27 @@ run elisp, query SQLite, and more *through Emacs primitives* instead
 of generic =sed= / =grep= / =read-whole-file= round-trips.  That
 swap is where the token savings come from.
 
-v1.0 (2026-04) shipped the first stable release, plus a Rust runtime
-that lets you run anvil *without an Emacs install at all*.  The
-2026-05 update adds the AI-enhancement layer:
-Tool Attention for shrinking tool manifests, cross-AI memory/worklog
-bridges, a safe autoresearch loop, and a Claude Code watchdog.
+v1.3.0 turns the 2026-05/06 develop line into a release: codebase
+graph analysis in =anvil-defs=, structured mail tools for mu4e and
+Wanderlust/Maildir, CAD DXF/SVG read/edit tools, fusion/long-run
+evaluation helpers, and Headroom-style reversible context compression.
+The older v1.0 architecture milestone still matters: anvil can run
+through a normal Emacs daemon or through the NeLisp standalone runtime.
 
 [[file:STORY.org][STORY.org]] ([[file:STORY.ja.org][日本語]]) tells the longer "why this exists" story.
+
+* Current Release Highlights
+
+v1.3.0 is focused on making Anvil useful beyond narrow file edits:
+
+| Area | What changed |
+|------+--------------|
+| Codebase graph | =anvil-defs= now indexes call edges for Elisp, Python, JavaScript, and TypeScript, traces caller/callee paths, detects blast radius from changed lines, and ranks architecture clusters. |
+| Context compression | New =anvil-context= adds =context-compress= / =context-retrieve= / =context-stats= for JSON, diffs, logs, code excerpts, and prose. Raw text is stored by ccr-id so agents can recover exact context when needed. |
+| Mail workflows | =anvil-mu4e= and =anvil-wl= expose structured read/search/compose/send surfaces over local mail stores. The WL path is Maildir-first and CJK-friendly; sends are gated. |
+| CAD workflows | =anvil-cad= reads and edits ASCII DXF/SVG through a shared entity IR, with outline, extract, annotate, batch-update, and generate tools. |
+| Long-running evaluation | The fusion modules add panel, async, long-run store, and MCP surfaces for comparing agent outputs and keeping only compact summaries in the parent context. |
+| Client setup | README now documents both Claude Code and Codex CLI MCP registration, plus AGENTS.md / CLAUDE.md guidance for compression tools. |
 
 * Why does this save tokens?
 
@@ -119,7 +133,7 @@ not invoked.  Surface today via this path: =file-*= / =shell-*= /
 
 ** Path B — Emacs integrated (recommended for Emacs users)
 
-For day-to-day Emacs users.  Pin to v1.2.0 via your favourite
+For day-to-day Emacs users.  Pin to v1.3.0 via your favourite
 package manager.
 
 *** Quick install (one command)
@@ -145,17 +159,17 @@ installed.
 #+begin_src emacs-lisp
 ;; async-installer
 (async-installer-git-add "https://github.com/zawatton/anvil.el.git"
-                         :tag "v1.2.0"
+                         :tag "v1.3.0"
                          :main "anvil.el")
 
 ;; or straight.el
 (straight-use-package
  '(anvil :type git :host github :repo "zawatton/anvil.el"
-         :branch "v1.2.0"))
+         :branch "v1.3.0"))
 
 ;; or elpaca
 (elpaca (anvil :host github :repo "zawatton/anvil.el"
-               :ref "v1.2.0"))
+               :ref "v1.3.0"))
 #+end_src
 
 After installing:
@@ -267,6 +281,11 @@ sister package).  Highlights:
 | =anvil-memory= (v0.4.0 + 2026-05) | Auto-memory engine with Bayesian TTL + FTS5 full-text search.  Scans multi-provider =.md= memories, supports DB-primary =memory-add= / =memory-get= / =memory-export-md=, WHISPER session deltas, contradiction scans, static HTML export, and review-only memory harvesting.  Designed for one per-machine SQLite DB plus text export, not binary DB merges |
 | =anvil-memory-bridge= (2026-05) | Local JSON bridge in front of =anvil-memory= and =anvil-worklog=.  Adds read/write memory endpoints, event stream, read-replica pull, worklog search/list/get endpoints, configured-origin CORS, a side-load browser extension for Claude.ai / ChatGPT / Gemini, and a static mobile thin client with offline save queue |
 | =anvil-autoresearch= (2026-05) | Safe self-improvement primitives: scan local Web/X/YouTube/design notes for implementation candidates, rank weak MCP docstrings, propose / harvest / apply descriptions behind eval+holdout gates, route provider-mapping experiments through the orchestrator, scaffold NeLisp Phase 47 codegen tasks, and watch progress in a tabulated-list dashboard |
+| =anvil-defs= codebase graph (v1.3.0) | SQLite-backed definitions, references, call graph, change detection, trace path, callers/callees ranking, dead-code hints, and architecture clustering across Elisp / Python / JS / TS projects |
+| =anvil-context= (v1.3.0) | Headroom-inspired reversible context compression.  Compress JSON / diff / log / code / prose before handing it back to the model; retrieve raw context later by =ccr-id= when exact wording matters |
+| =anvil-mu4e= / =anvil-wl= (v1.3.0) | Structured mail tools for local mu4e and Wanderlust/Maildir workflows.  Read/search/compose surfaces are structured; send tools are gated so agent-driven mail cannot transmit silently |
+| =anvil-cad= (v1.3.0) | DXF/SVG outline, extract, annotate, batch-update, and generate tools through a format-agnostic entity IR |
+| =anvil-fusion= / long-run (v1.3.0) | Compare multiple agent outputs, keep compact panel summaries, store long-run results, and expose MCP surfaces for review/evaluation workflows |
 | =anvil-tools-by-intent= + =anvil-manifest= (v0.4.0 + 2026-05) | Intent-based tool discovery plus =ANVIL_PROFILE= filter.  The 2026-05 update adds Tool Attention: dynamic query-based ranking, optional embedding backends, state preconditions, schema trimming, warm LRU full-schema retention, recovery suggestions, and a Doc43 bridge for docstring rewrite candidates |
 | =anvil-worklog= (2026-05) | SQLite-backed AI worklog index.  Old org logs can be scanned, new entries are DB-primary via =worklog-add=, and bridge endpoints expose read-only search/list/get to other AI clients.  The DB handle self-recovers after file replacement/unlink events and uses short write transactions for =worklog-add= |
 | =anvil-claude-watchdog= (2026-05) | Linux procfs/jsonl watchdog for Claude Code TUI hangs.  Detects State=R stalls and the State=S spinner/MCP-child-IO variant, records events, notifies the desktop, and offers confirmation-gated manual recovery via =claude --resume= staged in tmux |
@@ -668,11 +687,16 @@ budget goes to reasoning about your code, not re-reading it.
 | =worklog= (2026-05) | AI worklog org scan + DB-primary =worklog-add= + search/list/get/export tools; stale SQLite handle recovery for long-lived daemons (opt.) | Emacs 29+ |
 | =autoresearch= (2026-05) | Candidate scan, MCP docstring proposal/apply/harvest gates, routing experiments, NeLisp codegen task scaffold, tabulated-list dashboard (opt.) | =orchestrator=, optional =memory= |
 | =claude-watchdog= (2026-05) | Linux Claude Code hang detector + desktop notification + confirmation-gated tmux resume staging (opt.) | Linux procfs, tmux for recovery |
+| =mu4e= (v1.3.0) | Structured tools over local mu4e state: search/read/compose/send helpers with CJK-aware fallbacks and gated sending (opt.) | mu4e, local mail setup |
+| =wl= (v1.3.0) | Wanderlust/Maildir tools: local Maildir read/search/compose/draft/send, RFC2047/CJK decoding, gated SMTP send path (opt.) | FLIM/Wanderlust-style mail stack |
+| =cad= (v1.3.0) | ASCII DXF/SVG read/edit/generate through a shared entity IR (opt.) | — |
+| =fusion= / =fusion-longrun= (v1.3.0) | Agent-output comparison, panels, async collection, long-run result store, MCP review surfaces (opt.) | =orchestrator= |
 | =session= (v0.4.0) | Session snapshot / resume + 5 Claude Code lifecycle hooks (opt.) | =state= |
 | =discovery= (v0.4.0) | Intent-based MCP tool discovery (=anvil-tools-by-intent=) + per-tool usage counter (opt.) | =state= |
 | =manifest= (v0.4.0 + 2026-05) | Per-session =tools/list= filter driven by =ANVIL_PROFILE=; dynamic Tool Attention adds query ranking, state filtering, schema trimming, warm LRU, and recovery hints (opt.) | — |
 | =disclosure= (v0.4.0) | 3-layer read contract + citation URI scheme + =disclosure-help= (opt.) | =org-index= |
 | =shell-filter= (v0.4.0) | Shell output compression with 20 bundled filters + tee + gain stats (opt.) | =state= |
+| =context= (2026-06) | Headroom-inspired reversible context compression for JSON / diff / log / code / prose, with CCR-style raw retrieval and savings stats (opt.) | =state= |
 | =data= (v0.4.0) | JSON path-based edits with preview-by-default: data-get-path / data-set-path / data-delete-path / data-list-keys (opt.) | — |
 | =sexp= (v0.4.0) | Reader-based Elisp structural edits: rename-symbol / replace-defun / wrap-form / macroexpand (opt.) | — |
 | =sexp-cst= (v0.4.0) | Tree-sitter-elisp CST + runtime =inspect-object= + =sexp-cst-read= / =-edit= / =-repair= (opt.) | Emacs 29+, tree-sitter-elisp grammar |
@@ -695,6 +719,14 @@ budget goes to reasoning about your code, not re-reading it.
 
 ;; Enable optional modules
 (setq anvil-optional-modules '(xlsx pdf ide cron browser))
+
+;; Token-saving output/context tools used by Claude Code and Codex CLI.
+;; `shell-filter' compresses command stdout; `context' compresses
+;; arbitrary JSON/diff/log/code/text and lets agents retrieve the raw
+;; original by ccr-id when needed.
+(add-to-list 'anvil-optional-modules 'state)
+(add-to-list 'anvil-optional-modules 'shell-filter)
+(add-to-list 'anvil-optional-modules 'context)
 
 ;; Start anvil
 (anvil-enable)
@@ -1281,6 +1313,34 @@ claude mcp add -s user -t stdio anvil-emacs-eval -- \
 On Windows, replace the script path with the Git Bash invocation
 shown above (=command= = bash.exe, first =arg= = the script path).
 
+** Codex CLI
+
+Codex CLI can use the same MCP stdio bridge. Register both server
+entries, mirroring the Claude Code setup: one =anvil= entry that
+initializes the daemon, and one =anvil-emacs-eval= entry that exposes
+file/org/buffer/worker plus optional tools such as =shell-run=,
+=shell-filter=, =context-compress=, =context-retrieve=, and
+=context-stats=.
+
+If you manage Codex MCP servers through =codex mcp add=:
+
+#+begin_src sh
+codex mcp add anvil -- \
+  ~/.emacs.d/anvil-stdio.sh \
+  --server-id=anvil \
+  --init-function=anvil-enable \
+  --stop-function=anvil-disable
+
+codex mcp add anvil-emacs-eval -- \
+  ~/.emacs.d/anvil-stdio.sh \
+  --server-id=emacs-eval
+#+end_src
+
+If your Codex version uses project/global =config.toml= instead,
+create equivalent stdio MCP entries with the same command and args.
+The important part is that the =emacs-eval= entry is present; the
+compression tools live there.
+
 ** Optional: register the worker pool too
 
 For workloads that benefit from out-of-band execution (large
@@ -1320,16 +1380,16 @@ In your AI client: ask the agent to list its tools, or invoke a
 read-only one like =anvil-host-info=. If the call returns, the
 bridge is working.
 
-* Teaching your AI to use Anvil — CLAUDE.md guidance
+* Teaching your AI to use Anvil — AGENTS.md / CLAUDE.md guidance
 
 Connecting Anvil only exposes the tools — your AI agent still
 needs to *prefer* them over its built-in =Read= / =Edit= / =Write=
 to realize the token savings described above. Most LLM clients
-read a project-level instructions file (Claude Code uses
-=CLAUDE.md=, Cursor uses =.cursorrules=, etc.). Drop the snippet
-below into yours.
+read a project-level instructions file (Codex uses =AGENTS.md=,
+Claude Code uses =CLAUDE.md=, Cursor uses =.cursorrules=, etc.).
+Drop the snippet below into yours.
 
-** Recommended snippet (Claude Code =CLAUDE.md=)
+** Recommended snippet (=AGENTS.md= / Claude Code =CLAUDE.md=)
 
 #+begin_src markdown
 ## File editing
@@ -1387,6 +1447,26 @@ and trigger them through the cron MCP tools:
 
 Before writing a new ad-hoc script, check `anvil-cron-list` —
 the job may already be defined.
+
+## Context and output compression
+
+When command output or retrieved context is long, compress it before
+feeding it back into the main reasoning loop.
+
+- Use `shell-run` for shell commands whose stdout can be filtered
+  automatically. It returns compressed stdout plus a `tee-id`; recover
+  the raw output with `shell-tee-get` only when the compressed view is
+  insufficient.
+- Use `context-compress` for non-shell text: API JSON, RAG snippets,
+  web/article extracts, logs from another tool, diffs, or code
+  excerpts. Set `store=true` when the raw text may be needed later;
+  recover it with `context-retrieve` and the returned `ccr-id`.
+- Use `context-stats` / `shell-gain` to inspect savings instead of
+  guessing whether the compression layer is helping.
+
+Do not use compressed views as the only source of truth for legal,
+financial, safety-critical, or exact numeric work. Retrieve the raw
+context before making claims that depend on exact wording or values.
 #+end_src
 
 ** Self-reinforcement rule (optional)

@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-06-26
+
+Develop-line release focused on broader AI maintainer workflows: codebase
+graph analysis, reversible context compression, structured mail tools, CAD
+read/edit tools, and long-running agent-output evaluation.
+
+### Added
+
+- **`anvil-defs` codebase graph (Doc 57)** — expands the SQLite defs
+  index into call-graph analysis for Elisp, Python, JavaScript, and
+  TypeScript.  Adds trace-path, change blast-radius, caller/callee
+  ranking, dead-code hints, file-level clustering, architecture summaries,
+  and default exclusions for `.worktrees/` and `target/`.
+- **`anvil-context`** — Headroom-inspired reversible context compression
+  for arbitrary JSON, diffs, logs, code excerpts, and prose.  Adds
+  `context-compress`, `context-retrieve`, and `context-stats`; raw context
+  is retained by ccr-id through `anvil-state`.
+- **`anvil-mu4e` and `anvil-wl` (Docs 53/56)** — structured mail tools
+  over local mu4e and Wanderlust/Maildir stores.  Read/search/compose
+  paths are structured and CJK-aware; send paths are gated.
+- **`anvil-cad`** — ASCII DXF/SVG read/edit/generate tools through a
+  shared entity IR: outline, extract, annotate, batch-update, and generate.
+- **Fusion modules (Docs 54/55)** — panel, async, long-run store, and MCP
+  surfaces for comparing agent outputs and preserving compact review
+  summaries.
+- **Client documentation** — README now documents both Claude Code and
+  Codex CLI MCP registration, plus AGENTS.md / CLAUDE.md guidance for
+  `shell-run`, `shell-tee-get`, `context-compress`, `context-retrieve`,
+  and `context-stats`.
+
+### Fixed
+
+- Use `#!/usr/bin/env bash` in the stdio bridge for NixOS-friendly
+  execution.
+- Decode literal newline escapes in the mu4e compose body path.
+- Improve test isolation around orchestrator task-table state.
+- Skip org-habit assertions on older org-habit builds where the habit
+  summary format differs.
+
 ## [1.0.0] - 2026-04-27
 
 First stable release.  Two landmark capabilities ship together:
