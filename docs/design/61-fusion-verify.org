@@ -176,10 +176,29 @@ Phase 6-7 produce trajectories worth keeping.
 | 6d'   | debt bundle (async loop, egress inference, :verify)| 6d         | SHIPPED da51e05 |
 | 6e    | unsaturated eval battery + verify-effect run       | 6d         | MEASURED (PASS, saturated — see below) |
 | 7     | opus-solo panel (k-member self-consistency)        | 6d         | SHIPPED c9fe0ff |
-| 8a    | plan fusion                                        | 6d         | TODO   |
-| 8b    | longrun step = fusion panel                        | 8a         | TODO   |
-| 8c    | inter-step verify gate                             | 6d, 8b     | TODO   |
+| 8a    | plan fusion                                        | 6d         | SHIPPED 9b4fdc4 |
+| 8b    | longrun step = fusion panel                        | 8a         | SHIPPED 543295c |
+| 8c    | inter-step verify gate                             | 6d, 8b     | SHIPPED c191a43 |
 | 9     | verified-trajectory exemplar library (sketch)      | 6-7 live   | LATER  |
+
+Phase 8 implementation notes (2026-07-03/04, codex via orchestrator — 8a on
+the daemon orchestrator, 8b/8c on the Doc 43 standalone batch orchestrator
+after in-daemon anvil re-enables twice broke task tracking):
+- 8a: mechanical-checker seam in the verify layer (confirm-or-hint contract,
+  never mechanical refutation) + repo-reality checker (path existence, elisp
+  definition grep under anvil-fusion-verify-repo-root); anvil-fusion-plan
+  wraps anvil-fusion-ask with a plan-eliciting member template and a
+  {{CLAIMS}}-bearing plan-merge judge template via :verify-base-template.
+- 8b: hardness originates from the distiller (trailing NEXT-HARD: yes|no
+  line, end-anchored parse; parse-distill now returns a plist); hard steps
+  execute as fusion panels (:step-panel / :step-panel-mode), capped by
+  anvil-fusion-longrun-max-panel-steps (v1 budget guard — Doc 47 :budget
+  threading through ask deferred); async panels/verify are bounded-blocking
+  poll advances.
+- 8c: gate on the fresh digest before it becomes state; fail = any REFUTED
+  claim; one feedback retry (「前回試行への反証」 block) of the same step
+  (no double panel-budget decrement), then surfaced via meta :gate 'failed
+  and result :gate-failures — the quest never wedges.
 
 6e measured 2026-07-03 (benchmarks/doc61-phase6e/, $15.01, results org in
 that dir). Acceptance PASS: verified-judge gold-wrong adoption 0/10; claim
