@@ -214,6 +214,35 @@ normal template is used, the judge still runs, and :claims is nil."
           (let ((jprompt (plist-get (car (car submitted)) :prompt)))
             (should-not (string-match-p "検証済み主張表" jprompt))))))))
 
+(ert-deftest anvil-fusion-ask-test-verify-extraction-nil-uses-base-template-fallback ()
+  "Nil extraction uses VERIFY-BASE-TEMPLATE when no explicit TEMPLATE was provided."
+  (let ((base "DISTINCT-FALLBACK\n# 原問\n%s\n# 候補回答\n%s\n# 検証済み主張表\n{{CLAIMS}}\n"))
+    (cl-letf (((symbol-function 'anvil-fusion-verify-extract-claims)
+               (lambda (&rest _) nil)))
+      (anvil-fusion-ask-test--with-fake-orchestrator
+          anvil-fusion-ask-test--cands
+        (anvil-fusion-ask "Q" :panel 'sovereign :verify t
+                          :verify-base-template base :max-rounds 0)
+        (let ((jprompt (plist-get (car (car submitted)) :prompt)))
+          (should (string-match-p "DISTINCT-FALLBACK" jprompt))
+          (should (string-match-p "(検証済み主張なし)" jprompt)))))))
+
+(ert-deftest anvil-fusion-ask-test-verify-extraction-nil-explicit-template-wins ()
+  "An explicit TEMPLATE overrides the nil-extraction fallback template."
+  (let ((base "DISTINCT-FALLBACK\n# 原問\n%s\n# 候補回答\n%s\n# 検証済み主張表\n{{CLAIMS}}\n")
+        (explicit "EXPLICIT-TEMPLATE\nQ=%s\nC=%s\n"))
+    (cl-letf (((symbol-function 'anvil-fusion-verify-extract-claims)
+               (lambda (&rest _) nil)))
+      (anvil-fusion-ask-test--with-fake-orchestrator
+          anvil-fusion-ask-test--cands
+        (anvil-fusion-ask "Q" :panel 'sovereign :verify t
+                          :template explicit
+                          :verify-base-template base
+                          :max-rounds 0)
+        (let ((jprompt (plist-get (car (car submitted)) :prompt)))
+          (should (string-match-p "EXPLICIT-TEMPLATE" jprompt))
+          (should-not (string-match-p "DISTINCT-FALLBACK" jprompt)))))))
+
 (ert-deftest anvil-fusion-ask-test-verify-local-only-threads-panel-judge ()
   "A local-only panel's :verify t threads the panel judge's
 provider/model into both extraction and verification, and passes
@@ -235,6 +264,20 @@ provider/model into both extraction and verification, and passes
         (should (eq 'ollama (plist-get verify-kw :provider)))
         (should (equal "llama3.1:8b" (plist-get verify-kw :model)))
         (should (eq 'local-only (plist-get verify-kw :egress)))))))
+
+(ert-deftest anvil-fusion-ask-test-verify-base-template-forwarded ()
+  "A custom VERIFY-BASE-TEMPLATE is used when building the verified judge prompt."
+  (let ((base "DISTINCT-PLAN-BASE\n# 原問\n%s\n# 候補回答\n%s\n# 検証済み主張表\n{{CLAIMS}}\n"))
+    (cl-letf (((symbol-function 'anvil-fusion-verify-extract-claims)
+               (lambda (&rest _) anvil-fusion-ask-test--claims-raw))
+              ((symbol-function 'anvil-fusion-verify-claims)
+               (lambda (&rest _) anvil-fusion-ask-test--claims-annotated)))
+      (anvil-fusion-ask-test--with-fake-orchestrator
+          anvil-fusion-ask-test--cands
+        (anvil-fusion-ask "Q" :panel 'sovereign :verify t
+                          :verify-base-template base :max-rounds 0)
+        (let ((jprompt (plist-get (car (car submitted)) :prompt)))
+          (should (string-match-p "DISTINCT-PLAN-BASE" jprompt)))))))
 
 (provide 'anvil-fusion-ask-test)
 ;;; anvil-fusion-ask-test.el ends here

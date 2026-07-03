@@ -568,6 +568,199 @@ claim unverified without signaling to the caller."
       (should (null (anvil-fusion-verify-claims nil :question "Q")))
       (should (null called)))))
 
+(defun anvil-fusion-verify-test--with-repo-fixture (fn)
+  "Create a temporary repo fixture and call FN with its root."
+  (let ((root (make-temp-file "anvil-fusion-verify-" t)))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "sub" root) t)
+          (with-temp-file (expand-file-name "fixture.el" root)
+            (insert ";;; fixture.el --- test fixture -*- lexical-binding: t; -*-\n"
+                    "(defun fixture-fn-alpha () t)\n"))
+          (with-temp-file (expand-file-name "sub/x.org" root)
+            (insert "* fixture\n"))
+          (funcall fn root))
+      (delete-directory root t))))
+
+(ert-deftest anvil-fusion-verify-test-repo-reality-checker-path-confirmed ()
+  "An existing path token confirms the claim."
+  (anvil-fusion-verify-test--with-repo-fixture
+   (lambda (root)
+     (let ((anvil-fusion-verify-repo-root root))
+       (should (equal '(:verdict confirmed :evidence "exists: sub/x.org")
+                      (anvil-fusion-verify-checker-repo-reality
+                       '(:claim "see sub/x.org"))))))))
+
+(ert-deftest anvil-fusion-verify-test-repo-reality-checker-path-missing-hint ()
+  "A missing path token yields a mechanical hint, not a verdict."
+  (anvil-fusion-verify-test--with-repo-fixture
+   (lambda (root)
+     (let* ((anvil-fusion-verify-repo-root root)
+            (result (anvil-fusion-verify-checker-repo-reality
+                     '(:claim "create tests/missing-test.el and docs/missing.org"))))
+       (should (null (plist-get result :verdict)))
+       (should (string-match-p "tests/missing-test\\.el, docs/missing\\.org"
+                               (plist-get result :evidence)))))))
+
+(ert-deftest anvil-fusion-verify-test-repo-reality-checker-symbol-confirmed ()
+  "A defined symbol confirms the claim with a location."
+  (anvil-fusion-verify-test--with-repo-fixture
+   (lambda (root)
+     (let* ((anvil-fusion-verify-repo-root root)
+            (result (anvil-fusion-verify-checker-repo-reality
+                     '(:claim "call `fixture-fn-alpha` from the plan"))))
+       (should (eq 'confirmed (plist-get result :verdict)))
+       (should (string-match-p "defined: fixture-fn-alpha at .*fixture\\.el:[0-9]+"
+                               (plist-get result :evidence)))))))
+
+(ert-deftest anvil-fusion-verify-test-repo-reality-checker-symbol-missing-hint ()
+  "An unknown symbol yields a hint, not a verdict."
+  (anvil-fusion-verify-test--with-repo-fixture
+   (lambda (root)
+     (let* ((anvil-fusion-verify-repo-root root)
+            (result (anvil-fusion-verify-checker-repo-reality
+                     '(:claim "use fixture-fn-beta next"))))
+       (should (null (plist-get result :verdict)))
+       (should (string-match-p "fixture-fn-beta" (plist-get result :evidence)))))))
+
+(ert-deftest anvil-fusion-verify-test-repo-reality-checker-no-tokens ()
+  "Claims with no path or symbol token return nil."
+  (anvil-fusion-verify-test--with-repo-fixture
+   (lambda (root)
+     (let ((anvil-fusion-verify-repo-root root))
+       (should (null (anvil-fusion-verify-checker-repo-reality
+                      '(:claim "write a careful implementation plan"))))))))
+
+(ert-deftest anvil-fusion-verify-test-repo-reality-checker-root-nil ()
+  "A nil repo root makes the checker inert."
+  (let ((anvil-fusion-verify-repo-root nil))
+    (should (null (anvil-fusion-verify-checker-repo-reality
+                   '(:claim "see sub/x.org"))))))
+
+(ert-deftest anvil-fusion-verify-test-verify-claims-mechanical-confirmed-prunes-batch ()
+  "Mechanically confirmed claims are excluded from the skeptic batch."
+  (let ((anvil-fusion-verify-skeptics 2)
+        (anvil-fusion-verify-kb-roots nil)
+        (anvil-fusion-verify-mechanical-checkers
+         (list (lambda (claim)
+                 (when (string-match-p "sub/x\\.org" (plist-get claim :claim))
+                   '(:verdict confirmed :evidence "exists: sub/x.org")))))
+        (submitted-tasks nil))
+    (cl-letf (((symbol-function 'anvil-orchestrator-submit)
+               (lambda (tasks)
+                 (setq submitted-tasks tasks)
+                 "b1"))
+              ((symbol-function 'anvil-orchestrator-collect)
+               (lambda (&rest _) t))
+              ((symbol-function 'anvil-orchestrator-status)
+               (lambda (_id)
+                 (list :tasks
+                       (mapcar (lambda (task)
+                                 (list :id (plist-get task :name)
+                                       :name (plist-get task :name)))
+                               submitted-tasks))))
+              ((symbol-function 'anvil-orchestrator-extract-result)
+               (lambda (_id _full)
+                 (list :status 'done :summary "VERDICT: UNVERIFIED\nREASON: "))))
+      (let ((result (anvil-fusion-verify-claims
+                     (list (list :claim "touch sub/x.org" :kind 'code :candidates '("A"))
+                           (list :claim "unknown" :kind 'fact :candidates '("B")))
+                     :question "Q")))
+        (should (= 2 (length submitted-tasks)))
+        (should (cl-every (lambda (task)
+                            (string-prefix-p "fusion-verify-skeptic-1-" (plist-get task :name)))
+                          submitted-tasks))
+        (should (eq 'confirmed (plist-get (car result) :verdict)))
+        (should (equal "exists: sub/x.org"
+                       (plist-get (car result) :evidence)))))))
+
+(ert-deftest anvil-fusion-verify-test-verify-claims-mechanical-all-confirmed-no-submit ()
+  "All mechanically confirmed claims skip the orchestrator entirely."
+  (let ((anvil-fusion-verify-kb-roots nil)
+        (anvil-fusion-verify-mechanical-checkers
+         (list (lambda (_claim)
+                 '(:verdict confirmed :evidence "defined: fixture-fn-alpha at fixture.el:2"))))
+        called)
+    (cl-letf (((symbol-function 'anvil-orchestrator-submit)
+               (lambda (_tasks) (setq called t) "b1")))
+      (let ((result (anvil-fusion-verify-claims
+                     (list (list :claim "one" :kind 'fact :candidates '("A"))
+                           (list :claim "two" :kind 'fact :candidates '("B")))
+                     :question "Q")))
+        (should-not called)
+        (should (cl-every (lambda (claim)
+                            (eq 'confirmed (plist-get claim :verdict)))
+                          result))))))
+
+(ert-deftest anvil-fusion-verify-test-verify-claims-preserves-input-order ()
+  "Mechanically confirmed and skeptic-judged claims are returned in input order."
+  (let ((anvil-fusion-verify-skeptics 1)
+        (anvil-fusion-verify-kb-roots nil)
+        (anvil-fusion-verify-mechanical-checkers
+         (list (lambda (claim)
+                 (when (member (plist-get claim :claim) '("claim-1" "claim-3"))
+                   (list :verdict 'confirmed
+                         :evidence (format "mechanical:%s" (plist-get claim :claim)))))))
+        (submitted-tasks nil))
+    (cl-letf (((symbol-function 'anvil-orchestrator-submit)
+               (lambda (tasks)
+                 (setq submitted-tasks tasks)
+                 "b1"))
+              ((symbol-function 'anvil-orchestrator-collect)
+               (lambda (&rest _) t))
+              ((symbol-function 'anvil-orchestrator-status)
+               (lambda (_id)
+                 (list :tasks
+                       (mapcar (lambda (task)
+                                 (list :id (plist-get task :name)
+                                       :name (plist-get task :name)))
+                               submitted-tasks))))
+              ((symbol-function 'anvil-orchestrator-extract-result)
+               (lambda (_id _full)
+                 (list :status 'done :summary "VERDICT: REFUTED\nREASON: skeptic"))))
+      (let* ((claims (list (list :claim "claim-1" :kind 'fact :candidates '("A"))
+                           (list :claim "claim-2" :kind 'fact :candidates '("B"))
+                           (list :claim "claim-3" :kind 'fact :candidates '("C"))))
+             (result (anvil-fusion-verify-claims claims :question "Q")))
+        (should (equal '("claim-1" "claim-2" "claim-3")
+                       (mapcar (lambda (claim)
+                                 (plist-get claim :claim))
+                               result)))
+        (should (equal '(confirmed refuted confirmed)
+                       (mapcar (lambda (claim)
+                                 (plist-get claim :verdict))
+                               result)))))))
+
+(ert-deftest anvil-fusion-verify-test-verify-claims-mechanical-hint-reaches-prompt ()
+  "A mechanical hint is appended to the skeptic prompt evidence block."
+  (let ((anvil-fusion-verify-skeptics 1)
+        (anvil-fusion-verify-kb-roots nil)
+        (anvil-fusion-verify-mechanical-checkers
+         (list (lambda (_claim)
+                 '(:evidence "not found under ROOT: tests/missing-test.el"))))
+        (submitted-tasks nil))
+    (cl-letf (((symbol-function 'anvil-orchestrator-submit)
+               (lambda (tasks)
+                 (setq submitted-tasks tasks)
+                 "b1"))
+              ((symbol-function 'anvil-orchestrator-collect)
+               (lambda (&rest _) t))
+              ((symbol-function 'anvil-orchestrator-status)
+               (lambda (_id)
+                 (list :tasks
+                       (mapcar (lambda (task)
+                                 (list :id (plist-get task :name)
+                                       :name (plist-get task :name)))
+                               submitted-tasks))))
+              ((symbol-function 'anvil-orchestrator-extract-result)
+               (lambda (_id _full)
+                 (list :status 'done :summary "VERDICT: UNVERIFIED\nREASON: "))))
+      (anvil-fusion-verify-claims
+       (list (list :claim "use tests/missing-test.el" :kind 'code :candidates '("A")))
+       :question "Q")
+      (should (string-match-p "mechanical — not found under ROOT: tests/missing-test\\.el"
+                              (plist-get (car submitted-tasks) :prompt))))))
+
 ;;;; ============================================================
 ;;;; Phase 6d — verdict-annotated judge synthesis
 ;;;; ============================================================

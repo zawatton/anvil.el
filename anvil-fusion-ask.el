@@ -133,7 +133,7 @@ candidates before judging.  Returns (:answer :candidates
 (cl-defun anvil-fusion-ask
     (prompt &key panel fidelity judge judge-model extra lenses cwd
             max-rounds converge-threshold timeout-sec (max-wait-sec 1800)
-            template verify verify-args)
+            template verify verify-args verify-base-template)
   "Answer PROMPT by fusing a panel of models into one synthesized reply.
 
 PANEL names a panel in `anvil-fusion-panels' (default
@@ -151,7 +151,8 @@ prompt template for every round (forwarded to
 explicit TEMPLATE always wins over the verified-judge template
 Phase 6d would otherwise build for the judge call (see below) --
 claim extraction/verification and the returned :CLAIMS still run,
-only the template swap is skipped.
+only the template swap is skipped.  VERIFY-BASE-TEMPLATE optionally
+overrides the base template used to build the verified judge prompt.
 
 For a `local-only' panel a non-local JUDGE override is refused
 before anything is submitted, preserving the zero-egress
@@ -189,11 +190,14 @@ skeptics) unless VERIFY-ARGS overrides them.
 Fallback discipline: when extraction finds nothing to verify (no
 contested claims, or extraction fails/times out --
 `anvil-fusion-verify-extract-claims' is itself best-effort and
-returns nil rather than signaling), verification is skipped and the
-NORMAL (un-verified) judge template is used for the round exactly as
-when VERIFY is nil; one `message' notes the fallback.  Everything
-degrades to the pre-Phase-6d behavior when VERIFY is nil -- zero
-behavior change for existing callers.
+returns nil rather than signaling), or verification returns no
+annotations, the round falls back best-effort: an explicit TEMPLATE
+still wins; otherwise a non-nil VERIFY-BASE-TEMPLATE is used via
+`anvil-fusion-verify-judge-template-for' with an empty claims block,
+and only if neither is present does the NORMAL (un-verified) judge
+template remain in force.  One `message' notes the fallback.
+Everything degrades to the pre-Phase-6d behavior when VERIFY is nil
+-- zero behavior change for existing callers.
 
 Returns a plist: :answer :panel :egress :fidelity :rounds :looped
 :members-batch :judge-batch :judge-task-id :judge-provider
@@ -240,9 +244,14 @@ when VERIFY is nil)."
                                  (list :max-wait-sec (plist-get vargs :max-wait-sec)))))
                    (raw-claims (apply #'anvil-fusion-verify-extract-claims
                                        prompt candidates extract-kwargs)))
-              (if (null raw-claims)
-                  (message
-                   "anvil-fusion-ask: :verify requested but claim extraction found nothing to verify; using the normal judge template")
+             (if (null raw-claims)
+                  (progn
+                    (message
+                     "anvil-fusion-ask: :verify requested but claim extraction found nothing to verify; using the fallback judge template")
+                    (when (and (null template) verify-base-template)
+                      (setq etemplate
+                            (anvil-fusion-verify-judge-template-for
+                             nil verify-base-template))))
                 (let* ((vk-provider (or (plist-get vargs :provider) ex-provider))
                        (vk-model    (or (plist-get vargs :model) ex-model))
                        (vk-egress   (if local-panel 'local-only 'external))
@@ -260,7 +269,17 @@ when VERIFY is nil)."
                   (when annotated
                     (setq claims annotated)
                     (unless template
-                      (setq etemplate (anvil-fusion-verify-judge-template-for annotated)))))))))
+                      (setq etemplate
+                            (anvil-fusion-verify-judge-template-for
+                             annotated verify-base-template))))
+                  (when (and (null annotated)
+                             (null template)
+                             verify-base-template)
+                    (message
+                     "anvil-fusion-ask: :verify requested but verification produced no annotations; using the fallback judge template")
+                    (setq etemplate
+                          (anvil-fusion-verify-judge-template-for
+                           nil verify-base-template))))))))
         (let* ((jresult (anvil-fusion--run-judge
                          prompt candidates jprov jmodel
                          :fidelity fidelity :extra extra :template etemplate
