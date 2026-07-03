@@ -186,6 +186,16 @@ failure mode (judge が正答候補を棄却し幻覚候補を採用、fusion �
 |----+--------------------------------------------------------------+------------+----------+------+-------|
 | 61 | [[file:61-fusion-verify.org][Fusion Verify — Verifier-Grounded Judge / opus-solo / Agentic Fusion]] | 54, 55, 10 | 中-大 | — | DRAFT |
 
+** Token Thrift Wave 2 (Doc 62, DRAFT, 2026-07-04)
+
+Doc 26-29 の既存省トークン層が触れていない消費 — fusion/verify 実行時
+コスト (opus-solo+verify ≈ 4x) とセッション側の反復トラフィック (テスト
+出力・再読・大型ツール結果) — を、計測 (Phase 1 telemetry) を起点に削減。
+
+| #  | Doc                                                          | 依存       | 想定工数 | 判定 | 状態  |
+|----+--------------------------------------------------------------+------------+----------+------+-------|
+| 62 | [[file:62-token-thrift.org][Token Thrift Wave 2 — telemetry / router / distiller / caches]] | 61, 26-28, 36 | 中 | — | DRAFT (Ph1 進行中) |
+
 監査元 → 取り込み先:
 
 | 監査元 (X OSS)         | 取り込み先 / 判定                         |
