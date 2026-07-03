@@ -38,11 +38,35 @@
 ;; Extraction is best-effort: on task failure or timeout this returns
 ;; nil (with a `message' warning) rather than signaling, so a caller
 ;; can treat "no claims" the same as "nothing to verify".
+;;
+;; Phase 6b ("evidence check per claim", docs/design/61-fusion-verify.org
+;; §2) extends this module with two evidence sources fed per-claim,
+;; BEFORE judge synthesis:
+;;
+;;   1. Local KB grep (`anvil-fusion-verify--kb-search') — greps
+;;      `anvil-fusion-verify-kb-roots' for claim-derived search terms.
+;;      Zero content egress, so it runs for sovereign panels too.
+;;   2. An adversarial skeptic vote (`anvil-fusion-verify-claims') —
+;;      N independent tasks per claim, each told to try to refute it;
+;;      `anvil-fusion-verify--aggregate-verdicts' majority-decides
+;;      `confirmed' / `refuted' / `unverified'.
+;;
+;; `anvil-fusion-verify-claims' enforces the same sovereignty
+;; discipline as `anvil-fusion-ask': for a `local-only' egress request
+;; it refuses (via `user-error') a non-local skeptic provider BEFORE
+;; submitting anything, reusing `anvil-fusion-provider-local-p' (the
+;; predicate `anvil-fusion-panels' uses to validate sovereign panels).
+;; The KB grep half stays pure (no orchestrator dependency); the
+;; skeptic-vote half lazily requires `anvil-orchestrator' and follows
+;; the same submit -> collect(:wait) -> extract-result pattern as
+;; Phase 6a, batched (all skeptic tasks for all claims submitted as
+;; ONE batch).
 
 ;;; Code:
 
 (require 'cl-lib)
 (require 'anvil-fusion)
+(require 'anvil-fusion-panels)
 
 ;; Public anvil-orchestrator functions used only at call time.  Declared
 ;; (not required) so the pure prompt layer loads without dragging in the
@@ -265,6 +289,422 @@ claim list (see `anvil-fusion-verify--parse-claims') on success."
      (message "anvil-fusion-verify: claim extraction failed: %s"
               (error-message-string err))
      nil)))
+
+;;;; ============================================================
+;;;; Phase 6b — evidence check per claim
+;;;; ============================================================
+
+;;;; --- customization (6b) ---------------------------------------------------
+
+(defcustom anvil-fusion-verify-skeptics 2
+  "Number of adversarial skeptic tasks fanned out per claim.
+Doc 61 §2 (6b) notes 3 skeptics for a \"rigorous\" verification pass;
+2 is the default cost/signal balance.  Override per call with the
+:skeptics argument to `anvil-fusion-verify-claims'."
+  :type 'integer
+  :group 'anvil-fusion)
+
+(defcustom anvil-fusion-verify-skeptic-provider 'claude
+  "Default provider for the Phase 6b adversarial skeptic vote.
+Override per call with the :provider argument to
+`anvil-fusion-verify-claims' — sovereign / local-only flows pass a
+provider satisfying `anvil-fusion-provider-local-p'."
+  :type 'symbol
+  :group 'anvil-fusion)
+
+(defcustom anvil-fusion-verify-skeptic-model nil
+  "Model for the Phase 6b skeptic vote, or nil for the provider default.
+Override per call with the :model argument to
+`anvil-fusion-verify-claims'."
+  :type '(choice (const :tag "Provider default" nil) string)
+  :group 'anvil-fusion)
+
+(defcustom anvil-fusion-verify-kb-roots nil
+  "Directories to grep for local KB evidence (Phase 6b).
+Nil (the default) disables the KB backend entirely — this module
+ships with no personal paths baked in (anvil.el is OSS-bound); wire
+your own knowledge-base roots (org / notes / docs directories) in
+your init.  See `anvil-fusion-verify--kb-search'."
+  :type '(repeat directory)
+  :group 'anvil-fusion)
+
+(defcustom anvil-fusion-verify-max-evidence 3
+  "Maximum KB snippets kept as evidence per claim (Phase 6b).
+Caps both what `anvil-fusion-verify--kb-search' returns and what is
+fed into the skeptic prompt's evidence block."
+  :type 'integer
+  :group 'anvil-fusion)
+
+(defcustom anvil-fusion-verify-skeptic-template
+  "あなたは、AI 候補回答から抽出された主張を検証する懐疑的な検証者です。
+与えられた主張を鵜呑みにせず、積極的に反証を試みてください。
+
+# 原問（文脈）
+%s
+
+# 検証対象の主張
+%s
+
+# 証拠（ローカル KB 検索結果。file:line 付き。無ければ「(証拠なし)」）
+%s
+
+# 指示
+- この主張を反証できないか、批判的に検討してください。
+- 判定は厳格に行うこと。確信が持てない場合は CONFIRMED ではなく REFUTED 寄りに
+  判定する。
+- CONFIRMED は、証拠または確実な知識により積極的に裏付けられる場合のみ選ぶこと。
+- 主張の真偽そのものが根拠不足で判断不能な場合に限り UNVERIFIED とする。
+
+# 出力形式
+以下の 2 行のみを、この形式に厳密に従って出力してください（前置き・後書き・
+追加の説明は一切禁止）:
+VERDICT: <CONFIRMED か REFUTED か UNVERIFIED のいずれか一語>
+REASON: <一行の理由>"
+  "Skeptic-vote prompt template (Doc 61 Phase 6b).
+Three %s placeholders filled in order by `format' via
+`anvil-fusion-verify--skeptic-prompt': (1) the original question,
+(2) the claim text, (3) the formatted KB evidence block (see
+`anvil-fusion-verify--format-evidence').  The exact two-line
+`VERDICT: ...' / `REASON: ...' output format is required by
+`anvil-fusion-verify--parse-verdict'; keep the tail of the template
+in sync with the parser's regexps if you customize it."
+  :type 'string
+  :group 'anvil-fusion)
+
+;;;; --- pure heuristic term extraction (6b) ----------------------------------
+
+(defconst anvil-fusion-verify--max-search-terms 8
+  "Hard cap on the number of terms `anvil-fusion-verify--claim-search-terms'
+returns for one claim.")
+
+(defconst anvil-fusion-verify--search-term-regexp
+  (concat "[0-9]+\\(?:\\.[0-9]+\\)?[A-Za-zΩµμ℃°%]*"  ; (a) number [+ unit]
+          "\\|[ァ-ヶー]\\{2,\\}"                        ; (b) katakana run
+          "\\|[一-鿿々]\\{2,\\}"                        ; (b) kanji run
+          "\\|[A-Za-z][A-Za-z0-9_-]\\{2,\\}")           ; (c) ASCII word, len>=3
+  "Alternation matching one KB search term at a time.
+Mirrors `anvil-semantic--term-regexp''s katakana/kanji ranges.  Order
+matters: a digit-led match tries the number[+unit] branch first, so
+e.g. \"150V\" or \"0.1MΩ\" is captured whole rather than split.")
+
+(defun anvil-fusion-verify--claim-search-terms (claim-text)
+  "Extract up to `anvil-fusion-verify--max-search-terms' KB search terms
+from CLAIM-TEXT.  Collects, in order of first appearance:
+  (a) numbers optionally followed by (space-free) unit characters,
+      e.g. \"0.1MΩ\", \"150V\";
+  (b) katakana or kanji runs of length >= 2;
+  (c) ASCII word runs of length >= 3.
+Deduplicated (case-sensitive, first occurrence wins), capped at 8.
+Pure — no I/O.  Nil/empty CLAIM-TEXT yields nil."
+  (let ((acc nil) (start 0) (text (or claim-text "")))
+    (while (string-match anvil-fusion-verify--search-term-regexp text start)
+      (cl-pushnew (match-string 0 text) acc :test #'string=)
+      (setq start (match-end 0)))
+    (let ((ordered (nreverse acc)))
+      (if (> (length ordered) anvil-fusion-verify--max-search-terms)
+          (cl-subseq ordered 0 anvil-fusion-verify--max-search-terms)
+        ordered))))
+
+;;;; --- local KB grep backend (6b, zero egress) ------------------------------
+
+(defun anvil-fusion-verify--kb-grep-program ()
+  "Return \"rg\" when ripgrep is on PATH, else \"grep\"."
+  (if (executable-find "rg") "rg" "grep"))
+
+(defun anvil-fusion-verify--truncate-evidence (text)
+  "Trim TEXT and clamp it to ~200 chars for use as an evidence snippet."
+  (let ((s (string-trim (or text ""))))
+    (if (> (length s) 200) (concat (substring s 0 200) "…") s)))
+
+(defun anvil-fusion-verify--kb-search-term (root term program)
+  "Fixed-string-grep ROOT for TERM, restricted to *.org/*.md/*.txt.
+PROGRAM is \"rg\" or \"grep\" (see `anvil-fusion-verify--kb-grep-program').
+Returns a list of (:source \"PATH:LINE\" :text SNIPPET) plists in the
+order the tool reported them, or nil on no matches / any process
+error — this never signals, matching the KB backend's \"must not
+error\" contract."
+  (condition-case nil
+      (with-temp-buffer
+        (let ((args (if (string= program "rg")
+                        (list "-n" "-F" "--no-heading"
+                              "-g" "*.org" "-g" "*.md" "-g" "*.txt"
+                              "--" term root)
+                      (list "-r" "-n" "-F"
+                            "--include=*.org" "--include=*.md" "--include=*.txt"
+                            "--" term root))))
+          (apply #'call-process program nil t nil args)
+          (goto-char (point-min))
+          (let (hits)
+            (while (re-search-forward "^\\(.*?\\):\\([0-9]+\\):\\(.*\\)$" nil t)
+              (push (list :source (format "%s:%s" (match-string 1) (match-string 2))
+                          :text (anvil-fusion-verify--truncate-evidence (match-string 3)))
+                    hits))
+            (nreverse hits))))
+    (error nil)))
+
+(defun anvil-fusion-verify--kb-search (claim-text &optional roots)
+  "Search local KB ROOTS for evidence relevant to CLAIM-TEXT.
+ROOTS defaults to `anvil-fusion-verify-kb-roots'; nil (the default)
+disables the KB backend entirely and this returns nil immediately —
+zero I/O, zero egress.  Otherwise: extract search terms via
+`anvil-fusion-verify--claim-search-terms', grep each existing
+directory in ROOTS for each term (ripgrep when available, else
+`grep -rn', both restricted to *.org/*.md/*.txt), rank the matching
+lines by how many DISTINCT terms they hit (descending; ties broken
+by first-seen order for determinism regardless of `sort' stability),
+and return up to `anvil-fusion-verify-max-evidence' hits as
+\(:source \"PATH:LINE\" :text SNIPPET) plists.  A nonexistent /
+non-directory root is skipped silently.  Never signals."
+  (let ((rs (or roots anvil-fusion-verify-kb-roots)))
+    (when rs
+      (let ((terms (anvil-fusion-verify--claim-search-terms claim-text)))
+        (when terms
+          (let ((program (anvil-fusion-verify--kb-grep-program))
+                (table (make-hash-table :test 'equal))
+                (order nil)
+                (idx 0))
+            (dolist (root rs)
+              (when (and (stringp root) (file-directory-p root))
+                (dolist (term terms)
+                  (dolist (hit (anvil-fusion-verify--kb-search-term root term program))
+                    (let* ((src (plist-get hit :source))
+                           (entry (gethash src table)))
+                      (if entry
+                          (unless (member term (plist-get entry :terms))
+                            (plist-put entry :terms (cons term (plist-get entry :terms))))
+                        (setq idx (1+ idx))
+                        (puthash src (list :source src :text (plist-get hit :text)
+                                            :terms (list term) :order idx)
+                                 table)
+                        (push src order)))))))
+            (let* ((entries (mapcar (lambda (s) (gethash s table)) (nreverse order)))
+                   (ranked (sort entries
+                                 (lambda (a b)
+                                   (let ((la (length (plist-get a :terms)))
+                                         (lb (length (plist-get b :terms))))
+                                     (if (= la lb)
+                                         (< (plist-get a :order) (plist-get b :order))
+                                       (> la lb)))))))
+              (mapcar (lambda (e) (list :source (plist-get e :source) :text (plist-get e :text)))
+                      (cl-subseq ranked 0 (min (length ranked)
+                                                anvil-fusion-verify-max-evidence))))))))))
+
+;;;; --- skeptic prompt + tolerant verdict parser (6b) ------------------------
+
+(defun anvil-fusion-verify--format-evidence (evidence)
+  "Format EVIDENCE (a `anvil-fusion-verify--kb-search' result) into a
+block for the skeptic prompt.  Returns \"(証拠なし)\" when empty."
+  (if (null evidence)
+      "(証拠なし)"
+    (mapconcat (lambda (e) (format "- %s — %s"
+                                   (plist-get e :source) (plist-get e :text)))
+               evidence "\n")))
+
+(defun anvil-fusion-verify--skeptic-prompt (question claim evidence)
+  "Build one skeptic-vote prompt for CLAIM.
+QUESTION is the original question the claim's candidates answered
+(context).  EVIDENCE is a `anvil-fusion-verify--kb-search' result (or
+nil).  Pure — safe to call without `anvil-orchestrator' loaded."
+  (format anvil-fusion-verify-skeptic-template
+          (or question "") (or claim "")
+          (anvil-fusion-verify--format-evidence evidence)))
+
+(defconst anvil-fusion-verify--verdict-line-regexp
+  "verdict[ \t]*:[ \t]*\\(confirmed\\|refuted\\|unverified\\)"
+  "Matches a `VERDICT: ...' label + value, case-insensitively.
+See `anvil-fusion-verify--parse-verdict'.")
+
+(defconst anvil-fusion-verify--reason-line-regexp
+  "reason[ \t]*:[ \t]*\\(.*\\)"
+  "Matches a `REASON: ...' label + one-line text, case-insensitively.
+See `anvil-fusion-verify--parse-verdict'.")
+
+(defun anvil-fusion-verify--parse-verdict (text)
+  "Tolerantly parse TEXT (raw skeptic-task output) into a verdict plist.
+Searches TEXT for `VERDICT: CONFIRMED|REFUTED|UNVERIFIED' and
+`REASON: ...' labels anywhere (case-insensitive), tolerating
+surrounding prose and label-case variation.  An unrecognized or
+absent VERDICT normalizes to `unverified'; an absent REASON
+normalizes to \"\".  Returns (:verdict SYM :reason STR).  Never
+signals — nil/non-string TEXT also yields the unverified default."
+  (let ((case-fold-search t)
+        (verdict 'unverified)
+        (reason ""))
+    (when (stringp text)
+      (when (string-match anvil-fusion-verify--verdict-line-regexp text)
+        (setq verdict (intern (downcase (match-string 1 text)))))
+      (when (string-match anvil-fusion-verify--reason-line-regexp text)
+        (setq reason (string-trim (match-string 1 text)))))
+    (list :verdict verdict :reason reason)))
+
+(defun anvil-fusion-verify--aggregate-verdicts (verdicts)
+  "Majority-aggregate VERDICTS (a list of (:verdict SYM :reason STR)).
+A strict majority (> half) of `refuted' votes wins as `refuted'; else
+a strict majority of `confirmed' votes wins as `confirmed'; anything
+else — a tie, all-`unverified', or an empty list — yields
+`unverified'.  Returns (:verdict SYM :reason STR), REASON being the
+first reason from the winning side (list order preserved), or \"\"
+when there is no winning side.  Pure."
+  (let* ((n (length verdicts))
+         (refuted (cl-remove-if-not
+                   (lambda (v) (eq (plist-get v :verdict) 'refuted)) verdicts))
+         (confirmed (cl-remove-if-not
+                     (lambda (v) (eq (plist-get v :verdict) 'confirmed)) verdicts)))
+    (cond
+     ((zerop n) (list :verdict 'unverified :reason ""))
+     ((> (length refuted) (/ n 2))
+      (list :verdict 'refuted :reason (or (plist-get (car refuted) :reason) "")))
+     ((> (length confirmed) (/ n 2))
+      (list :verdict 'confirmed :reason (or (plist-get (car confirmed) :reason) "")))
+     (t (list :verdict 'unverified :reason "")))))
+
+;;;; --- claim annotation helpers (6b) -----------------------------------------
+
+(defun anvil-fusion-verify--annotate-claim (claim verdict evidence)
+  "Return a FRESH copy of CLAIM (a Phase 6a claim plist) carrying
+:VERDICT VERDICT and :EVIDENCE EVIDENCE.  Never mutates CLAIM — a new
+plist is allocated so `anvil-fusion-verify-claims' never touches its
+CLAIMS argument."
+  (list :claim (plist-get claim :claim)
+        :kind (plist-get claim :kind)
+        :candidates (plist-get claim :candidates)
+        :verdict verdict
+        :evidence evidence))
+
+(defun anvil-fusion-verify--claim-evidence-line (kb-evidence agg)
+  "Return the one-line :EVIDENCE string for a claim.
+KB-EVIDENCE is `anvil-fusion-verify--kb-search''s result for the
+claim (ranked (:source :text) plists, or nil).  AGG is
+`anvil-fusion-verify--aggregate-verdicts''s result.  Prefers a
+\"SOURCE — REASON\" pointer when KB evidence exists and the
+aggregate verdict is decisive (`confirmed' / `refuted'); otherwise
+falls back to the winning reason alone, then \"\"."
+  (let ((verdict (plist-get agg :verdict))
+        (reason  (or (plist-get agg :reason) "")))
+    (cond
+     ((and kb-evidence (memq verdict '(confirmed refuted)))
+      (format "%s — %s" (plist-get (car kb-evidence) :source) reason))
+     ((not (string-empty-p reason)) reason)
+     (t ""))))
+
+;;;; --- orchestration wrapper (6b, lazy require of anvil-orchestrator) -------
+
+(defun anvil-fusion-verify--task-verdict (task-id)
+  "Return a verdict plist for skeptic TASK-ID.
+Fetches the result via `anvil-orchestrator-extract-result' (full); a
+non-`done' terminal status (failure / timeout / cancellation) counts
+as an `unverified' vote rather than propagating — the skeptic vote
+is best-effort per task, same discipline as Phase 6a's extraction
+task."
+  (let* ((result (anvil-orchestrator-extract-result task-id t))
+         (status (plist-get result :status)))
+    (if (eq status 'done)
+        (anvil-fusion-verify--parse-verdict (plist-get result :summary))
+      (list :verdict 'unverified :reason ""))))
+
+(cl-defun anvil-fusion-verify-claims
+    (claims &key question egress provider model skeptics timeout-sec (max-wait-sec 1800))
+  "Annotate each claim in CLAIMS with a Phase 6b evidence verdict.
+
+CLAIMS is the Phase 6a claim-plist list (see
+`anvil-fusion-verify-extract-claims').  Returns a NEW list of claim
+plists — CLAIMS is never mutated — each gaining two keys: :VERDICT
+(`confirmed' / `refuted' / `unverified') and :EVIDENCE (a one-line
+string, or \"\" when nothing usable was found).  An empty/nil CLAIMS
+returns nil immediately, without touching the orchestrator.
+
+Two evidence sources are combined per claim:
+1. Local KB grep (`anvil-fusion-verify--kb-search' over
+   `anvil-fusion-verify-kb-roots'), zero-egress and therefore always
+   run — even under EGRESS `local-only'.
+2. An adversarial skeptic vote: SKEPTICS (default
+   `anvil-fusion-verify-skeptics') independent tasks per claim, each
+   asked to try to refute the claim
+   (`anvil-fusion-verify-skeptic-template'), majority-aggregated via
+   `anvil-fusion-verify--aggregate-verdicts'.  ALL skeptic tasks for
+   ALL claims are submitted as ONE orchestrator batch (task names
+   \"fusion-verify-skeptic-<claim-index>-<k>\"), collected with
+   :wait, then read back one at a time via
+   `anvil-orchestrator-extract-result' — the same submit -> collect
+   -> extract-result pattern `anvil-fusion-verify-extract-claims'
+   already uses.
+
+QUESTION is the original question the claims' candidates answered
+(context for the skeptic prompt).  PROVIDER / MODEL override
+`anvil-fusion-verify-skeptic-provider' /
+`anvil-fusion-verify-skeptic-model'.  EGRESS is `external' (default)
+or `local-only'; under `local-only' the *effective* skeptic provider
+must satisfy `anvil-fusion-provider-local-p' (the exact predicate
+`anvil-fusion-panels' uses to validate sovereign panels), or this
+signals a `user-error' BEFORE anything is submitted — mirroring
+`anvil-fusion-ask''s sovereignty refusal.  TIMEOUT-SEC caps each
+skeptic task; MAX-WAIT-SEC caps the batch collect wait.
+
+Best-effort like Phase 6a: an individual skeptic task that does not
+reach `done' counts as an `unverified' vote rather than signaling; a
+wholesale orchestrator error (e.g. submit itself fails) annotates
+EVERY claim `:verdict unverified :evidence \"\"' and emits a
+`message' warning instead of propagating.  The EGRESS sovereignty
+check above is the sole exception — it always signals."
+  (when claims
+    (let* ((eg   (or egress 'external))
+           (prov (or provider anvil-fusion-verify-skeptic-provider))
+           (mdl  (or model anvil-fusion-verify-skeptic-model))
+           (nsk  (or skeptics anvil-fusion-verify-skeptics)))
+      (when (and (eq eg 'local-only) (not (anvil-fusion-provider-local-p prov)))
+        (user-error
+         "anvil-fusion-verify: local-only egress refuses non-local skeptic provider %S"
+         prov))
+      (require 'anvil-orchestrator)
+      (condition-case err
+          (let* ((kb-evidence (mapcar (lambda (c)
+                                         (anvil-fusion-verify--kb-search (plist-get c :claim)))
+                                       claims))
+                 (tasks nil)
+                 (ci -1))
+            (cl-mapc
+             (lambda (c ev)
+               (setq ci (1+ ci))
+               (let ((prompt (anvil-fusion-verify--skeptic-prompt
+                              question (plist-get c :claim) ev)))
+                 (dotimes (k nsk)
+                   (push (append
+                          (list :name (format "fusion-verify-skeptic-%d-%d" ci k)
+                                :provider prov
+                                :prompt prompt)
+                          (and mdl (list :model mdl))
+                          (and timeout-sec (list :timeout-sec timeout-sec)))
+                         tasks))))
+             claims kb-evidence)
+            (setq tasks (nreverse tasks))
+            (let* ((batch (anvil-orchestrator-submit tasks)))
+              (anvil-orchestrator-collect batch :wait t :max-wait-sec max-wait-sec)
+              (let* ((btasks (plist-get (anvil-orchestrator-status batch) :tasks))
+                     (by-claim (make-hash-table :test 'eql)))
+                (dolist (tk btasks)
+                  (let ((nm (plist-get tk :name)))
+                    (when (and (stringp nm)
+                               (string-match
+                                "\\`fusion-verify-skeptic-\\([0-9]+\\)-[0-9]+\\'" nm))
+                      (let ((idx (string-to-number (match-string 1 nm))))
+                        (puthash idx (cons (plist-get tk :id) (gethash idx by-claim))
+                                 by-claim)))))
+                (let ((ci2 -1))
+                  (cl-mapcar
+                   (lambda (c ev)
+                     (setq ci2 (1+ ci2))
+                     (let* ((ids (nreverse (gethash ci2 by-claim)))
+                            (verdicts (mapcar #'anvil-fusion-verify--task-verdict ids))
+                            (agg (anvil-fusion-verify--aggregate-verdicts verdicts)))
+                       (anvil-fusion-verify--annotate-claim
+                        c (plist-get agg :verdict)
+                        (anvil-fusion-verify--claim-evidence-line ev agg))))
+                   claims kb-evidence)))))
+        (error
+         (message "anvil-fusion-verify: verify-claims failed: %s"
+                  (error-message-string err))
+         (mapcar (lambda (c) (anvil-fusion-verify--annotate-claim c 'unverified ""))
+                 claims))))))
 
 (provide 'anvil-fusion-verify)
 ;;; anvil-fusion-verify.el ends here
