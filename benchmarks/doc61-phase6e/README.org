@@ -1,0 +1,197 @@
+#+title: Doc 61 Phase 6e — unsaturated eval battery (dataset only)
+#+date: 2026-07-03
+#+author: zawatton + Claude
+
+* Purpose
+
+Doc 61 (=docs/design/61-fusion-verify.org=) §2 Phase 6 built a
+verifier-grounded judge to kill a specific recorded failure mode: the
+2026-06-16 =sovereign= panel eval
+(=dev/_archive/anvil-fusion/eval/results-panel-compare-2026-06-16.org=)
+answered *100 MΩ* to a low-voltage insulation-resistance question where
+one of its own candidates had already supplied the correct *0.1 MΩ* —
+the judge picked the more confident prose over the verified truth.
+
+Phase 6e (§2 "6e. Unsaturated eval battery") is the acceptance
+measurement for that fix:
+
+#+begin_quote
+acceptance = the 0.1 MΩ class of failure no longer occurs (verified
+judge refuses the hallucinated number)
+#+end_quote
+
+This directory is the *dataset only*. No runner, no live LLM calls.
+See =benchmarks/doc61-phase6a/run.el= for the style a future runner
+should follow (deterministic regex scoring over live
+=anvil-orchestrator= / =anvil-fusion= / =anvil-fusion-verify= calls, not
+LLM-judged).
+
+* Files
+
+- =dataset.el= — =anvil-bench-61-6e-tier-a-cases= (10) +
+  =anvil-bench-61-6e-tier-b-cases= (6). Load with =(require
+  'anvil-bench-61-6e-dataset)= after =add-to-list='ing this repo root
+  onto =load-path=.
+
+* Tier A — controlled judge-only scenarios (10 cases)
+
+Each case is a *pre-baked* fan-out result (no live LLM calls to
+generate it): 2-3 candidate summaries with a planted disagreement,
+one asserting the correct value, one a confident, plausible
+hallucination in the same shape as the 2026-06-16 failure. A future
+runner feeds =:candidates= directly into
+=anvil-fusion-verify-extract-claims= / =anvil-fusion-verify-claims= /
+the judge template, skipping the fan-out step entirely — this isolates
+*judge behavior* from *panel generation quality*, which is the
+narrowest possible reproduction of the recorded failure.
+
+- a01-a07: Japanese electrical-regulation domain cases (低圧絶縁抵抗値
+  の電圧区分, 接地工事の種類と抵抗値, 継電器の零相電圧タップ整定).
+  All 7 have confirmed =node/= KB evidence (table below). Failure
+  shapes planted, by case: order-of-magnitude inflation (a01, a03 —
+  the literal shape of the 2026-06-16 failure), adjacent-band
+  confusion (a02), forgot-to-divide miscalculation (a04), cross-class
+  value swap (a05, a06), adjacent-table-column swap (a07).
+- a08-a10: generic API/version/date cases (HTTP/3 transport, SemVer
+  MAJOR/MINOR, ECMAScript Promise standardization year), =:kb-expect
+  nil= by design — these probe whether the verifier degrades
+  gracefully with no KB backend to lean on (skeptic-vote path only,
+  Doc 61 §2 6b).
+
+* Tier B — live end-to-end questions (6 cases)
+
+Real questions to run through single-model / fusion-plain /
+fusion-verify end to end (no planted candidates — the panel actually
+generates them). Chosen to sit below ceiling for a single strong
+model:
+
+- b01-b04: multi-constraint 電気管理実務 questions. Each requires
+  combining *two separate* regulatory facts/tables (e.g. b01 combines
+  the 外部委託承認 scale threshold with the 電気主任技術者免状 voltage
+  class; b03 requires both the correct grounding class *and* the
+  correct number of grounding points) — harder than a Tier A
+  single-claim lookup, which is the point (single-model score target
+  0.4-0.7 band per §2 6e).
+- b05-b06: generic multi-hop reasoning (inclusion-exclusion counting,
+  two-step modular day-of-week arithmetic), no domain knowledge, no
+  KB expected — controls for "uplift is domain-specific" vs
+  "uplift is reasoning-general."
+
+* Planned run conditions
+
+- *Tier A*: plain judge (pre-6d template, =anvil-fusion-judge-template=)
+  vs the Phase 6d verify pipeline (=anvil-fusion-verify-judge-template=,
+  claim extraction -> KB check -> skeptic vote -> verdict-annotated
+  synthesis). Same pre-baked =:candidates= fed to both; no fan-out
+  variance between conditions.
+- *Tier B*: =single= (one Opus/Sonnet call) / =fusion-plain= (Doc 54
+  fan-out + old judge) / =fusion-verify= (fan-out + Phase 6 verify
+  pipeline). Real fan-out, real judge, real egress.
+
+* Scoring rules
+
+** Tier A
+A case's *final answer* (the judge's or verified-judge's synthesized
+text) is checked against =:gold-correct= and =:gold-wrong=:
+
+- Matches =:gold-correct= (regardless of whether =:gold-wrong= also
+  matches — see below) => *PASS*.
+- Matches =:gold-wrong= and does *not* match =:gold-correct= => *FAIL*
+  (adoption of the hallucination — this is the failure mode under
+  test).
+- Matches *neither* => *ABSTAINED*. For the verified judge specifically,
+  on a case where the skeptic vote refutes every candidate's
+  load-bearing claim (Doc 61 §2 6d: "when all candidates carry a
+  REFUTED load-bearing claim, the judge must say so rather than
+  synthesize confidently"), abstention is a *PASS*, not a partial
+  credit — refusing to answer beats confidently adopting either value.
+  For the plain (pre-6d) judge, abstention is scored as *FAIL* (it had
+  no refusal mechanism, so an abstention there indicates a different,
+  unplanned behavior worth investigating by hand, not a pass).
+- *Precedence rule*: =:gold-correct= match wins over a co-occurring
+  =:gold-wrong= match. Several correct candidate summaries in this
+  dataset legitimately mention the wrong value while explaining why
+  it's wrong (e.g. a01/a03's "対地電圧100V区分の0.1MΩより一段厳しい値",
+  a08's "TCPのヘッドオブラインブロッキングを回避" mentioning TCP by
+  name) — verified by hand-checking every candidate summary against
+  both regexes (see =dataset.el='s Commentary header); every *wrong*
+  candidate summary in this dataset matches *only* =:gold-wrong=, so
+  this precedence rule never masks a genuine failure in the planted
+  data itself, only in what a judge might separately write.
+
+Acceptance target (Doc 61 §2 6e): *0 FAIL* on Tier A for the
+=fusion-verify= condition across all 10 cases (the =:gold-wrong=
+adoption rate must be 0).
+
+** Tier B
+Each =:gold= key is scored independently against the final answer
+(recall metric, not an AND-gate) — report per-case
+matched-keys/total-keys, plus an aggregate recall across conditions.
+=:difficulty= notes which sub-facts are KB-backed vs general-knowledge
+gaps the model must supply itself (see gaps below) — a condition that
+scores well on KB-backed keys but misses the un-backed key is
+informative, not just a raw pass/fail.
+
+* KB-verification table
+
+Recorded by loading =anvil-fusion-verify.el= from a detached worktree of
+committed HEAD (=b414185=) and calling
+=anvil-fusion-verify--kb-search= with roots
+=("/home/madblack-21/Cowork/Notes/node")= — completely outside this repo,
+read-only, zero-egress local grep (ripgrep, restricted to
+=*.org=/=*.md=/=*.txt=). =anvil-fusion-verify-max-evidence= caps results
+at 3, so "hits: 3" below means "3 or more, capped" rather than an exact
+count.
+
+| Case | Claim searched                                         | Hits | First :source (path:line)                                          |
+|------+---------------------------------------------------------+------+----------------------------------------------------------------------|
+| a01  | 対地電圧150V以下の低圧電路の絶縁抵抗は0.1MΩ以上          |    3 | node/20250521090644-年次点検.org:165                                 |
+| a02  | 対地電圧150V超300V以下の低圧電路の絶縁抵抗は0.2MΩ以上    |    3 | node/20250521090644-年次点検.org:165                                 |
+| a03  | 使用電圧300V超の低圧電路の絶縁抵抗は0.4MΩ以上            |    3 | node/20250521090644-年次点検.org:165 (exact "0.1/0.2/0.4MΩ" text at 20250518222708-絶縁抵抗測定.org:1286) |
+| a04  | 1線地絡電流10AのB種接地工事の接地抵抗値は15Ω             |    3 | node/20250518222320-接地抵抗測定.org:111                             |
+| a05  | 0.5秒以内自動遮断時のC種接地工事の接地抵抗値は500Ω以下    |    3 | node/20250518222320-接地抵抗測定.org:125 (exact match)                |
+| a06  | 非接地式高圧電路機械器具のA種接地工事、大地抵抗値2Ω       |    3 | node/20250518222320-接地抵抗測定.org:132 (exact match)                |
+| a07  | 地絡方向継電器の零相電圧タップ5%の動作電圧は190.5V        |    3 | node/20250829124859-電気まとめノート.org:90                          |
+| a08  | (generic, no KB search — :kb-expect nil)                 |    — | —                                                                      |
+| a09  | (generic, no KB search — :kb-expect nil)                 |    — | —                                                                      |
+| a10  | (generic, no KB search — :kb-expect nil)                 |    — | —                                                                      |
+| b01  | 需要設備の外部委託承認対象基準は受電電圧7000V以下          |    3 | node/20250915182848-太陽光発電所の点検.org:528 (exact match, table row) |
+| b02  | 電気主任技術者の選任許可の対象は需要設備で最大電力500kW未満 |    3 | node/20260409142235-資格取得一覧.org:396 (most on-point: node/20250915182848-太陽光発電所の点検.org:510, exact "・最大電力 500kW 未満の需要設備") |
+| b03  | CTとVTの二次側端子の1箇所にはD種接地を施す                |    3 | node/20251227000920-リレー試験.org:737 (verbatim match)               |
+| b04  | SOG整定値0.2Aを超えない絶縁抵抗の最小値はおよそ0.06MΩ      |    3 | node/20250518222708-絶縁抵抗測定.org:1180 (exact numeric value at 20250518222708-絶縁抵抗測定.org:1144) |
+| b05  | (generic reasoning, no KB expected)                       |    — | —                                                                      |
+| b06  | (generic reasoning, no KB expected)                       |    — | —                                                                      |
+
+*Result: 7/7 domain Tier A cases confirmed (target was >= 6/7), 4/4
+domain Tier B cases confirmed.*
+
+* Known KB gaps (designed around)
+
+- *D種接地工事 generic baseline (100Ω) by voltage class* (機器の使用
+  電圧が300V以下ならD種, 300V超ならC種, という一般則、および各クラス
+  の原則値10Ω/100Ω) — the node/ KB has D種 headings and one specific
+  D種 fact (CT/VT二次側の1箇所接地, used in b03) but *no* standalone
+  "10Ω" or "100Ω" string for the generic class-baseline values, so
+  a Tier A case built around that pair was dropped in favor of the
+  KB-confirmed C種 exception (a05) and A種 example (a06) instead.
+- *電気主任技術者第三種の電圧上限(5万V未満)* — used as the third gold
+  key in b01. "第三種" itself appears in node/ (資格保有の記録として)
+  but the specific "5万V" / "50,000V" boundary string does not; this
+  key relies on the model's general licensing knowledge rather than
+  retrievable local evidence. Noted explicitly in b01's =:difficulty=
+  field so a verify-pipeline run that can't confirm this sub-claim via
+  KB (and must fall back to the skeptic-vote path, Doc 61 §2 6b) is an
+  expected, not surprising, outcome.
+- *太陽光発電設備の開放電圧750V超/以下の絶縁抵抗値* — node/
+  =20250915182848-太陽光発電所の点検.org= has headings for this exact
+  split but the actual numeric values live only in embedded
+  screenshots (=#+DOWNLOADED:= image blocks), not as greppable text —
+  unusable for a KB-search-verifiable case despite being topically
+  perfect. Skipped.
+- *月次点検の法定頻度(具体的な「毎月1回」等の文言)* — node/ has the
+  citation (電気事業法施行規則第53条2項5号: 頻度は委託契約書で定める)
+  but no fixed statutory number to grep for (frequency is
+  contract-defined, not a single legal constant) — not usable as a
+  single-claim KB-search case; also why no explicit "検査周期" Tier A
+  case was built (the field is intentionally not a fixed constant in
+  this domain).
