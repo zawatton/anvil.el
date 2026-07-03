@@ -100,12 +100,26 @@ the :provider argument to `anvil-fusion-verify-extract-claims'."
   :type 'symbol
   :group 'anvil-fusion)
 
-(defcustom anvil-fusion-verify-extract-model nil
-  "Model for the claim-extraction pass, or nil for the provider default.
-Nil lets the provider pick its default model.  Set this to pin a
-cheaper/faster tier (e.g. a haiku-class model) once Doc 61 §9's
-haiku-vs-sonnet fidelity question is settled; left open for now so
-it is overridable per call via the :model argument to
+(defcustom anvil-fusion-verify-extract-model "haiku"
+  "Model for the claim-extraction pass, applied ONLY when the effective
+provider is `claude'.
+Doc 61 §9's haiku-vs-sonnet fidelity spike
+(benchmarks/doc61-phase6a/, 2026-07-03) measured haiku-tier
+(`claude-haiku-4-5-20251001') against sonnet-tier on 8 synthetic
+fan-out cases: 79% gold recall vs sonnet's 86%, zero format collapse
+on either tier (8/8 well-formed responses each), and haiku at ~0.6x
+sonnet's cost.  The spike's Recommendation pins haiku as the default
+extraction tier -- the 7-point recall gap is within the ~10% bar
+Doc 61 §9 set as the pinning criterion, and sonnet's own worst
+failure (a false NONE, case 8) is arguably worse for Phase 6b than
+haiku's one-sided disagreement merges, which at least surface the
+contested topic.
+This is a claude-CLI model alias (\"haiku\"), so it is applied ONLY
+when the effective provider resolves to `claude' -- see
+`anvil-fusion-verify-extract-claims' for the exact provider-scoped
+resolution logic (an alias like this would break e.g. an `ollama'
+provider).  Set to nil to let the claude CLI pick its own default
+model instead.  Override per call via the :model argument to
 `anvil-fusion-verify-extract-claims'."
   :type '(choice (const :tag "Provider default" nil) string)
   :group 'anvil-fusion)
@@ -123,6 +137,10 @@ it is overridable per call via the :model argument to
 
 # 指示
 - 上記の基準に従い、係争中の主張を、結論への影響が大きい順に列挙してください。
+- 候補間で見解が分かれている論点は、一つの CLAIM 行にまとめず、立場ごとに別々の CLAIM 行として出力してください。
+- 各 CLAIM 行の CANDIDATES には、その立場を実際に述べた候補だけを列挙し、他の立場の候補を含めないでください（帰属は正確に）。
+- 同じ論点の両側は隣接する行にまとめ、両方とも上限件数の中に数えてください（片側だけの論点を多く挙げるより、少ない論点を両側とも漏れなく挙げることを優先してください）。
+- NONE の判定は厳格に行ってください。全候補が実質的に同一の主張をしている場合に限り NONE としてください。言い回しの違い・説明の詳しさや網羅性の差・周辺的な論点への言及の有無は、係争中の主張とはみなしません。結論を左右しない周辺的な差異についての CLAIM は出力しないでください。
 - 最大 %d 件まで。
 - 係争中の主張が一つも無ければ、他には何も書かず NONE とだけ出力してください。
 - 各主張は 1 行、以下の形式に厳密に従ってください（番号付けや装飾、余計な前置きは禁止）:
@@ -135,7 +153,19 @@ Three placeholders filled in order by `format' via
 `anvil-fusion-verify-max-claims'.  The exact `CLAIM: ... | KIND:
 ... | CANDIDATES: ...' line format is required by
 `anvil-fusion-verify--parse-claims'; keep the tail of the template
-in sync with the parser's regexp if you customize it."
+in sync with the parser's regexp if you customize it.
+
+Hardened per the Doc 61 §9 haiku-vs-sonnet spike
+(benchmarks/doc61-phase6a/results-extract-fidelity-2026-07-03.org)
+against two failure modes both tiers showed: (1) collapsing a
+two-sided disagreement into one CLAIM line, sometimes with wrong
+CANDIDATES attribution -- fixed by the per-side-extraction
+instruction (each contested position gets its own CLAIM line, with
+CANDIDATES restricted to the candidates that actually asserted that
+position); (2) 2-3 false-positive CLAIMs on an all-agreeing panel --
+fixed by tightening the NONE criterion to require substantively
+identical assertions (wording / coverage / peripheral-point
+differences no longer qualify as contested)."
   :type 'string
   :group 'anvil-fusion)
 
@@ -253,10 +283,15 @@ and submits it as a single task via the same orchestrator public-API
 pattern as `anvil-fusion-ask.el': `anvil-orchestrator-submit' with one
 task, `anvil-orchestrator-collect' with :wait t, then
 `anvil-orchestrator-extract-result' (full) on the task id (obtained
-via `anvil-fusion--batch-first-task-id').  :PROVIDER / :MODEL default
-to `anvil-fusion-verify-extract-provider' /
-`anvil-fusion-verify-extract-model'.  :TIMEOUT-SEC caps the task;
-:MAX-WAIT-SEC caps the collect wait (default 1800s).
+via `anvil-fusion--batch-first-task-id').  :PROVIDER defaults to
+`anvil-fusion-verify-extract-provider'.  :MODEL resolution is
+provider-scoped: an explicit :MODEL argument always wins; otherwise
+`anvil-fusion-verify-extract-model' is applied ONLY when the
+effective PROVIDER (:PROVIDER, or its default, above) is `claude' --
+that default is a claude-CLI model alias (e.g. \"haiku\") and would
+break a non-claude provider such as `ollama'; any other provider
+gets no :model unless :MODEL was passed explicitly.  :TIMEOUT-SEC
+caps the task; :MAX-WAIT-SEC caps the collect wait (default 1800s).
 
 Extraction is best-effort: on task failure, a non-`done' terminal
 status, or any signaled error, this returns nil and emits a
@@ -266,7 +301,8 @@ claim list (see `anvil-fusion-verify--parse-claims') on success."
   (require 'anvil-orchestrator)
   (condition-case err
       (let* ((prov   (or provider anvil-fusion-verify-extract-provider))
-             (mdl    (or model anvil-fusion-verify-extract-model))
+             (mdl    (or model
+                         (and (eq prov 'claude) anvil-fusion-verify-extract-model)))
              (prompt (anvil-fusion-verify--extract-prompt question candidates))
              (task   (append
                       (list :name "fusion-verify-extract"

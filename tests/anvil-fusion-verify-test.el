@@ -48,7 +48,9 @@
 
 (ert-deftest anvil-fusion-verify-test-extract-prompt-structure ()
   "Extraction prompt embeds the question, candidate names + bodies, the
-max-claims number, and the CLAIM format line."
+max-claims number, and the CLAIM format line.  Format-call smoke: the
+template still consumes exactly three %-placeholders (question,
+candidate block, max-claims) without error."
   (let* ((anvil-fusion-verify-max-claims 5)
          (p (anvil-fusion-verify--extract-prompt
              "絶縁抵抗の測定値は？" anvil-fusion-verify-test--candidates)))
@@ -59,7 +61,15 @@ max-claims number, and the CLAIM format line."
     (should (string-match-p "100 MOhm" p))
     (should (string-match-p "\\<5\\>" p))
     (should (string-match-p
-             "CLAIM:.*|[ \t]*KIND:.*|[ \t]*CANDIDATES:" p))))
+             "CLAIM:.*|[ \t]*KIND:.*|[ \t]*CANDIDATES:" p))
+    (should (string-match-p "NONE" p))))
+
+(ert-deftest anvil-fusion-verify-test-extract-prompt-per-side-instruction ()
+  "Template instructs per-side extraction on disagreement (Doc 61 §9
+hardening): a stable substring of that instruction is present."
+  (let ((p (anvil-fusion-verify--extract-prompt
+            "Q" anvil-fusion-verify-test--candidates)))
+    (should (string-match-p "立場ごとに別々の CLAIM 行" p))))
 
 (ert-deftest anvil-fusion-verify-test-extract-prompt-max-claims-changes ()
   "Changing `anvil-fusion-verify-max-claims' is reflected in the prompt."
@@ -224,7 +234,36 @@ submitted prompt contains the question."
                    "Q" anvil-fusion-verify-test--candidates)))))
 
 (ert-deftest anvil-fusion-verify-test-extract-claims-provider-model-override ()
-  ":provider / :model keywords reach the submitted task."
+  "An explicit :model always wins, regardless of :provider."
+  (anvil-fusion-verify-test--with-fake-orchestrator
+      (lambda (_id _full) (list :status 'done :summary "NONE"))
+    (anvil-fusion-verify-extract-claims
+     "Q" anvil-fusion-verify-test--candidates
+     :provider 'ollama :model "llama3.1:8b")
+    (should (eq 'ollama (plist-get submitted :provider)))
+    (should (equal "llama3.1:8b" (plist-get submitted :model)))))
+
+(ert-deftest anvil-fusion-verify-test-extract-claims-default-model-claude ()
+  "With defaults (provider `claude'), the submitted task carries the
+`anvil-fusion-verify-extract-model' default (\"haiku\")."
+  (anvil-fusion-verify-test--with-fake-orchestrator
+      (lambda (_id _full) (list :status 'done :summary "NONE"))
+    (anvil-fusion-verify-extract-claims "Q" anvil-fusion-verify-test--candidates)
+    (should (eq 'claude (plist-get submitted :provider)))
+    (should (equal "haiku" (plist-get submitted :model)))))
+
+(ert-deftest anvil-fusion-verify-test-extract-claims-ollama-no-default-model ()
+  "Provider `ollama' with no explicit :model submits NO :model key -- the
+claude-CLI \"haiku\" alias default must not leak to other providers."
+  (anvil-fusion-verify-test--with-fake-orchestrator
+      (lambda (_id _full) (list :status 'done :summary "NONE"))
+    (anvil-fusion-verify-extract-claims
+     "Q" anvil-fusion-verify-test--candidates :provider 'ollama)
+    (should (eq 'ollama (plist-get submitted :provider)))
+    (should (null (plist-member submitted :model)))))
+
+(ert-deftest anvil-fusion-verify-test-extract-claims-ollama-explicit-model ()
+  "Provider `ollama' WITH an explicit :model carries it through."
   (anvil-fusion-verify-test--with-fake-orchestrator
       (lambda (_id _full) (list :status 'done :summary "NONE"))
     (anvil-fusion-verify-extract-claims
