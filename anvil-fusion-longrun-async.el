@@ -60,6 +60,7 @@
 (defvar anvil-fusion-longrun-hermetic-instruction)
 (declare-function anvil-fusion-longrun-disclosure-tools-string "anvil-fusion-longrun" ())
 (declare-function anvil-fusion-longrun--apply-suffix "anvil-fusion-longrun" (prompt suffix))
+(declare-function anvil-fusion-longrun--apply-suffixes "anvil-fusion-longrun" (prompt &rest suffixes))
 (declare-function anvil-fusion-longrun--allowed-tools-plist "anvil-fusion-longrun"
                   (allowed-tools))
 (declare-function anvil-fusion-longrun--resolve-allowed-tools "anvil-fusion-longrun"
@@ -68,9 +69,16 @@
                   (allowed-tools-string))
 (declare-function anvil-fusion-longrun--panel-step-p "anvil-fusion-longrun"
                   (step-panel step-panel-mode next-hard panel-budget-left))
+(declare-function anvil-fusion-longrun--default-verify-fn "anvil-fusion-longrun"
+                  (question digest))
+(declare-function anvil-fusion-longrun--gate-result "anvil-fusion-longrun"
+                  (verify-fn question digest))
+(declare-function anvil-fusion-longrun--retry-feedback-block "anvil-fusion-longrun"
+                  (refuted-claims))
 (defvar anvil-fusion-longrun-hermetic-manifest-profile)
 (defvar anvil-fusion-longrun-hermetic-disallowed-tools)
 (defvar anvil-fusion-longrun-max-panel-steps)
+(defvar anvil-fusion-longrun--verify-max-wait-sec)
 (defvar anvil-orchestrator-manifest-profile)
 
 (defvar anvil-fusion-longrun--jobs (make-hash-table :test 'equal)
@@ -81,6 +89,10 @@
 When a Doc 61 Phase 8b panel step is chosen, `anvil-fusion-longrun-status'
 blocks only long enough to call `anvil-fusion-ask' once, then resumes the
 normal distill polling flow."
+  :type 'integer :group 'anvil-fusion-longrun)
+
+(defcustom anvil-fusion-longrun-async-verify-max-wait-sec 600
+  "Upper bound for a synchronous verify-gate call inside one poll advance."
   :type 'integer :group 'anvil-fusion-longrun)
 
 ;;;; --- orchestrator helpers (non-blocking) ---------------------------------
@@ -124,28 +136,33 @@ within this poll advance (bounded by
 `anvil-fusion-longrun-async-panel-max-wait-sec'), then immediately
 submit the distill batch and return JOB at stage `distill-running'."
   (let* ((target  (1+ (plist-get job :step)))
-         (sprompt (anvil-fusion-longrun--apply-suffix
+         (sprompt (anvil-fusion-longrun--apply-suffixes
                    (anvil-fusion-longrun-build-step-prompt
                     (plist-get job :goal) (plist-get job :digest)
                     target (plist-get job :maxn))
-                   (plist-get job :step-suffix)))
+                   (plist-get job :step-suffix)
+                   (plist-get job :retry-feedback)))
          (want-panel
-          (and (plist-get job :step-panel)
+          (and (not (plist-get job :retry-pending))
+               (plist-get job :step-panel)
                (pcase (or (plist-get job :step-panel-mode) 'hard-only)
                  ('always t)
                  (_ (plist-get job :next-hard)))))
-         (panelp (anvil-fusion-longrun--panel-step-p
-                  (plist-get job :step-panel)
-                  (plist-get job :step-panel-mode)
-                  (plist-get job :next-hard)
-                  (plist-get job :panel-budget-left))))
+         (panelp (or (plist-get job :retry-panelp)
+                     (anvil-fusion-longrun--panel-step-p
+                      (plist-get job :step-panel)
+                      (plist-get job :step-panel-mode)
+                      (plist-get job :next-hard)
+                      (plist-get job :panel-budget-left)))))
+    (setq job (plist-put job :retry-feedback nil))
     (if panelp
         (progn
           (require 'anvil-fusion-ask)
-          (setq job (plist-put job :panel-budget-left
-                               (1- (plist-get job :panel-budget-left))))
-          (setq job (plist-put job :panel-steps
-                               (1+ (or (plist-get job :panel-steps) 0))))
+          (unless (plist-get job :retry-pending)
+            (setq job (plist-put job :panel-budget-left
+                                 (1- (plist-get job :panel-budget-left))))
+            (setq job (plist-put job :panel-steps
+                                 (1+ (or (plist-get job :panel-steps) 0)))))
           (setq job (plist-put job :last-panelp t))
           (anvil-fusion-longrun--submit-distill
            job
@@ -196,7 +213,7 @@ submit the distill batch and return JOB at stage `distill-running'."
     (goal &key provider model distill-provider distill-model
           max-steps digest-max-chars cwd db hermetic step-allowed-tools
           step-manifest-profile step-panel (step-panel-mode 'hard-only)
-          panel-verify)
+          panel-verify verify-steps verify-fn)
   "Start a quest for GOAL and return a job plist immediately.
 Creates the persisted quest and registers a poll-able job without
 blocking the start call.  The first normal step batch is submitted on
@@ -229,18 +246,26 @@ distill batch.  DB defaults to the cached store.  Returns
                       :step-panel step-panel
                       :step-panel-mode step-panel-mode
                       :panel-verify panel-verify
+                      :verify-steps verify-steps
+                      :verify-fn (and verify-steps
+                                       (or verify-fn
+                                           #'anvil-fusion-longrun--default-verify-fn))
+                      :gate-failures 0
+                      :retry-pending nil
+                      :retry-panelp nil
+                      :retry-feedback nil
                       :panel-budget-left anvil-fusion-longrun-max-panel-steps
                       :panel-steps 0
                       :next-hard nil
                       :step 0 :digest nil :stage 'step-ready :batch nil)))
     (puthash (plist-get job :job-id) job anvil-fusion-longrun--jobs)
-    (list :job-id (plist-get job :job-id) :quest-id qid
-          :stage 'step-ready :panel-steps 0)))
+  (list :job-id (plist-get job :job-id) :quest-id qid
+          :stage 'step-ready :panel-steps 0 :gate-failures 0)))
 
 (cl-defun anvil-fusion-longrun-resume-async
     (quest-id &key max-steps db hermetic step-allowed-tools
               step-manifest-profile step-panel (step-panel-mode 'hard-only)
-              panel-verify)
+              panel-verify verify-steps verify-fn)
   "Resume QUEST-ID from its checkpoint and return a job plist immediately.
 Registers the next step without blocking the resume call.  The first
 poll advances it as in `anvil-fusion-longrun-start-async'.  Returns
@@ -272,6 +297,14 @@ poll advances it as in `anvil-fusion-longrun-start-async'.  Returns
                      :step-panel step-panel
                      :step-panel-mode step-panel-mode
                      :panel-verify panel-verify
+                     :verify-steps verify-steps
+                     :verify-fn (and verify-steps
+                                      (or verify-fn
+                                          #'anvil-fusion-longrun--default-verify-fn))
+                     :gate-failures 0
+                     :retry-pending nil
+                     :retry-panelp nil
+                     :retry-feedback nil
                      :panel-budget-left anvil-fusion-longrun-max-panel-steps
                      :panel-steps 0
                      :next-hard nil
@@ -294,6 +327,7 @@ poll advances it as in `anvil-fusion-longrun-start-async'.  Returns
         :answer (plist-get job :digest)
         :digest (plist-get job :digest)
         :steps (plist-get job :step)
+        :gate-failures (or (plist-get job :gate-failures) 0)
         :panel-steps (or (plist-get job :panel-steps) 0)
         :stopped (or (plist-get job :stopped) 'done)))
 
@@ -310,42 +344,82 @@ poll advances it as in `anvil-fusion-longrun-start-async'.  Returns
   (let* ((prev   (plist-get job :digest))
          (draw   (anvil-fusion-longrun--batch-output (plist-get job :batch)))
          (parsed (anvil-fusion-longrun--parse-distill draw (plist-get job :maxc)))
-         (digest (plist-get parsed :digest))
-         (done   (plist-get parsed :done))
-         (next-hard (plist-get parsed :next-hard))
-         (pat    anvil-fusion-longrun-converge-patience)
-         (streak (anvil-fusion-longrun--streak
-                  (or (plist-get job :streak) 0) prev digest
-                  anvil-fusion-longrun-converge-threshold pat))
-         (converged (anvil-fusion-longrun--converged-p streak pat))
+         (verify-fn (plist-get job :verify-fn))
          (target (1+ (plist-get job :step)))
-         (eot    (or done converged (>= target (plist-get job :maxn))))
-         (meta   (list :step target
-                       :panelp (plist-get job :last-panelp)
-                       :output-chars (plist-get job :last-output-chars)
-                       :digest-chars (length (or digest ""))
-                       :digest-head (let ((d (or digest "")))
-                                      (substring d 0 (min 80 (length d))))
-                       :done (or done converged))))
-    (setq job (plist-put job :step target))
-    (setq job (plist-put job :digest digest))
-    (setq job (plist-put job :next-hard next-hard))
-    (setq job (plist-put job :streak streak))
-    (anvil-fusion-longrun-store-checkpoint
-     (plist-get job :db) (plist-get job :quest-id) target digest
-     (if (or done converged) "done" "running") meta)
-    (if eot
-        (let ((stopped (cond (done 'done) (converged 'converged) (t 'budget))))
-          (anvil-fusion-longrun-store-finish
-           (plist-get job :db) (plist-get job :quest-id) target digest stopped)
-          (setq job (plist-put job :stopped stopped))
-          (setq job (plist-put job :stage 'done))
-          (puthash job-id job anvil-fusion-longrun--jobs)
-          (anvil-fusion-longrun--report-done job))
-      (progn
-        (setq job (anvil-fusion-longrun--submit-step job))
-        (puthash job-id job anvil-fusion-longrun--jobs)
-        (anvil-fusion-longrun--running-status job)))))
+         (gate-state nil)
+         (refuted-texts nil)
+         (retry-status nil))
+    (when verify-fn
+      (let ((anvil-fusion-longrun--verify-max-wait-sec
+             anvil-fusion-longrun-async-verify-max-wait-sec)
+            (gate-1 (anvil-fusion-longrun--gate-result
+                     verify-fn (plist-get job :goal) (plist-get parsed :digest))))
+        (if (plist-get gate-1 :pass)
+            (setq gate-state 'pass)
+          (if (plist-get job :retry-pending)
+              (progn
+                (setq gate-state 'failed)
+                (setq refuted-texts
+                      (mapcar (lambda (claim) (plist-get claim :claim))
+                              (plist-get gate-1 :refuted)))
+                (setq job (plist-put job :gate-failures
+                                     (1+ (or (plist-get job :gate-failures) 0))))
+                (message "anvil-fusion-longrun-async: step %d verify gate failed after retry"
+                         target))
+            (setq job (plist-put job :retry-pending t))
+            (setq job (plist-put job :retry-panelp (plist-get job :last-panelp)))
+            (setq job (plist-put job :retry-feedback
+                                 (anvil-fusion-longrun--retry-feedback-block
+                                  (plist-get gate-1 :refuted))))
+            (setq job (anvil-fusion-longrun--submit-step job))
+            (puthash job-id job anvil-fusion-longrun--jobs)
+            (setq retry-status (anvil-fusion-longrun--running-status job))))))
+    (if retry-status
+        retry-status
+      (let* ((digest (plist-get parsed :digest))
+             (done   (plist-get parsed :done))
+             (next-hard (plist-get parsed :next-hard))
+             (pat    anvil-fusion-longrun-converge-patience)
+             (streak (anvil-fusion-longrun--streak
+                      (or (plist-get job :streak) 0) prev digest
+                      anvil-fusion-longrun-converge-threshold pat))
+             (converged (anvil-fusion-longrun--converged-p streak pat))
+             (eot    (or done converged (>= target (plist-get job :maxn))))
+             (meta   (append
+                      (list :step target
+                            :panelp (plist-get job :last-panelp)
+                            :output-chars (plist-get job :last-output-chars)
+                            :digest-chars (length (or digest ""))
+                            :digest-head (let ((d (or digest "")))
+                                           (substring d 0 (min 80 (length d))))
+                            :done (or done converged))
+                      (and verify-fn (list :gate (or gate-state
+                                                     (if (plist-get job :retry-pending)
+                                                         'retried-pass
+                                                       'pass))))
+                      (and (eq gate-state 'failed) (list :refuted refuted-texts)))))
+        (setq job (plist-put job :step target))
+        (setq job (plist-put job :digest digest))
+        (setq job (plist-put job :next-hard next-hard))
+        (setq job (plist-put job :streak streak))
+        (setq job (plist-put job :retry-pending nil))
+        (setq job (plist-put job :retry-panelp nil))
+        (setq job (plist-put job :retry-feedback nil))
+        (anvil-fusion-longrun-store-checkpoint
+         (plist-get job :db) (plist-get job :quest-id) target digest
+         (if (or done converged) "done" "running") meta)
+        (if eot
+            (let ((stopped (cond (done 'done) (converged 'converged) (t 'budget))))
+              (anvil-fusion-longrun-store-finish
+               (plist-get job :db) (plist-get job :quest-id) target digest stopped)
+              (setq job (plist-put job :stopped stopped))
+              (setq job (plist-put job :stage 'done))
+              (puthash job-id job anvil-fusion-longrun--jobs)
+              (anvil-fusion-longrun--report-done job))
+          (progn
+            (setq job (anvil-fusion-longrun--submit-step job))
+            (puthash job-id job anvil-fusion-longrun--jobs)
+            (anvil-fusion-longrun--running-status job)))))))
 
 (defun anvil-fusion-longrun-status (job-id)
   "Advance and report async quest JOB-ID (non-blocking).

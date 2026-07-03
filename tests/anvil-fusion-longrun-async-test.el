@@ -276,5 +276,120 @@ BODY may inspect `--submitted', `--asks', and `--tasks'."
                           (mapcar (lambda (task) (plist-get task :name))
                                   --submitted))))))))
 
+(ert-deftest anvil-fusion-longrun-async-test-verify-retry-then-pass ()
+  (let ((db (anvil-fusion-longrun-async-test--tmpdb))
+        (--counter 0)
+        (--order nil)
+        (--tasks (make-hash-table :test 'equal))
+        (distill-counts (make-hash-table :test 'equal)))
+    (cl-letf (((symbol-function 'anvil-orchestrator-submit)
+               (lambda (tasks)
+                 (cl-incf --counter)
+                 (let ((bid (format "batch-%d" --counter))
+                       (task (car tasks)))
+                   (puthash bid task --tasks)
+                   (push bid --order)
+                   bid)))
+              ((symbol-function 'anvil-orchestrator-status)
+               (lambda (_id) (list :running 0 :queued 0)))
+              ((symbol-function 'anvil-fusion--batch-first-task-id)
+               (lambda (bid) bid))
+              ((symbol-function 'anvil-orchestrator-extract-result)
+               (lambda (bid &optional _full)
+                 (let* ((task (gethash bid --tasks))
+                        (name (plist-get task :name)))
+                   (if (string-prefix-p "lr-distill" name)
+                       (let ((seen (1+ (gethash name distill-counts 0))))
+                         (puthash name seen distill-counts)
+                         (list :summary
+                               (pcase (list name seen)
+                                 (`("lr-distill-1" 1) "DIGEST-FIRST\nSTATUS: CONTINUE")
+                                 (`("lr-distill-1" 2) "DIGEST-RETRY\nSTATUS: CONTINUE")
+                                 (_ "DIGEST-DONE\nSTATUS: DONE"))))
+                     (list :summary (format "stepout-%s" name)))))))
+      (let* ((s (anvil-fusion-longrun-start-async
+                 "G" :provider 'ollama :max-steps 2 :db db
+                 :verify-steps t
+                 :verify-fn (lambda (_question digest)
+                              (if (equal digest "DIGEST-FIRST")
+                                  (list (list :claim "wrong fact"
+                                              :evidence "proof"
+                                              :verdict 'refuted))
+                                nil))))
+             (r (anvil-fusion-longrun-async-test--drain (plist-get s :job-id))))
+        (should (eq (plist-get r :status) 'done))
+        (should (= (plist-get r :steps) 2))
+        (should (= (plist-get r :gate-failures) 0))
+        (should (equal (plist-get r :answer) "DIGEST-DONE"))
+        (let* ((order (nreverse --order))
+               (submitted
+                (mapcar (lambda (bid) (plist-get (gethash bid --tasks) :name))
+                        order))
+               (step1-prompts
+                (mapcar (lambda (bid) (plist-get (gethash bid --tasks) :prompt))
+                        (seq-filter
+                         (lambda (bid)
+                           (equal (plist-get (gethash bid --tasks) :name) "lr-step-1"))
+                         order))))
+          (should (= (length step1-prompts) 2))
+          (should (equal submitted
+                         '("lr-step-1" "lr-distill-1" "lr-step-1"
+                           "lr-distill-1" "lr-step-2" "lr-distill-2")))
+          (should (string-match-p "前回試行への反証" (cadr step1-prompts)))
+          (should (string-match-p "wrong fact" (cadr step1-prompts))))))))
+
+(ert-deftest anvil-fusion-longrun-async-test-verify-retry-then-fail ()
+  (let ((db (anvil-fusion-longrun-async-test--tmpdb))
+        (--counter 0)
+        (--order nil)
+        (--tasks (make-hash-table :test 'equal))
+        (distill-counts (make-hash-table :test 'equal)))
+    (cl-letf (((symbol-function 'anvil-orchestrator-submit)
+               (lambda (tasks)
+                 (cl-incf --counter)
+                 (let ((bid (format "batch-%d" --counter))
+                       (task (car tasks)))
+                   (puthash bid task --tasks)
+                   (push bid --order)
+                   bid)))
+              ((symbol-function 'anvil-orchestrator-status)
+               (lambda (_id) (list :running 0 :queued 0)))
+              ((symbol-function 'anvil-fusion--batch-first-task-id)
+               (lambda (bid) bid))
+              ((symbol-function 'anvil-orchestrator-extract-result)
+               (lambda (bid &optional _full)
+                 (let* ((task (gethash bid --tasks))
+                        (name (plist-get task :name)))
+                   (if (string-prefix-p "lr-distill" name)
+                       (let ((seen (1+ (gethash name distill-counts 0))))
+                         (puthash name seen distill-counts)
+                         (list :summary
+                               (pcase (list name seen)
+                                 (`("lr-distill-1" 1) "DIGEST-FIRST\nSTATUS: CONTINUE")
+                                 (`("lr-distill-1" 2) "DIGEST-STILL-BAD\nSTATUS: CONTINUE")
+                                 (_ "DIGEST-DONE\nSTATUS: DONE"))))
+                     (list :summary (format "stepout-%s" name)))))))
+      (let* ((s (anvil-fusion-longrun-start-async
+                 "G" :provider 'ollama :max-steps 2 :db db
+                 :verify-steps t
+                 :verify-fn (lambda (_question digest)
+                              (if (member digest '("DIGEST-FIRST" "DIGEST-STILL-BAD"))
+                                  (list (list :claim "still wrong"
+                                              :evidence "source"
+                                              :verdict 'refuted))
+                                nil))))
+             (r (anvil-fusion-longrun-async-test--drain (plist-get s :job-id))))
+        (should (eq (plist-get r :status) 'done))
+        (should (= (plist-get r :steps) 2))
+        (should (= (plist-get r :gate-failures) 1))
+        (should (equal (plist-get r :answer) "DIGEST-DONE"))
+        (should (equal (mapcar (lambda (bid) (plist-get (gethash bid --tasks) :name))
+                               (nreverse --order))
+                       '("lr-step-1" "lr-distill-1" "lr-step-1"
+                         "lr-distill-1" "lr-step-2" "lr-distill-2")))
+        (should (= (length (anvil-fusion-longrun-store-steps
+                            db (plist-get s :quest-id)))
+                   2))))))
+
 (provide 'anvil-fusion-longrun-async-test)
 ;;; anvil-fusion-longrun-async-test.el ends here

@@ -209,6 +209,125 @@ falsely stopped the quest at step 1."
     (should (= (plist-get r :panel-steps) 0))
     (should (equal (plist-get r :answer) "DIGEST-2"))))
 
+;;;; --- verify gate (Doc 61 Phase 8c) --------------------------------------
+
+(ert-deftest anvil-fusion-longrun-test-verify-gate-pass-through ()
+  (let ((r (anvil-fusion-longrun-run
+            "goal"
+            :max-steps 1
+            :verify-steps t
+            :step-fn (lambda (_prompt _step) "out")
+            :distill-fn (lambda (_prompt _step) "DIGEST-PASS\nSTATUS: DONE")
+            :verify-fn (lambda (_question digest)
+                         (list (list :claim digest :verdict 'confirmed))))))
+    (should (equal (plist-get r :answer) "DIGEST-PASS"))
+    (should (= (plist-get r :gate-failures) 0))
+    (should (eq (plist-get (car (plist-get r :trace)) :gate) 'pass))))
+
+(ert-deftest anvil-fusion-longrun-test-verify-gate-retry-then-pass ()
+  (let (prompts step-nos)
+    (let ((r (anvil-fusion-longrun-run
+              "goal"
+              :max-steps 1
+              :verify-steps t
+              :step-fn (lambda (prompt step-n)
+                         (push prompt prompts)
+                         (push step-n step-nos)
+                         (if (= (length prompts) 1) "STEP-FIRST" "STEP-RETRY"))
+              :distill-fn (lambda (prompt _step)
+                            (if (string-match-p "STEP-RETRY" prompt)
+                                "DIGEST-RETRY\nSTATUS: DONE"
+                              "DIGEST-FIRST\nSTATUS: DONE"))
+              :verify-fn (lambda (_question digest)
+                           (if (equal digest "DIGEST-FIRST")
+                               (list (list :claim "bad fact"
+                                           :evidence "proof"
+                                           :verdict 'refuted))
+                             (list (list :claim digest :verdict 'confirmed)))))))
+      (setq prompts (nreverse prompts))
+      (setq step-nos (nreverse step-nos))
+      (should (equal step-nos '(1 1)))
+      (should (equal (plist-get r :answer) "DIGEST-RETRY"))
+      (should (eq (plist-get (car (plist-get r :trace)) :gate) 'retried-pass))
+      (should (string-match-p "前回試行への反証" (nth 1 prompts)))
+      (should (string-match-p "bad fact" (nth 1 prompts))))))
+
+(ert-deftest anvil-fusion-longrun-test-verify-gate-retry-then-fail ()
+  (let ((calls 0))
+    (let ((r (anvil-fusion-longrun-run
+              "goal"
+              :max-steps 2
+              :verify-steps t
+              :step-fn (lambda (_prompt step-n)
+                         (cl-incf calls)
+                         (format "STEP-%d-%d" step-n calls))
+              :distill-fn (lambda (prompt step-n)
+                            (if (string-match-p "STEP-1-2" prompt)
+                                "DIGEST-FAILED\nSTATUS: CONTINUE"
+                              (format "DIGEST-%d\nSTATUS: %s"
+                                      step-n (if (= step-n 2) "DONE" "CONTINUE"))))
+              :verify-fn (lambda (_question digest)
+                           (if (member digest '("DIGEST-1" "DIGEST-FAILED"))
+                               (list (list :claim "wrong number"
+                                           :evidence "source"
+                                           :verdict 'refuted))
+                             (list (list :claim digest :verdict 'confirmed)))))))
+      (should (= calls 3))
+      (should (= (plist-get r :gate-failures) 1))
+      (should (equal (plist-get r :answer) "DIGEST-2"))
+      (let ((meta (car (plist-get r :trace))))
+        (should (eq (plist-get meta :gate) 'failed))
+        (should (equal (plist-get meta :refuted) '("wrong number")))))))
+
+(ert-deftest anvil-fusion-longrun-test-verify-gate-off-by-default ()
+  (let ((calls 0))
+    (let ((r (anvil-fusion-longrun-run
+              "goal"
+              :max-steps 1
+              :step-fn (lambda (_prompt _step) "out")
+              :distill-fn (lambda (_prompt _step) "DIGEST\nSTATUS: DONE")
+              :verify-fn (lambda (_question _digest)
+                           (cl-incf calls)
+                           nil))))
+      (should (= calls 0))
+      (should (= (plist-get r :gate-failures) 0))
+      (should-not (plist-member (car (plist-get r :trace)) :gate)))))
+
+(ert-deftest anvil-fusion-longrun-test-verify-gate-panel-retry-preserves-budget ()
+  (let ((anvil-fusion-longrun-max-panel-steps 1)
+        step-calls
+        panel-prompts)
+    (let ((r (anvil-fusion-longrun-run
+              "goal"
+              :max-steps 1
+              :verify-steps t
+              :step-panel 'opus-solo
+              :step-panel-mode 'always
+              :step-fn (lambda (_prompt _step)
+                         (push 'step step-calls)
+                         "STEP")
+              :panel-step-fn (lambda (prompt _step)
+                               (push prompt panel-prompts)
+                               (if (= (length panel-prompts) 1)
+                                   "PANEL-FIRST"
+                                 "PANEL-RETRY"))
+              :distill-fn (lambda (prompt _step)
+                            (if (string-match-p "PANEL-RETRY" prompt)
+                                "DIGEST-PANEL-RETRY\nSTATUS: DONE"
+                              "DIGEST-PANEL-FIRST\nSTATUS: DONE"))
+              :verify-fn (lambda (_question digest)
+                           (if (equal digest "DIGEST-PANEL-FIRST")
+                               (list (list :claim "panel miss"
+                                           :evidence "evidence"
+                                           :verdict 'refuted))
+                             nil)))))
+      (setq panel-prompts (nreverse panel-prompts))
+      (should-not step-calls)
+      (should (= (length panel-prompts) 2))
+      (should (= (plist-get r :panel-steps) 1))
+      (should (eq (plist-get (car (plist-get r :trace)) :gate) 'retried-pass))
+      (should (string-match-p "前回試行への反証" (nth 1 panel-prompts))))))
+
 ;;;; --- loop: bounded-context HANDOFF invariant (the core property) ---------
 
 (ert-deftest anvil-fusion-longrun-test-run-handoff-carries-digest ()
