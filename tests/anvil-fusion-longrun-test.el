@@ -34,23 +34,47 @@
 
 (ert-deftest anvil-fusion-longrun-test-parse-done ()
   (let ((r (anvil-fusion-longrun--parse-distill "state body\nSTATUS: DONE" 100)))
-    (should (cdr r))
-    (should (equal (car r) "state body"))))
+    (should (plist-get r :done))
+    (should-not (plist-get r :next-hard))
+    (should (equal (plist-get r :digest) "state body"))))
 
 (ert-deftest anvil-fusion-longrun-test-parse-continue ()
   (let ((r (anvil-fusion-longrun--parse-distill "state body\nSTATUS: CONTINUE" 100)))
-    (should-not (cdr r))
-    (should (equal (car r) "state body"))))
+    (should-not (plist-get r :done))
+    (should-not (plist-get r :next-hard))
+    (should (equal (plist-get r :digest) "state body"))))
 
 (ert-deftest anvil-fusion-longrun-test-parse-no-status ()
   (let ((r (anvil-fusion-longrun--parse-distill "  just state  " 100)))
-    (should-not (cdr r))
-    (should (equal (car r) "just state"))))
+    (should-not (plist-get r :done))
+    (should-not (plist-get r :next-hard))
+    (should (equal (plist-get r :digest) "just state"))))
+
+(ert-deftest anvil-fusion-longrun-test-parse-next-hard-yes ()
+  (let ((r (anvil-fusion-longrun--parse-distill
+            "state body\nNEXT-HARD: yes\nSTATUS: CONTINUE" 100)))
+    (should-not (plist-get r :done))
+    (should (plist-get r :next-hard))
+    (should (equal (plist-get r :digest) "state body"))))
+
+(ert-deftest anvil-fusion-longrun-test-parse-next-hard-no ()
+  (let ((r (anvil-fusion-longrun--parse-distill
+            "state body\nNEXT-HARD: no\nSTATUS: CONTINUE" 100)))
+    (should-not (plist-get r :done))
+    (should-not (plist-get r :next-hard))
+    (should (equal (plist-get r :digest) "state body"))))
+
+(ert-deftest anvil-fusion-longrun-test-parse-next-hard-lowercase ()
+  (let ((r (anvil-fusion-longrun--parse-distill
+            "state body\nnext-hard: yes\nstatus: continue" 100)))
+    (should-not (plist-get r :done))
+    (should (plist-get r :next-hard))
+    (should (equal (plist-get r :digest) "state body"))))
 
 (ert-deftest anvil-fusion-longrun-test-parse-truncates ()
   (let* ((big (concat (make-string 200 ?x) "\nSTATUS: CONTINUE"))
          (r   (anvil-fusion-longrun--parse-distill big 50)))
-    (should (= (length (car r)) 50))))
+    (should (= (length (plist-get r :digest)) 50))))
 
 (ert-deftest anvil-fusion-longrun-test-parse-done-only-trailing ()
   "Only a trailing STATUS: DONE terminates; a DONE inside the body does not.
@@ -60,15 +84,31 @@ falsely stopped the quest at step 1."
   ;; mid-body DONE + trailing CONTINUE -> not done, body kept verbatim
   (let ((r (anvil-fusion-longrun--parse-distill
             "課題: 早期 STATUS: DONE 判定\n本文\nSTATUS: CONTINUE" 200)))
-    (should-not (cdr r))
-    (should (string-match-p "STATUS: DONE" (car r))))
+    (should-not (plist-get r :done))
+    (should (string-match-p "STATUS: DONE" (plist-get r :digest))))
   ;; mid-body DONE, no trailing marker -> not done
   (let ((r (anvil-fusion-longrun--parse-distill
             "本文に STATUS: DONE という語が出るだけ" 200)))
-    (should-not (cdr r)))
+    (should-not (plist-get r :done)))
   ;; trailing DONE still terminates
   (let ((r (anvil-fusion-longrun--parse-distill "本文\nSTATUS: DONE" 200)))
-    (should (cdr r))))
+    (should (plist-get r :done))))
+
+(ert-deftest anvil-fusion-longrun-test-parse-next-hard-only-trailing ()
+  "Only a trailing NEXT-HARD line sets the hardness flag."
+  ;; mid-body NEXT-HARD + trailing no -> false, body kept verbatim
+  (let ((r (anvil-fusion-longrun--parse-distill
+            "本文に NEXT-HARD: yes が出る\nNEXT-HARD: no\nSTATUS: CONTINUE" 200)))
+    (should-not (plist-get r :next-hard))
+    (should (string-match-p "NEXT-HARD: yes" (plist-get r :digest))))
+  ;; mid-body NEXT-HARD with no trailing status-bound marker -> false
+  (let ((r (anvil-fusion-longrun--parse-distill
+            "本文に NEXT-HARD: yes という語が出るだけ\nSTATUS: CONTINUE" 200)))
+    (should-not (plist-get r :next-hard)))
+  ;; trailing yes still sets the flag
+  (let ((r (anvil-fusion-longrun--parse-distill
+            "本文\nNEXT-HARD: yes\nSTATUS: CONTINUE" 200)))
+    (should (plist-get r :next-hard))))
 
 ;;;; --- loop: termination ---------------------------------------------------
 
@@ -97,6 +137,77 @@ falsely stopped the quest at step 1."
             :distill-fn (anvil-fusion-longrun-test--const-distill "DIGEST" 2))))
     (should (= (plist-get r :steps) 2))
     (should (eq (plist-get r :stopped) 'done))))
+
+(ert-deftest anvil-fusion-longrun-test-panel-hard-only-gates-on-previous-distill ()
+  (let (steps-used panel-steps)
+    (let ((r (anvil-fusion-longrun-run
+              "g"
+              :max-steps 3
+              :step-panel 'opus-solo
+              :step-fn (lambda (_prompt step-n)
+                         (push step-n steps-used)
+                         (format "STEP-%d" step-n))
+              :panel-step-fn (lambda (_prompt step-n)
+                               (push step-n panel-steps)
+                               (format "PANEL-%d" step-n))
+              :distill-fn (lambda (_prompt step-n)
+                            (format "DIGEST-%d\n%s\nSTATUS: CONTINUE"
+                                    step-n
+                                    (if (= step-n 1)
+                                        "NEXT-HARD: yes"
+                                      "NEXT-HARD: no"))))))
+      (should (equal (nreverse steps-used) '(1 3)))
+      (should (equal (nreverse panel-steps) '(2)))
+      (should (= (plist-get r :panel-steps) 1)))))
+
+(ert-deftest anvil-fusion-longrun-test-panel-always-mode-uses-budgeted-every-step ()
+  (let (panel-steps)
+    (let ((r (let ((anvil-fusion-longrun-max-panel-steps 3))
+               (anvil-fusion-longrun-run
+                "g"
+                :max-steps 3
+                :step-panel 'opus-solo
+                :step-panel-mode 'always
+                :step-fn (lambda (_prompt step-n) (format "STEP-%d" step-n))
+                :panel-step-fn (lambda (_prompt step-n)
+                                 (push step-n panel-steps)
+                                 (format "PANEL-%d" step-n))
+                :distill-fn (anvil-fusion-longrun-test--const-distill "DIGEST" nil)))))
+      (should (equal (nreverse panel-steps) '(1 2 3)))
+      (should (= (plist-get r :panel-steps) 3)))))
+
+(ert-deftest anvil-fusion-longrun-test-panel-budget-cap-falls-back ()
+  (let ((anvil-fusion-longrun-max-panel-steps 1)
+        steps-used
+        panel-steps)
+    (let ((r (anvil-fusion-longrun-run
+              "g"
+              :max-steps 3
+              :step-panel 'opus-solo
+              :step-fn (lambda (_prompt step-n)
+                         (push step-n steps-used)
+                         (format "STEP-%d" step-n))
+              :panel-step-fn (lambda (_prompt step-n)
+                               (push step-n panel-steps)
+                               (format "PANEL-%d" step-n))
+              :distill-fn (lambda (_prompt step-n)
+                            (format "DIGEST-%d\n%s\nSTATUS: CONTINUE"
+                                    step-n
+                                    (if (< step-n 3)
+                                        "NEXT-HARD: yes"
+                                      "NEXT-HARD: no"))))))
+      (should (equal (nreverse panel-steps) '(2)))
+      (should (equal (nreverse steps-used) '(1 3)))
+      (should (= (plist-get r :panel-steps) 1)))))
+
+(ert-deftest anvil-fusion-longrun-test-panel-off-by-default ()
+  (let ((r (anvil-fusion-longrun-run
+            "g"
+            :max-steps 2
+            :step-fn (lambda (_p _n) "out")
+            :distill-fn (anvil-fusion-longrun-test--const-distill "DIGEST" nil))))
+    (should (= (plist-get r :panel-steps) 0))
+    (should (equal (plist-get r :answer) "DIGEST-2"))))
 
 ;;;; --- loop: bounded-context HANDOFF invariant (the core property) ---------
 

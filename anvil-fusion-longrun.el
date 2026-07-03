@@ -36,6 +36,7 @@
 (declare-function anvil-orchestrator-submit "anvil-orchestrator" (tasks))
 (declare-function anvil-orchestrator-collect "anvil-orchestrator" (batch-id &rest _))
 (declare-function anvil-orchestrator-extract-result "anvil-orchestrator" (task-id &optional full))
+(declare-function anvil-fusion-ask "anvil-fusion-ask" (prompt &rest args))
 ;; Special var from anvil-orchestrator; forward-declare so a hermetic step can
 ;; dynamically let-bind it to inject a read-only --mcp-config for that step.
 (defvar anvil-orchestrator-manifest-profile)
@@ -59,6 +60,16 @@
   "Upper bound on the carried state digest, in characters.
 This is the knob that keeps per-step context O(1) regardless of
 how long the quest runs."
+  :type 'integer :group 'anvil-fusion-longrun)
+
+(defcustom anvil-fusion-longrun-max-panel-steps 3
+  "Maximum panel-executed steps per quest.
+This is the v1 budget guard for Doc 61 Phase 8b: once this many
+steps have run through `anvil-fusion-ask', further panel-eligible
+steps fall back to the normal single-provider step function with one
+`message'.  Threading a richer Doc 47-style :budget through
+`anvil-fusion-ask' is deferred because that API does not expose
+`:budget' today."
   :type 'integer :group 'anvil-fusion-longrun)
 
 (defcustom anvil-fusion-longrun-default-cwd "/tmp"
@@ -167,7 +178,10 @@ Format args: GOAL, DIGEST, STEP-N, MAX-STEPS."
 # 指示
 「直前の状態」に「今ステップの新しい出力」を統合し、ゴール達成に必要な情報だけを
 残した更新後の状態を出力してください。冗長・重複・脱線は削り、%d 文字以内に
-圧縮すること。
+圧縮すること。次の一手が、候補間で判断が割れうる難所（設計判断・相反する情報の
+裁定・重要な数値判断）だと考える場合のみ、最後の STATUS 行の直前の行に
+NEXT-HARD: yes と書いてください。そうでなければその行は省略するか
+NEXT-HARD: no と書いてください。
 出力の最後の行に、ゴールが完全に達成されたなら STATUS: DONE、まだ続けるべきなら
 STATUS: CONTINUE と必ず書いてください。"
   "Template for the per-step distillation prompt.
@@ -189,21 +203,26 @@ PREV-DIGEST may be nil.  MAX-CHARS bounds the requested digest.  Pure."
           goal (or prev-digest "(まだ無し)") output max-chars))
 
 (defun anvil-fusion-longrun--parse-distill (text max-chars)
-  "Parse distiller TEXT into (DIGEST . DONE-P).
+  "Parse distiller TEXT into (:digest STR :done BOOL :next-hard BOOL).
 DONE-P is non-nil only when the *trailing* STATUS marker line is
-STATUS: DONE.  The check is anchored to the end of TEXT (same anchor
-as the strip below) so a STATUS: DONE that merely appears inside the
-digest body -- e.g. when the quest is cataloguing a document that
-itself describes the STATUS protocol -- does not falsely terminate
-the quest.  The trailing STATUS line is stripped and the digest is
-trimmed and clamped to MAX-CHARS.  Pure."
-  (let* ((done   (and (string-match-p "STATUS:[ \t]*DONE[ \t\r\n]*\\'" text) t))
+STATUS: DONE.  NEXT-HARD is non-nil only when the line immediately
+before that trailing STATUS line is a trailing NEXT-HARD: yes marker.
+Both checks are anchored to the end of TEXT, so STATUS / NEXT-HARD
+text that merely appears inside the digest body does not alter the
+control flow.  The trailing STATUS and optional NEXT-HARD lines are
+stripped, then the digest is trimmed and clamped to MAX-CHARS.  Pure."
+  (let* ((case-fold-search t)
+         (done   (and (string-match-p "STATUS:[ \t]*DONE[ \t\r\n]*\\'" text) t))
+         (body   (replace-regexp-in-string
+                  "[ \t\r\n]*STATUS:[ \t]*\\(?:DONE\\|CONTINUE\\)[ \t]*\\'" "" text))
+         (next-hard
+          (and (string-match-p "NEXT-HARD:[ \t]*yes[ \t\r\n]*\\'" body) t))
          (digest (replace-regexp-in-string
-                  "[ \t\n]*STATUS:[ \t]*\\(?:DONE\\|CONTINUE\\)[ \t]*\\'" "" text)))
+                  "[ \t\r\n]*NEXT-HARD:[ \t]*\\(?:yes\\|no\\)[ \t]*\\'" "" body)))
     (setq digest (string-trim digest))
     (when (> (length digest) max-chars)
       (setq digest (substring digest 0 max-chars)))
-    (cons digest done)))
+    (list :digest digest :done done :next-hard next-hard)))
 
 ;;;; --- convergence (digest stagnation) -------------------------------------
 
@@ -321,6 +340,17 @@ injects a read-only --mcp-config for the step."
      provider prompt (format "longrun-distill-%d" step-n)
      model cwd timeout-sec max-wait-sec)))
 
+(defun anvil-fusion-longrun--panel-step-p (step-panel step-panel-mode next-hard panel-budget-left)
+  "Return non-nil when the current step should execute as a panel step.
+STEP-PANEL names the panel; STEP-PANEL-MODE is `hard-only' or
+`always'; NEXT-HARD is the previous distiller's hardness signal; and
+PANEL-BUDGET-LEFT is the remaining panel-step budget.  Pure."
+  (and step-panel
+       (> (or panel-budget-left 0) 0)
+       (pcase (or step-panel-mode 'hard-only)
+         ('always t)
+         (_ next-hard))))
+
 ;;;; --- the loop ------------------------------------------------------------
 
 (cl-defun anvil-fusion-longrun-run
@@ -328,7 +358,8 @@ injects a read-only --mcp-config for the step."
           max-steps digest-max-chars cwd timeout-sec (max-wait-sec 1800)
           step-fn distill-fn (keep-trace t)
           id resume-step resume-digest on-step on-finish
-          hermetic step-allowed-tools step-manifest-profile)
+          hermetic step-allowed-tools step-manifest-profile
+          step-panel (step-panel-mode 'hard-only) panel-verify panel-step-fn)
   "Execute GOAL as a long-horizon quest carrying a bounded state digest.
 
 Each step advances the work (STEP-FN) then distills the new output
@@ -349,8 +380,17 @@ ON-STEP is called after each step as (ON-STEP ID STEP DIGEST DONE
 META); ON-FINISH as (ON-FINISH ID STEP DIGEST STOPPED) -- the store
 module (Phase 2) wires these to SQLite checkpoints.
 
+When STEP-PANEL is non-nil, a step may run through
+`anvil-fusion-ask' instead of the single-provider STEP-FN.
+STEP-PANEL-MODE controls the gate: `always' panels every eligible
+step until the panel budget is exhausted; `hard-only' (the default)
+uses a panel only when the PREVIOUS distill emitted NEXT-HARD: yes,
+so step 1 is never a panel step in `hard-only' mode.  PANEL-VERIFY is
+forwarded as `:verify' to `anvil-fusion-ask'.  PANEL-STEP-FN is a
+test seam that overrides the real panel call.
+
 Returns a plist: :id :goal :answer :digest :steps :stopped :provider
-:digest-chars :trace.  Only :answer / :digest are meant to cross
+:digest-chars :panel-steps :trace.  Only :answer / :digest are meant to cross
 back into the caller's context; intermediate step OUTPUTS are
 consumed into the digest and never returned (the parent context
 stays clean).  :trace holds per-step metadata only (output-chars /
@@ -377,6 +417,10 @@ digest-chars / digest-head), not the full outputs."
          (digest resume-digest)
          (trace  nil)
          (step   (or resume-step 0))
+         (next-hard nil)
+         (panel-budget-left anvil-fusion-longrun-max-panel-steps)
+         (panel-steps 0)
+         (panel-budget-noted nil)
          (streak 0)
          (reason nil)
          (done   nil))
@@ -384,17 +428,44 @@ digest-chars / digest-head), not the full outputs."
       (setq step (1+ step))
       (let* ((prev    digest)
              (sprompt (anvil-fusion-longrun-build-step-prompt goal digest step maxn))
-             (output  (funcall sfn sprompt step))
+             (want-panel
+              (and step-panel
+                   (pcase (or step-panel-mode 'hard-only)
+                     ('always t)
+                     (_ next-hard))))
+             (panelp  (anvil-fusion-longrun--panel-step-p
+                       step-panel step-panel-mode next-hard panel-budget-left))
+             (output
+              (if panelp
+                  (progn
+                    (require 'anvil-fusion-ask)
+                    (cl-decf panel-budget-left)
+                    (cl-incf panel-steps)
+                    (if panel-step-fn
+                        (funcall panel-step-fn sprompt step)
+                      (plist-get
+                       (anvil-fusion-ask
+                        sprompt :panel step-panel :verify panel-verify
+                        :cwd cwd :timeout-sec timeout-sec
+                        :max-wait-sec max-wait-sec)
+                       :answer)))
+                (progn
+                  (when (and want-panel (<= panel-budget-left 0) (not panel-budget-noted))
+                    (setq panel-budget-noted t)
+                    (message "anvil-fusion-longrun: panel-step budget exhausted; falling back to single-provider steps"))
+                  (funcall sfn sprompt step))))
              (dprompt (anvil-fusion-longrun-build-distill-prompt
                        goal digest output maxc))
              (draw    (funcall dfn dprompt step))
              (parsed  (anvil-fusion-longrun--parse-distill draw maxc)))
-        (setq digest (car parsed))
+        (setq digest (plist-get parsed :digest))
+        (setq next-hard (plist-get parsed :next-hard))
         (setq streak (anvil-fusion-longrun--streak streak prev digest thr pat))
-        (cond ((cdr parsed) (setq done t reason 'done))
+        (cond ((plist-get parsed :done) (setq done t reason 'done))
               ((anvil-fusion-longrun--converged-p streak pat)
                (setq done t reason 'converged)))
         (let ((meta (list :step step
+                          :panelp panelp
                           :output-chars (length (or output ""))
                           :digest-chars (length (or digest ""))
                           :digest-head (let ((d (or digest "")))
@@ -412,6 +483,7 @@ digest-chars / digest-head), not the full outputs."
             :stopped stopped
             :provider prov
             :digest-chars (length (or digest ""))
+            :panel-steps panel-steps
             :trace (nreverse trace)))))
 
 (provide 'anvil-fusion-longrun)
