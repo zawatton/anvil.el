@@ -1,0 +1,184 @@
+#+title: Doc 61 section 9 — haiku vs sonnet claim-extraction fidelity (Phase 6a)
+#+date: 2026-07-03
+#+author: zawatton + Claude (Fable 5 spike agent)
+
+* Purpose
+
+Doc 61 ("Verifier-grounded judge") section 9 open question:
+
+  "6a extraction provider: haiku-tier is cheap but the weakdistill
+   eval showed weak models mangle structure — measure haiku vs sonnet
+   extraction fidelity before pinning
+   `anvil-fusion-verify-extract-model'."
+
+This run measures `anvil-fusion-verify-extract-claims' (Phase 6a,
+commit a2a4b11) under =--model haiku= vs =--model sonnet= on 8
+synthetic fan-out cases ([[file:dataset.el][dataset.el]], 14 gold contested claims + one
+deliberate no-contested-claims control), scored deterministically by
+[[file:run.el][run.el]] (regex recall, no LLM judging).
+
+* Run context
+
+- Date: 2026-07-03
+- Emacs: 30.1 (batch mode, daemon-independent orchestrator — Doc 43)
+- claude CLI: 2.1.199
+- Model specifiers: =haiku= (resolved to =claude-haiku-4-5-20251001=),
+  =sonnet= (resolved to =claude-sonnet-5=) — both verified by 1-word
+  smoke calls before the runs
+- Module under test loaded from a detached-HEAD worktree of a2a4b11
+  (feat(fusion): Doc 61 Phase 6a)
+- 16 live calls total (8 per model), sequential, via
+  `anvil-orchestrator-submit' -> `-collect :wait t' ->
+  `-extract-result' (the module's own path); state db + work dir
+  sandboxed to scratch
+- Cost figures are the orchestrator-reported =total_cost_usd= per
+  child claude session (includes session startup overhead, not just
+  the extraction tokens)
+
+* Aggregate scores
+
+| Metric                      | haiku            | sonnet           |
+|-----------------------------+------------------+------------------|
+| Gold recall                 | 11/14 (79%)      | 12/14 (86%)      |
+| Spurious claims (total)     | 8                | 8                |
+| Kind accuracy (on recalled) | 9/11 (82%)       | 10/12 (83%)      |
+| Format validity             | 8/8 (100%)       | 8/8 (100%)       |
+| Mean latency                | 39.1 s           | 24.1 s           |
+| Total cost (8 calls)        | $0.287           | $0.465           |
+
+Scoring note: case 2's gold keys were loosened mid-run from
+"C種接地"/"D種接地" to "C種"/"D種" (haiku phrased the claim as
+「接地工事の種類はC種である」— same assertion, regex too strict).
+The haiku row above is deterministically re-scored from the captured
+raw output under the final keys; sonnet ran against the final keys
+directly.  No other key changed.
+
+* Per-case detail
+
+** haiku (case 2 re-scored under final gold keys)
+
+| ID | Category                 | Gold | Recalled | Spurious | Kind hit/total | Fmt valid | Wall ms | Cost    |
+|----+--------------------------+------+----------+----------+----------------+-----------+---------+---------|
+|  1 | jp-insulation-resistance |    2 |        2 |        3 | 2/2            | yes       |   40763 | $0.0418 |
+|  2 | jp-grounding-class       |    2 |        1 |        2 | 1/1            | yes       |   49775 | $0.0494 |
+|  3 | jp-relay-type            |    2 |        2 |        1 | 2/2            | yes       |   83994 | $0.0694 |
+|  4 | jp-code-citation         |    2 |        2 |        0 | 2/2            | yes       |   21389 | $0.0198 |
+|  5 | jp-none-control          |    0 |        0 |        2 | 0/0            | yes       |   53300 | $0.0471 |
+|  6 | en-release-date          |    2 |        1 |        0 | 1/1            | yes       |   22045 | $0.0197 |
+|  7 | en-protocol-version      |    2 |        1 |        0 | 1/1            | yes       |   18229 | $0.0163 |
+|  8 | en-api-name              |    2 |        2 |        0 | 0/2            | yes       |   22996 | $0.0239 |
+
+** sonnet
+
+| ID | Category                 | Gold | Recalled | Spurious | Kind hit/total | Fmt valid | Wall ms | Cost    |
+|----+--------------------------+------+----------+----------+----------------+-----------+---------+---------|
+|  1 | jp-insulation-resistance |    2 |        2 |        1 | 2/2            | yes       |   33811 | $0.1029 |
+|  2 | jp-grounding-class       |    2 |        2 |        3 | 2/2            | yes       |   23712 | $0.0561 |
+|  3 | jp-relay-type            |    2 |        2 |        1 | 2/2            | yes       |   24155 | $0.0550 |
+|  4 | jp-code-citation         |    2 |        2 |        0 | 2/2            | yes       |    8500 | $0.0317 |
+|  5 | jp-none-control          |    0 |        0 |        3 | 0/0            | yes       |   59346 | $0.1059 |
+|  6 | en-release-date          |    2 |        2 |        0 | 0/2            | yes       |   23575 | $0.0465 |
+|  7 | en-protocol-version      |    2 |        2 |        0 | 2/2            | yes       |   13543 | $0.0406 |
+|  8 | en-api-name              |    2 |        0 |        0 | 0/0            | yes       |    5828 | $0.0262 |
+
+* Failure notes (raw claim lines quoted)
+
+** haiku collapses two-sided disagreements into one side (cases 2, 6, 7)
+
+The characteristic haiku failure is NOT format damage — it is merging
+a planted A-says-X / B-says-Y disagreement into a single claim
+carrying only one side (sometimes with wrong candidate attribution):
+
+- case 2: =CLAIM: 300Vを超える低圧用機器の金属製外箱の接地工事の種類はC種である | KIND: fact | CANDIDATES: cand-A,cand-B=
+  — cand-B actually said D種; the D種 counter-claim was never
+  extracted, and the attribution is wrong.
+- case 6: =CLAIM: Python 3.12 was released in 2023. | KIND: number | CANDIDATES: cand-A,cand-B,cand-C=
+  — cand-B's "2022" side disappeared entirely (attributed the
+  majority value to all three candidates).
+- case 7: =CLAIM: HTTP/1.1 introduced true multiplexed streams over a single TCP connection | KIND: fact | CANDIDATES: cand-B=
+  — kept only the minority (wrong) side; the HTTP/2 majority claim
+  is implied but absent.
+
+This matters for Phase 6b: a verifier can still refute the extracted
+one-sided claim, but the "which candidate said what" map — the input
+the grounded judge needs — is degraded.
+
+** sonnet's one big miss: false NONE (case 8)
+
+sonnet output the literal =NONE= for en-api-name despite the planted
+pathlib-vs-os.path contradiction (raw: ="NONE"=).  Recall damage
+equal to two haiku one-side merges, and arguably worse for 6b (the
+disagreement is invisible rather than half-visible).  haiku extracted
+both sides of this case cleanly (kind mislabeled fact vs code, text
+correct).
+
+** Both models fail the NONE control (case 5)
+
+Neither model output =NONE= on the no-contested-claims control; both
+promoted paraphrase-level differences to "contested claims":
+
+- haiku (2 spurious), e.g. =CLAIM: 月次点検を外部の業者に委託して実施することができる | KIND: fact | CANDIDATES: cand-C=
+- sonnet (3 spurious), e.g. =CLAIM: 電気主任技術者の指揮監督の下で点検を実施する者は「点検員」という特定の役割を持つ人物である。 | KIND: fact | CANDIDATES: cand-B=
+
+False-positive behaviour is a *prompt-level* issue
+(`anvil-fusion-verify-extract-template' criterion (b) "単一の候補のみ
+が述べている…重要な主張" invites this), not a model-tier issue.
+Verification cost in 6b is capped by `anvil-fusion-verify-max-claims'
+anyway, but the template's "single-candidate load-bearing claim"
+criterion deserves tightening regardless of model choice.
+
+** Kind labels drift between fact/number/code (both models)
+
+- haiku case 8: both pathlib/os.path claims recalled but labeled
+  non-=code= (0/2 kind).
+- sonnet case 6: both 2023/2022 claims recalled but labeled
+  non-=number= (0/2 kind).
+
+The parser's normalization (unknown kind -> =fact=) absorbs this;
+Phase 6b should not branch hard on :kind.
+
+* RECOMMENDATION
+
+*haiku-class is sufficient for the extraction pass* under Doc 61
+section 9's criterion (recall within ~10% of sonnet-class, no format
+collapse):
+
+1. Recall gap is 7 points (79% vs 86%), inside the ~10% bar — and
+   sonnet's advantage is not uniform: sonnet's single false-NONE
+   (case 8) is a worse failure mode for 6b than haiku's one-sided
+   merges, which at least surface the contested topic.
+2. Zero format damage in 16/16 calls: every response was either
+   well-formed =CLAIM: ... | KIND: ... | CANDIDATES: ...= lines or
+   the literal =NONE= sentinel.  The weakdistill "weak models mangle
+   structure" concern did not reproduce at haiku-4.5 tier for this
+   narrow, rigidly-templated task.
+3. haiku is ~40% cheaper per call ($0.036 vs $0.058 avg); latency is
+   noisier but same order (both dominated by child-session startup).
+
+Action: pin =anvil-fusion-verify-extract-model= default to ="haiku"=
+(keep `anvil-fusion-verify-extract-provider' = `claude').  Two
+follow-ups independent of the model choice:
+
+- Harden `anvil-fusion-verify-extract-template': instruct that when
+  candidates disagree, EACH side must be emitted as its own CLAIM
+  line with only the candidates that actually asserted it (fixes the
+  haiku merge failure and sharpens sonnet attribution too).
+- Tighten the NONE criterion (e.g. "paraphrase/emphasis differences
+  are NOT contested claims") — both tiers currently over-extract on
+  agreeing panels.
+
+* Reproducing
+
+#+begin_src sh
+  # from repo root; ~8 live claude calls / ~$0.3-0.5 per model
+  emacs --batch -L . \
+    -l benchmarks/doc61-phase6a/dataset.el \
+    -l benchmarks/doc61-phase6a/run.el -- haiku  > /tmp/6a-haiku.org
+  emacs --batch -L . \
+    -l benchmarks/doc61-phase6a/dataset.el \
+    -l benchmarks/doc61-phase6a/run.el -- sonnet > /tmp/6a-sonnet.org
+#+end_src
+
+See run.el's header for sandboxing `anvil-state-db-path' /
+`anvil-orchestrator-work-dir' / cwd when you do not want the run to
+share the daemon's orchestrator state or trigger worktree-auto.

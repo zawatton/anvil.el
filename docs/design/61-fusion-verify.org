@@ -196,9 +196,17 @@ the heavyweight design).
 - ERT for every module; byte-compile 0 warnings.
 
 * 9. Open questions
-- 6a extraction provider: haiku-tier is cheap but the weakdistill eval showed
-  weak models mangle structure — measure haiku vs sonnet extraction fidelity
-  first (reuse =results-longrun-weakdistill= methodology).
+- [RESOLVED 2026-07-03] 6a extraction provider: measured haiku vs sonnet on 8
+  synthetic cases / 14 gold claims (=benchmarks/doc61-phase6a/=, 16 live
+  calls). haiku recall 11/14 (79%) vs sonnet 12/14 (86%) — within the ~10%
+  bar; format collapse 0/16 (the weakdistill structure-mangling concern does
+  not reproduce on this narrow, templated task); haiku 1.6x slower but 0.6x
+  cost; sonnet's single big miss was a FALSE NONE (dropped a whole
+  disagreement), worse for 6b than haiku's one-sided extractions. Decision:
+  pin the extraction default to the haiku tier. Residual (both models):
+  one-sided extraction of a disagreement + 2-3 false positives on the NONE
+  control — a prompt-template issue, tracked as follow-up 6a' (each side of a
+  disagreement as its own CLAIM line; stricter NONE criteria).
 - 6b KB coverage: hourei/node KB is strong for the electrical domain; for
   general questions the skeptic vote is the only verifier — is N=2 enough?
 - 8b cost envelope: panel-per-step multiplies longrun cost; define the =:hard=
