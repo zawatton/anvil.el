@@ -175,7 +175,7 @@ Phase 6-7 produce trajectories worth keeping.
 | 6d    | verdict-annotated judge template + plumbing        | 6b         | SHIPPED 281aa63 |
 | 6d'   | debt bundle (async loop, egress inference, :verify)| 6d         | SHIPPED da51e05 |
 | 6e    | unsaturated eval battery + verify-effect run       | 6d         | MEASURED (PASS, saturated — see below) |
-| 7     | opus-solo panel (k-member self-consistency)        | 6d         | IN-PROGRESS |
+| 7     | opus-solo panel (k-member self-consistency)        | 6d         | SHIPPED c9fe0ff |
 | 8a    | plan fusion                                        | 6d         | TODO   |
 | 8b    | longrun step = fusion panel                        | 8a         | TODO   |
 | 8c    | inter-step verify gate                             | 6d, 8b     | TODO   |
