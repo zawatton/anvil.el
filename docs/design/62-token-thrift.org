@@ -43,7 +43,7 @@ patterns (test runs, re-reads) return unbounded text.
 
 | Phase | Deliverable                                            | Layer   | Status |
 |-------+--------------------------------------------------------+---------+--------|
-| 1     | token telemetry: per-tool volume accounting + report   | server  | IN-PROGRESS |
+| 1     | token telemetry: per-tool volume accounting + report   | server  | SHIPPED 9ad1435 |
 | 2     | hard-prompt router: auto-escalate single -> pair -> opus-solo+verify | fusion | TODO |
 | 3     | test-run distiller tool (ERT batch -> fixed digest)    | dev     | TODO |
 | 4     | verdict cache (SQLite, TTL) for verified claims        | verify  | TODO |
