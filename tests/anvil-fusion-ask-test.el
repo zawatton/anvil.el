@@ -140,5 +140,101 @@ nothing is submitted."
                        (mapcar (lambda (tk) (plist-get tk :provider))
                                member-list)))))))
 
+;;;; ============================================================
+;;;; Phase 6d — :verify keyword
+;;;; ============================================================
+
+(defconst anvil-fusion-ask-test--claims-raw
+  (list (list :claim "DGR を使う" :kind 'fact :candidates '("A" "B"))
+        (list :claim "OCGR でも良い" :kind 'fact :candidates '("C")))
+  "Two raw (Phase 6a) claims used as the extraction stub's return value.")
+
+(defconst anvil-fusion-ask-test--claims-annotated
+  (list (list :claim "DGR を使う" :kind 'fact :candidates '("A" "B")
+              :verdict 'confirmed :evidence "a.org:1")
+        (list :claim "OCGR でも良い" :kind 'fact :candidates '("C")
+              :verdict 'refuted :evidence "反証: OCGR は不可"))
+  "Annotated (Phase 6b) claims, one confirmed one refuted.")
+
+(ert-deftest anvil-fusion-ask-test-verify-nil-skips-verification ()
+  "With :verify nil (the default), extract-claims/verify-claims are
+never invoked, and the judge prompt is the normal (un-verified)
+template -- existing behavior is untouched."
+  (let (extract-called verify-called)
+    (cl-letf (((symbol-function 'anvil-fusion-verify-extract-claims)
+               (lambda (&rest _) (setq extract-called t) nil))
+              ((symbol-function 'anvil-fusion-verify-claims)
+               (lambda (&rest _) (setq verify-called t) nil)))
+      (anvil-fusion-ask-test--with-fake-orchestrator
+          anvil-fusion-ask-test--cands
+        (let ((res (anvil-fusion-ask "Q" :panel 'sovereign :max-rounds 0)))
+          (should-not extract-called)
+          (should-not verify-called)
+          (should (null (plist-get res :claims)))
+          (let ((jprompt (plist-get (car (car submitted)) :prompt)))
+            (should (string-match-p "最終回答" jprompt))
+            (should-not (string-match-p "検証済み主張表" jprompt))))))))
+
+(ert-deftest anvil-fusion-ask-test-verify-happy-path ()
+  "With :verify t, extraction + verification run, the verified judge
+template is used (claims block + the refuted claim present in the
+judge prompt), and the return plist carries :claims."
+  (cl-letf (((symbol-function 'anvil-fusion-verify-extract-claims)
+             (lambda (question _candidates &rest _)
+               (should (equal "Q" question))
+               anvil-fusion-ask-test--claims-raw))
+            ((symbol-function 'anvil-fusion-verify-claims)
+             (lambda (claims &rest kwargs)
+               (should (equal anvil-fusion-ask-test--claims-raw claims))
+               (should (equal "Q" (plist-get kwargs :question)))
+               anvil-fusion-ask-test--claims-annotated)))
+    (anvil-fusion-ask-test--with-fake-orchestrator
+        anvil-fusion-ask-test--cands
+      (let ((res (anvil-fusion-ask "Q" :panel 'sovereign :verify t :max-rounds 0)))
+        (let ((jprompt (plist-get (car (car submitted)) :prompt)))
+          (should (string-match-p "検証済み主張表" jprompt))
+          (should (string-match-p "OCGR でも良い" jprompt))
+          (should (string-match-p "refuted" jprompt)))
+        (should (equal anvil-fusion-ask-test--claims-annotated (plist-get res :claims)))))))
+
+(ert-deftest anvil-fusion-ask-test-verify-extraction-nil-falls-back ()
+  "When extraction returns nil, verify-claims is never called, the
+normal template is used, the judge still runs, and :claims is nil."
+  (let (verify-called)
+    (cl-letf (((symbol-function 'anvil-fusion-verify-extract-claims)
+               (lambda (&rest _) nil))
+              ((symbol-function 'anvil-fusion-verify-claims)
+               (lambda (&rest _) (setq verify-called t) nil)))
+      (anvil-fusion-ask-test--with-fake-orchestrator
+          anvil-fusion-ask-test--cands
+        (let ((res (anvil-fusion-ask "Q" :panel 'sovereign :verify t :max-rounds 0)))
+          (should-not verify-called)
+          (should (equal "FUSED-ANSWER" (plist-get res :answer)))
+          (should (null (plist-get res :claims)))
+          (let ((jprompt (plist-get (car (car submitted)) :prompt)))
+            (should-not (string-match-p "検証済み主張表" jprompt))))))))
+
+(ert-deftest anvil-fusion-ask-test-verify-local-only-threads-panel-judge ()
+  "A local-only panel's :verify t threads the panel judge's
+provider/model into both extraction and verification, and passes
+:egress \\='local-only to verify-claims."
+  (let (extract-kw verify-kw)
+    (cl-letf (((symbol-function 'anvil-fusion-verify-extract-claims)
+               (lambda (_question _candidates &rest kwargs)
+                 (setq extract-kw kwargs)
+                 anvil-fusion-ask-test--claims-raw))
+              ((symbol-function 'anvil-fusion-verify-claims)
+               (lambda (_claims &rest kwargs)
+                 (setq verify-kw kwargs)
+                 anvil-fusion-ask-test--claims-annotated)))
+      (anvil-fusion-ask-test--with-fake-orchestrator
+          anvil-fusion-ask-test--cands
+        (anvil-fusion-ask "Q" :panel 'sovereign :verify t :max-rounds 0)
+        (should (eq 'ollama (plist-get extract-kw :provider)))
+        (should (equal "llama3.1:8b" (plist-get extract-kw :model)))
+        (should (eq 'ollama (plist-get verify-kw :provider)))
+        (should (equal "llama3.1:8b" (plist-get verify-kw :model)))
+        (should (eq 'local-only (plist-get verify-kw :egress)))))))
+
 (provide 'anvil-fusion-ask-test)
 ;;; anvil-fusion-ask-test.el ends here

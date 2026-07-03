@@ -61,6 +61,21 @@
 ;; the same submit -> collect(:wait) -> extract-result pattern as
 ;; Phase 6a, batched (all skeptic tasks for all claims submitted as
 ;; ONE batch).
+;;
+;; Phase 6d ("verdict-annotated synthesis", docs/design/61-fusion-verify.org
+;; §2 6d) adds the last piece: a verified variant of
+;; `anvil-fusion-judge-template' (`anvil-fusion-verify-judge-template')
+;; that instructs the judge how to read the Phase 6b verdict table and
+;; forbids adopting a REFUTED claim, plus the pure renderer/builder
+;; (`anvil-fusion-verify--format-claims-block',
+;; `anvil-fusion-verify-judge-template-for') that turns annotated
+;; claims into a ready-to-use :template for the EXISTING, UNCHANGED
+;; `anvil-fusion-judge-consensus' / `anvil-fusion-build-judge-prompt'
+;; (anvil-fusion.el).  The seam that keeps anvil-fusion.el untouched is
+;; a literal `{{CLAIMS}}' marker rather than a third %s slot -- see
+;; `anvil-fusion-verify-judge-template''s docstring for the full
+;; rationale, including why the rendered block must have its `%'
+;; characters doubled before substitution.
 
 ;;; Code:
 
@@ -741,6 +756,156 @@ check above is the sole exception — it always signals."
                   (error-message-string err))
          (mapcar (lambda (c) (anvil-fusion-verify--annotate-claim c 'unverified ""))
                  claims))))))
+
+;;;; ============================================================
+;;;; Phase 6d — verdict-annotated judge synthesis
+;;;; ============================================================
+
+;;;; --- customization (6d) ---------------------------------------------------
+
+(defcustom anvil-fusion-verify-judge-template
+  "あなたは、ひとつの問いに対する複数の AI アシスタントの回答を統合する判定者です。
+
+# 原問
+%s
+
+# 候補回答
+%s
+
+# 検証済み主張表
+{{CLAIMS}}
+
+# 手順
+以下を順に行ってください。
+1. 合意点 — 複数の候補が一致して主張している点を列挙する。
+2. 矛盾点 — 候補間で食い違う主張を挙げ、どちらがより妥当かを根拠とともに判定する。
+3. 部分カバー — 一部の候補だけが触れている重要な点。
+4. 独自洞察 — 単一の候補のみが提供した価値ある視点。
+5. 見落とし — どの候補も答えていないが、原問が要求している点。
+6. 検証済み主張表の見方 — VERDICT は confirmed（確認済み）/ refuted（反証済み）/
+   unverified（未検証）のいずれか、EVIDENCE は file:line の出典または反証理由を示す。
+7. REFUTED と判定された主張を最終回答に採用してはならない。REFUTED な主張にしか
+   根拠を持たない候補の結論は棄却すること。
+8. CONFIRMED な主張は、その evidence とともに優先的に採用すること。UNVERIFIED な
+   主張は通常の判断（上記 1〜5 の分析）で扱ってよい。
+9. 全候補の結論が REFUTED な主張にのみ依存している場合は、無理に統合せず、検証
+   不合格である旨と、何が反証されたかを明示した回答をすること。
+
+上記の分析を踏まえ、それらを統合した最終回答を作成する。最終回答は、いずれの
+候補単体よりも正確かつ網羅的でなければならない。失敗・空・エラーの候補は割り引く。
+
+# 出力形式
+## 分析
+（手順 1〜9 を簡潔に）
+## 最終回答
+（原問に対する、統合された単一の回答）"
+  "Verified variant of `anvil-fusion-judge-template' (Doc 61 Phase 6d,
+docs/design/61-fusion-verify.org §2).  Deliberately structurally
+parallel to the base template (same five analysis axes 1-5, same
+`# 出力形式' contract) so the two stay visibly diffable; steps 6-9 are
+the only addition, teaching the judge to read the Phase 6b verdict
+table and forbidding it from adopting a REFUTED claim.
+
+Placeholder design (read this before customizing): this template
+still carries exactly the same TWO %s placeholders as
+`anvil-fusion-judge-template', filled in the same order -- (1) the
+original question, (2) the candidate block -- by the same `format'
+call `anvil-fusion-build-judge-prompt' already makes for every
+:template (anvil-fusion.el, `anvil-fusion-build-judge-prompt''s
+`(format tmpl (or original-prompt \"\") (anvil-fusion--format-candidates ...))').
+The claims table is NOT a third %s slot; it is the literal marker
+`{{CLAIMS}}', substituted by `anvil-fusion-verify-judge-template-for'
+BEFORE that `format' call ever runs.  This is the seam Doc 61 asked
+for: it makes a Phase 6d template a drop-in :TEMPLATE argument for
+the existing, UNCHANGED `anvil-fusion-judge-consensus' /
+`anvil-fusion-build-judge-prompt' plumbing in anvil-fusion.el -- zero
+changes needed there.  Precisely BECAUSE the substitution happens
+before that later `format' call sees the string,
+`anvil-fusion-verify-judge-template-for' must (and does) double any
+literal `%' inside the rendered claims block to `%%' first -- else a
+claim like \"効率は 95% です\" would be misread as a `format' directive
+and corrupt (or error) the final judge prompt."
+  :type 'string
+  :group 'anvil-fusion)
+
+(defconst anvil-fusion-verify--claims-marker "{{CLAIMS}}"
+  "Literal marker in a judge template, substituted by
+`anvil-fusion-verify-judge-template-for' with the rendered claims
+block.  Deliberately NOT a %s placeholder -- see
+`anvil-fusion-verify-judge-template''s docstring for why.")
+
+;;;; --- pure rendering + template plumbing (6d) -------------------------------
+
+(defun anvil-fusion-verify--format-claims-block (claims)
+  "Render CLAIMS as a numbered table for the Phase 6d judge template.
+CLAIMS is a list of Phase 6a claim plists, ideally annotated with
+:VERDICT / :EVIDENCE by `anvil-fusion-verify-claims'.  A claim missing
+:VERDICT renders as `unverified' (the same default
+`anvil-fusion-verify--parse-verdict' uses for an absent/garbage
+verdict) with \"(証拠なし)\" for a missing/empty :EVIDENCE.  Returns
+\"(検証済み主張なし)\" for nil/empty CLAIMS.  Pure -- no I/O, no
+orchestrator dependency."
+  (if (null claims)
+      "(検証済み主張なし)"
+    (let ((i 0))
+      (mapconcat
+       (lambda (c)
+         (setq i (1+ i))
+         (format (concat "%d. 主張: %s\n"
+                         "   KIND: %s\n"
+                         "   VERDICT: %s\n"
+                         "   EVIDENCE: %s\n"
+                         "   主張した候補: %s")
+                 i
+                 (or (plist-get c :claim) "")
+                 (or (plist-get c :kind) 'fact)
+                 (or (plist-get c :verdict) 'unverified)
+                 (let ((ev (plist-get c :evidence)))
+                   (if (and (stringp ev) (not (string-empty-p ev))) ev "(証拠なし)"))
+                 (let ((cands (plist-get c :candidates)))
+                   (if cands (mapconcat #'identity cands ", ") "(不明)"))))
+       claims "\n\n"))))
+
+(defun anvil-fusion-verify--escape-percent (text)
+  "Double every `%' in TEXT so it survives a later `format' call as a
+single literal `%' instead of being read as a directive.  Pure."
+  (replace-regexp-in-string "%" "%%" (or text "")))
+
+(defun anvil-fusion-verify-judge-template-for (claims &optional base-template)
+  "Return a judge :TEMPLATE with CLAIMS substituted into BASE-TEMPLATE.
+
+BASE-TEMPLATE defaults to `anvil-fusion-verify-judge-template'.  Its
+`{{CLAIMS}}' marker (`anvil-fusion-verify--claims-marker') is replaced
+with CLAIMS rendered via `anvil-fusion-verify--format-claims-block'.
+The result is ready to pass as the :TEMPLATE argument to
+`anvil-fusion-judge-consensus' / `anvil-fusion-build-judge-prompt' --
+it still has exactly the same two %s placeholders (question, then
+candidate block) BASE-TEMPLATE had; the marker itself carries no %s
+and is substituted as LITERAL text (`replace-regexp-in-string' called
+with FIXEDCASE and LITERAL both t, so no accidental `\\&'/`\\N'
+backslash expansion from the rendered block).
+
+Because the marker substitution happens BEFORE
+`anvil-fusion-build-judge-prompt' applies its `format' call to the
+resulting template string, any `%' inside the rendered claims block is
+first doubled to `%%' (`anvil-fusion-verify--escape-percent') so it
+survives that later `format' as a single literal `%' rather than being
+misread as (or overflowing) a directive -- see
+`anvil-fusion-verify-judge-template''s docstring for the full
+rationale of this two-stage substitute-then-format design.
+
+Signals `user-error' when BASE-TEMPLATE lacks the marker: silently
+falling back to an un-grounded judge prompt would defeat the entire
+point of Phase 6d, so misconfiguration is loud rather than silent."
+  (let ((base (or base-template anvil-fusion-verify-judge-template)))
+    (unless (string-match-p (regexp-quote anvil-fusion-verify--claims-marker) base)
+      (user-error
+       "anvil-fusion-verify-judge-template-for: BASE-TEMPLATE lacks the %s marker"
+       anvil-fusion-verify--claims-marker))
+    (replace-regexp-in-string
+     (regexp-quote anvil-fusion-verify--claims-marker)
+     (anvil-fusion-verify--escape-percent (anvil-fusion-verify--format-claims-block claims))
+     base t t)))
 
 (provide 'anvil-fusion-verify)
 ;;; anvil-fusion-verify.el ends here

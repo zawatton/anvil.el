@@ -568,5 +568,90 @@ claim unverified without signaling to the caller."
       (should (null (anvil-fusion-verify-claims nil :question "Q")))
       (should (null called)))))
 
+;;;; ============================================================
+;;;; Phase 6d — verdict-annotated judge synthesis
+;;;; ============================================================
+
+(defconst anvil-fusion-verify-test--6d-claims
+  (list (list :claim "接地抵抗は10Ω以下である" :kind 'number :candidates '("A" "B")
+              :verdict 'confirmed :evidence "a.org:3 — 出典と一致")
+        (list :claim "漏電遮断器の設置は不要である" :kind 'fact :candidates '("A")
+              :verdict 'refuted :evidence "出典に一致しない"))
+  "Two Phase 6b-annotated claims used by the Phase 6d tests.")
+
+;;;; --- claims-block renderer ---------------------------------------------------
+
+(ert-deftest anvil-fusion-verify-test-claims-block-renders-fields ()
+  "Annotated claims render claim/kind/verdict/evidence/candidates."
+  (let ((block (anvil-fusion-verify--format-claims-block
+                anvil-fusion-verify-test--6d-claims)))
+    (should (string-match-p "接地抵抗は10Ω以下である" block))
+    (should (string-match-p "number" block))
+    (should (string-match-p "confirmed" block))
+    (should (string-match-p "a\\.org:3" block))
+    (should (string-match-p "A, B" block))
+    (should (string-match-p "漏電遮断器の設置は不要である" block))
+    (should (string-match-p "refuted" block))
+    (should (string-match-p "出典に一致しない" block))))
+
+(ert-deftest anvil-fusion-verify-test-claims-block-missing-verdict-unverified ()
+  "A claim lacking :verdict (e.g. a raw Phase 6a claim never sent
+through `anvil-fusion-verify-claims') renders as unverified with the
+no-evidence marker."
+  (let ((block (anvil-fusion-verify--format-claims-block
+                (list (list :claim "X" :kind 'fact :candidates '("A"))))))
+    (should (string-match-p "unverified" block))
+    (should (string-match-p "(証拠なし)" block))))
+
+(ert-deftest anvil-fusion-verify-test-claims-block-empty ()
+  "Nil claims render the (検証済み主張なし) sentinel."
+  (should (equal "(検証済み主張なし)" (anvil-fusion-verify--format-claims-block nil))))
+
+(ert-deftest anvil-fusion-verify-test-claims-block-empty-list ()
+  "An empty (non-nil-but-zero-length) claims list is nil in Elisp, so
+this is the same case as the nil test -- kept for the \"empty\"
+wording in the spec."
+  (should (equal "(検証済み主張なし)" (anvil-fusion-verify--format-claims-block '()))))
+
+;;;; --- judge-template-for -------------------------------------------------------
+
+(ert-deftest anvil-fusion-verify-test-judge-template-for-substitutes-marker ()
+  "The {{CLAIMS}} marker is replaced by the rendered claims block, and
+the base's two %s slots survive substitution (a two-argument `format'
+call on the result does not error)."
+  (let ((tmpl (anvil-fusion-verify-judge-template-for anvil-fusion-verify-test--6d-claims)))
+    (should-not (string-match-p (regexp-quote "{{CLAIMS}}") tmpl))
+    (should (string-match-p "接地抵抗は10Ω以下である" tmpl))
+    (should (string-match-p "confirmed" tmpl))
+    (should (stringp (format tmpl "Q" "CANDS")))))
+
+(ert-deftest anvil-fusion-verify-test-judge-template-for-empty-claims ()
+  "Nil claims substitutes the (検証済み主張なし) sentinel into the template."
+  (let ((tmpl (anvil-fusion-verify-judge-template-for nil)))
+    (should (string-match-p (regexp-quote "(検証済み主張なし)") tmpl))))
+
+(ert-deftest anvil-fusion-verify-test-judge-template-for-missing-marker-errors ()
+  "A BASE-TEMPLATE without the {{CLAIMS}} marker signals `user-error'."
+  (should-error
+   (anvil-fusion-verify-judge-template-for nil "no marker here: %s / %s")
+   :type 'user-error))
+
+(ert-deftest anvil-fusion-verify-test-judge-template-for-percent-survives-format ()
+  "A literal % inside a claim text survives escaping + marker
+substitution + the SAME `format' call
+`anvil-fusion-build-judge-prompt' (and therefore
+`anvil-fusion-judge-consensus' / `anvil-fusion-ask') applies to
+:template, uncorrupted (not doubled, not misread as a directive) in
+the final judge prompt."
+  (let* ((claims (list (list :claim "効率は 95% です" :kind 'number
+                              :verdict 'confirmed :evidence "a.org:1"
+                              :candidates '("A"))))
+         (tmpl (anvil-fusion-verify-judge-template-for claims))
+         ;; The exact path `anvil-fusion-judge-consensus' / `anvil-fusion-ask'
+         ;; use to turn a :template into the final judge prompt.
+         (prompt (anvil-fusion-build-judge-prompt "Q" nil :template tmpl)))
+    (should (string-match-p "効率は 95% です" prompt))
+    (should-not (string-match-p "95%%" prompt))))
+
 (provide 'anvil-fusion-verify-test)
 ;;; anvil-fusion-verify-test.el ends here
