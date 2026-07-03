@@ -4,6 +4,15 @@
 ;; Pure tests for the rubric scorer, runner (stub ask-fn), aggregation,
 ;; comparison and tuning report.  The panel ask-fn builder is checked by
 ;; stubbing `anvil-fusion-ask'.
+;;
+;; Doc 61 Phase 6d' (docs/design/61-fusion-verify.org §2 6d', Doc 54 §12
+;; residual item) added the egress-inference tests for
+;; `anvil-fusion-eval-single-ask-fn' at the bottom: its closure now
+;; requires `anvil-orchestrator' AND `anvil-fusion-panels' (for
+;; `anvil-fusion-provider-local-p'), so those tests load the real
+;; orchestrator module when present (same pattern
+;; tests/anvil-fusion-ask-test.el / -async-test.el / -loop-test.el use)
+;; and stub its four public functions with `cl-letf'.
 
 ;;; Code:
 
@@ -12,6 +21,9 @@
 (let ((dir (file-name-directory (or load-file-name buffer-file-name
                                     default-directory))))
   (add-to-list 'load-path (expand-file-name ".." dir)))
+(or (require 'anvil-orchestrator nil t) ;; load the real module when present (anvil.el)
+    (provide 'anvil-orchestrator))  ;; else fake it (fusion standalone repo)
+(require 'anvil-fusion-panels)
 (require 'anvil-fusion-eval)
 
 ;;;; --- scorer --------------------------------------------------------------
@@ -123,6 +135,39 @@
       (should (equal "FUSED" (plist-get out :answer)))
       (should (eq 'local-only (plist-get out :egress)))
       (should (integerp (plist-get out :elapsed-ms))))))
+
+;;;; --- single-ask-fn egress inference (Doc 61 Phase 6d') --------------------
+
+(defmacro anvil-fusion-eval-test--with-fake-single-orchestrator (&rest body)
+  "Run BODY with a faked orchestrator answering any single-task submit."
+  (declare (indent 0) (debug t))
+  `(cl-letf (((symbol-function 'anvil-orchestrator-submit)
+              (lambda (_tasks) "b1"))
+             ((symbol-function 'anvil-orchestrator-collect)
+              (lambda (&rest _) t))
+             ((symbol-function 'anvil-orchestrator-status)
+              (lambda (_id) (list :tasks '((:id "t1")))))
+             ((symbol-function 'anvil-orchestrator-extract-result)
+              (lambda (_id _full) (list :summary "SINGLE-ANSWER"))))
+     ,@body))
+
+(ert-deftest anvil-fusion-eval-test-single-ask-fn-ollama-local-only ()
+  "A local provider (ollama, per `anvil-fusion-local-providers') reports
+:egress `local-only' instead of the old hard-coded `external'."
+  (anvil-fusion-eval-test--with-fake-single-orchestrator
+    (let* ((fn (anvil-fusion-eval-single-ask-fn 'ollama "llama3.1:8b"))
+           (out (funcall fn "QQ")))
+      (should (equal "SINGLE-ANSWER" (plist-get out :answer)))
+      (should (eq 'local-only (plist-get out :egress)))
+      (should (integerp (plist-get out :elapsed-ms))))))
+
+(ert-deftest anvil-fusion-eval-test-single-ask-fn-claude-external ()
+  "A non-local provider (claude) still reports :egress `external'."
+  (anvil-fusion-eval-test--with-fake-single-orchestrator
+    (let* ((fn (anvil-fusion-eval-single-ask-fn 'claude))
+           (out (funcall fn "QQ")))
+      (should (equal "SINGLE-ANSWER" (plist-get out :answer)))
+      (should (eq 'external (plist-get out :egress))))))
 
 (provide 'anvil-fusion-eval-test)
 ;;; anvil-fusion-eval-test.el ends here

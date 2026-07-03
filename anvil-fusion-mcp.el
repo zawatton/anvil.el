@@ -84,7 +84,23 @@ plain lists -> vectors (JSON arrays)."
 
 ;;;; --- MCP tool wrappers ---------------------------------------------------
 
-(defun anvil-fusion--tool-ask (prompt &optional panel fidelity lenses judge extra)
+(defun anvil-fusion--arg-bool (value default)
+  "Coerce a JSON-sourced boolean VALUE to Lisp t/nil.
+VALUE is nil when the MCP caller omitted the argument entirely (an
+absent key never reaches the handler as a value at all — see
+`anvil-server--handle-tools-call') — that case returns DEFAULT.  An
+explicit JSON `false' arrives as either the `:false' keyword or the
+literal string \"false\" (both observed across this MCP transport's
+JSON decode paths — see `anvil-org--tool-edit-body' for the same
+normalization) and returns nil.  Anything else explicitly provided
+(t, \"true\", 1, …) is truthy and returns t."
+  (cond
+   ((eq value :false) nil)
+   ((equal value "false") nil)
+   ((null value) default)
+   (t t)))
+
+(defun anvil-fusion--tool-ask (prompt &optional panel fidelity lenses judge extra verify)
   "Submit a Fusion ask over a model panel; return a job id to poll.
 
 MCP Parameters:
@@ -99,6 +115,11 @@ MCP Parameters:
   judge    - Override judge provider name; refused for a local-only
              panel when non-local.
   extra    - Extra instruction appended to the judge prompt.
+  verify   - (boolean) Run the Doc 61 Phase 6d verifier-grounded judge
+             (docs/design/61-fusion-verify.org §2 6d): contested-claim
+             extraction + evidence check before synthesis, via two
+             bounded-blocking poll steps.  Defaults to
+             `anvil-fusion-verify-by-default' when omitted.
 
 Returns a plist (:job-id :stage :panel :egress).  Poll the job id
 with the `fusion-result' tool until :status is \"done\"."
@@ -109,7 +130,8 @@ with the `fusion-result' tool until :status is \"done\"."
                   (let ((l (anvil-fusion--arg-list lenses)))  (and l (list :lenses l)))
                   (let ((j (anvil-fusion--arg-sym judge)))    (and j (list :judge j)))
                   (and extra (stringp extra) (not (string-empty-p extra))
-                       (list :extra extra))))))
+                       (list :extra extra))
+                  (list :verify (anvil-fusion--arg-bool verify anvil-fusion-verify-by-default))))))
 
 (defun anvil-fusion--tool-result (job_id)
   "Poll a Fusion ask job and return its current status / answer.
@@ -119,7 +141,8 @@ MCP Parameters:
 
 Returns a plist whose :status is \"running\" / \"done\" / \"error\";
 when \"done\" it carries :answer (the synthesized reply), :panel,
-:egress and :n-candidates."
+:egress, :n-candidates, :rounds, :looped, and — when the job was
+started with verify t — :claims (the verdict-annotated claim table)."
   (anvil-server-with-error-handling
    (anvil-fusion-result job_id)))
 
@@ -135,9 +158,12 @@ when \"done\" it carries :answer (the synthesized reply), :panel,
    "Submit a Fusion ask: fan a prompt out to a model panel (sovereign
 = local / zero-egress by default, or quality / budget) and have a
 judge synthesize one answer (consensus / contradictions / unique
-insights -> final answer).  Recovers Fable-class output WITHOUT the
-banned model.  Returns a job id immediately; poll `fusion-result'
-until done (a full ask runs tens of seconds to minutes).")
+insights -> final answer), optionally critiquing and re-synthesizing
+across disagreement (verify=true also grounds the judge in a
+verified, verdict-annotated claim table before synthesis).  Recovers
+Fable-class output WITHOUT the banned model.  Returns a job id
+immediately; poll `fusion-result' until done (a full ask runs tens of
+seconds to minutes; a verify=true or looped ask can take longer).")
 
   (anvil-server-register-tool
    (anvil-fusion--encode-handler #'anvil-fusion--tool-result)
@@ -147,7 +173,8 @@ until done (a full ask runs tens of seconds to minutes).")
    :description
    "Poll a Fusion ask job started by `fusion-ask'.  Returns :status
 running / done / error; when done, :answer holds the synthesized
-reply plus :panel / :egress / :n-candidates."))
+reply plus :panel / :egress / :n-candidates / :rounds / :looped, and
+:claims when the job was started with verify=true."))
 
 (defun anvil-fusion--unregister-tools ()
   "Unregister the fusion MCP tools."
