@@ -168,17 +168,33 @@ Phase 6-7 produce trajectories worth keeping.
 
 | Phase | Deliverable                                        | Depends on | Status |
 |-------+----------------------------------------------------+------------+--------|
-| 6a    | claim extraction pass                              | —          | TODO   |
-| 6b    | evidence check (KB + skeptic vote)                 | 6a         | TODO   |
+| 6a    | claim extraction pass                              | —          | SHIPPED a2a4b11 |
+| 6a'   | haiku default pin + per-side/NONE template harden  | 6a, spike  | SHIPPED b414185 |
+| 6b    | evidence check (KB + skeptic vote)                 | 6a         | SHIPPED de5ebb7 |
 | 6c    | execution verification for code candidates         | 6a         | TODO   |
-| 6d    | verdict-annotated judge template + plumbing        | 6b         | TODO   |
-| 6d'   | debt bundle (async loop, egress inference, :verify)| 6d         | TODO   |
-| 6e    | unsaturated eval battery + re-run panel-compare    | 6d         | TODO   |
-| 7     | opus-solo panel (k-member self-consistency)        | 6d         | TODO   |
+| 6d    | verdict-annotated judge template + plumbing        | 6b         | SHIPPED 281aa63 |
+| 6d'   | debt bundle (async loop, egress inference, :verify)| 6d         | SHIPPED da51e05 |
+| 6e    | unsaturated eval battery + verify-effect run       | 6d         | MEASURED (PASS, saturated — see below) |
+| 7     | opus-solo panel (k-member self-consistency)        | 6d         | IN-PROGRESS |
 | 8a    | plan fusion                                        | 6d         | TODO   |
 | 8b    | longrun step = fusion panel                        | 8a         | TODO   |
 | 8c    | inter-step verify gate                             | 6d, 8b     | TODO   |
 | 9     | verified-trajectory exemplar library (sketch)      | 6-7 live   | LATER  |
+
+6e measured 2026-07-03 (benchmarks/doc61-phase6e/, $15.01, results org in
+that dir). Acceptance PASS: verified-judge gold-wrong adoption 0/10; claim
+extraction hit the planted disagreement 10/10 and verdicts were 20/20
+(correct side confirmed, hallucinated side refuted — the 6a' per-side
+template works). CAVEAT: the battery saturated — the plain claude judge
+also went 10/10, so this run proves correctness + non-regression, not
+uplift (the 2026-06-16 failure was recorded on a small-local sovereign
+judge). Tier B: single 79% / fusion-plain 93% / fusion-verified 100% gold
+recall; the one real differential cell (b02) came from claim SURFACING
+(an unverified naming dispute placed in the judge's claim table), not from
+a verdict. Follow-ups filed: de-saturation re-run with a small/local judge
+(runner supports it), KB evidence-relevance threshold (irrelevant file:line
+sources mislead even when verdicts are right — "6f" candidate), hedging
+candidates getting REFUTED.
 
 Recommended order: 6 -> 7 -> 8 (Phase 6 fixes a recorded, harmful failure mode
 and is measurable immediately; Phase 7 is a small addition on top; Phase 8 is
@@ -211,6 +227,7 @@ the heavyweight design).
   general questions the skeptic vote is the only verifier — is N=2 enough?
 - 8b cost envelope: panel-per-step multiplies longrun cost; define the =:hard=
   step marking heuristic (divergent digest? prior step retried?).
-- Phase 7 sampling diversity: claude CLI temperature control availability per
-  invocation needs a spike; lens-only diversity may be sufficient (Doc 54:
-  1/4 of lift).
+- [RESOLVED 2026-07-03] Phase 7 sampling diversity: the claude CLI exposes no
+  per-invocation temperature/sampling flag (checked v2.1.199 --help) —
+  opus-solo diversity is lens-only (correctness / completeness / skeptic by
+  position; the domain lens stays opt-in per ask).
