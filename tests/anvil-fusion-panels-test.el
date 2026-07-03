@@ -48,6 +48,29 @@
   (dolist (p anvil-fusion-panels)
     (should (anvil-fusion-panel-validate (car p)))))
 
+(ert-deftest anvil-fusion-panels-test-opus-solo-exists ()
+  "The Phase 7 Opus self-consistency panel is registered."
+  (should (assq 'opus-solo anvil-fusion-panels)))
+
+(ert-deftest anvil-fusion-panels-test-opus-solo-shape ()
+  "The Opus self-consistency panel matches the shipped design."
+  (let* ((body (anvil-fusion-panel-get 'opus-solo))
+         (members (anvil-fusion-panel-members body)))
+    (should (= 3 (length members)))
+    (should (equal '((claude . "claude-opus-4-8")
+                     (claude . "claude-opus-4-8")
+                     (claude . "claude-opus-4-8"))
+                   members))
+    (should (equal '(claude . "claude-opus-4-8")
+                   (anvil-fusion-panel-judge body)))
+    (should (eq 'external (anvil-fusion-panel-egress body)))
+    (should (equal '(correctness completeness skeptic)
+                   (cdr (assq 'lenses body))))))
+
+(ert-deftest anvil-fusion-panels-test-opus-solo-validates ()
+  "The shipped Opus self-consistency panel validates."
+  (should (anvil-fusion-panel-validate 'opus-solo)))
+
 ;;;; --- validation: sovereignty enforcement --------------------------------
 
 (ert-deftest anvil-fusion-panels-test-local-only-rejects-external-member ()
@@ -131,6 +154,31 @@
                       tasks))
     (should (equal '("llama3.1:8b" "llama3.2:3b" "gemma4:e4b")
                    (mapcar (lambda (tk) (plist-get tk :model)) tasks)))))
+
+(ert-deftest anvil-fusion-panels-test-opus-solo-tasks ()
+  "Opus self-consistency members keep order, names, and lens prefixes."
+  (let* ((body (anvil-fusion-panel-get 'opus-solo))
+         (prompt "PROMPT-X")
+         (lenses (cdr (assq 'lenses body)))
+         (tasks (anvil-fusion-panel-tasks body prompt lenses))
+         (prefixes (mapcar (lambda (lens) (cdr (assq lens anvil-fusion-lenses)))
+                           lenses))
+         (names (mapcar (lambda (tk) (plist-get tk :name)) tasks)))
+    (should (= 3 (length tasks)))
+    (should (cl-every (lambda (tk) (eq 'claude (plist-get tk :provider)))
+                      tasks))
+    (should (equal '("claude-opus-4-8" "claude-opus-4-8" "claude-opus-4-8")
+                   (mapcar (lambda (tk) (plist-get tk :model)) tasks)))
+    (should (= 3 (length (delete-dups (copy-sequence names)))))
+    (should (string-prefix-p (nth 0 prefixes) (plist-get (nth 0 tasks) :prompt)))
+    (should (string-prefix-p (nth 1 prefixes) (plist-get (nth 1 tasks) :prompt)))
+    (should (string-prefix-p (nth 2 prefixes) (plist-get (nth 2 tasks) :prompt)))
+    (should-not (equal (plist-get (nth 0 tasks) :prompt)
+                       (plist-get (nth 1 tasks) :prompt)))
+    (should-not (equal (plist-get (nth 1 tasks) :prompt)
+                       (plist-get (nth 2 tasks) :prompt)))
+    (should-not (equal (plist-get (nth 0 tasks) :prompt)
+                       (plist-get (nth 2 tasks) :prompt)))))
 
 (provide 'anvil-fusion-panels-test)
 ;;; anvil-fusion-panels-test.el ends here
