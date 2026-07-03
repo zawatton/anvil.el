@@ -53,6 +53,7 @@
 
 ;; `anvil-offload' is an optional module — loaded on demand in
 ;; `anvil-server--offload-apply'.  Declare to silence byte-compile warnings.
+(declare-function anvil-server-start "anvil-server-commands" ())
 (declare-function anvil-offload "anvil-offload" (form &rest keys))
 (declare-function anvil-future-await "anvil-offload" (future &optional timeout))
 (declare-function anvil-future-cancel "anvil-offload" (future))
@@ -1815,6 +1816,8 @@ virtual server-ids share the same handler pool."
                        ,(vector
                          `((type . "text") (text . ,result-text))))
                       (isError . :json-false))))
+                (anvil-server-metrics--track-tool-payload
+                 tool-name tool-args result-text)
                 (anvil-server-metrics--track-tool-call tool-name)
                 (condition-case hook-err
                     (run-hook-with-args
