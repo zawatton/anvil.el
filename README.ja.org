@@ -78,9 +78,20 @@ Anvil の背景 - 何故開発するに至ったのか — [[file:STORY.ja.org][
 
 * 現在のリリースハイライト
 
-v1.3.0 は、2026-05/06 の develop line をまとめたリリースです。Anvil を
-単なるファイル編集補助から、コードベース分析、メール、CAD、長時間評価、
-context 圧縮まで扱える AI workbench に広げます。
+2026-07 wave (post-v1.3.0、master 反映済み) は「検証接地 fusion スタック」と
+「実測ベースの省トークン層」を追加します。使い方ガイド:
+[[file:docs/FUSION-GUIDE.org][docs/FUSION-GUIDE.org]] (英語)。
+
+| 領域 | 何が増えたか |
+|------+--------------|
+| 検証接地 fusion | =anvil-fusion-verify= が panel 回答から係争中の主張を抽出し、ローカル KB (grep 証拠 + 懐疑者投票 + 機械チェッカー) で検証、REFUTED な主張の採用を judge に禁止します。受入測定: 幻覚採用 0/10、難タスク gold recall 79% (単体) → 100% (fusion+verify)。 |
+| カスケードルーター | =anvil-fusion-route-ask= が「単体回答 → haiku プローブで危険度判定 → 危険時のみ panel 昇格」を自動化。4-8x の fusion コストを既定でなく意図的に払う構造にします。 |
+| 実行検証 | =anvil-fusion-exec= がコード候補のパッチを使い捨て worktree で実走し check コマンドで判定。失敗候補は合成から除外されます。 |
+| plan fusion + agentic long-run | =anvil-fusion-plan= は実装計画を repo 実在チェック (計画が挙げるファイル/API の存在確認) 付きでマージ。long-run は distiller が難所宣言した step を panel 実行 (=:step-panel=) し、step 間で digest を claim 検証 (=:verify-steps=) できます。 |
+| 軌跡ライブラリ | =anvil-fusion-traj= が検証済みの勝ち筋 (confirmed≥1 かつ refuted=0) だけを蓄積し、類似タスクで exemplar として panel に前置 — 重み更新なしの自己改善です。 |
+| 省トークン (実測) | ツール別 volume telemetry (=metrics-token-report=)、テスト結果の定型化 (=ert-run-distilled=、~120 字)、差分再読 (=file-read-delta=、~126x 減)、検索 snippet clamp (~87% 減)、verdict キャッシュ + 逐次懐疑者、judge 入力 dedup、opt-in の応答予算 + 継続取得 (=disclosure-fetch=)。 |
+
+v1.3.0 ハイライト (前 wave):
 
 | 領域 | 何が増えたか |
 |------+--------------|
@@ -202,7 +213,7 @@ Anvil の default install は *約 40 個の MCP ツール* を提供します (
 | =anvil-context= (v1.3.0) | Headroom 風の可逆 context 圧縮。JSON / diff / log / code / prose を model に戻す前に圧縮し、厳密な文面が必要な時は =ccr-id= から raw context を復元 |
 | =anvil-mu4e= / =anvil-wl= (v1.3.0) | local mu4e と Wanderlust/Maildir 向けの構造化 mail tools。read/search/compose surface を提供し、send tool は gate 付きで無音送信を防ぐ |
 | =anvil-cad= (v1.3.0) | DXF/SVG の outline、extract、annotate、batch-update、generate を共通 entity IR 経由で提供 |
-| =anvil-fusion= / long-run (v1.3.0) | 複数 agent output の比較、compact panel summary、long-run result store、review/evaluation 用 MCP surface を提供 |
+| =anvil-fusion= スタック (2026-07) | 検証済みマルチモデル回答: named panel (=opus-solo= / =claude-pair= / =sovereign=)、claim 抽出 + KB/懐疑者/実行検証、REFUTED 採用禁止の judge、カスケードルーター、plan fusion、panel 化 long-run step + step 間 verify gate、検証済み軌跡ライブラリ。使い方: [[file:docs/FUSION-GUIDE.org][docs/FUSION-GUIDE.org]] |
 | =anvil-tools-by-intent= + =anvil-manifest= (v0.4.0 + 2026-05) | Intent-based tool discovery + =ANVIL_PROFILE= フィルタ。2026-05 の Tool Attention で query ranking、optional embedding backend、state precondition、schema trimming、warm LRU full-schema 保持、recovery suggestion、Doc43 docstring rewrite candidate 連携を追加 |
 | =anvil-worklog= (2026-05) | SQLite-backed AI 作業ログ index。旧 org log は scan、新規は =worklog-add= で DB-primary。search/list/get/export を MCP と memory-bridge から提供。DB ファイルの差し替え・unlink 後も stale handle を検出して再 open し、=worklog-add= は短い transaction で書き込む |
 | =anvil-claude-watchdog= (2026-05) | Linux procfs/jsonl ベースの Claude Code TUI hang watchdog。State=R stall と State=S spinner/MCP-child-IO 停止 variant を検出し、event 記録、desktop notification、確認付き =claude --resume= tmux staging を提供 |
@@ -525,6 +536,7 @@ Anvil を使うと:
 | =wl= (v1.3.0) | Wanderlust/Maildir tools。local Maildir read/search/compose/draft/send、RFC2047/CJK decode、gated SMTP send path（オプション） | FLIM/Wanderlust 系 mail stack |
 | =cad= (v1.3.0) | ASCII DXF/SVG を共通 entity IR で read/edit/generate（オプション） | — |
 | =fusion= / =fusion-longrun= (v1.3.0) | agent output 比較、panel、async collect、long-run result store、MCP review surface（オプション） | =orchestrator= |
+| =fusion-verify= / =-route= / =-exec= / =-plan= / =-traj= (2026-07) | 検証接地 judge (claim + KB/懐疑者/機械チェック + verdict キャッシュ)、カスケードルーター、コード候補の worktree 実行判定、repo 実在チェック付き plan fusion、検証済み軌跡ストア（オプション） | =fusion=, =orchestrator=; =state= 任意 |
 | =semantic= (v1.3.0) | org/text/code corpus の local search。SQLite FTS5、CJK LIKE fallback、hybrid RRF scoring、任意の ollama/Gemini/OpenAI vector embedding を提供（オプション） | Emacs 29+, =sqlite=, optional =http= |
 | =session= (v0.4.0) | セッション snapshot / resume + Claude Code lifecycle hook 5 本 | =state= |
 | =discovery= (v0.4.0) | Intent-based tool discovery (=anvil-tools-by-intent=) + tool 毎 usage counter | =state= |

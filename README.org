@@ -34,7 +34,19 @@ through a normal Emacs daemon or through the NeLisp standalone runtime.
 
 * Current Release Highlights
 
-v1.3.0 is focused on making Anvil useful beyond narrow file edits:
+The 2026-07 wave (post-v1.3.0, on master) adds a verified fusion stack
+and a measured token-thrift layer — usage guide: [[file:docs/FUSION-GUIDE.org][docs/FUSION-GUIDE.org]]:
+
+| Area | What changed |
+|------+--------------|
+| Verifier-grounded fusion | =anvil-fusion-verify= extracts contested claims from panel answers, checks them against a local KB (grep evidence + adversarial skeptic vote + mechanical checkers), and feeds verdicts to a judge that may not adopt refuted claims. Acceptance run: 0/10 hallucination adoptions; hard-task gold recall 79% (single) → 100% (fusion+verify). |
+| Cascade router | =anvil-fusion-route-ask= answers once, risk-probes its own answer with a haiku-tier call, and escalates to panels only when risky — the 4-8x fusion multiplier is paid deliberately, not by default. |
+| Execution verification | =anvil-fusion-exec= runs each candidate code patch in a disposable git worktree and gates on a check command; failing candidates are excluded from synthesis. |
+| Plan fusion + agentic long-runs | =anvil-fusion-plan= merges implementation plans with repo-reality checks (files/APIs named by a plan must exist); long-run quests can execute distiller-flagged hard steps as panels (=:step-panel=) with a claim-verification gate between steps (=:verify-steps=). |
+| Trajectory library | =anvil-fusion-traj= stores verified wins (admission gate: ≥1 confirmed claim, zero refuted) and prepends retrieved exemplars to future panel prompts — self-improvement without weight updates. |
+| Token thrift (measured) | Per-tool volume telemetry (=metrics-token-report=), distilled test runs (=ert-run-distilled=, ~120-char results), diff-first re-reads (=file-read-delta=, ~126x smaller re-reads), search snippet clamps (~87% smaller), verdict cache + sequential skeptics, judge-input dedup, and an opt-in response budget with continuation fetch (=disclosure-fetch=). |
+
+v1.3.0 highlights (previous wave):
 
 | Area | What changed |
 |------+--------------|
@@ -287,7 +299,7 @@ sister package).  Highlights:
 | =anvil-context= (v1.3.0) | Headroom-inspired reversible context compression.  Compress JSON / diff / log / code / prose before handing it back to the model; retrieve raw context later by =ccr-id= when exact wording matters |
 | =anvil-mu4e= / =anvil-wl= (v1.3.0) | Structured mail tools for local mu4e and Wanderlust/Maildir workflows.  Read/search/compose surfaces are structured; send tools are gated so agent-driven mail cannot transmit silently |
 | =anvil-cad= (v1.3.0) | DXF/SVG outline, extract, annotate, batch-update, and generate tools through a format-agnostic entity IR |
-| =anvil-fusion= / long-run (v1.3.0) | Compare multiple agent outputs, keep compact panel summaries, store long-run results, and expose MCP surfaces for review/evaluation workflows |
+| =anvil-fusion= stack (2026-07) | Verified multi-model answers: named panels (=opus-solo= / =claude-pair= / =sovereign=), claim extraction + KB/skeptic/execution verification, a judge barred from adopting refuted claims, cascade routing, plan fusion, panelized long-run steps with inter-step verify gates, and a verified-trajectory exemplar library.  Usage: [[file:docs/FUSION-GUIDE.org][docs/FUSION-GUIDE.org]] |
 | =anvil-tools-by-intent= + =anvil-manifest= (v0.4.0 + 2026-05) | Intent-based tool discovery plus =ANVIL_PROFILE= filter.  The 2026-05 update adds Tool Attention: dynamic query-based ranking, optional embedding backends, state preconditions, schema trimming, warm LRU full-schema retention, recovery suggestions, and a Doc43 bridge for docstring rewrite candidates |
 | =anvil-worklog= (2026-05) | SQLite-backed AI worklog index.  Old org logs can be scanned, new entries are DB-primary via =worklog-add=, and bridge endpoints expose read-only search/list/get to other AI clients.  The DB handle self-recovers after file replacement/unlink events and uses short write transactions for =worklog-add= |
 | =anvil-claude-watchdog= (2026-05) | Linux procfs/jsonl watchdog for Claude Code TUI hangs.  Detects State=R stalls and the State=S spinner/MCP-child-IO variant, records events, notifies the desktop, and offers confirmation-gated manual recovery via =claude --resume= staged in tmux |
@@ -693,6 +705,7 @@ budget goes to reasoning about your code, not re-reading it.
 | =wl= (v1.3.0) | Wanderlust/Maildir tools: local Maildir read/search/compose/draft/send, RFC2047/CJK decoding, gated SMTP send path (opt.) | FLIM/Wanderlust-style mail stack |
 | =cad= (v1.3.0) | ASCII DXF/SVG read/edit/generate through a shared entity IR (opt.) | — |
 | =fusion= / =fusion-longrun= (v1.3.0) | Agent-output comparison, panels, async collection, long-run result store, MCP review surfaces (opt.) | =orchestrator= |
+| =fusion-verify= / =-route= / =-exec= / =-plan= / =-traj= (2026-07) | Verifier-grounded judge (claims + KB/skeptic/mechanical checks + verdict cache), cascade router, worktree execution gating for code candidates, plan fusion with repo-reality checks, verified-trajectory exemplar store (opt.) | =fusion=, =orchestrator=; =state= optional |
 | =semantic= (v1.3.0) | Local corpus search over org/text/code using SQLite FTS5, CJK LIKE fallback, hybrid RRF scoring, and optional vector embeddings via ollama/Gemini/OpenAI (opt.) | Emacs 29+, =sqlite=, optional =http= |
 | =session= (v0.4.0) | Session snapshot / resume + 5 Claude Code lifecycle hooks (opt.) | =state= |
 | =discovery= (v0.4.0) | Intent-based MCP tool discovery (=anvil-tools-by-intent=) + per-tool usage counter (opt.) | =state= |
