@@ -1809,6 +1809,10 @@ virtual server-ids share the same handler pool."
                           " value (string / nil / plist / list /"
                           " hash-table / vector), got: %s")
                          (type-of result)))))))
+                   (result-text
+                    (if (fboundp 'anvil-disclosure-budget-apply)
+                        (anvil-disclosure-budget-apply tool-name result-text)
+                      result-text))
                    ;; Wrap the handler result in the MCP format
                    (formatted-result
                     `((content

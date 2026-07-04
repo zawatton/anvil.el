@@ -13,6 +13,8 @@
 (let ((dir (file-name-directory (or load-file-name buffer-file-name
                                     default-directory))))
   (add-to-list 'load-path (expand-file-name ".." dir)))
+(require 'anvil-server)
+(require 'anvil-disclosure)
 (require 'anvil-server-metrics)
 
 (defmacro anvil-server-metrics-test--with-clean-state (&rest body)
@@ -114,6 +116,42 @@
       (should (= (length "(:ok t)") (plist-get obj-entry :response-chars)))
       (should (= (length "nil") (plist-get nil-entry :max-response-chars)))
       (should (= (length "(:ok t)") (plist-get obj-entry :max-response-chars))))))
+
+(ert-deftest anvil-server-metrics-test-dispatch-seam-tracks-truncated-response ()
+  "Dispatch metrics must measure the post-budget response text."
+  (anvil-server-metrics-test--with-clean-state
+    (let ((tool-id "metrics-budget-test")
+          (server-id "anvil-test")
+          (anvil-disclosure-response-budget-chars 8)
+          (anvil-disclosure-response-budget-overrides nil))
+      (unwind-protect
+          (progn
+            (anvil-disclosure--store-reset)
+            (anvil-server-register-tool
+             (lambda () "abcdefghijklmnopqrstuvwxyz")
+             :id tool-id
+             :description "Test seam ordering"
+             :server-id server-id
+             :read-only t)
+            (let* ((resp (json-read-from-string
+                          (anvil-server--handle-tools-call
+                           1 `((name . ,tool-id) (arguments . ()))
+                           (make-anvil-server-metrics)
+                           server-id)))
+                   (result (alist-get 'result resp))
+                   (content (alist-get 'content result))
+                   (text (alist-get 'text (aref content 0)))
+                   (tool-entry (gethash tool-id
+                                        anvil-server-metrics--tool-token-table)))
+              (should (= 1 (plist-get tool-entry :calls)))
+              (should (= (length text)
+                         (plist-get tool-entry :response-chars)))
+              (should (/= (plist-get tool-entry :response-chars)
+                          (length "abcdefghijklmnopqrstuvwxyz")))
+              (should (string-match-p "truncated 8 of 26 chars" text))
+              (should (string-match-p "disclosure-fetch" text))))
+        (anvil-server-unregister-tool tool-id server-id)
+        (anvil-disclosure--store-reset)))))
 
 (provide 'anvil-server-metrics-test)
 ;;; anvil-server-metrics-test.el ends here

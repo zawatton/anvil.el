@@ -48,6 +48,23 @@
                       :rows ,rows))))
      ,@body))
 
+(defmacro anvil-disclosure-test--with-clean-store (&rest body)
+  "Run BODY with a fresh disclosure payload store."
+  (declare (indent 0) (debug t))
+  `(let ((anvil-disclosure-response-budget-chars
+          anvil-disclosure-response-budget-chars)
+         (anvil-disclosure-response-budget-overrides
+          anvil-disclosure-response-budget-overrides)
+         (anvil-disclosure-store-max-entries
+          anvil-disclosure-store-max-entries)
+         (anvil-disclosure-store-max-total-chars
+          anvil-disclosure-store-max-total-chars))
+     (unwind-protect
+         (progn
+           (anvil-disclosure--store-reset)
+           ,@body)
+       (anvil-disclosure--store-reset))))
+
 ;;;; --- Layer-1 projection -------------------------------------------------
 
 (ert-deftest anvil-disclosure-test-project-rows-basic ()
@@ -566,6 +583,100 @@ ENTRIES (a list of cache-list plists with :url :sha :body etc)."
   (should (equal "cl-lib/reduce"
                  (anvil-elisp--strip-defs-uri
                   "defs://abc/cl-lib/reduce"))))
+
+;;;; --- Phase 9: generic disclosure budget -------------------------------
+
+(ert-deftest anvil-disclosure-test-budget-off-passes-through ()
+  (anvil-disclosure-test--with-clean-store
+    (let ((anvil-disclosure-response-budget-chars nil)
+          (text (make-string 64 ?x)))
+      (should (equal text
+                     (anvil-disclosure-budget-apply "tool-a" text))))))
+
+(ert-deftest anvil-disclosure-test-budget-global-truncates-and-fetches ()
+  (anvil-disclosure-test--with-clean-store
+    (let* ((anvil-disclosure-response-budget-chars 12)
+           (anvil-disclosure-response-budget-overrides nil)
+           (text "abcdefghijklmnopqrstuvwxyz")
+           (truncated (anvil-disclosure-budget-apply "tool-a" text))
+           (id (progn
+                 (string-match "id=\\([^ ]+\\) offset=12" truncated)
+                 (match-string 1 truncated)))
+           (page-1 (anvil-disclosure-fetch id 0 10))
+           (page-2 (anvil-disclosure-fetch id 10 10))
+           (page-3 (anvil-disclosure-fetch id 20 10)))
+      (should (string-prefix-p "abcdefghijkl" truncated))
+      (should (string-match-p
+               "tool `disclosure-fetch' id=d[0-9a-f]+ offset=12"
+               truncated))
+      (should (equal text (gethash id anvil-disclosure--store)))
+      (should (equal text
+                     (concat (plist-get page-1 :text)
+                             (plist-get page-2 :text)
+                             (plist-get page-3 :text))))
+      (should (= 16 (plist-get page-1 :remaining)))
+      (should (= 6 (plist-get page-2 :remaining)))
+      (should (= 0 (plist-get page-3 :remaining))))))
+
+(ert-deftest anvil-disclosure-test-budget-override-wins-and-nil-exempts ()
+  (anvil-disclosure-test--with-clean-store
+    (let ((anvil-disclosure-response-budget-chars 5)
+          (anvil-disclosure-response-budget-overrides
+           '(("tool-a" . 20)
+             ("file-read" . nil)))
+          (text "0123456789"))
+      (should (equal text
+                     (anvil-disclosure-budget-apply "tool-a" text)))
+      (should (equal text
+                     (anvil-disclosure-budget-apply "file-read" text)))
+      (should (string-match-p
+               "disclosure-fetch"
+               (anvil-disclosure-budget-apply "tool-b" text))))))
+
+(ert-deftest anvil-disclosure-test-fetch-tool-is-budget-exempt ()
+  (anvil-disclosure-test--with-clean-store
+    (let* ((anvil-disclosure-response-budget-chars 1)
+           (anvil-disclosure-response-budget-overrides nil)
+           (text "0123456789")
+           (truncated (anvil-disclosure-budget-apply "tool-a" text))
+           (id (progn
+                 (string-match "id=\\([^ ]+\\) offset=1" truncated)
+                 (match-string 1 truncated)))
+           (fetch-res (anvil-disclosure--tool-fetch id "0" "20000")))
+      (should (string-match-p ":text \"0123456789\"" fetch-res))
+      (should-not (string-match-p "truncated" fetch-res)))))
+
+(ert-deftest anvil-disclosure-test-store-evicts-oldest-entry ()
+  (anvil-disclosure-test--with-clean-store
+    (let* ((anvil-disclosure-response-budget-chars 3)
+           (anvil-disclosure-response-budget-overrides nil)
+           (anvil-disclosure-store-max-entries 2)
+           (one (anvil-disclosure-budget-apply "tool" "abcdef"))
+           (two (anvil-disclosure-budget-apply "tool" "ghijkl"))
+           (three (anvil-disclosure-budget-apply "tool" "mnopqr"))
+           (id-1 (progn
+                   (string-match "id=\\([^ ]+\\) offset=3" one)
+                   (match-string 1 one)))
+           (id-2 (progn
+                   (string-match "id=\\([^ ]+\\) offset=3" two)
+                   (match-string 1 two)))
+           (id-3 (progn
+                   (string-match "id=\\([^ ]+\\) offset=3" three)
+                   (match-string 1 three))))
+      (should (equal (format "disclosure-fetch: unknown or evicted id %s"
+                             id-1)
+                     (anvil-disclosure-fetch id-1)))
+      (should (equal "ghijkl"
+                     (plist-get (anvil-disclosure-fetch id-2) :text)))
+      (should (equal "mnopqr"
+                     (plist-get (anvil-disclosure-fetch id-3) :text))))))
+
+(ert-deftest anvil-disclosure-test-budget-hardened-for-non-strings ()
+  (anvil-disclosure-test--with-clean-store
+    (let ((anvil-disclosure-response-budget-chars 5))
+      (should (null (anvil-disclosure-budget-apply "tool-a" nil)))
+      (should (equal '(:ok t)
+                     (anvil-disclosure-budget-apply "tool-a" '(:ok t)))))))
 
 (provide 'anvil-disclosure-test)
 ;;; anvil-disclosure-test.el ends here

@@ -46,6 +46,9 @@
 ;;   http-cache-get    — Layer 3 for cached HTTP responses.  Takes
 ;;                       an http-cache://sha URI (or raw sha256)
 ;;                       and returns the full stored body + headers.
+;;   disclosure-fetch  — Generic continuation fetch for dispatch-seam
+;;                       budget trailers.  Reads stored slices of an
+;;                       over-budget tool response by short handle.
 ;;   disclosure-help   — Returns the 3-layer flow so LLM agents can
 ;;                       discover the contract at runtime.
 ;;
@@ -106,6 +109,190 @@ should fit under ~500 tokens per call."
   "Hard upper bound for `file-read-snippet' window size."
   :type 'integer
   :group 'anvil-disclosure)
+
+(defcustom anvil-disclosure-response-budget-chars nil
+  "Generic per-tool response budget at the dispatch seam, in characters.
+When nil, the mechanism is disabled and tool responses are sent
+unchanged.  This ships disabled so validation can happen before any
+default such as ~24000 chars is enabled in a later change."
+  :type '(choice (const :tag "Disabled" nil)
+                 integer)
+  :group 'anvil-disclosure)
+
+(defcustom anvil-disclosure-response-budget-overrides
+  '(("file-read" . nil)
+    ("buffer-read" . nil)
+    ("org-read-file" . nil)
+    ("elisp-read-source-file" . nil))
+  "Per-tool response budget overrides, as an alist of (TOOL-ID . BUDGET).
+Overrides win over `anvil-disclosure-response-budget-chars'.  A nil
+budget exempts the tool completely.
+
+Ship conservative exemptions for exact-body read tools whose callers
+often need the verbatim full text for edit workflows:
+`file-read' reads on-disk files, `buffer-read' reads unsaved live
+buffers, `org-read-file' returns whole Org files, and
+`elisp-read-source-file' returns full library source.  Truncating those
+payloads at the generic seam would break copy/edit/patch flows."
+  :type '(alist :key-type string
+                :value-type (choice (const :tag "Exempt" nil)
+                                    integer))
+  :group 'anvil-disclosure)
+
+(defcustom anvil-disclosure-store-max-entries 32
+  "Maximum number of stored disclosure payloads."
+  :type 'integer
+  :group 'anvil-disclosure)
+
+(defcustom anvil-disclosure-store-max-total-chars (* 2 1024 1024)
+  "Maximum total characters retained by the disclosure payload store."
+  :type 'integer
+  :group 'anvil-disclosure)
+
+;;; Generic disclosure store
+
+(defvar anvil-disclosure--store (make-hash-table :test #'equal)
+  "Handle -> full disclosure payload text.")
+
+(defvar anvil-disclosure--store-order nil
+  "FIFO order of disclosure payload handles, oldest first.")
+
+(defvar anvil-disclosure--store-total-chars 0
+  "Total character count retained in `anvil-disclosure--store'.")
+
+(defvar anvil-disclosure--store-counter 0
+  "Monotonic counter used to mint disclosure payload handles.")
+
+(defun anvil-disclosure--store-reset ()
+  "Reset the disclosure payload store.
+Used by tests to get a clean store."
+  (setq anvil-disclosure--store (make-hash-table :test #'equal)
+        anvil-disclosure--store-order nil
+        anvil-disclosure--store-total-chars 0
+        anvil-disclosure--store-counter 0))
+
+(defun anvil-disclosure--next-id ()
+  "Return a fresh short disclosure payload handle."
+  (let (id)
+    (while (or (null id)
+               (gethash id anvil-disclosure--store))
+      (setq anvil-disclosure--store-counter
+            (1+ anvil-disclosure--store-counter))
+      (setq id (format "d%x" anvil-disclosure--store-counter)))
+    id))
+
+(defun anvil-disclosure--store-evict-one ()
+  "Evict the oldest disclosure payload, if any."
+  (when-let* ((id (car anvil-disclosure--store-order)))
+    (setq anvil-disclosure--store-order (cdr anvil-disclosure--store-order))
+    (when-let* ((text (gethash id anvil-disclosure--store)))
+      (setq anvil-disclosure--store-total-chars
+            (max 0 (- anvil-disclosure--store-total-chars
+                      (length text)))))
+    (remhash id anvil-disclosure--store)))
+
+(defun anvil-disclosure--store-trim ()
+  "Evict oldest disclosure payloads until both store caps are satisfied."
+  (while (and anvil-disclosure--store-order
+              (or (> (hash-table-count anvil-disclosure--store)
+                     anvil-disclosure-store-max-entries)
+                  (> anvil-disclosure--store-total-chars
+                     anvil-disclosure-store-max-total-chars)))
+    (anvil-disclosure--store-evict-one)))
+
+(defun anvil-disclosure--store-put (text)
+  "Store TEXT in the bounded disclosure payload store and return its handle."
+  (let ((id (anvil-disclosure--next-id)))
+    (puthash id text anvil-disclosure--store)
+    (setq anvil-disclosure--store-order
+          (append anvil-disclosure--store-order (list id)))
+    (setq anvil-disclosure--store-total-chars
+          (+ anvil-disclosure--store-total-chars (length text)))
+    (anvil-disclosure--store-trim)
+    id))
+
+(defun anvil-disclosure--store-fetch (id)
+  "Return the full stored text for disclosure payload handle ID, or nil."
+  (and (stringp id)
+       (gethash id anvil-disclosure--store)))
+
+(defun anvil-disclosure--coerce-nonnegative-int (value default)
+  "Coerce VALUE to a non-negative integer, or return DEFAULT."
+  (cond
+   ((integerp value)
+    (max 0 value))
+   ((and (stringp value)
+         (not (string-empty-p (string-trim value)))
+         (string-match-p "\\`[0-9]+\\'" value))
+    (string-to-number value))
+   (t default)))
+
+(defun anvil-disclosure--effective-budget (tool-name)
+  "Return the effective response budget for TOOL-NAME, or nil when exempt."
+  (if (equal tool-name "disclosure-fetch")
+      nil
+    (let ((override (assoc tool-name
+                           anvil-disclosure-response-budget-overrides)))
+      (if override
+          (cdr override)
+        anvil-disclosure-response-budget-chars))))
+
+(defun anvil-disclosure-fetch (id &optional offset limit)
+  "Fetch a stored disclosure payload slice by ID.
+OFFSET defaults to 0, LIMIT defaults to 20000 chars.  Returns a plist
+with the slice and remaining count, or a clear error string when ID is
+unknown or has been evicted."
+  (let* ((off (anvil-disclosure--coerce-nonnegative-int offset 0))
+         (lim (anvil-disclosure--coerce-nonnegative-int limit 20000))
+         (text (anvil-disclosure--store-fetch id)))
+    (if (not (stringp text))
+        (format "disclosure-fetch: unknown or evicted id %s" id)
+      (let* ((total (length text))
+             (start (min off total))
+             (end (min total (+ start lim)))
+             (slice (substring text start end)))
+        (list :id id
+              :offset start
+              :limit lim
+              :text slice
+              :remaining (- total end))))))
+
+(defun anvil-disclosure--tool-fetch (id &optional offset limit)
+  "MCP wrapper for `anvil-disclosure-fetch'.
+
+MCP Parameters:
+  id     - Disclosure payload handle returned by the trailer (string).
+  offset - Optional starting char offset, default 0.
+  limit  - Optional max chars to return, default 20000."
+  (anvil-server-with-error-handling
+   (let ((res (anvil-disclosure-fetch id offset limit)))
+     (if (stringp res)
+         res
+       (format "%S" res)))))
+
+(defun anvil-disclosure-budget-apply (tool-name result-text)
+  "Apply the generic disclosure budget for TOOL-NAME to RESULT-TEXT.
+Returns RESULT-TEXT unchanged when budgeting is disabled, the text is
+already within budget, the tool is exempt, or any internal error
+occurs.  Over-budget responses are stored in the disclosure payload
+store and replaced by a truncated prefix plus a fetch trailer."
+  (condition-case nil
+      (if (not (stringp result-text))
+          result-text
+        (let ((budget (anvil-disclosure--effective-budget tool-name)))
+          (if (or (null budget)
+                  (<= (length result-text) budget))
+              result-text
+            (let* ((shown (max 0 budget))
+                   (total (length result-text))
+                   (id (anvil-disclosure--store-put result-text)))
+              (concat
+               (substring result-text 0 shown)
+               "\n\n"
+               (format
+                "[anvil-disclosure: truncated %d of %d chars; fetch the rest with tool `disclosure-fetch' id=%s offset=%d]"
+                shown total id shown))))))
+    (error result-text)))
 
 ;;; Layer-1 projection helpers
 
@@ -610,7 +797,12 @@ Rule of thumb: start at Layer 1.  If nothing relevant matched, do not
 escalate — adjust the query instead.  Never call Layer 3 (e.g.,
 `file-read') until you have a citation URI from Layer 1 or 2; reading
 a whole org file when org-index-index would have answered in <1 kB of
-context is a 5-10x token waste."
+context is a 5-10x token waste.
+
+Generic seam safety net: when dispatch budgeting is enabled, an
+over-budget tool response is replaced by a truncated body plus a
+machine-readable trailer naming `disclosure-fetch', the stored payload
+id, and the continuation offset."
   "Static 3-layer flow documentation returned by `disclosure-help'.")
 
 (defun anvil-disclosure-help-handler ()
@@ -679,6 +871,14 @@ MCP Parameters: (none)"
      "Layer 3 for cached HTTP responses. Accepts a raw sha256 or an http-cache://SHA citation URI and returns the full stored entry (:url :sha :status :headers :body :fetched-at :final-url ...). Errors when the sha does not match any live cache entry."
      :read-only t
      :title "HTTP Cache Get (Layer 3)")
+    (,#'anvil-disclosure--tool-fetch
+     :id "disclosure-fetch"
+     :intent '(meta discovery)
+     :layer 'dev
+     :description
+     "Fetch a stored continuation slice for a response that was truncated by the generic disclosure budget at the dispatch seam. Pass the trailer's `id' and optional `offset' / `limit'. Returns (:id :offset :limit :text :remaining). Unknown or evicted ids return a clear error string instead of signaling."
+     :read-only t
+     :title "Disclosure Fetch")
     (,#'anvil-disclosure-help-handler
      :id "disclosure-help"
      :intent '(meta discovery)
