@@ -50,6 +50,46 @@ first)."
                   (list :summary "FUSED-ANSWER"))))
        ,@body)))
 
+(defmacro anvil-fusion-ask-test--with-scripted-orchestrator
+    (script &rest body)
+  "Run BODY with a scripted fake orchestrator.
+SCRIPT is a submission-order list of plists:
+`(:status (:tasks ...) [:extract (:summary ...)])'.  Submitted task
+lists are pushed onto `submitted' newest first."
+  (declare (indent 1) (debug t))
+  `(let ((submitted '())
+         (calls 0)
+         (queue (copy-tree ,script))
+         (batch-map (make-hash-table :test #'equal))
+         (result-map (make-hash-table :test #'equal)))
+     (cl-letf (((symbol-function 'anvil-orchestrator-submit)
+                (lambda (tasks)
+                  (let* ((entry (pop queue))
+                         (batch-id (format "b-%d" calls)))
+                    (should entry)
+                    (push tasks submitted)
+                    (setq calls (1+ calls))
+                    (puthash batch-id entry batch-map)
+                    (let* ((status (plist-get entry :status))
+                           (first-task (car (plist-get status :tasks)))
+                           (task-id (plist-get first-task :id))
+                           (extract (plist-get entry :extract)))
+                      (when (and task-id extract)
+                        (puthash task-id extract result-map)))
+                    batch-id)))
+               ((symbol-function 'anvil-orchestrator-collect)
+                (lambda (&rest _) t))
+               ((symbol-function 'anvil-orchestrator-status)
+                (lambda (id)
+                  (or (plist-get (gethash id batch-map) :status)
+                      (list :tasks nil))))
+               ((symbol-function 'anvil-orchestrator-extract-result)
+                (lambda (id full)
+                  (should full)
+                  (or (gethash id result-map)
+                      (error "Unexpected extract-result id: %S" id)))))
+       ,@body)))
+
 (defconst anvil-fusion-ask-test--cands
   '((:id "m1" :provider ollama :status done :summary "候補A: DGR を使う。")
     (:id "m2" :provider ollama :status done :summary "候補B: 地絡方向継電器。")
@@ -292,6 +332,18 @@ nothing is submitted."
               :verdict 'refuted :evidence "反証: OCGR は不可"))
   "Annotated (Phase 6b) claims, one confirmed one refuted.")
 
+(defconst anvil-fusion-ask-test--debate-round0-cands
+  '((:id "m1" :name "member-1" :provider ollama :status done :summary "候補A: DGR を使う。")
+    (:id "m2" :name "member-2" :provider ollama :status done :summary "候補B: 地絡方向継電器。")
+    (:id "m3" :name "member-3" :provider ollama :status done :summary "候補C: OCGR は不可。"))
+  "Divergent candidates used to trigger round-1 debate.")
+
+(defconst anvil-fusion-ask-test--debate-round1-cands
+  '((:id "m4" :name "member-1" :provider ollama :status done :summary "収束案: DGR を使う。")
+    (:id "m5" :name "member-2" :provider ollama :status done :summary "収束案: DGR を使う。")
+    (:id "m6" :name "member-3" :provider ollama :status done :summary "収束案: DGR を使う。"))
+  "Converged candidates used to stop the loop after one extra round.")
+
 (ert-deftest anvil-fusion-ask-test-verify-nil-skips-verification ()
   "With :verify nil (the default), extract-claims/verify-claims are
 never invoked, and the judge prompt is the normal (un-verified)
@@ -414,6 +466,107 @@ provider/model into both extraction and verification, and passes
                           :verify-base-template base :max-rounds 0)
         (let ((jprompt (plist-get (car (car submitted)) :prompt)))
           (should (string-match-p "DISTINCT-PLAN-BASE" jprompt)))))))
+
+;;;; ============================================================
+;;;; Phase 10 — multi-round debate
+;;;; ============================================================
+
+(ert-deftest anvil-fusion-ask-test-critique-loop-legacy-prompt-locked-when-debate-disabled ()
+  "With debate disabled, round-1 member prompts remain the exact critique prompt."
+  (let ((anvil-fusion-debate nil))
+    (anvil-fusion-ask-test--with-scripted-orchestrator
+        `((:status (:tasks ,anvil-fusion-ask-test--debate-round0-cands))
+          (:status (:tasks ((:id "j1" :provider ollama :status done)))
+           :extract (:summary "ROUND0-FUSED"))
+          (:status (:tasks ,anvil-fusion-ask-test--debate-round1-cands))
+          (:status (:tasks ((:id "j2" :provider ollama :status done)))
+           :extract (:summary "ROUND1-FUSED")))
+      (let ((res (anvil-fusion-ask "Q" :panel 'sovereign :max-rounds 1)))
+        (should (= 1 (plist-get res :rounds)))
+        (should (= 0 (plist-get res :debate-rounds)))
+        (let* ((submissions (nreverse submitted))
+               (round1-member-tasks (nth 2 submissions))
+               (expected (anvil-fusion-build-critique-prompt "Q" "ROUND0-FUSED")))
+          (should (= 3 (length round1-member-tasks)))
+          (dolist (task round1-member-tasks)
+            (should (equal expected (plist-get task :prompt)))))))))
+
+(ert-deftest anvil-fusion-ask-test-debate-round-prompts-show-other-candidates ()
+  "With debate enabled, round-1 prompts include own answer, other answers, and stop after convergence."
+  (let ((anvil-fusion-debate t))
+    (anvil-fusion-ask-test--with-scripted-orchestrator
+        `((:status (:tasks ,anvil-fusion-ask-test--debate-round0-cands))
+          (:status (:tasks ((:id "j1" :provider ollama :status done)))
+           :extract (:summary "ROUND0-FUSED"))
+          (:status (:tasks ,anvil-fusion-ask-test--debate-round1-cands))
+          (:status (:tasks ((:id "j2" :provider ollama :status done)))
+           :extract (:summary "ROUND1-FUSED")))
+      (let ((res (anvil-fusion-ask "Q" :panel 'sovereign :max-rounds 2)))
+        (should (= 1 (plist-get res :rounds)))
+        (should (= 1 (plist-get res :debate-rounds)))
+        (should (plist-get res :looped))
+        (let* ((submissions (nreverse submitted))
+               (round1-member-tasks (nth 2 submissions))
+               (prompt1 (plist-get (nth 0 round1-member-tasks) :prompt))
+               (prompt2 (plist-get (nth 1 round1-member-tasks) :prompt)))
+          (should-not (equal (anvil-fusion-build-critique-prompt "Q" "ROUND0-FUSED")
+                             prompt1))
+          (should (string-match-p "候補A: DGR を使う。" prompt1))
+          (should (string-match-p "候補B: 地絡方向継電器。" prompt1))
+          (should (string-match-p "候補C: OCGR は不可。" prompt2))
+          (should (string-match-p "# 検証済み主張表\n(なし)" prompt1)))))))
+
+(ert-deftest anvil-fusion-ask-test-debate-verify-incremental-new-claims-only ()
+  "Debate verification re-checks only newly surfaced claims and merges them into the judge table."
+  (let ((anvil-fusion-debate t)
+        (extract-calls 0)
+        verify-inputs)
+    (cl-letf (((symbol-function 'anvil-fusion-verify-extract-claims)
+               (lambda (&rest _)
+                 (setq extract-calls (1+ extract-calls))
+                 (if (= extract-calls 1)
+                     (list (list :claim "既存主張" :kind 'fact :candidates '("A")))
+                   (list (list :claim "既存主張" :kind 'fact :candidates '("A"))
+                         (list :claim "新規主張" :kind 'fact :candidates '("B"))))))
+              ((symbol-function 'anvil-fusion-verify-claims)
+               (lambda (claims &rest _)
+                 (push (mapcar (lambda (claim) (plist-get claim :claim)) claims)
+                       verify-inputs)
+                 (mapcar
+                  (lambda (claim)
+                    (list :claim (plist-get claim :claim)
+                          :kind (plist-get claim :kind)
+                          :candidates (plist-get claim :candidates)
+                          :verdict 'confirmed
+                          :evidence (format "ev:%s" (plist-get claim :claim))))
+                  claims))))
+      (anvil-fusion-ask-test--with-scripted-orchestrator
+          `((:status (:tasks ,anvil-fusion-ask-test--debate-round0-cands))
+            (:status (:tasks ((:id "j1" :provider ollama :status done)))
+             :extract (:summary "ROUND0-FUSED"))
+            (:status (:tasks ,anvil-fusion-ask-test--debate-round1-cands))
+            (:status (:tasks ((:id "j2" :provider ollama :status done)))
+             :extract (:summary "ROUND1-FUSED")))
+        (let ((res (anvil-fusion-ask "Q" :panel 'sovereign
+                                     :verify t
+                                     :max-rounds 1)))
+          (should (equal '(("既存主張") ("新規主張"))
+                         (nreverse verify-inputs)))
+          (should (= 1 (plist-get res :debate-rounds)))
+          (should (= 2 (length (plist-get res :claims))))
+          (let ((jprompt (plist-get (car (car submitted)) :prompt)))
+            (should (string-match-p "既存主張" jprompt))
+            (should (string-match-p "新規主張" jprompt))))))))
+
+(ert-deftest anvil-fusion-ask-test-debate-max-rounds-zero-skips-debate ()
+  "Max-rounds 0 suppresses debate even when the feature flag is on."
+  (let ((anvil-fusion-debate t))
+    (anvil-fusion-ask-test--with-fake-orchestrator
+        anvil-fusion-ask-test--debate-round0-cands
+      (let ((res (anvil-fusion-ask "Q" :panel 'sovereign :max-rounds 0)))
+        (should (= 0 (plist-get res :rounds)))
+        (should (= 0 (plist-get res :debate-rounds)))
+        (should (= 2 (length submitted)))))))
 
 ;;;; ============================================================
 ;;;; Phase 6c — :exec-check keyword

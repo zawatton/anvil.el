@@ -107,6 +107,75 @@ Pure."
                (member tool anvil-fusion--local-panel-network-tools))
              tools)))
 
+(defun anvil-fusion--claims-block-for-debate (claims)
+  "Render CLAIMS for a debate prompt.
+Uses the same Phase 6d claims-table formatter the judge sees; nil/empty
+claims render as \"(なし)\" for the member-facing prompt."
+  (if claims
+      (anvil-fusion-verify--format-claims-block claims)
+    "(なし)"))
+
+(defun anvil-fusion--new-claims-only (claims seen-claims)
+  "Return CLAIMS whose normalized claim keys are absent from SEEN-CLAIMS.
+Matching uses `anvil-fusion-verify--cache-key', so the same
+normalization as the Phase 4 cache decides whether a claim is new.
+Duplicate new claims within CLAIMS are collapsed to the first seen."
+  (let ((seen (make-hash-table :test #'equal))
+        fresh)
+    (dolist (claim seen-claims)
+      (puthash (anvil-fusion-verify--cache-key claim) t seen))
+    (dolist (claim claims)
+      (let ((key (anvil-fusion-verify--cache-key claim)))
+        (unless (gethash key seen)
+          (puthash key t seen)
+          (push claim fresh))))
+    (nreverse fresh)))
+
+(defun anvil-fusion--merge-claims-by-key (claims new-claims)
+  "Return CLAIMS plus NEW-CLAIMS, deduped by normalized claim key.
+Existing CLAIMS win on key collisions; NEW-CLAIMS are appended in input
+order only when their `anvil-fusion-verify--cache-key' is unseen."
+  (let ((merged (copy-sequence claims))
+        (seen (make-hash-table :test #'equal)))
+    (dolist (claim claims)
+      (puthash (anvil-fusion-verify--cache-key claim) t seen))
+    (dolist (claim new-claims)
+      (let ((key (anvil-fusion-verify--cache-key claim)))
+        (unless (gethash key seen)
+          (puthash key t seen)
+          (setq merged (append merged (list claim))))))
+    merged))
+
+(cl-defun anvil-fusion--run-debate-members
+    (member-prompts body lenses cwd &key member-extras (max-wait-sec 1800))
+  "Fan MEMBER-PROMPTS out to BODY's members positionally and collect results.
+The Nth prompt is sent to the Nth panel member, preserving panel order
+and therefore using same-index prior candidates as the member-identity
+heuristic.  If a later round cannot recover a same-index prior
+candidate, callers may fall back to showing all prior candidates as
+\"others\" while leaving the member's own prior answer empty."
+  (let* ((members (anvil-fusion-panel-members body))
+         (extras (anvil-fusion--member-extras-plist member-extras))
+         (i -1)
+         (member-tasks
+          (mapcar
+           (lambda (member)
+             (setq i (1+ i))
+             (let ((prompt (anvil-fusion-apply-lens
+                            (or (nth i member-prompts) "")
+                            (nth i lenses))))
+               (append (list :provider (car member)
+                             :prompt prompt
+                             :name (format "fusion-member-%d-%s" i (car member)))
+                       (and (cdr member) (list :model (cdr member)))
+                       (and cwd (list :cwd cwd))
+                       extras)))
+           members))
+         (mbatch (anvil-orchestrator-submit member-tasks)))
+    (anvil-orchestrator-collect mbatch :wait t :max-wait-sec max-wait-sec)
+    (list :candidates (plist-get (anvil-orchestrator-status mbatch) :tasks)
+          :members-batch mbatch)))
+
 (cl-defun anvil-fusion--run-members
     (member-prompt body lenses cwd &key member-extras (max-wait-sec 1800))
   "Fan MEMBER-PROMPT out to panel BODY's members and collect the results.
@@ -212,7 +281,8 @@ before anything is submitted, preserving the zero-egress
 guarantee.
 
 VERIFY (default nil) runs the Doc 61 Phase 6d verifier-grounded judge
-(docs/design/61-fusion-verify.org §2 6d) for the FIRST round only:
+(docs/design/61-fusion-verify.org §2 6d) for the FIRST round only when
+`anvil-fusion-debate' is nil:
 after the member fan-out, `anvil-fusion-verify-extract-claims' mines
 contested claims from PROMPT + the collected candidates, then
 `anvil-fusion-verify-claims' checks them against evidence, and --
@@ -221,7 +291,12 @@ unless an explicit TEMPLATE was given (see above) --
 template used for the judge call.  ANY critique round thereafter
 (see MAX-ROUNDS) re-judges its own fresh candidates against that SAME
 template; claims are extracted and verified ONCE, never re-run per
-round.  VERIFY-ARGS is a plist of `:provider' / `:model' /
+round.  When `anvil-fusion-debate' is non-nil, later debate rounds
+re-extract claims from the fresh member answers, diff them against the
+already-verified set by `anvil-fusion-verify--cache-key', verify only
+the new claims, and rebuild the verified judge template from the merged
+annotated claim set for that round.  VERIFY-ARGS is a plist of
+`:provider' / `:model' /
 `:skeptics' / `:timeout-sec' / `:max-wait-sec' overrides forwarded to
 the extraction/verification calls below, taking priority over the
 defaults `anvil-fusion-ask' computes for them.
@@ -279,6 +354,7 @@ downgrades to a minimal `:allowed-tools \"Bash\"' grant and logs one
 `:allowed-tools' grants before submission.
 
 Returns a plist: :answer :panel :egress :fidelity :rounds :looped
+:debate-rounds
 :members-batch :judge-batch :judge-task-id :judge-provider
 :judge-model :candidates :prompt-chars :claims :exec-results
 :trajectory-id.  :CLAIMS
@@ -302,7 +378,8 @@ against the ORIGINAL PROMPT and adds :TRAJECTORY-ID (id or nil)."
             (append (anvil-fusion--member-extras-plist member-extras)
                     agentic-extras))
            (cap     (or max-rounds anvil-fusion-max-rounds))
-           (thr     converge-threshold))
+           (thr     converge-threshold)
+           (debate-enabled anvil-fusion-debate))
       (when (and (eq egress 'local-only)
                  (not (anvil-fusion-provider-local-p jprov)))
         (user-error
@@ -343,62 +420,63 @@ against the ORIGINAL PROMPT and adds :TRAJECTORY-ID (id or nil)."
              (judge-candidates candidates)
              (claims     nil)
              (exec-results nil)
-             (etemplate  template))
+             (etemplate  template)
+             (local-panel (eq egress 'local-only))
+             (vargs       (or verify-args nil))
+             (ex-provider (or (plist-get vargs :provider) (and local-panel jprov)))
+             (ex-model    (or (plist-get vargs :model) (and local-panel jmodel)))
+             (extract-kwargs
+              (append (and ex-provider (list :provider ex-provider))
+                      (and ex-model    (list :model ex-model))
+                      (and (plist-get vargs :timeout-sec)
+                           (list :timeout-sec (plist-get vargs :timeout-sec)))
+                      (and (plist-get vargs :max-wait-sec)
+                           (list :max-wait-sec (plist-get vargs :max-wait-sec)))))
+             (verify-kwargs
+              (let ((vk-provider (or (plist-get vargs :provider) ex-provider))
+                    (vk-model    (or (plist-get vargs :model) ex-model)))
+                (append (list :question prompt
+                              :egress (if local-panel 'local-only 'external))
+                        (and vk-provider (list :provider vk-provider))
+                        (and vk-model    (list :model vk-model))
+                        (and (plist-get vargs :skeptics)
+                             (list :skeptics (plist-get vargs :skeptics)))
+                        (and (plist-get vargs :timeout-sec)
+                             (list :timeout-sec (plist-get vargs :timeout-sec)))
+                        (and (plist-get vargs :max-wait-sec)
+                             (list :max-wait-sec (plist-get vargs :max-wait-sec)))))))
         (when verify
-          (let* ((local-panel (eq egress 'local-only))
-                 (vargs       (or verify-args nil))
-                 (ex-provider (or (plist-get vargs :provider) (and local-panel jprov)))
-                 (ex-model    (or (plist-get vargs :model) (and local-panel jmodel))))
-            (when (and local-panel ex-provider
-                       (not (anvil-fusion-provider-local-p ex-provider)))
-              (user-error
-               "anvil-fusion-ask: panel %s is local-only; refusing non-local :verify-args extraction provider %S"
-               pname ex-provider))
-            (let* ((extract-kwargs
-                    (append (and ex-provider (list :provider ex-provider))
-                            (and ex-model    (list :model ex-model))
-                            (and (plist-get vargs :timeout-sec)
-                                 (list :timeout-sec (plist-get vargs :timeout-sec)))
-                            (and (plist-get vargs :max-wait-sec)
-                                 (list :max-wait-sec (plist-get vargs :max-wait-sec)))))
-                   (raw-claims (apply #'anvil-fusion-verify-extract-claims
-                                       prompt candidates extract-kwargs)))
-             (if (null raw-claims)
-                  (progn
-                    (message
-                     "anvil-fusion-ask: :verify requested but claim extraction found nothing to verify; using the fallback judge template")
-                    (when (and (null template) verify-base-template)
-                      (setq etemplate
-                            (anvil-fusion-verify-judge-template-for
-                             nil verify-base-template))))
-                (let* ((vk-provider (or (plist-get vargs :provider) ex-provider))
-                       (vk-model    (or (plist-get vargs :model) ex-model))
-                       (vk-egress   (if local-panel 'local-only 'external))
-                       (verify-kwargs
-                        (append (list :question prompt :egress vk-egress)
-                                (and vk-provider (list :provider vk-provider))
-                                (and vk-model    (list :model vk-model))
-                                (and (plist-get vargs :skeptics)
-                                     (list :skeptics (plist-get vargs :skeptics)))
-                                (and (plist-get vargs :timeout-sec)
-                                     (list :timeout-sec (plist-get vargs :timeout-sec)))
-                                (and (plist-get vargs :max-wait-sec)
-                                     (list :max-wait-sec (plist-get vargs :max-wait-sec)))))
-                       (annotated (apply #'anvil-fusion-verify-claims raw-claims verify-kwargs)))
-                  (when annotated
-                    (setq claims annotated)
-                    (unless template
-                      (setq etemplate
-                            (anvil-fusion-verify-judge-template-for
-                             annotated verify-base-template))))
-                  (when (and (null annotated)
-                             (null template)
-                             verify-base-template)
-                    (message
-                     "anvil-fusion-ask: :verify requested but verification produced no annotations; using the fallback judge template")
+          (when (and local-panel ex-provider
+                     (not (anvil-fusion-provider-local-p ex-provider)))
+            (user-error
+             "anvil-fusion-ask: panel %s is local-only; refusing non-local :verify-args extraction provider %S"
+             pname ex-provider))
+          (let ((raw-claims (apply #'anvil-fusion-verify-extract-claims
+                                   prompt candidates extract-kwargs)))
+            (if (null raw-claims)
+                (progn
+                  (message
+                   "anvil-fusion-ask: :verify requested but claim extraction found nothing to verify; using the fallback judge template")
+                  (when (and (null template) verify-base-template)
                     (setq etemplate
                           (anvil-fusion-verify-judge-template-for
-                           nil verify-base-template))))))))
+                           nil verify-base-template))))
+              (let ((annotated (apply #'anvil-fusion-verify-claims
+                                      raw-claims verify-kwargs)))
+                (when annotated
+                  (setq claims annotated)
+                  (unless template
+                    (setq etemplate
+                          (anvil-fusion-verify-judge-template-for
+                           annotated verify-base-template))))
+                (when (and (null annotated)
+                           (null template)
+                           verify-base-template)
+                  (message
+                   "anvil-fusion-ask: :verify requested but verification produced no annotations; using the fallback judge template")
+                  (setq etemplate
+                        (anvil-fusion-verify-judge-template-for
+                         nil verify-base-template)))))))
         (when exec-check
           (require 'anvil-fusion-exec)
           (let* ((exec-fn (symbol-function 'anvil-fusion-exec-verify-candidates))
@@ -437,29 +515,93 @@ against the ORIGINAL PROMPT and adds :TRAJECTORY-ID (id or nil)."
                             :judge-batch   (plist-get jresult :judge-batch)
                             :members-batch (plist-get mresult :members-batch)
                             :prompt-chars  (plist-get jresult :prompt-chars)))
-               (rounds 0))
+               (rounds 0)
+               (debate-rounds 0))
           (while (and (< rounds cap)
                       (anvil-fusion-should-loop-p
                        (plist-get round :candidates) thr))
-            (let ((critique (anvil-fusion-build-critique-prompt
-                             prompt (plist-get round :answer))))
-              (setq round (anvil-fusion--run-round
-                           (if agentic
-                               (concat critique "\n\n"
-                                       anvil-fusion--agentic-member-prompt-block)
-                             critique)
-                           prompt body jprov jmodel
-                           :fidelity fidelity :extra extra :template etemplate
-                           :lenses lenses :cwd cwd
-                           :member-extras member-extras
-                           :timeout-sec timeout-sec :max-wait-sec max-wait-sec))
-              (setq rounds (1+ rounds))))
+            (if debate-enabled
+                (let* ((prior-candidates (plist-get round :candidates))
+                       (claims-block (anvil-fusion--claims-block-for-debate claims))
+                       (member-prompts
+                        (cl-loop for i from 0 below (length (anvil-fusion-panel-members body))
+                                 for own = (nth i prior-candidates)
+                                 collect
+                                 (anvil-fusion-build-debate-prompt
+                                  prompt
+                                  (and own (plist-get own :summary))
+                                  (if own
+                                      (append (cl-subseq prior-candidates 0 i)
+                                              (nthcdr (1+ i) prior-candidates))
+                                    prior-candidates)
+                                  claims-block
+                                  fidelity)))
+                       (mresult (anvil-fusion--run-debate-members
+                                 (if agentic
+                                     (mapcar
+                                      (lambda (mp)
+                                        (concat mp "\n\n"
+                                                anvil-fusion--agentic-member-prompt-block))
+                                      member-prompts)
+                                   member-prompts)
+                                 body lenses cwd
+                                 :member-extras member-extras
+                                 :max-wait-sec max-wait-sec))
+                       (round-candidates (plist-get mresult :candidates))
+                       (round-claims claims)
+                       (round-template etemplate))
+                  (when verify
+                    (let* ((raw-claims (apply #'anvil-fusion-verify-extract-claims
+                                              prompt round-candidates extract-kwargs))
+                           (new-claims (anvil-fusion--new-claims-only raw-claims claims))
+                           (annotated-new
+                            (and new-claims
+                                 (apply #'anvil-fusion-verify-claims
+                                        new-claims verify-kwargs))))
+                      (when annotated-new
+                        (setq round-claims
+                              (anvil-fusion--merge-claims-by-key
+                               claims annotated-new)))
+                      (when (and (null template)
+                                 (or round-claims verify-base-template))
+                        (setq round-template
+                              (anvil-fusion-verify-judge-template-for
+                               round-claims verify-base-template)))))
+                  (let ((jresult (anvil-fusion--run-judge
+                                  prompt round-candidates jprov jmodel
+                                  :fidelity fidelity :extra extra :template round-template
+                                  :cwd cwd :timeout-sec timeout-sec
+                                  :max-wait-sec max-wait-sec)))
+                    (setq claims round-claims)
+                    (setq etemplate round-template)
+                    (setq round
+                          (list :answer        (plist-get jresult :answer)
+                                :candidates    round-candidates
+                                :judge-task-id (plist-get jresult :judge-task-id)
+                                :judge-batch   (plist-get jresult :judge-batch)
+                                :members-batch (plist-get mresult :members-batch)
+                                :prompt-chars  (plist-get jresult :prompt-chars))))
+                  (setq debate-rounds (1+ debate-rounds)))
+              (let ((critique (anvil-fusion-build-critique-prompt
+                               prompt (plist-get round :answer))))
+                (setq round (anvil-fusion--run-round
+                             (if agentic
+                                 (concat critique "\n\n"
+                                         anvil-fusion--agentic-member-prompt-block)
+                               critique)
+                             prompt body jprov jmodel
+                             :fidelity fidelity :extra extra :template etemplate
+                             :lenses lenses :cwd cwd
+                             :member-extras member-extras
+                             :timeout-sec timeout-sec :max-wait-sec max-wait-sec))))
+            (setq rounds (1+ rounds)))
           (let ((result
                  (list :answer        (plist-get round :answer)
                        :panel         pname
                        :egress        egress
                        :fidelity      (or fidelity anvil-fusion-default-fidelity)
                        :rounds        rounds
+                       :debate-rounds debate-rounds
                        :looped        (> rounds 0)
                        :members-batch (plist-get round :members-batch)
                        :judge-batch   (plist-get round :judge-batch)
