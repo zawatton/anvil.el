@@ -1,7 +1,7 @@
 #+TITLE: Doc 61 — anvil-fusion-verify: Verifier-Grounded Judge, Opus Self-Consistency, Agentic Fusion
 #+AUTHOR: zawatton + Claude
 #+DATE: <2026-07-03>
-#+STATUS: DRAFT
+#+STATUS: ALL PHASES SHIPPED (6a-9, 2026-07-03/04); 6e acceptance PASS (saturated); ops follow-ups: de-saturation re-run, KB relevance threshold (6f), traj library needs live trajectories
 #+OPTIONS: toc:2 num:t
 
 * 0. Executive summary
@@ -179,7 +179,7 @@ Phase 6-7 produce trajectories worth keeping.
 | 8a    | plan fusion                                        | 6d         | SHIPPED 9b4fdc4 |
 | 8b    | longrun step = fusion panel                        | 8a         | SHIPPED 543295c |
 | 8c    | inter-step verify gate                             | 6d, 8b     | SHIPPED c191a43 |
-| 9     | verified-trajectory exemplar library (sketch)      | 6-7 live   | LATER  |
+| 9     | verified-trajectory exemplar library (sketch)      | 6-7 live   | SHIPPED (anvil-fusion-traj; admission gate = verified wins only; opt-in :exemplars / :store-trajectory) |
 
 Phase 8 implementation notes (2026-07-03/04, codex via orchestrator — 8a on
 the daemon orchestrator, 8b/8c on the Doc 43 standalone batch orchestrator
