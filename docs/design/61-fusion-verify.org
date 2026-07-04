@@ -301,6 +301,35 @@ larger-codebase fixtures or a weaker baseline step model; an 8e re-run
 that forces the panel path (:step-panel-mode 'always or multi-step
 tasks); surface the permission knob in anvil-fusion-longrun docs.
 
+8e-hard measured 2026-07-05 (benchmarks/doc61-phase8e-hard/,
+results-8ehard-2026-07-05.org, ~$4.81, 6 runs). The de-saturation attempt
+FAILED to de-saturate: on the one-shot-resistant battery (naive
+visible-passing patches provably fail the hidden tests) baseline was still
+3/3 == full 3/3 hidden completions, every run finished in 1 step (mean
+baseline 1.33 / full 1.00), panels never fired (hard-only skips step 1 and
+every quest ended at step 1) and all 3 gates passed first try. The C-axis
+(does panel+verify raise completion over a plain baseline?) is STILL
+unproven — not because the harness is wrong but because a single Claude
+Code step-agent WITH real Bash/build execution already self-corrects to
+ceiling on coding tasks: it runs the code, sees the failure, and fixes it,
+so the difficulty levers that would trip a text-only one-shot model
+(hidden invariants, multi-file cascades) do not trip an executing agent.
+Honest conclusion after two saturated runs: for CODE tasks where the agent
+can execute and iterate, the ensemble/verify machinery has little room to
+add completion — the execution oracle is doing the verification already
+(this is 6c's premise from the other direction). The harness's measurable
+value must be sought where there is NO cheap execution oracle: fact/
+citation-critical Q&A (6e's 0/10 hallucination-adoption win), KB-grounded
+domain answers, and multi-hour tasks exceeding a single agent's context —
+none of which these coding fixtures exercise. A fair C-axis test needs a
+NON-code long-horizon task with a checkable-but-not-self-evident answer.
+NEW design gap found: anvil-fusion-longrun--default-distill-fn passes no
+member-extras, so the distill (and any future verify) phase always runs
+under the orchestrator default permission mode — harmless today (the step
+phase already ran the build) but a real wall if distill/verify is ever
+given execution duties. Follow-up: thread member-extras into the distill
+fn.
+
 Recommended order: 6 -> 7 -> 8 (Phase 6 fixes a recorded, harmful failure mode
 and is measurable immediately; Phase 7 is a small addition on top; Phase 8 is
 the heavyweight design).
