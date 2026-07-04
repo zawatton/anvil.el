@@ -30,6 +30,18 @@
       (insert-file-contents path))
     (buffer-string)))
 
+(defun anvil-org-test--make-outline-org (count body-len)
+  "Return an Org file with COUNT top-level headings of BODY-LEN chars."
+  (mapconcat
+   (lambda (i)
+     (format "* Heading %03d\n%s\n** Child %03d\n%s\n"
+             i
+             (make-string body-len (+ ?a (mod i 26)))
+             i
+             (make-string (/ body-len 2) (+ ?A (mod i 26)))))
+   (number-sequence 1 count)
+   ""))
+
 (ert-deftest anvil-org-test-modify-errors-do-not-prompt-on-kill ()
   "Failed modify tools must not ask to kill their temp file buffer."
   (anvil-org-test--with-temp-org
@@ -83,6 +95,63 @@
          (let ((content (anvil-org--tool-read-by-id id)))
            (should (string-match-p "\\* TODO Root" content))
            (should (string-match-p "Body line." content))))))))
+
+(ert-deftest anvil-org-test-read-outline-small-file-unchanged ()
+  "Small outlines remain unchanged and do not grow a note."
+  (anvil-org-test--with-temp-org
+   "* Root\n** Child\n"
+   (lambda (path)
+     (let ((anvil-org-allowed-files (list path))
+           (anvil-org-allowed-files-enabled t)
+           (anvil-org-use-index nil))
+       (let* ((expected (anvil-org--handle-outline-resource
+                         `(("filename" . ,path))))
+              (actual (anvil-org--tool-read-outline path)))
+         (should (equal expected actual))
+         (should-not (string-match-p "\"note\":" actual)))))))
+
+(ert-deftest anvil-org-test-read-outline-max-chars-zero-is-unlimited ()
+  "max_chars=0 preserves the pre-clamp output exactly."
+  (anvil-org-test--with-temp-org
+   (anvil-org-test--make-outline-org 30 220)
+   (lambda (path)
+     (let ((anvil-org-allowed-files (list path))
+           (anvil-org-allowed-files-enabled t)
+           (anvil-org-use-index nil))
+       (let ((expected
+              (or (anvil-org--try-index-read-outline path nil)
+                  (anvil-org--handle-outline-resource
+                   `(("filename" . ,path))))))
+         (should (equal expected
+                        (anvil-org--tool-read-outline path nil "0"))))))))
+
+(ert-deftest anvil-org-test-read-outline-clamps-at-entry-boundary ()
+  "Large outlines truncate under budget at whole top-level entries."
+  (anvil-org-test--with-temp-org
+   (anvil-org-test--make-outline-org 120 480)
+   (lambda (path)
+     (let ((anvil-org-allowed-files (list path))
+           (anvil-org-allowed-files-enabled t)
+           (anvil-org-use-index nil)
+           (json-object-type 'alist)
+           (json-array-type 'list))
+       (let* ((full-json (anvil-org--handle-outline-resource
+                          `(("filename" . ,path))))
+              (full (json-read-from-string full-json))
+              (full-headings (alist-get 'headings full))
+              (clamped-json (anvil-org--tool-read-outline path))
+              (clamped (json-read-from-string clamped-json))
+              (clamped-headings (alist-get 'headings clamped))
+              (note (alist-get 'note clamped))
+              (omitted (- (length full-headings) (length clamped-headings))))
+         (should (< (length clamped-json) anvil-org-outline-max-chars))
+         (should (> omitted 0))
+         (should note)
+         (should (string-match-p
+                  (format "%d top-level entries omitted" omitted)
+                  note))
+         (should (equal clamped-headings
+                        (cl-subseq full-headings 0 (length clamped-headings)))))))))
 
 (ert-deftest anvil-org-test-edit-body-returns-target-headline-id ()
   "Editing parent body must return the parent URI, not a child URI."

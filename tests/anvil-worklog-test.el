@@ -98,6 +98,18 @@ Binds:
    (expand-file-name "todo.org" root)
    "* TODO not a worklog\n"))
 
+(defun anvil-worklog-test--seed-long-db-entries (count)
+  "Insert COUNT long matching rows through the DB-direct API."
+  (dotimes (i count)
+    (anvil-worklog-add
+     (format "Long entry %02d" i)
+     (concat
+      "clampterm "
+      (make-string 1000 (+ ?a (mod i 26))))
+     :date (format "2026-05-%02d" (1+ (mod i 28)))
+     :machine "linux-debian"
+     :year 2026)))
+
 
 ;;;; --- scan ---------------------------------------------------------------
 
@@ -237,6 +249,70 @@ Binds:
       (dolist (r hits)
         (should (= 2026 (plist-get r :year)))))
     (should-not (anvil-worklog-search "Doc" :year 2025))))
+
+(ert-deftest anvil-worklog-test/tool-search-clamps-snippets-by-default ()
+  "The MCP wrapper clamps hit bodies, keeps pull keys, and adds one note."
+  (skip-unless (and (anvil-worklog-test--supported-p 'search)
+                    (anvil-worklog-test--supported-p 'get)
+                    (anvil-worklog-test--supported-p 'add)))
+  (anvil-worklog-test--with-env
+    (anvil-worklog-test--seed-long-db-entries 12)
+    (let* ((response (anvil-worklog--tool-search "clampterm"))
+           (rows (plist-get response :rows))
+           (note (plist-get response :note))
+           (first (car rows))
+           (pulled (anvil-worklog-get (plist-get first :file)
+                                      (plist-get first :start-line))))
+      (should (= 10 (length rows)))
+      (should note)
+      (dolist (row rows)
+        (should (string-suffix-p "..." (plist-get row :body)))
+        (should (<= (length (plist-get row :body))
+                    (+ anvil-worklog-search-snippet-chars 3)))
+        (should (plist-get row :file))
+        (should (integerp (plist-get row :start-line))))
+      (should (> (length (plist-get pulled :body))
+                 anvil-worklog-search-snippet-chars))
+      (should-not
+       (equal (plist-get first :body)
+              (plist-get pulled :body))))))
+
+(ert-deftest anvil-worklog-test/tool-search-full-override-restores-body ()
+  "full=true returns the historical untruncated per-hit bodies."
+  (skip-unless (and (anvil-worklog-test--supported-p 'search)
+                    (anvil-worklog-test--supported-p 'add)))
+  (anvil-worklog-test--with-env
+    (anvil-worklog-test--seed-long-db-entries 1)
+    (let* ((response (anvil-worklog--tool-search "clampterm" nil nil nil nil nil "true"))
+           (rows (plist-get response :rows)))
+      (should (= 1 (length rows)))
+      (should-not (plist-get response :note))
+      (should (> (length (plist-get (car rows) :body))
+                 anvil-worklog-search-snippet-chars))
+      (should-not (string-suffix-p "..." (plist-get (car rows) :body))))))
+
+(ert-deftest anvil-worklog-test/tool-search-false-values-still-clamp ()
+  "False-y FULL values keep the default clamp behavior."
+  (skip-unless (and (anvil-worklog-test--supported-p 'search)
+                    (anvil-worklog-test--supported-p 'add)))
+  (anvil-worklog-test--with-env
+    (anvil-worklog-test--seed-long-db-entries 1)
+    (dolist (full '(:false "false"))
+      (let* ((response (anvil-worklog--tool-search
+                        "clampterm" nil nil nil nil nil full))
+             (row (car (plist-get response :rows))))
+        (should row)
+        (should (plist-get response :note))
+        (should (string-suffix-p "..." (plist-get row :body)))))))
+
+(ert-deftest anvil-worklog-test/tool-search-explicit-limit-overrides-default ()
+  "An explicit LIMIT still overrides the new default cap."
+  (skip-unless (and (anvil-worklog-test--supported-p 'search)
+                    (anvil-worklog-test--supported-p 'add)))
+  (anvil-worklog-test--with-env
+    (anvil-worklog-test--seed-long-db-entries 12)
+    (let ((response (anvil-worklog--tool-search "clampterm" "12")))
+      (should (= 12 (length (plist-get response :rows)))))))
 
 
 ;;;; --- list -------------------------------------------------------------

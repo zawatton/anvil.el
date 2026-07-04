@@ -104,6 +104,7 @@
 (declare-function org-habit-scheduled "org-habit" (habit))
 (declare-function org-habit-scheduled-repeat "org-habit" (habit))
 (declare-function org-is-habit-p "org-habit" (&optional pom))
+(declare-function anvil--buffer-first-viable-p "anvil" (path))
 
 (defcustom anvil-org-allowed-files nil
   "List of absolute paths to Org files that can be accessed via MCP."
@@ -124,6 +125,14 @@ disable the fast-path entirely (e.g. while comparing behaviour)."
   "When non-nil, restrict file access to `anvil-org-allowed-files'.
 Set to nil to allow access to any file."
   :type 'boolean
+  :group 'anvil-org)
+
+(defcustom anvil-org-outline-max-chars 8000
+  "Default character budget for `org-read-outline' MCP replies.
+When non-zero, the MCP wrapper trims the serialized outline at the
+last whole top-level entry that fits and appends a note naming how
+many entries were omitted.  Set to 0 for unlimited output."
+  :type 'integer
   :group 'anvil-org)
 
 (defconst anvil-org--server-id "emacs-eval"
@@ -851,6 +860,25 @@ Empty or nil VALUE returns nil."
       (unless (> n 0)
         (anvil-org--tool-validation-error
          "%s must be a positive integer, got: %s" field value))
+      n)))
+
+(defun anvil-org--parse-nonnegative-integer (value field)
+  "Parse VALUE as a non-negative integer named FIELD, or return nil."
+  (when value
+    (let ((n (cond
+              ((integerp value) value)
+              ((and (stringp value)
+                    (not (string-empty-p (string-trim value)))
+                    (string-match-p "\\`[0-9]+\\'" (string-trim value)))
+               (string-to-number value))
+              ((stringp value) nil)
+              (t nil))))
+      (when (and value (null n))
+        (anvil-org--tool-validation-error
+         "%s must be a non-negative integer, got: %s" field value))
+      (when (and n (< n 0))
+        (anvil-org--tool-validation-error
+         "%s must be a non-negative integer, got: %s" field value))
       n)))
 
 (defun anvil-org--capture-target-file (target)
@@ -1747,7 +1775,46 @@ MCP Parameters:
   file - Absolute path to an Org file"
   (anvil-org--handle-file-resource `(("filename" . ,file))))
 
-(defun anvil-org--tool-read-outline (file &optional max_depth)
+(defun anvil-org--outline-note (omitted)
+  "Return the truncation note string for OMITTED top-level entries."
+  (format
+   "outline truncated; %d top-level entries omitted. Narrow with max_depth or pass max_chars=0 for the full result."
+   omitted))
+
+(defun anvil-org--render-outline-json (headings &optional note)
+  "Return the canonical JSON outline string for HEADINGS and NOTE."
+  (concat
+   "{\"headings\":["
+   (mapconcat #'json-encode headings ",")
+   "]"
+   (when note
+     (concat ",\"note\":" (json-encode note)))
+   "}"))
+
+(defun anvil-org--clamp-outline-json (json-text max-chars)
+  "Clamp JSON-TEXT to MAX-CHARS at whole top-level outline entries."
+  (if (or (null max-chars) (zerop max-chars)
+          (<= (length json-text) max-chars))
+      json-text
+    (let* ((json-object-type 'alist)
+           (json-array-type 'list)
+           (obj (json-read-from-string json-text))
+           (headings (alist-get 'headings obj))
+           (total (length headings))
+           (kept total)
+           (result nil))
+      (while (and (>= kept 0) (null result))
+        (let* ((prefix (cl-subseq headings 0 kept))
+               (omitted (- total kept))
+               (note (and (> omitted 0) (anvil-org--outline-note omitted)))
+               (candidate (anvil-org--render-outline-json prefix note)))
+          (when (<= (length candidate) max-chars)
+            (setq result candidate))
+          (setq kept (1- kept))))
+      (or result
+          (anvil-org--render-outline-json nil (anvil-org--outline-note total))))))
+
+(defun anvil-org--tool-read-outline (file &optional max_depth max_chars)
   "Tool wrapper for org-outline://{filename} resource template.
 FILE is the absolute path to an Org file.  When MAX_DEPTH is a
 string that parses as a positive integer, only headlines at that
@@ -1758,16 +1825,23 @@ its historical 2-level structure.
 MCP Parameters:
   file      - Absolute path to an Org file
   max_depth - Optional integer string (e.g. \"1\", \"3\") capping
-              the outline depth; omit for full depth."
+              the outline depth; omit for full depth.
+  max_chars - Optional non-negative integer string overriding
+              `anvil-org-outline-max-chars'.  Use \"0\" for unlimited."
   (let ((depth (and max_depth
                     (stringp max_depth)
                     (not (string-empty-p (string-trim max_depth)))
-                    (string-to-number max_depth))))
+                    (string-to-number max_depth)))
+        (budget (or (anvil-org--parse-nonnegative-integer
+                     max_chars "max_chars")
+                    anvil-org-outline-max-chars)))
     (when (and depth (<= depth 0)) (setq depth nil))
-    (or (anvil-org--try-index-read-outline file depth)
-        (anvil-org--handle-outline-resource `(("filename" . ,file))))))
+    (anvil-org--clamp-outline-json
+     (or (anvil-org--try-index-read-outline file depth)
+         (anvil-org--handle-outline-resource `(("filename" . ,file))))
+     budget)))
 
-(declare-function anvil-org-index-read-by-id       "anvil-org-index" (org-id))
+(declare-function anvil-org-index-read-by-id       "anvil-org-index" (org-id &optional max-depth))
 (declare-function anvil-org-index-read-headline    "anvil-org-index" (file path))
 (declare-function anvil-org-index-read-outline-json "anvil-org-index" (file &optional max-depth))
 

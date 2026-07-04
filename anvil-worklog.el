@@ -115,6 +115,14 @@ clients."
   :type 'integer
   :group 'anvil-worklog)
 
+(defcustom anvil-worklog-search-snippet-chars 240
+  "Default per-hit body snippet budget for `worklog-search' MCP replies.
+When a hit body exceeds this many characters, the MCP wrapper clamps
+`:body' to a snippet plus a trailing \"...\".  Full bodies remain
+available via `worklog-get' or `full=true'."
+  :type 'integer
+  :group 'anvil-worklog)
+
 (defconst anvil-worklog-supported
   '(scan prune search list get add export)
   "Capability tags this module currently provides.
@@ -972,6 +980,34 @@ Returns =(:path PATH :entries N)=."
         ((stringp v) (split-string v ":" t))
         (t nil)))
 
+(defun anvil-worklog--coerce-bool (value)
+  "Return non-nil when VALUE represents true on the MCP wire."
+  (cond
+   ((eq value t) t)
+   ((or (null value) (eq value :false)) nil)
+   ((stringp value)
+    (member (downcase (string-trim value)) '("1" "t" "true" "yes")))
+   (t value)))
+
+(defun anvil-worklog--clamp-body (row max-chars)
+  "Return ROW with `:body' clamped to MAX-CHARS, plus a truncated flag."
+  (let* ((body (or (plist-get row :body) ""))
+         (limit (max 0 max-chars)))
+    (if (<= (length body) limit)
+        (cons row nil)
+      (cons (plist-put (copy-sequence row)
+                       :body
+                       (concat (substring body 0 limit) "..."))
+            t))))
+
+(defun anvil-worklog--search-hit-snippet-row (row)
+  "Return the compact default MCP hit shape derived from ROW."
+  (list :file (plist-get row :file)
+        :start-line (plist-get row :start-line)
+        :date (plist-get row :date)
+        :title (plist-get row :title)
+        :body (plist-get row :body)))
+
 (defun anvil-worklog--tool-scan (&optional roots)
   "(Re-)populate the worklog index from `ai-logs-*-YYYY.org' files.
 
@@ -997,27 +1033,48 @@ Returns =(:pruned N :roots DIRS-OR-ALL)=."
           (n (anvil-worklog-prune roots*)))
      (list :pruned n :roots (or roots* 'all)))))
 
-(defun anvil-worklog--tool-search (query &optional limit machine since until year)
+(defun anvil-worklog--tool-search
+    (query &optional limit machine since until year full)
   "Full-text search the worklog index.
 
 MCP Parameters:
   query   - FTS5 query string.  Empty / whitespace returns (:rows nil).
-  limit   - Optional max result count (default 20).
+  limit   - Optional max result count (default 10).
   machine - Optional machine token equality filter (e.g. linux-debian).
   since   - Optional ISO date (inclusive lower bound).
   until   - Optional ISO date (inclusive upper bound).
   year    - Optional 4-digit year filter (digit-string accepted).
+  full    - Optional true/false flag.  Set true to return the historical
+            untruncated `:body' per hit; false/nil keeps snippets clamped.
 
 Returns =(:rows ROWS)=."
   (anvil-server-with-error-handling
-   (list :rows
-         (anvil-worklog-search
-          (or query "")
-          :limit (anvil-worklog--coerce-int limit 20)
-          :machine (anvil-worklog--coerce-string machine)
-          :since (anvil-worklog--coerce-string since)
-          :until (anvil-worklog--coerce-string until)
-          :year (anvil-worklog--coerce-int year nil)))))
+   (let* ((fullp (anvil-worklog--coerce-bool full))
+          (rows (anvil-worklog-search
+                 (or query "")
+                 :limit (anvil-worklog--coerce-int limit 10)
+                 :machine (anvil-worklog--coerce-string machine)
+                 :since (anvil-worklog--coerce-string since)
+                 :until (anvil-worklog--coerce-string until)
+                 :year (anvil-worklog--coerce-int year nil))))
+     (if fullp
+         (list :rows rows)
+       (let ((clamped-rows '())
+             (any-clamped nil))
+         (dolist (row rows)
+           (pcase-let ((`(,clamped-row . ,truncated)
+                        (anvil-worklog--clamp-body
+                         row anvil-worklog-search-snippet-chars)))
+             (push (anvil-worklog--search-hit-snippet-row clamped-row)
+                   clamped-rows)
+             (setq any-clamped (or any-clamped truncated))))
+         (setq clamped-rows (nreverse clamped-rows))
+         (append
+          (list :rows clamped-rows)
+          (when any-clamped
+            (list :note
+                  (format "snippets clamped to %d chars; pull full entries via worklog-get FILE START-LINE, or pass full=true"
+                          anvil-worklog-search-snippet-chars)))))))))
 
 (defun anvil-worklog--tool-list (&optional limit machine since until year)
   "List worklog entries ordered by date DESC.
