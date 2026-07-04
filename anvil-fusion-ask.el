@@ -63,8 +63,52 @@
 (declare-function anvil-fusion-traj-store "anvil-fusion-traj"
                   (question result &rest args))
 
+(defconst anvil-fusion--agentic-member-prompt-block
+  "必要なら作業ディレクトリ内でコマンドやツールを実行し、最終回答の前に自分の答えを検証してよい。"
+  "Instruction appended to agentic member prompts.")
+
+(defconst anvil-fusion--local-panel-network-tools
+  '("WebFetch" "WebSearch")
+  "Tool names treated as network egress for local-only panels.")
+
+(defun anvil-fusion--agentic-extras (agentic cwd)
+  "Return the default member extras plist for AGENTIC and CWD.
+Nil AGENTIC returns nil.  Scratch temp CWDs get Claude's
+`bypassPermissions'; otherwise the preset downgrades to a minimal
+tool grant.  Codex's workspace-write sandbox is always included.
+Pure."
+  (when agentic
+    (let ((safe-cwd
+           (and cwd
+                (or (eq agentic 'force)
+                    (file-in-directory-p
+                     (expand-file-name cwd)
+                     (file-name-as-directory
+                      (expand-file-name temporary-file-directory)))))))
+      (append (and safe-cwd
+                   (list :permission-mode "bypassPermissions"))
+              (and (not safe-cwd)
+                   (list :allowed-tools "Bash"))
+              (list :sandbox "workspace-write")))))
+
+(defun anvil-fusion--split-allowed-tools (allowed-tools)
+  "Return ALLOWED-TOOLS as a normalized list of tool-name strings."
+  (cond ((null allowed-tools) nil)
+        ((listp allowed-tools) allowed-tools)
+        ((stringp allowed-tools)
+         (split-string allowed-tools "," t "[ \t\r\n]*"))
+        (t nil)))
+
+(defun anvil-fusion--member-extras-has-network-egress-p (member-extras)
+  "Return non-nil when MEMBER-EXTRAS grants known network-egress tools."
+  (let ((tools (anvil-fusion--split-allowed-tools
+                (plist-get member-extras :allowed-tools))))
+    (cl-some (lambda (tool)
+               (member tool anvil-fusion--local-panel-network-tools))
+             tools)))
+
 (cl-defun anvil-fusion--run-members
-    (member-prompt body lenses cwd &key (max-wait-sec 1800))
+    (member-prompt body lenses cwd &key member-extras (max-wait-sec 1800))
   "Fan MEMBER-PROMPT out to panel BODY's members and collect the results.
 MEMBER-PROMPT is what each panel member answers (lens-prefixed).
 LENSES / CWD are forwarded to `anvil-fusion-panel-tasks' unchanged
@@ -74,7 +118,8 @@ capped the judge task).  Returns (:candidates :members-batch) -- the
 member half of what `anvil-fusion--run-round' used to do in one
 shot, split out so Phase 6d (`:verify' in `anvil-fusion-ask') can
 inspect CANDIDATES before the judge is asked to synthesize them."
-  (let* ((member-tasks (anvil-fusion-panel-tasks body member-prompt lenses cwd))
+  (let* ((member-tasks (anvil-fusion-panel-tasks
+                        body member-prompt lenses cwd member-extras))
          (mbatch (anvil-orchestrator-submit member-tasks)))
     (anvil-orchestrator-collect mbatch :wait t :max-wait-sec max-wait-sec)
     (list :candidates (plist-get (anvil-orchestrator-status mbatch) :tasks)
@@ -108,7 +153,8 @@ rounds.  :TEMPLATE overrides the judge prompt template (nil uses
 
 (cl-defun anvil-fusion--run-round
     (member-prompt judge-question body jprov jmodel
-                   &key fidelity extra template lenses cwd timeout-sec (max-wait-sec 1800))
+                   &key fidelity extra template lenses cwd member-extras
+                   timeout-sec (max-wait-sec 1800))
   "Run one fan-out + judge round and return its result plist.
 MEMBER-PROMPT is what each panel member answers (lens-prefixed);
 JUDGE-QUESTION is the question the judge synthesizes against
@@ -121,7 +167,9 @@ kept as one call for callers (e.g. the critique loop in
 candidates before judging.  Returns (:answer :candidates
 :judge-task-id :judge-batch :members-batch :prompt-chars)."
   (let* ((mresult    (anvil-fusion--run-members
-                      member-prompt body lenses cwd :max-wait-sec max-wait-sec))
+                      member-prompt body lenses cwd
+                      :member-extras member-extras
+                      :max-wait-sec max-wait-sec))
          (candidates (plist-get mresult :candidates))
          (jresult    (anvil-fusion--run-judge
                       judge-question candidates jprov jmodel
@@ -138,7 +186,7 @@ candidates before judging.  Returns (:answer :candidates
     (prompt &key panel fidelity judge judge-model extra lenses cwd
             max-rounds converge-threshold timeout-sec (max-wait-sec 1800)
             template verify verify-args verify-base-template exec-check
-            exemplars store-trajectory)
+            exemplars store-trajectory member-extras agentic)
   "Answer PROMPT by fusing a panel of models into one synthesized reply.
 
 PANEL names a panel in `anvil-fusion-panels' (default
@@ -219,6 +267,17 @@ reuse the same template and do not re-run execution.  Sovereignty note:
 execution is local only (git + the caller's check command), so it is
 allowed for local-only panels too.
 
+MEMBER-EXTRAS is forwarded to every member task after whitelist
+filtering (`anvil-fusion--member-extras-keys'); unknown keys are
+dropped.  AGENTIC (default nil) adds a safe preset under explicit
+MEMBER-EXTRAS (explicit keys win): codex members get sandbox
+`workspace-write'; Claude gets `bypassPermissions' only when CWD is
+a scratch directory under `temporary-file-directory' (or AGENTIC is
+the symbol `force' and CWD is non-nil).  Otherwise AGENTIC
+downgrades to a minimal `:allowed-tools \"Bash\"' grant and logs one
+`message'.  Local-only panels refuse known network-egress
+`:allowed-tools' grants before submission.
+
 Returns a plist: :answer :panel :egress :fidelity :rounds :looped
 :members-batch :judge-batch :judge-task-id :judge-provider
 :judge-model :candidates :prompt-chars :claims :exec-results
@@ -238,6 +297,10 @@ against the ORIGINAL PROMPT and adds :TRAJECTORY-ID (id or nil)."
            (jprov   (or judge (car jspec)))
            (jmodel  (or judge-model (cdr jspec)))
            (lenses  (or lenses (cdr (assq 'lenses body))))
+           (agentic-extras (anvil-fusion--agentic-extras agentic cwd))
+           (member-extras
+            (append (anvil-fusion--member-extras-plist member-extras)
+                    agentic-extras))
            (cap     (or max-rounds anvil-fusion-max-rounds))
            (thr     converge-threshold))
       (when (and (eq egress 'local-only)
@@ -245,6 +308,15 @@ against the ORIGINAL PROMPT and adds :TRAJECTORY-ID (id or nil)."
         (user-error
          "anvil-fusion-ask: panel %s is local-only; refusing external judge %S"
          pname jprov))
+      (when (and (eq egress 'local-only)
+                 (anvil-fusion--member-extras-has-network-egress-p member-extras))
+        (user-error
+         "anvil-fusion-ask: panel %s is local-only; refusing network-egress :allowed-tools grant"
+         pname))
+      (when (and agentic
+                 (not (plist-member agentic-extras :permission-mode)))
+        (message
+         "anvil-fusion-ask: :agentic downgraded to minimal :allowed-tools because :cwd is absent or not a scratch temp dir"))
       (let* ((member-prompt
               (if exemplars
                   (condition-case err
@@ -259,7 +331,13 @@ against the ORIGINAL PROMPT and adds :TRAJECTORY-ID (id or nil)."
                               (error-message-string err))
                      prompt))
                 prompt))
+             (member-prompt
+              (if agentic
+                  (concat member-prompt "\n\n"
+                          anvil-fusion--agentic-member-prompt-block)
+                member-prompt))
              (mresult    (anvil-fusion--run-members member-prompt body lenses cwd
+                                                     :member-extras member-extras
                                                      :max-wait-sec max-wait-sec))
              (candidates (plist-get mresult :candidates))
              (judge-candidates candidates)
@@ -366,9 +444,14 @@ against the ORIGINAL PROMPT and adds :TRAJECTORY-ID (id or nil)."
             (let ((critique (anvil-fusion-build-critique-prompt
                              prompt (plist-get round :answer))))
               (setq round (anvil-fusion--run-round
-                           critique prompt body jprov jmodel
+                           (if agentic
+                               (concat critique "\n\n"
+                                       anvil-fusion--agentic-member-prompt-block)
+                             critique)
+                           prompt body jprov jmodel
                            :fidelity fidelity :extra extra :template etemplate
                            :lenses lenses :cwd cwd
+                           :member-extras member-extras
                            :timeout-sec timeout-sec :max-wait-sec max-wait-sec))
               (setq rounds (1+ rounds))))
           (let ((result

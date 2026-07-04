@@ -56,6 +56,24 @@ first)."
     (:id "m3" :provider ollama :status done :summary "候補C: OCGR は不可。"))
   "Three simulated sovereign-panel candidate answers.")
 
+(ert-deftest anvil-fusion-ask-test-agentic-extras-safe-cwd ()
+  "Scratch temp CWD grants bypassPermissions plus codex sandbox."
+  (let ((extras (anvil-fusion--agentic-extras t
+                                              (expand-file-name
+                                               "fusion-agentic"
+                                               temporary-file-directory))))
+    (should (equal "bypassPermissions" (plist-get extras :permission-mode)))
+    (should-not (plist-member extras :allowed-tools))
+    (should (equal "workspace-write" (plist-get extras :sandbox)))))
+
+(ert-deftest anvil-fusion-ask-test-agentic-extras-unsafe-cwd-downgrades ()
+  "Unsafe or absent CWD downgrades to a minimal tool grant."
+  (dolist (cwd (list nil default-directory))
+    (let ((extras (anvil-fusion--agentic-extras t cwd)))
+      (should-not (plist-member extras :permission-mode))
+      (should (equal "Bash" (plist-get extras :allowed-tools)))
+      (should (equal "workspace-write" (plist-get extras :sandbox))))))
+
 (ert-deftest anvil-fusion-ask-test-happy-path-sovereign ()
   "Sovereign panel returns the fused answer + metadata.
 Panel is passed explicitly: the default is no longer `sovereign'
@@ -137,9 +155,63 @@ nothing is submitted."
       (should (eq 'external (plist-get res :egress)))
       (should (eq 'claude (plist-get res :judge-provider)))
       (let ((member-list (cadr submitted)))
-        (should (equal '(claude codex gemini)
+      (should (equal '(claude codex gemini)
                        (mapcar (lambda (tk) (plist-get tk :provider))
                                member-list)))))))
+
+(ert-deftest anvil-fusion-ask-test-member-extras-reach-member-tasks ()
+  "MEMBER-EXTRAS are merged into member tasks, not the judge task."
+  (anvil-fusion-ask-test--with-fake-orchestrator
+      anvil-fusion-ask-test--cands
+    (anvil-fusion-ask "Q" :panel 'sovereign
+                      :member-extras '(:timeout-sec 42 :sandbox "workspace-write")
+                      :max-rounds 0)
+    (let ((member-list (cadr submitted))
+          (judge-task (car (car submitted))))
+      (dolist (task member-list)
+        (should (= 42 (plist-get task :timeout-sec)))
+        (should (equal "workspace-write" (plist-get task :sandbox))))
+      (should-not (plist-member judge-task :timeout-sec))
+      (should-not (plist-member judge-task :sandbox)))))
+
+(ert-deftest anvil-fusion-ask-test-agentic-explicit-member-extras-win ()
+  "Explicit MEMBER-EXTRAS override the AGENTIC preset on matching keys."
+  (anvil-fusion-ask-test--with-fake-orchestrator
+      '((:id "m1" :provider claude :status done :summary "A")
+        (:id "m2" :provider codex :status done :summary "B")
+        (:id "m3" :provider gemini :status done :summary "C"))
+    (anvil-fusion-ask "Q"
+                      :panel 'quality
+                      :agentic t
+                      :cwd (expand-file-name "fusion-agentic"
+                                             temporary-file-directory)
+                      :member-extras '(:sandbox "danger-full-access"
+                                       :permission-mode "acceptEdits")
+                      :max-rounds 0)
+    (let ((member-list (cadr submitted)))
+      (dolist (task member-list)
+        (should (equal "danger-full-access" (plist-get task :sandbox)))
+        (should (equal "acceptEdits" (plist-get task :permission-mode)))))))
+
+(ert-deftest anvil-fusion-ask-test-local-only-refuses-network-egress-tools ()
+  "A local-only panel refuses :allowed-tools grants that add egress."
+  (anvil-fusion-ask-test--with-fake-orchestrator
+      anvil-fusion-ask-test--cands
+    (should-error (anvil-fusion-ask "Q" :panel 'sovereign
+                                    :member-extras '(:allowed-tools "WebSearch,Bash")
+                                    :max-rounds 0)
+                  :type 'user-error)
+    (should (null submitted))))
+
+(ert-deftest anvil-fusion-ask-test-agentic-member-prompt-appends-instruction ()
+  "Agentic runs append the verification instruction to each member prompt."
+  (anvil-fusion-ask-test--with-fake-orchestrator
+      '((:id "m1" :provider claude :status done :summary "A")
+        (:id "m2" :provider codex :status done :summary "B")
+        (:id "m3" :provider gemini :status done :summary "C"))
+    (anvil-fusion-ask "Q" :panel 'quality :agentic t :max-rounds 0)
+    (let ((member-prompt (plist-get (car (cadr submitted)) :prompt)))
+      (should (string-match-p "必要なら作業ディレクトリ内でコマンドやツールを実行し" member-prompt)))))
 
 (ert-deftest anvil-fusion-ask-test-exemplars-prepend-member-prompt-only ()
   "EXEMPLARS prepends the retrieved block to member prompts, not the judge question."

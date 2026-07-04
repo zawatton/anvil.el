@@ -228,5 +228,39 @@
     (should-not (equal (plist-get (nth 0 tasks) :prompt)
                        (plist-get (nth 2 tasks) :prompt)))))
 
+(ert-deftest anvil-fusion-panels-test-member-extras-whitelist-merged ()
+  "Whitelisted MEMBER-EXTRAS keys reach every member; unknown keys are dropped."
+  (let* ((tasks (anvil-fusion-panel-tasks
+                 (anvil-fusion-panel-get 'sovereign) "Q" nil nil
+                 '(:permission-mode "bypassPermissions"
+                   :allowed-tools "Bash"
+                   :sandbox "workspace-write"
+                   :no-worktree t
+                   :timeout-sec 55
+                   :bogus "nope"))))
+    (should (= 3 (length tasks)))
+    (dolist (task tasks)
+      (should (equal "bypassPermissions" (plist-get task :permission-mode)))
+      (should (equal "Bash" (plist-get task :allowed-tools)))
+      (should (equal "workspace-write" (plist-get task :sandbox)))
+      (should (eq t (plist-get task :no-worktree)))
+      (should (= 55 (plist-get task :timeout-sec)))
+      (should-not (plist-member task :bogus)))))
+
+(ert-deftest anvil-fusion-panels-test-member-extras-nil-regression-identical ()
+  "Nil MEMBER-EXTRAS keeps the exact prior task plist shape."
+  (let* ((body (anvil-fusion-panel-get 'sovereign))
+         (expected
+          '((:provider ollama :prompt "Q" :name "fusion-member-0-ollama"
+             :model "llama3.1:8b" :cwd "/tmp")
+            (:provider ollama :prompt "Q" :name "fusion-member-1-ollama"
+             :model "llama3.2:3b" :cwd "/tmp")
+            (:provider ollama :prompt "Q" :name "fusion-member-2-ollama"
+             :model "gemma4:e4b" :cwd "/tmp"))))
+    (should (equal expected
+                   (anvil-fusion-panel-tasks body "Q" nil "/tmp")))
+    (should (equal expected
+                   (anvil-fusion-panel-tasks body "Q" nil "/tmp" nil)))))
+
 (provide 'anvil-fusion-panels-test)
 ;;; anvil-fusion-panels-test.el ends here
