@@ -58,6 +58,10 @@
 (declare-function anvil-orchestrator-collect "anvil-orchestrator" (batch-id &rest _))
 (declare-function anvil-orchestrator-status "anvil-orchestrator" (id))
 (declare-function anvil-orchestrator-extract-result "anvil-orchestrator" (task-id &optional full))
+(declare-function anvil-fusion-traj-exemplar-block "anvil-fusion-traj"
+                  (query &rest args))
+(declare-function anvil-fusion-traj-store "anvil-fusion-traj"
+                  (question result &rest args))
 
 (cl-defun anvil-fusion--run-members
     (member-prompt body lenses cwd &key (max-wait-sec 1800))
@@ -133,7 +137,8 @@ candidates before judging.  Returns (:answer :candidates
 (cl-defun anvil-fusion-ask
     (prompt &key panel fidelity judge judge-model extra lenses cwd
             max-rounds converge-threshold timeout-sec (max-wait-sec 1800)
-            template verify verify-args verify-base-template exec-check)
+            template verify verify-args verify-base-template exec-check
+            exemplars store-trajectory)
   "Answer PROMPT by fusing a panel of models into one synthesized reply.
 
 PANEL names a panel in `anvil-fusion-panels' (default
@@ -216,10 +221,14 @@ allowed for local-only panels too.
 
 Returns a plist: :answer :panel :egress :fidelity :rounds :looped
 :members-batch :judge-batch :judge-task-id :judge-provider
-:judge-model :candidates :prompt-chars :claims :exec-results.  :CLAIMS
+:judge-model :candidates :prompt-chars :claims :exec-results
+:trajectory-id.  :CLAIMS
 is the merged annotated claim list when VERIFY and/or EXEC-CHECK
 produced one, else nil.  :EXEC-RESULTS is the per-candidate execution
-result list, else nil."
+result list, else nil.  EXEMPLARS prepends a best-effort retrieved
+Japanese exemplar block to the MEMBER prompt only (`t' = default k,
+number = k).  STORE-TRAJECTORY best-effort stores the finished result
+against the ORIGINAL PROMPT and adds :TRAJECTORY-ID (id or nil)."
   (require 'anvil-orchestrator)
   (let ((pname (or panel anvil-fusion-default-panel)))
     (anvil-fusion-panel-validate pname)
@@ -236,7 +245,21 @@ result list, else nil."
         (user-error
          "anvil-fusion-ask: panel %s is local-only; refusing external judge %S"
          pname jprov))
-      (let* ((mresult    (anvil-fusion--run-members prompt body lenses cwd
+      (let* ((member-prompt
+              (if exemplars
+                  (condition-case err
+                      (progn
+                        (require 'anvil-fusion-traj)
+                        (let ((block (anvil-fusion-traj-exemplar-block
+                                      prompt
+                                      :k (and (numberp exemplars) exemplars))))
+                          (if block (concat block "\n" prompt) prompt)))
+                    (error
+                     (message "anvil-fusion-ask: exemplar build failed (%s)"
+                              (error-message-string err))
+                     prompt))
+                prompt))
+             (mresult    (anvil-fusion--run-members member-prompt body lenses cwd
                                                      :max-wait-sec max-wait-sec))
              (candidates (plist-get mresult :candidates))
              (judge-candidates candidates)
@@ -348,21 +371,41 @@ result list, else nil."
                            :lenses lenses :cwd cwd
                            :timeout-sec timeout-sec :max-wait-sec max-wait-sec))
               (setq rounds (1+ rounds))))
-          (list :answer        (plist-get round :answer)
-                :panel         pname
-                :egress        egress
-                :fidelity      (or fidelity anvil-fusion-default-fidelity)
-                :rounds        rounds
-                :looped        (> rounds 0)
-                :members-batch (plist-get round :members-batch)
-                :judge-batch   (plist-get round :judge-batch)
-                :judge-task-id (plist-get round :judge-task-id)
-                :judge-provider jprov
-                :judge-model   jmodel
-                :candidates    (plist-get round :candidates)
-                :prompt-chars  (plist-get round :prompt-chars)
-                :claims        claims
-                :exec-results  exec-results))))))
+          (let ((result
+                 (list :answer        (plist-get round :answer)
+                       :panel         pname
+                       :egress        egress
+                       :fidelity      (or fidelity anvil-fusion-default-fidelity)
+                       :rounds        rounds
+                       :looped        (> rounds 0)
+                       :members-batch (plist-get round :members-batch)
+                       :judge-batch   (plist-get round :judge-batch)
+                       :judge-task-id (plist-get round :judge-task-id)
+                       :judge-provider jprov
+                       :judge-model   jmodel
+                       :candidates    (plist-get round :candidates)
+                       :prompt-chars  (plist-get round :prompt-chars)
+                       :claims        claims
+                       :exec-results  exec-results)))
+            (when store-trajectory
+              (setq result
+                    (plist-put
+                     result :trajectory-id
+                     (condition-case err
+                         (progn
+                           (require 'anvil-fusion-traj)
+                           (anvil-fusion-traj-store
+                            prompt result
+                            :tags (cond
+                                   ((or (stringp store-trajectory)
+                                        (listp store-trajectory))
+                                    store-trajectory)
+                                   (t nil))))
+                       (error
+                        (message "anvil-fusion-ask: trajectory store failed (%s)"
+                                 (error-message-string err))
+                        nil)))))
+            result))))))
 
 (provide 'anvil-fusion-ask)
 ;;; anvil-fusion-ask.el ends here

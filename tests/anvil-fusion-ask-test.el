@@ -141,6 +141,69 @@ nothing is submitted."
                        (mapcar (lambda (tk) (plist-get tk :provider))
                                member-list)))))))
 
+(ert-deftest anvil-fusion-ask-test-exemplars-prepend-member-prompt-only ()
+  "EXEMPLARS prepends the retrieved block to member prompts, not the judge question."
+  (let ((block "# 過去の検証済み事例（参考。事実確認済みの回答例）\n## 事例: 既存問\n既存答\n"))
+    (require 'anvil-fusion-traj)
+    (cl-letf (((symbol-function 'anvil-fusion-traj-exemplar-block)
+               (lambda (query &rest kwargs)
+                 (should (equal "Q" query))
+                 (should (= 2 (plist-get kwargs :k)))
+                 block)))
+      (anvil-fusion-ask-test--with-fake-orchestrator
+          anvil-fusion-ask-test--cands
+        (anvil-fusion-ask "Q" :panel 'sovereign :exemplars 2 :max-rounds 0)
+        (let* ((member-list (cadr submitted))
+               (judge-task (car (car submitted)))
+               (member-prompt (plist-get (car member-list) :prompt))
+               (judge-prompt (plist-get judge-task :prompt)))
+          (should (string-prefix-p (concat block "\nQ") member-prompt))
+          (should (string-match-p "^# 原問\nQ" judge-prompt))
+          (should-not (string-prefix-p block judge-prompt)))))))
+
+(ert-deftest anvil-fusion-ask-test-store-trajectory-best-effort-and-default-off ()
+  "STORE-TRAJECTORY stores against the original prompt; default remains off."
+  (let (stored-prompt stored-result stored-tags store-called default-called)
+    (cl-letf (((symbol-function 'anvil-fusion-verify-extract-claims)
+               (lambda (&rest _) anvil-fusion-ask-test--claims-raw))
+              ((symbol-function 'anvil-fusion-verify-claims)
+               (lambda (&rest _)
+                 (list (list :claim "DGR を使う"
+                             :kind 'fact
+                             :candidates '("A")
+                             :verdict 'confirmed
+                             :evidence "kb:1"))))
+              ((symbol-function 'anvil-fusion-traj-store)
+               (lambda (prompt result &rest kwargs)
+                 (setq store-called t
+                       stored-prompt prompt
+                       stored-result result
+                       stored-tags (plist-get kwargs :tags))
+                 41))
+              ((symbol-function 'anvil-fusion-traj-exemplar-block)
+               (lambda (&rest _)
+                 (setq default-called t)
+                 nil)))
+      (anvil-fusion-ask-test--with-fake-orchestrator
+          anvil-fusion-ask-test--cands
+        (let ((res (anvil-fusion-ask "Q" :panel 'sovereign
+                                     :verify t
+                                     :store-trajectory t
+                                     :max-rounds 0)))
+          (should store-called)
+          (should (equal "Q" stored-prompt))
+          (should (equal "FUSED-ANSWER" (plist-get stored-result :answer)))
+          (should (equal nil stored-tags))
+          (should (= 41 (plist-get res :trajectory-id)))))
+      (setq store-called nil
+            default-called nil)
+      (anvil-fusion-ask-test--with-fake-orchestrator
+          anvil-fusion-ask-test--cands
+        (let ((res (anvil-fusion-ask "Q" :panel 'sovereign :max-rounds 0)))
+          (should-not store-called)
+          (should-not default-called)
+          (should-not (plist-member res :trajectory-id)))))))
+
 ;;;; ============================================================
 ;;;; Phase 6d — :verify keyword
 ;;;; ============================================================
