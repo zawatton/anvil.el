@@ -1,7 +1,7 @@
 #+TITLE: Doc 61 — anvil-fusion-verify: Verifier-Grounded Judge, Opus Self-Consistency, Agentic Fusion
 #+AUTHOR: zawatton + Claude
 #+DATE: <2026-07-03>
-#+STATUS: ALL PHASES SHIPPED (6a-9, 2026-07-03/04); 6e acceptance PASS (saturated); ops follow-ups: de-saturation re-run, KB relevance threshold (6f), traj library needs live trajectories
+#+STATUS: ALL PHASES SHIPPED (6a-9, 2026-07-03/04); 6e acceptance PASS (saturated); ops follow-ups: de-saturation re-run, KB relevance threshold (6f), traj library needs live trajectories, 8e end-to-end eval 2026-07-04 saturated (baseline 3/3 = full 3/3; panels/gates unexercised; found+fixed orchestrator permission-mode blocker for coding quests) — C-axis proof still open, needs harder battery + longrun permission knob
 #+OPTIONS: toc:2 num:t
 
 * 0. Executive summary
