@@ -545,6 +545,27 @@ backend entirely — returns nil without touching the filesystem."
     (should (eq 'unverified (plist-get agg :verdict)))
     (should (equal "" (plist-get agg :reason)))))
 
+(ert-deftest anvil-fusion-verify-test-escalate-p-unverified ()
+  (should (anvil-fusion-verify--escalate-p nil nil '(:verdict unverified :reason "long enough"))))
+
+(ert-deftest anvil-fusion-verify-test-escalate-p-refuted-with-kb-evidence ()
+  (should (anvil-fusion-verify--escalate-p
+           nil '((:source "kb.org:1" :text "x")) '(:verdict refuted :reason "long enough"))))
+
+(ert-deftest anvil-fusion-verify-test-escalate-p-refuted-without-kb-evidence-long-reason ()
+  (should-not (anvil-fusion-verify--escalate-p
+               nil nil '(:verdict refuted :reason "long enough reason"))))
+
+(ert-deftest anvil-fusion-verify-test-escalate-p-confirmed-short-reason ()
+  (let ((anvil-fusion-verify-sequential-weak-reason-chars 12))
+    (should (anvil-fusion-verify--escalate-p
+             nil nil '(:verdict confirmed :reason "short")))))
+
+(ert-deftest anvil-fusion-verify-test-escalate-p-confirmed-long-reason ()
+  (let ((anvil-fusion-verify-sequential-weak-reason-chars 12))
+    (should-not (anvil-fusion-verify--escalate-p
+                 nil nil '(:verdict confirmed :reason "long enough reason")))))
+
 ;;;; --- verify-claims: multi-task orchestrator boundary stub -------------------
 
 (defmacro anvil-fusion-verify-test--with-fake-batch-orchestrator (extract-result-fn &rest body)
@@ -552,30 +573,40 @@ backend entirely — returns nil without touching the filesystem."
 Generalizes `anvil-fusion-verify-test--with-fake-orchestrator' (6a,
 single fixed task) for 6b's one-batch-many-tasks flow.
 `anvil-orchestrator-submit' records the full submitted task list in
-`submitted-tasks' (bound for BODY), assigns each task an :id equal to
-its :name (unique within one batch, since production code names
-tasks \"fusion-verify-skeptic-<claim-index>-<k>\"), and returns batch
-id \"b1\".  `-collect' is a no-op (the fake batch is immediately
-\"terminal\").  `-status' on \"b1\" returns the fabricated :id/:name
-pairs.  EXTRACT-RESULT-FN is a form evaluating to the function used
-as `anvil-orchestrator-extract-result' (TASK-ID FULL) -> plist; since
+`submitted-tasks' (latest batch) and accumulates every submit in
+`submitted-batches' (bound for BODY), assigning each task an :id equal
+to its :name.  Returns batch ids \"b1\", \"b2\", ... and `-status'
+reflects the tasks submitted for that specific batch id.
+EXTRACT-RESULT-FN is a form evaluating to the function used as
+`anvil-orchestrator-extract-result' (TASK-ID FULL) -> plist; since
 TASK-ID == the task's :name here, EXTRACT-RESULT-FN can branch on the
 \"fusion-verify-skeptic-<i>-<k>\" pattern to vary the verdict per
 claim / skeptic."
   (declare (indent 1) (debug t))
-  `(let ((submitted-tasks nil))
+  `(let ((submitted-tasks nil)
+         (submitted-batches nil)
+         (batch-table (make-hash-table :test 'equal))
+         (submit-count 0))
      (cl-letf (((symbol-function 'anvil-orchestrator-submit)
-                (lambda (tasks) (setq submitted-tasks tasks) "b1"))
+               (lambda (tasks)
+                  (setq submit-count (1+ submit-count))
+                  (setq submitted-tasks tasks)
+                  (setq submitted-batches (append submitted-batches (list tasks)))
+                  (let ((batch-id (format "b%d" submit-count)))
+                    (puthash batch-id tasks batch-table)
+                    batch-id)))
                ((symbol-function 'anvil-orchestrator-collect)
                 (lambda (&rest _) t))
                ((symbol-function 'anvil-orchestrator-status)
                 (lambda (id)
-                  (if (equal id "b1")
-                      (list :tasks (mapcar (lambda (tk)
-                                              (list :id (plist-get tk :name)
-                                                    :name (plist-get tk :name)))
-                                            submitted-tasks))
-                    (list :tasks nil))))
+                  (let ((tasks (gethash id batch-table)))
+                    (if tasks
+                        (list :tasks
+                              (mapcar (lambda (tk)
+                                        (list :id (plist-get tk :name)
+                                              :name (plist-get tk :name)))
+                                      tasks))
+                      (list :tasks nil)))))
                ((symbol-function 'anvil-orchestrator-extract-result)
                 ,extract-result-fn))
        ,@body)))
@@ -584,6 +615,7 @@ claim / skeptic."
   "2 claims x 2 skeptics = 4 tasks in one batch; majority computed per
 claim; :verdict / :evidence present; inputs not mutated."
   (let ((anvil-fusion-verify-skeptics 2)
+        (anvil-fusion-verify-sequential-skeptics nil)
         (anvil-fusion-verify-kb-roots nil))
     (anvil-fusion-verify-test--with-fake-batch-orchestrator
         (lambda (id _full)
@@ -606,6 +638,106 @@ claim; :verdict / :evidence present; inputs not mutated."
         (should (null (plist-get (nth 0 anvil-fusion-verify-test--6b-claims) :verdict)))
         (should (null (plist-get (nth 0 anvil-fusion-verify-test--6b-claims) :evidence)))
         (should (null (plist-get (nth 1 anvil-fusion-verify-test--6b-claims) :verdict)))))))
+
+(ert-deftest anvil-fusion-verify-test-verify-claims-sequential-happy-path ()
+  "Round 1 settles both claims, so only one two-task submit is made."
+  (let ((anvil-fusion-verify-skeptics 2)
+        (anvil-fusion-verify-sequential-skeptics t)
+        (anvil-fusion-verify-kb-roots nil))
+    (anvil-fusion-verify-test--with-fake-batch-orchestrator
+        (lambda (id _full)
+          (cond
+           ((equal id "fusion-verify-skeptic-0-0")
+            (list :status 'done :summary "VERDICT: REFUTED\nREASON: clear contradiction in source"))
+           ((equal id "fusion-verify-skeptic-1-0")
+            (list :status 'done :summary "VERDICT: CONFIRMED\nREASON: supported by cited evidence"))
+           (t
+            (ert-fail (format "unexpected round-2 task: %s" id)))))
+      (let* ((result (anvil-fusion-verify-claims
+                      anvil-fusion-verify-test--6b-claims
+                      :question "接地について"))
+             (round1 (car submitted-batches)))
+        (should (= 1 submit-count))
+        (should (= 1 (length submitted-batches)))
+        (should (= 2 (length round1)))
+        (should (equal '("fusion-verify-skeptic-0-0" "fusion-verify-skeptic-1-0")
+                       (mapcar (lambda (task) (plist-get task :name))
+                               round1)))
+        (should (equal '(refuted confirmed)
+                       (mapcar (lambda (claim) (plist-get claim :verdict))
+                               result)))))))
+
+(ert-deftest anvil-fusion-verify-test-verify-claims-sequential-escalation ()
+  "Only the unresolved claim gets a second-round submit."
+  (let ((anvil-fusion-verify-skeptics 3)
+        (anvil-fusion-verify-sequential-skeptics t)
+        (anvil-fusion-verify-kb-roots nil))
+    (anvil-fusion-verify-test--with-fake-batch-orchestrator
+        (lambda (id _full)
+          (cond
+           ((equal id "fusion-verify-skeptic-0-0")
+            (list :status 'done :summary "VERDICT: REFUTED\nREASON: clear contradiction in source"))
+           ((equal id "fusion-verify-skeptic-1-0")
+            (list :status 'done :summary "VERDICT: UNVERIFIED\nREASON: uncertain"))
+           ((equal id "fusion-verify-skeptic-1-1")
+            (list :status 'done :summary "VERDICT: CONFIRMED\nREASON: supported by cited evidence"))
+           ((equal id "fusion-verify-skeptic-1-2")
+            (list :status 'done :summary "VERDICT: CONFIRMED\nREASON: second source agrees"))
+           (t
+            (ert-fail (format "unexpected task id: %s" id)))))
+      (let* ((result (anvil-fusion-verify-claims
+                      anvil-fusion-verify-test--6b-claims
+                      :question "接地について"))
+             (round1 (nth 0 submitted-batches))
+             (round2 (nth 1 submitted-batches)))
+        (should (= 2 submit-count))
+        (should (= 2 (length submitted-batches)))
+        (should (equal '("fusion-verify-skeptic-0-0" "fusion-verify-skeptic-1-0")
+                       (mapcar (lambda (task) (plist-get task :name))
+                               round1)))
+        (should (equal '("fusion-verify-skeptic-1-1" "fusion-verify-skeptic-1-2")
+                       (mapcar (lambda (task) (plist-get task :name))
+                               round2)))
+        (should (equal '("接地抵抗は10Ω以下である" "漏電遮断器の設置は不要である")
+                       (mapcar (lambda (claim) (plist-get claim :claim)) result)))
+        (should (equal '(refuted confirmed)
+                       (mapcar (lambda (claim) (plist-get claim :verdict))
+                               result)))
+        (should (equal "clear contradiction in source" (plist-get (nth 0 result) :evidence)))
+        (should (equal "supported by cited evidence" (plist-get (nth 1 result) :evidence)))))))
+
+(ert-deftest anvil-fusion-verify-test-verify-claims-nsk-1-single-round ()
+  "nsk=1 performs one round only and never submits escalation tasks."
+  (let ((anvil-fusion-verify-skeptics 1)
+        (anvil-fusion-verify-sequential-skeptics t)
+        (anvil-fusion-verify-kb-roots nil))
+    (anvil-fusion-verify-test--with-fake-batch-orchestrator
+        (lambda (_id _full)
+          (list :status 'done :summary "VERDICT: CONFIRMED\nREASON: enough detail here"))
+      (let ((result (anvil-fusion-verify-claims
+                     anvil-fusion-verify-test--6b-claims
+                     :question "接地について")))
+        (should (= 1 submit-count))
+        (should (= 2 (length submitted-tasks)))
+        (should (cl-every (lambda (task)
+                            (string-suffix-p "-0" (plist-get task :name)))
+                          submitted-tasks))
+        (should (equal '(confirmed confirmed)
+                       (mapcar (lambda (claim) (plist-get claim :verdict))
+                               result)))))))
+
+(ert-deftest anvil-fusion-verify-test-verify-claims-sequential-disabled-old-batch ()
+  "Sequential nil keeps the pre-change one-batch N-tasks-per-claim flow."
+  (let ((anvil-fusion-verify-skeptics 3)
+        (anvil-fusion-verify-sequential-skeptics nil)
+        (anvil-fusion-verify-kb-roots nil))
+    (anvil-fusion-verify-test--with-fake-batch-orchestrator
+        (lambda (_id _full)
+          (list :status 'done :summary "VERDICT: CONFIRMED\nREASON: enough detail here"))
+      (anvil-fusion-verify-claims anvil-fusion-verify-test--6b-claims :question "接地について")
+      (should (= 1 submit-count))
+      (should (= 1 (length submitted-batches)))
+      (should (= 6 (length (car submitted-batches)))))))
 
 (ert-deftest anvil-fusion-verify-test-verify-claims-task-failure-unverified ()
   "A failed skeptic task counts as an unverified vote."
@@ -655,6 +787,52 @@ claim unverified without signaling to the caller."
       (dolist (c result)
         (should (eq 'unverified (plist-get c :verdict)))
         (should (equal "" (plist-get c :evidence)))))))
+
+(ert-deftest anvil-fusion-verify-test-verify-claims-round-2-error-falls-back ()
+  "A wholesale round-2 failure falls back to all-unverified without signaling."
+  (let ((anvil-fusion-verify-skeptics 3)
+        (anvil-fusion-verify-sequential-skeptics t)
+        (anvil-fusion-verify-kb-roots nil)
+        (submitted-tasks nil))
+    (cl-letf (((symbol-function 'anvil-orchestrator-submit)
+               (let ((n 0))
+                 (lambda (tasks)
+                   (setq n (1+ n))
+                   (cond
+                    ((= n 1)
+                     (setq submitted-tasks tasks)
+                     "b1")
+                    ((= n 2)
+                     (error "round 2 broke"))
+                    (t
+                     (ert-fail "unexpected third submit"))))))
+              ((symbol-function 'anvil-orchestrator-collect)
+               (lambda (&rest _) t))
+              ((symbol-function 'anvil-orchestrator-status)
+               (lambda (_id)
+                 (list :tasks
+                       (mapcar (lambda (task)
+                                 (list :id (plist-get task :name)
+                                       :name (plist-get task :name)))
+                               submitted-tasks))))
+              ((symbol-function 'anvil-orchestrator-extract-result)
+               (lambda (id _full)
+                 (cond
+                  ((equal id "fusion-verify-skeptic-0-0")
+                   (list :status 'done :summary "VERDICT: REFUTED\nREASON: clear contradiction in source"))
+                  ((equal id "fusion-verify-skeptic-1-0")
+                  (list :status 'done :summary "VERDICT: UNVERIFIED\nREASON: uncertain"))
+                  (t
+                   (ert-fail (format "unexpected task id: %s" id)))))))
+      (let ((result (anvil-fusion-verify-claims
+                     anvil-fusion-verify-test--6b-claims
+                     :question "接地について")))
+        (should (equal '(unverified unverified)
+                       (mapcar (lambda (claim) (plist-get claim :verdict))
+                               result)))
+        (should (cl-every (lambda (claim)
+                            (equal "" (plist-get claim :evidence)))
+                          result))))))
 
 (ert-deftest anvil-fusion-verify-test-verify-claims-empty-claims-no-call ()
   "Empty CLAIMS returns nil immediately without any orchestrator call."
@@ -736,6 +914,7 @@ claim unverified without signaling to the caller."
 (ert-deftest anvil-fusion-verify-test-verify-claims-mechanical-confirmed-prunes-batch ()
   "Mechanically confirmed claims are excluded from the skeptic batch."
   (let ((anvil-fusion-verify-skeptics 2)
+        (anvil-fusion-verify-sequential-skeptics nil)
         (anvil-fusion-verify-kb-roots nil)
         (anvil-fusion-verify-mechanical-checkers
          (list (lambda (claim)
@@ -865,6 +1044,7 @@ claim unverified without signaling to the caller."
     (let ((anvil-fusion-verify-cache-ttl-sec 60)
           (anvil-fusion-verify--cache-now-fn (lambda () 1000.0))
           (anvil-fusion-verify-skeptics 2)
+          (anvil-fusion-verify-sequential-skeptics nil)
           (anvil-fusion-verify-kb-roots nil)
           (submitted-tasks nil)
           (claims (list (list :claim "cached claim" :kind 'fact :candidates '("A"))
@@ -931,6 +1111,7 @@ claim unverified without signaling to the caller."
     (let ((anvil-fusion-verify-cache-ttl-sec 60)
           (anvil-fusion-verify--cache-now-fn (lambda () 1000.0))
           (anvil-fusion-verify-skeptics 2)
+          (anvil-fusion-verify-sequential-skeptics nil)
           (anvil-fusion-verify-kb-roots nil)
           (claims (list (list :claim "decisive claim" :kind 'fact :candidates '("A"))
                         (list :claim "unclear claim" :kind 'fact :candidates '("B")))))

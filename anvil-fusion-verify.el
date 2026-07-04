@@ -351,10 +351,28 @@ claim list (see `anvil-fusion-verify--parse-claims') on success."
 ;;;; --- customization (6b) ---------------------------------------------------
 
 (defcustom anvil-fusion-verify-skeptics 2
-  "Number of adversarial skeptic tasks fanned out per claim.
+  "Maximum number of adversarial skeptic tasks used per claim.
 Doc 61 §2 (6b) notes 3 skeptics for a \"rigorous\" verification pass;
-2 is the default cost/signal balance.  Override per call with the
-:skeptics argument to `anvil-fusion-verify-claims'."
+2 is the default cost/signal balance.  When sequential skeptics are
+enabled, this is a cap: one skeptic votes first and the rest are spent
+only on claims that escalate.  Override per call with the :skeptics
+argument to `anvil-fusion-verify-claims'."
+  :type 'integer
+  :group 'anvil-fusion)
+
+(defcustom anvil-fusion-verify-sequential-skeptics t
+  "When non-nil, spend skeptic votes in up to two rounds.
+Round 1 sends one skeptic per pending claim.  Claims whose first vote
+is weak or conflicting escalate to Round 2, which spends the remaining
+skeptic budget for those claims only.  Nil restores the pre-change
+behavior: all skeptics are launched up front in one batch."
+  :type 'boolean
+  :group 'anvil-fusion)
+
+(defcustom anvil-fusion-verify-sequential-weak-reason-chars 12
+  "Round-1 reasons shorter than this many trimmed characters are weak.
+Weak first-pass skeptic reasons escalate to Round 2 when sequential
+skeptics are enabled."
   :type 'integer
   :group 'anvil-fusion)
 
@@ -696,6 +714,14 @@ signals — nil/non-string TEXT also yields the unverified default."
         (setq reason (string-trim (match-string 1 text)))))
     (list :verdict verdict :reason reason)))
 
+(defconst anvil-fusion-verify--skeptic-task-name-regexp
+  "\\`fusion-verify-skeptic-\\([0-9]+\\)-[0-9]+\\'"
+  "Regexp extracting the claim index from a skeptic task name.")
+
+(defun anvil-fusion-verify--skeptic-task-name (claim-index skeptic-index)
+  "Return the canonical skeptic task name for CLAIM-INDEX and SKEPTIC-INDEX."
+  (format "fusion-verify-skeptic-%d-%d" claim-index skeptic-index))
+
 (defun anvil-fusion-verify--aggregate-verdicts (verdicts)
   "Majority-aggregate VERDICTS (a list of (:verdict SYM :reason STR)).
 A strict majority (> half) of `refuted' votes wins as `refuted'; else
@@ -946,6 +972,107 @@ task."
         (anvil-fusion-verify--parse-verdict (plist-get result :summary))
       (list :verdict 'unverified :reason ""))))
 
+(defun anvil-fusion-verify--escalate-p (claim kb-evidence verdict-plist)
+  "Return non-nil when CLAIM should spend more skeptics after round 1.
+Escalates when VERDICT-PLIST is `unverified', when it is `refuted'
+despite local KB-EVIDENCE, or when its trimmed reason is shorter than
+`anvil-fusion-verify-sequential-weak-reason-chars'."
+  (ignore claim)
+  (let ((verdict (plist-get verdict-plist :verdict))
+        (reason (string-trim (or (plist-get verdict-plist :reason) ""))))
+    (or (eq verdict 'unverified)
+        (and (eq verdict 'refuted) kb-evidence)
+        (< (length reason) anvil-fusion-verify-sequential-weak-reason-chars))))
+
+(cl-defun anvil-fusion-verify--skeptic-round
+    (pending-entries round-index count prov mdl question timeout-sec max-wait-sec)
+  "Submit one skeptic batch for PENDING-ENTRIES and return verdict lists.
+PENDING-ENTRIES is an alist of (CLAIM-INDEX . CLAIM-PLIST).  ROUND-INDEX
+is the skeptic-number offset; COUNT is the number of skeptic tasks to
+launch per entry.  Returns a hash table mapping claim indices to
+ordered verdict-plist lists."
+  (let ((tasks nil)
+        (verdicts-by-claim (make-hash-table :test 'eql)))
+    (when (> count 0)
+      (dolist (entry pending-entries)
+        (let* ((claim-index (car entry))
+               (claim (cdr entry))
+               (prompt (anvil-fusion-verify--skeptic-prompt
+                        question
+                        (plist-get claim :claim)
+                        (plist-get claim :kb-evidence))))
+          (dotimes (k count)
+            (push (append
+                   (list :name (anvil-fusion-verify--skeptic-task-name
+                                claim-index (+ round-index k))
+                         :provider prov
+                         :prompt prompt)
+                   (and mdl (list :model mdl))
+                   (and timeout-sec (list :timeout-sec timeout-sec)))
+                  tasks))))
+      (let ((batch (anvil-orchestrator-submit (nreverse tasks))))
+        (anvil-orchestrator-collect batch :wait t :max-wait-sec max-wait-sec)
+        (let ((by-claim (make-hash-table :test 'eql)))
+          (dolist (task (plist-get (anvil-orchestrator-status batch) :tasks))
+            (let ((name (plist-get task :name)))
+              (when (and (stringp name)
+                         (string-match anvil-fusion-verify--skeptic-task-name-regexp name))
+                (let ((claim-index (string-to-number (match-string 1 name))))
+                  (puthash claim-index
+                           (cons (plist-get task :id) (gethash claim-index by-claim))
+                           by-claim)))))
+          (dolist (entry pending-entries)
+            (let* ((claim-index (car entry))
+                   (ids (nreverse (gethash claim-index by-claim))))
+              (puthash claim-index
+                       (mapcar #'anvil-fusion-verify--task-verdict ids)
+                       verdicts-by-claim))))))
+    verdicts-by-claim))
+
+(cl-defun anvil-fusion-verify--run-skeptics
+    (pending-entries nsk prov mdl question timeout-sec max-wait-sec)
+  "Run skeptic verification for PENDING-ENTRIES and return aggregates.
+PENDING-ENTRIES is an alist of (CLAIM-INDEX . CLAIM-PLIST) where each
+claim plist carries a temporary :kb-evidence entry for prompt building
+and escalation decisions.  Returns a hash table mapping claim indices
+to final aggregated verdict plists."
+  (let ((results (make-hash-table :test 'eql)))
+    (if (or (not anvil-fusion-verify-sequential-skeptics) (<= nsk 1))
+        (let ((round (anvil-fusion-verify--skeptic-round
+                      pending-entries 0 nsk prov mdl question timeout-sec max-wait-sec)))
+          (dolist (entry pending-entries)
+            (puthash (car entry)
+                     (anvil-fusion-verify--aggregate-verdicts
+                      (gethash (car entry) round))
+                     results)))
+      (let* ((round1 (anvil-fusion-verify--skeptic-round
+                      pending-entries 0 1 prov mdl question timeout-sec max-wait-sec))
+             (escalated nil))
+        (dolist (entry pending-entries)
+          (let* ((claim-index (car entry))
+                 (claim (cdr entry))
+                 (first-votes (or (gethash claim-index round1)
+                                  (list (list :verdict 'unverified :reason ""))))
+                 (first (car first-votes)))
+            (if (anvil-fusion-verify--escalate-p
+                 claim (plist-get claim :kb-evidence) first)
+                (push entry escalated)
+              (puthash claim-index
+                       (anvil-fusion-verify--aggregate-verdicts first-votes)
+                       results))))
+        (when escalated
+          (let ((round2 (anvil-fusion-verify--skeptic-round
+                         (nreverse escalated) 1 (1- nsk)
+                         prov mdl question timeout-sec max-wait-sec)))
+            (dolist (entry escalated)
+              (let* ((claim-index (car entry))
+                     (all-votes (append (gethash claim-index round1)
+                                        (gethash claim-index round2))))
+                (puthash claim-index
+                         (anvil-fusion-verify--aggregate-verdicts all-votes)
+                         results)))))))
+    results))
+
 (cl-defun anvil-fusion-verify-claims
     (claims &key question egress provider model skeptics timeout-sec (max-wait-sec 1800))
   "Annotate each claim in CLAIMS with a Phase 6b evidence verdict.
@@ -962,16 +1089,22 @@ Two evidence sources are combined per claim:
    `anvil-fusion-verify-kb-roots'), zero-egress and therefore always
    run — even under EGRESS `local-only'.
 2. An adversarial skeptic vote: SKEPTICS (default
-   `anvil-fusion-verify-skeptics') independent tasks per claim, each
-   asked to try to refute the claim
-   (`anvil-fusion-verify-skeptic-template'), majority-aggregated via
-   `anvil-fusion-verify--aggregate-verdicts'.  ALL skeptic tasks for
-   ALL claims are submitted as ONE orchestrator batch (task names
-   \"fusion-verify-skeptic-<claim-index>-<k>\"), collected with
-   :wait, then read back one at a time via
-   `anvil-orchestrator-extract-result' — the same submit -> collect
-   -> extract-result pattern `anvil-fusion-verify-extract-claims'
-   already uses.
+   `anvil-fusion-verify-skeptics') as the per-claim cap.  When
+   `anvil-fusion-verify-sequential-skeptics' is non-nil and SKEPTICS
+   is greater than 1, one skeptic votes first for every pending
+   claim; only claims whose first vote is unverified, refutes local
+   KB evidence, or gives a too-short reason escalate to a second
+   batch that spends the remaining skeptic budget for those claims.
+   Claims that do not escalate accept the first vote as a singleton
+   aggregate.  When sequential skeptics are disabled, the pre-change
+   behavior remains: all skeptic tasks for all claims are submitted as
+   one batch up front.  In every case the final claim verdict still
+   comes from `anvil-fusion-verify--aggregate-verdicts'.
+
+The single-skeptic acceptance path has not been re-measured at the
+Doc 61 Phase 6e scale; re-running the benchmark in
+benchmarks/doc61-phase6e/ is advisable before treating the cost cut as
+quality-neutral.
 
 QUESTION is the original question the claims' candidates answered
 (context for the skeptic prompt).  PROVIDER / MODEL override
@@ -990,8 +1123,10 @@ Best-effort like Phase 6a: an individual skeptic task that does not
 reach `done' counts as an `unverified' vote rather than signaling; a
 wholesale orchestrator error (e.g. submit itself fails) annotates
 EVERY claim `:verdict unverified :evidence \"\"' and emits a
-`message' warning instead of propagating.  The EGRESS sovereignty
-check above is the sole exception — it always signals."
+`message' warning instead of propagating.  The same fallback applies
+if either sequential skeptic round fails wholesale; round-1-only
+partial salvage is not attempted deliberately.  The EGRESS
+sovereignty check above is the sole exception — it always signals."
   (when claims
     (let* ((eg   (or egress 'external))
            (prov (or provider anvil-fusion-verify-skeptic-provider))
@@ -1028,7 +1163,9 @@ check above is the sole exception — it always signals."
                             (append kb-evidence
                                     (list (list :source "mechanical" :text hint)))))
                     (puthash claim-index kb-evidence kb-evidence-by-idx)
-                    (push (cons claim-index claim) pending)))))))
+                    (push (cons claim-index
+                                (append claim (list :kb-evidence kb-evidence)))
+                          pending)))))))
         (if (null pending)
             (let (ordered)
               (dotimes (i (length claims))
@@ -1036,59 +1173,31 @@ check above is the sole exception — it always signals."
               ordered)
           (require 'anvil-orchestrator)
           (condition-case err
-              (let ((tasks nil)
-                    (ordered-pending (reverse pending)))
+              (let* ((ordered-pending (reverse pending))
+                     (aggregates (anvil-fusion-verify--run-skeptics
+                                  ordered-pending nsk prov mdl question timeout-sec max-wait-sec))
+                     (results (make-hash-table :test 'eql)))
                 (dolist (entry ordered-pending)
                   (let* ((claim-index (car entry))
                          (claim (cdr entry))
-                         (prompt (anvil-fusion-verify--skeptic-prompt
-                                  question
-                                  (plist-get claim :claim)
-                                  (gethash claim-index kb-evidence-by-idx))))
-                    (dotimes (k nsk)
-                      (push (append
-                             (list :name (format "fusion-verify-skeptic-%d-%d" claim-index k)
-                                   :provider prov
-                                   :prompt prompt)
-                             (and mdl (list :model mdl))
-                             (and timeout-sec (list :timeout-sec timeout-sec)))
-                            tasks))))
-                (setq tasks (nreverse tasks))
-                (let* ((batch (anvil-orchestrator-submit tasks)))
-                  (anvil-orchestrator-collect batch :wait t :max-wait-sec max-wait-sec)
-                  (let* ((btasks (plist-get (anvil-orchestrator-status batch) :tasks))
-                         (by-claim (make-hash-table :test 'eql))
-                         (results (make-hash-table :test 'eql)))
-                    (dolist (tk btasks)
-                      (let ((nm (plist-get tk :name)))
-                        (when (and (stringp nm)
-                                   (string-match
-                                    "\\`fusion-verify-skeptic-\\([0-9]+\\)-[0-9]+\\'" nm))
-                          (let ((idx (string-to-number (match-string 1 nm))))
-                            (puthash idx (cons (plist-get tk :id) (gethash idx by-claim))
-                                     by-claim)))))
-                    (dolist (entry ordered-pending)
-                      (let* ((claim-index (car entry))
-                             (claim (cdr entry))
-                             (ids (nreverse (gethash claim-index by-claim)))
-                             (verdicts (mapcar #'anvil-fusion-verify--task-verdict ids))
-                             (agg (anvil-fusion-verify--aggregate-verdicts verdicts))
-                             (evidence (anvil-fusion-verify--claim-evidence-line
-                                        (gethash claim-index kb-evidence-by-idx) agg)))
-                        (anvil-fusion-verify--cache-put
-                         claim (plist-get agg :verdict) evidence)
-                        (puthash
-                         claim-index
-                         (anvil-fusion-verify--annotate-claim
-                          claim (plist-get agg :verdict) evidence)
-                         results)))
-                    (let (ordered)
-                      (dotimes (i (length claims))
-                        (setq ordered
-                              (append ordered
-                                      (list (or (gethash i confirmed)
-                                                (gethash i results))))))
-                      ordered))))
+                         (agg (or (gethash claim-index aggregates)
+                                  (list :verdict 'unverified :reason "")))
+                         (evidence (anvil-fusion-verify--claim-evidence-line
+                                    (gethash claim-index kb-evidence-by-idx) agg)))
+                    (anvil-fusion-verify--cache-put
+                     claim (plist-get agg :verdict) evidence)
+                    (puthash
+                     claim-index
+                     (anvil-fusion-verify--annotate-claim
+                      claim (plist-get agg :verdict) evidence)
+                     results)))
+                (let (ordered)
+                  (dotimes (i (length claims))
+                    (setq ordered
+                          (append ordered
+                                  (list (or (gethash i confirmed)
+                                            (gethash i results))))))
+                  ordered))
             (error
              (message "anvil-fusion-verify: verify-claims failed: %s"
                       (error-message-string err))
