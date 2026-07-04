@@ -90,6 +90,9 @@
 (declare-function anvil-orchestrator-collect "anvil-orchestrator" (batch-id &rest _))
 (declare-function anvil-orchestrator-status "anvil-orchestrator" (id))
 (declare-function anvil-orchestrator-extract-result "anvil-orchestrator" (task-id &optional full))
+(declare-function anvil-state-get "anvil-state" (key &rest args))
+(declare-function anvil-state-set "anvil-state" (key val &rest args))
+(declare-function anvil-state-delete "anvil-state" (key &rest args))
 
 (defgroup anvil-fusion nil
   "Fusion judge harness layered over anvil-orchestrator."
@@ -379,12 +382,35 @@ your init.  See `anvil-fusion-verify--kb-search'."
   :type '(repeat directory)
   :group 'anvil-fusion)
 
+(defcustom anvil-fusion-verify-cache-ttl-sec 604800
+  "Seconds a decisive verification verdict stays reusable locally.
+The cache is strictly local storage (`anvil-state' when available,
+else an in-session hash table fallback), so reads and writes are
+allowed even under EGRESS `local-only'.  Nil disables the cache
+entirely for both reads and writes, restoring the pre-cache behavior.
+Only skeptic-aggregated decisive verdicts are cached; mechanical
+checker confirmations stay uncached because they are already cheap and
+always fresh."
+  :type '(choice (const :tag "Disabled" nil) number)
+  :group 'anvil-fusion)
+
 (defcustom anvil-fusion-verify-max-evidence 3
   "Maximum KB snippets kept as evidence per claim (Phase 6b).
 Caps both what `anvil-fusion-verify--kb-search' returns and what is
 fed into the skeptic prompt's evidence block."
   :type 'integer
   :group 'anvil-fusion)
+
+(defvar anvil-fusion-verify--cache-now-fn #'float-time
+  "Function returning the current unix timestamp as a float.
+Tests bind this to a fake clock so cache expiry can be exercised
+without sleeping.")
+
+(defvar anvil-fusion-verify--cache-session-store (make-hash-table :test 'equal)
+  "Session-local fallback verdict cache used when `anvil-state' is unavailable.")
+
+(defconst anvil-fusion-verify--cache-namespace "fusion-verify-cache"
+  "Namespace used for verified-claim cache entries in `anvil-state'.")
 
 (defcustom anvil-fusion-verify-mechanical-checkers nil
   "List of best-effort mechanical claim checkers.
@@ -691,18 +717,133 @@ when there is no winning side.  Pure."
       (list :verdict 'confirmed :reason (or (plist-get (car confirmed) :reason) "")))
      (t (list :verdict 'unverified :reason "")))))
 
+(defun anvil-fusion-verify--cache-enabled-p ()
+  "Return non-nil when the verified-claim cache is enabled."
+  (numberp anvil-fusion-verify-cache-ttl-sec))
+
+(defun anvil-fusion-verify--cache-normalize-text (text)
+  "Normalize claim TEXT for cache keys.
+Trims leading/trailing whitespace and collapses internal whitespace
+runs to a single ASCII space."
+  (replace-regexp-in-string "\\s-+" " " (string-trim (or text ""))))
+
+(defun anvil-fusion-verify--cache-key (claim)
+  "Return the cache key for CLAIM.
+The key is the sha1 of normalized claim text, a NUL separator, and the
+claim kind symbol name.  Whitespace-only text differences therefore
+collide, while different claim kinds do not."
+  (secure-hash
+   'sha1
+   (concat (anvil-fusion-verify--cache-normalize-text (plist-get claim :claim))
+           "\0"
+           (symbol-name (or (plist-get claim :kind) 'fact)))))
+
+(defun anvil-fusion-verify--cache-kb-stamp ()
+  "Return the current KB-root freshness stamp, or nil.
+This is the maximum directory mtime across
+`anvil-fusion-verify-kb-roots' themselves, non-recursively.  This is
+only a best-effort invalidation signal: content edits that do not
+change a root directory's own mtime are not detected."
+  (when anvil-fusion-verify-kb-roots
+    (let ((stamp nil))
+      (dolist (root anvil-fusion-verify-kb-roots)
+        (when (and (stringp root) (file-directory-p root))
+          (let ((mtime (condition-case nil
+                           (float-time
+                            (file-attribute-modification-time
+                             (file-attributes root)))
+                         (error nil))))
+            (when (numberp mtime)
+              (setq stamp (if stamp (max stamp mtime) mtime))))))
+      stamp)))
+
+(defun anvil-fusion-verify--cache-delete-raw (key)
+  "Delete cached KEY best-effort from the active backend."
+  (condition-case nil
+      (if (require 'anvil-state nil t)
+          (anvil-state-delete key :ns anvil-fusion-verify--cache-namespace)
+        (remhash key anvil-fusion-verify--cache-session-store))
+    (error
+     (remhash key anvil-fusion-verify--cache-session-store)
+     nil)))
+
+(defun anvil-fusion-verify--cache-read-raw (key)
+  "Read cached KEY from the active backend, or nil on any error."
+  (condition-case nil
+      (if (require 'anvil-state nil t)
+          (anvil-state-get key :ns anvil-fusion-verify--cache-namespace)
+        (gethash key anvil-fusion-verify--cache-session-store))
+    (error
+     (gethash key anvil-fusion-verify--cache-session-store))))
+
+(defun anvil-fusion-verify--cache-write-raw (key value)
+  "Write VALUE under cached KEY best-effort to the active backend."
+  (condition-case nil
+      (if (require 'anvil-state nil t)
+          (anvil-state-set key value :ns anvil-fusion-verify--cache-namespace)
+        (puthash key value anvil-fusion-verify--cache-session-store))
+    (error
+     (puthash key value anvil-fusion-verify--cache-session-store)
+     nil)))
+
+(defun anvil-fusion-verify--cache-get (claim)
+  "Return a cached decisive verdict plist for CLAIM, or nil.
+Nil is returned when the cache is disabled, the entry is absent,
+expired, stale against the current KB stamp, malformed, or any backend
+error occurs.  Expired/stale entries are deleted best-effort."
+  (when (anvil-fusion-verify--cache-enabled-p)
+    (condition-case nil
+        (let* ((key (anvil-fusion-verify--cache-key claim))
+               (value (anvil-fusion-verify--cache-read-raw key)))
+          (when (and (listp value)
+                     (memq (plist-get value :verdict) '(confirmed refuted))
+                     (stringp (plist-get value :evidence))
+                     (numberp (plist-get value :ts)))
+            (let* ((now (funcall anvil-fusion-verify--cache-now-fn))
+                   (age (- now (plist-get value :ts)))
+                   (stored-stamp (plist-get value :kb-stamp))
+                   (current-stamp (anvil-fusion-verify--cache-kb-stamp)))
+              (cond
+               ((> age anvil-fusion-verify-cache-ttl-sec)
+                (anvil-fusion-verify--cache-delete-raw key)
+                nil)
+               ((and (numberp current-stamp)
+                     (or (null stored-stamp) (> current-stamp stored-stamp)))
+                (anvil-fusion-verify--cache-delete-raw key)
+                nil)
+               (t value)))))
+      (error nil))))
+
+(defun anvil-fusion-verify--cache-put (claim verdict evidence)
+  "Store a decisive VERDICT/EVIDENCE pair for CLAIM best-effort.
+This never signals.  `unverified' verdicts are intentionally not
+cached so inconclusive claims stay retryable."
+  (when (and (anvil-fusion-verify--cache-enabled-p)
+             (memq verdict '(confirmed refuted))
+             (stringp evidence))
+    (condition-case nil
+        (anvil-fusion-verify--cache-write-raw
+         (anvil-fusion-verify--cache-key claim)
+         (list :verdict verdict
+               :evidence evidence
+               :ts (funcall anvil-fusion-verify--cache-now-fn)
+               :kb-stamp (anvil-fusion-verify--cache-kb-stamp)))
+      (error nil))))
+
 ;;;; --- claim annotation helpers (6b) -----------------------------------------
 
-(defun anvil-fusion-verify--annotate-claim (claim verdict evidence)
+(defun anvil-fusion-verify--annotate-claim (claim verdict evidence &rest props)
   "Return a FRESH copy of CLAIM (a Phase 6a claim plist) carrying
-:VERDICT VERDICT and :EVIDENCE EVIDENCE.  Never mutates CLAIM — a new
-plist is allocated so `anvil-fusion-verify-claims' never touches its
-CLAIMS argument."
-  (list :claim (plist-get claim :claim)
-        :kind (plist-get claim :kind)
-        :candidates (plist-get claim :candidates)
-        :verdict verdict
-        :evidence evidence))
+:VERDICT VERDICT and :EVIDENCE EVIDENCE, plus optional PROPS.
+Never mutates CLAIM — a new plist is allocated so
+`anvil-fusion-verify-claims' never touches its CLAIMS argument."
+  (append
+   (list :claim (plist-get claim :claim)
+         :kind (plist-get claim :kind)
+         :candidates (plist-get claim :candidates)
+         :verdict verdict
+         :evidence evidence)
+   props))
 
 (defun anvil-fusion-verify--claim-evidence-line (kb-evidence agg)
   "Return the one-line :EVIDENCE string for a claim.
@@ -840,8 +981,10 @@ or `local-only'; under `local-only' the *effective* skeptic provider
 must satisfy `anvil-fusion-provider-local-p' (the exact predicate
 `anvil-fusion-panels' uses to validate sovereign panels), or this
 signals a `user-error' BEFORE anything is submitted — mirroring
-`anvil-fusion-ask''s sovereignty refusal.  TIMEOUT-SEC caps each
-skeptic task; MAX-WAIT-SEC caps the batch collect wait.
+`anvil-fusion-ask''s sovereignty refusal.  The decisive verdict cache
+is local storage only (`anvil-state', else an in-session hash table),
+so its reads/writes remain allowed under `local-only'.  TIMEOUT-SEC
+caps each skeptic task; MAX-WAIT-SEC caps the batch collect wait.
 
 Best-effort like Phase 6a: an individual skeptic task that does not
 reach `done' counts as an `unverified' vote rather than signaling; a
@@ -864,19 +1007,28 @@ check above is the sole exception — it always signals."
             (claim-index -1))
         (dolist (claim claims)
           (setq claim-index (1+ claim-index))
-          (let* ((kb-evidence (anvil-fusion-verify--kb-search (plist-get claim :claim)))
-                 (mechanical (anvil-fusion-verify--run-mechanical-checkers claim))
+          (let* ((mechanical (anvil-fusion-verify--run-mechanical-checkers claim))
                  (hint (plist-get mechanical :evidence)))
             (if (eq (plist-get mechanical :verdict) 'confirmed)
                 (puthash claim-index
                          (anvil-fusion-verify--annotate-claim claim 'confirmed hint)
                          confirmed)
-              (when hint
-                (setq kb-evidence
-                      (append kb-evidence
-                              (list (list :source "mechanical" :text hint)))))
-              (puthash claim-index kb-evidence kb-evidence-by-idx)
-              (push (cons claim-index claim) pending))))
+              (let ((cached (anvil-fusion-verify--cache-get claim)))
+                (if cached
+                    (puthash claim-index
+                             (anvil-fusion-verify--annotate-claim
+                              claim
+                              (plist-get cached :verdict)
+                              (plist-get cached :evidence)
+                              :cached t)
+                             confirmed)
+                  (let ((kb-evidence (anvil-fusion-verify--kb-search (plist-get claim :claim))))
+                    (when hint
+                      (setq kb-evidence
+                            (append kb-evidence
+                                    (list (list :source "mechanical" :text hint)))))
+                    (puthash claim-index kb-evidence kb-evidence-by-idx)
+                    (push (cons claim-index claim) pending)))))))
         (if (null pending)
             (let (ordered)
               (dotimes (i (length claims))
@@ -920,13 +1072,15 @@ check above is the sole exception — it always signals."
                              (claim (cdr entry))
                              (ids (nreverse (gethash claim-index by-claim)))
                              (verdicts (mapcar #'anvil-fusion-verify--task-verdict ids))
-                             (agg (anvil-fusion-verify--aggregate-verdicts verdicts)))
+                             (agg (anvil-fusion-verify--aggregate-verdicts verdicts))
+                             (evidence (anvil-fusion-verify--claim-evidence-line
+                                        (gethash claim-index kb-evidence-by-idx) agg)))
+                        (anvil-fusion-verify--cache-put
+                         claim (plist-get agg :verdict) evidence)
                         (puthash
                          claim-index
                          (anvil-fusion-verify--annotate-claim
-                          claim (plist-get agg :verdict)
-                          (anvil-fusion-verify--claim-evidence-line
-                           (gethash claim-index kb-evidence-by-idx) agg))
+                          claim (plist-get agg :verdict) evidence)
                          results)))
                     (let (ordered)
                       (dotimes (i (length claims))

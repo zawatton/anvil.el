@@ -18,6 +18,10 @@
     (provide 'anvil-orchestrator))  ;; else fake it (fusion standalone repo)
 (require 'anvil-fusion-verify)
 
+;; Keep pre-cache tests deterministic even when a real `anvil-state' DB
+;; exists in the environment; cache-focused tests bind this back on.
+(setq anvil-fusion-verify-cache-ttl-sec nil)
+
 (defconst anvil-fusion-verify-test--candidates
   '((:id "c1" :name "fusion-member-0-claude" :provider claude :status done
          :summary "絶縁抵抗は 0.1 MOhm と測定された。")
@@ -281,6 +285,26 @@ claude-CLI \"haiku\" alias default must not leak to other providers."
         (list :claim "漏電遮断器の設置は不要である" :kind 'fact :candidates '("A")))
   "Two Phase 6a claim plists used by the Phase 6b tests.")
 
+(defmacro anvil-fusion-verify-test--with-cache-fallback (&rest body)
+  "Run BODY with the verified-claim cache forced onto the hash fallback."
+  (declare (indent 0) (debug t))
+  `(let ((anvil-fusion-verify--cache-session-store (make-hash-table :test 'equal)))
+     (cl-letf (((symbol-function 'require)
+                (let ((orig (symbol-function 'require)))
+                  (lambda (feature &optional filename noerror)
+                    (if (eq feature 'anvil-state)
+                        nil
+                      (funcall orig feature filename noerror))))))
+       ,@body)))
+
+(defun anvil-fusion-verify-test--cache-values ()
+  "Return the fallback cache values as a plain list."
+  (let (values)
+    (maphash (lambda (_key value)
+               (push value values))
+             anvil-fusion-verify--cache-session-store)
+    values))
+
 ;;;; --- term extractor ---------------------------------------------------------
 
 (ert-deftest anvil-fusion-verify-test-search-terms-mixed ()
@@ -306,6 +330,78 @@ claude-CLI \"haiku\" alias default must not leak to other providers."
   "Nil / empty claim text yields no terms, no crash."
   (should (null (anvil-fusion-verify--claim-search-terms nil)))
   (should (null (anvil-fusion-verify--claim-search-terms ""))))
+
+;;;; --- verdict cache ----------------------------------------------------------
+
+(ert-deftest anvil-fusion-verify-test-cache-key-normalizes-whitespace ()
+  "Whitespace/newline variants collide in the cache key."
+  (should
+   (equal (anvil-fusion-verify--cache-key
+           '(:claim "絶縁抵抗は 0.1 MΩ である" :kind number))
+          (anvil-fusion-verify--cache-key
+           '(:claim "  絶縁抵抗は\n0.1   MΩ\tである  " :kind number)))))
+
+(ert-deftest anvil-fusion-verify-test-cache-key-distinguishes-kind ()
+  "Different claim kinds produce distinct cache keys."
+  (should-not
+   (equal (anvil-fusion-verify--cache-key
+           '(:claim "絶縁抵抗は 0.1 MΩ である" :kind number))
+          (anvil-fusion-verify--cache-key
+           '(:claim "絶縁抵抗は 0.1 MΩ である" :kind fact)))))
+
+(ert-deftest anvil-fusion-verify-test-cache-put-get-roundtrip-fallback ()
+  "Fallback cache stores decisive verdicts and skips unverified."
+  (anvil-fusion-verify-test--with-cache-fallback
+    (let ((anvil-fusion-verify-cache-ttl-sec 60)
+          (anvil-fusion-verify--cache-now-fn (lambda () 1000.0))
+          (claim '(:claim "絶縁抵抗は 0.1 MΩ である" :kind number)))
+      (anvil-fusion-verify--cache-put claim 'confirmed "kb.org:1 — confirmed")
+      (let ((entry (anvil-fusion-verify--cache-get claim)))
+        (should (eq 'confirmed (plist-get entry :verdict)))
+        (should (equal "kb.org:1 — confirmed" (plist-get entry :evidence)))
+        (should (= 1000.0 (plist-get entry :ts))))
+      (anvil-fusion-verify--cache-put claim 'unverified "should not persist")
+      (should (= 1 (hash-table-count anvil-fusion-verify--cache-session-store))))))
+
+(ert-deftest anvil-fusion-verify-test-cache-ttl-nil-disables-read-and-write ()
+  "Nil TTL disables both cache reads and cache writes."
+  (anvil-fusion-verify-test--with-cache-fallback
+    (let ((anvil-fusion-verify-cache-ttl-sec nil)
+          (anvil-fusion-verify--cache-now-fn (lambda () 1000.0))
+          (claim '(:claim "絶縁抵抗は 0.1 MΩ である" :kind number)))
+      (anvil-fusion-verify--cache-put claim 'confirmed "kb.org:1 — confirmed")
+      (should (= 0 (hash-table-count anvil-fusion-verify--cache-session-store)))
+      (should (null (anvil-fusion-verify--cache-get claim))))))
+
+(ert-deftest anvil-fusion-verify-test-cache-expiry-deletes-entry ()
+  "Expired fallback entries miss and are deleted eagerly."
+  (anvil-fusion-verify-test--with-cache-fallback
+    (let ((anvil-fusion-verify-cache-ttl-sec 10)
+          (now 1000.0)
+          (claim '(:claim "絶縁抵抗は 0.1 MΩ である" :kind number)))
+      (let ((anvil-fusion-verify--cache-now-fn (lambda () now)))
+        (anvil-fusion-verify--cache-put claim 'confirmed "kb.org:1 — confirmed")
+        (setq now 1011.0)
+        (should (null (anvil-fusion-verify--cache-get claim)))
+        (should (= 0 (hash-table-count anvil-fusion-verify--cache-session-store)))))))
+
+(ert-deftest anvil-fusion-verify-test-cache-kb-stamp-stale-misses ()
+  "A newer KB-root directory mtime invalidates the cached entry."
+  (skip-unless (fboundp 'set-file-times))
+  (anvil-fusion-verify-test--with-cache-fallback
+    (let* ((dir (make-temp-file "anvil-fusion-verify-cache-kb-" t))
+           (anvil-fusion-verify-cache-ttl-sec 60)
+           (anvil-fusion-verify-kb-roots (list dir))
+           (anvil-fusion-verify--cache-now-fn (lambda () 1000.0))
+           (claim '(:claim "絶縁抵抗は 0.1 MΩ である" :kind number)))
+      (unwind-protect
+          (progn
+            (anvil-fusion-verify--cache-put claim 'confirmed "kb.org:1 — confirmed")
+            (set-file-times dir (time-add (file-attribute-modification-time
+                                           (file-attributes dir))
+                                          1))
+            (should (null (anvil-fusion-verify--cache-get claim))))
+        (delete-directory dir t)))))
 
 ;;;; --- kb-search (local grep backend) -----------------------------------------
 
@@ -754,12 +850,111 @@ claim unverified without signaling to the caller."
                                submitted-tasks))))
               ((symbol-function 'anvil-orchestrator-extract-result)
                (lambda (_id _full)
-                 (list :status 'done :summary "VERDICT: UNVERIFIED\nREASON: "))))
+                 (list :status 'done
+                       :summary "VERDICT: UNVERIFIED\nREASON: "))))
       (anvil-fusion-verify-claims
        (list (list :claim "use tests/missing-test.el" :kind 'code :candidates '("A")))
        :question "Q")
-      (should (string-match-p "mechanical — not found under ROOT: tests/missing-test\\.el"
-                              (plist-get (car submitted-tasks) :prompt))))))
+      (should
+       (string-match-p "mechanical — not found under ROOT: tests/missing-test\\.el"
+                       (plist-get (car submitted-tasks) :prompt))))))
+
+(ert-deftest anvil-fusion-verify-test-verify-claims-cache-hit-prunes-batch ()
+  "A cached decisive claim skips skeptic tasks, is marked cached, and order stays intact."
+  (anvil-fusion-verify-test--with-cache-fallback
+    (let ((anvil-fusion-verify-cache-ttl-sec 60)
+          (anvil-fusion-verify--cache-now-fn (lambda () 1000.0))
+          (anvil-fusion-verify-skeptics 2)
+          (anvil-fusion-verify-kb-roots nil)
+          (submitted-tasks nil)
+          (claims (list (list :claim "cached claim" :kind 'fact :candidates '("A"))
+                        (list :claim "fresh claim" :kind 'fact :candidates '("B")))))
+      (anvil-fusion-verify--cache-put (car claims) 'refuted "cached evidence")
+      (cl-letf (((symbol-function 'anvil-orchestrator-submit)
+                 (lambda (tasks)
+                   (setq submitted-tasks tasks)
+                   "b1"))
+                ((symbol-function 'anvil-orchestrator-collect)
+                 (lambda (&rest _) t))
+                ((symbol-function 'anvil-orchestrator-status)
+                 (lambda (_id)
+                   (list :tasks
+                         (mapcar (lambda (task)
+                                   (list :id (plist-get task :name)
+                                         :name (plist-get task :name)))
+                                 submitted-tasks))))
+                ((symbol-function 'anvil-orchestrator-extract-result)
+                 (lambda (_id _full)
+                   (list :status 'done
+                         :summary "VERDICT: CONFIRMED\nREASON: fresh ok"))))
+        (let ((result (anvil-fusion-verify-claims claims :question "Q")))
+          (should (= 2 (length submitted-tasks)))
+          (should
+           (cl-every (lambda (task)
+                       (string-prefix-p "fusion-verify-skeptic-1-"
+                                        (plist-get task :name)))
+                     submitted-tasks))
+          (should (equal '("cached claim" "fresh claim")
+                         (mapcar (lambda (claim) (plist-get claim :claim))
+                                 result)))
+          (should (eq 'refuted (plist-get (car result) :verdict)))
+          (should (equal "cached evidence" (plist-get (car result) :evidence)))
+          (should (eq t (plist-get (car result) :cached)))
+          (should (eq 'confirmed (plist-get (cadr result) :verdict))))))))
+
+(ert-deftest anvil-fusion-verify-test-verify-claims-cache-all-hit-no-submit ()
+  "All cache hits bypass the orchestrator entirely."
+  (anvil-fusion-verify-test--with-cache-fallback
+    (let ((anvil-fusion-verify-cache-ttl-sec 60)
+          (anvil-fusion-verify--cache-now-fn (lambda () 1000.0))
+          (anvil-fusion-verify-kb-roots nil)
+          (claims (list (list :claim "claim-1" :kind 'fact :candidates '("A"))
+                        (list :claim "claim-2" :kind 'number :candidates '("B"))))
+          called)
+      (anvil-fusion-verify--cache-put (nth 0 claims) 'confirmed "cache-1")
+      (anvil-fusion-verify--cache-put (nth 1 claims) 'refuted "cache-2")
+      (cl-letf (((symbol-function 'anvil-orchestrator-submit)
+                 (lambda (_tasks)
+                   (setq called t)
+                   "b1")))
+        (let ((result (anvil-fusion-verify-claims claims :question "Q")))
+          (should-not called)
+          (should (equal '(confirmed refuted)
+                         (mapcar (lambda (claim) (plist-get claim :verdict))
+                                 result)))
+          (should (cl-every (lambda (claim) (plist-get claim :cached))
+                            result)))))))
+
+(ert-deftest anvil-fusion-verify-test-verify-claims-caches-decisive-results-only ()
+  "Decisive skeptic verdicts are cached; unverified ones are not."
+  (anvil-fusion-verify-test--with-cache-fallback
+    (let ((anvil-fusion-verify-cache-ttl-sec 60)
+          (anvil-fusion-verify--cache-now-fn (lambda () 1000.0))
+          (anvil-fusion-verify-skeptics 2)
+          (anvil-fusion-verify-kb-roots nil)
+          (claims (list (list :claim "decisive claim" :kind 'fact :candidates '("A"))
+                        (list :claim "unclear claim" :kind 'fact :candidates '("B")))))
+      (anvil-fusion-verify-test--with-fake-batch-orchestrator
+          (lambda (id _full)
+            (cond
+             ((equal id "fusion-verify-skeptic-0-0")
+              (list :status 'done :summary "VERDICT: CONFIRMED\nREASON: yes"))
+             ((equal id "fusion-verify-skeptic-0-1")
+              (list :status 'done :summary "VERDICT: CONFIRMED\nREASON: yes2"))
+             ((equal id "fusion-verify-skeptic-1-0")
+              (list :status 'done :summary "VERDICT: CONFIRMED\nREASON: maybe"))
+             ((equal id "fusion-verify-skeptic-1-1")
+              (list :status 'done :summary "VERDICT: REFUTED\nREASON: maybe not"))
+             (t
+              (list :status 'done :summary "VERDICT: UNVERIFIED\nREASON: "))))
+        (let ((result (anvil-fusion-verify-claims claims :question "Q")))
+          (should (equal '(confirmed unverified)
+                         (mapcar (lambda (claim) (plist-get claim :verdict))
+                                 result)))
+          (should (= 1 (hash-table-count anvil-fusion-verify--cache-session-store)))
+          (let ((cached (car (anvil-fusion-verify-test--cache-values))))
+            (should (eq 'confirmed (plist-get cached :verdict)))
+            (should (equal "yes" (plist-get cached :evidence)))))))))
 
 ;;;; ============================================================
 ;;;; Phase 6d — verdict-annotated judge synthesis
