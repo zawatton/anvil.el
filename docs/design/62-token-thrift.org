@@ -47,7 +47,7 @@ patterns (test runs, re-reads) return unbounded text.
 | 2     | hard-prompt router: auto-escalate single -> pair -> opus-solo+verify | fusion | SHIPPED bc291d4 (cascade: single -> haiku probe -> escalate; fail-to-middle) |
 | 3     | test-run distiller tool (ERT batch -> fixed digest)    | elisp   | SHIPPED 4e18908 (13-test digest = 118 chars; raw log via :log-path) |
 | 4     | verdict cache (SQLite, TTL) for verified claims        | verify  | SHIPPED (anvil-state KV; decisive-only; skeptic-skip on hit) |
-| 5     | sequential (early-exit) skeptics                       | verify  | TODO |
+| 5     | sequential (early-exit) skeptics                       | verify  | SHIPPED (1 skeptic first; escalate on unverified / KB-conflict / weak reason) |
 | 6     | KB numeric-match mechanical checker                    | verify  | TODO |
 | 7     | judge-input dedup (representative + delta for agreeing candidates) | fusion | TODO |
 | 8     | diff-first re-read tool (session content-hash cache)   | file    | SHIPPED 13adeb2 (40K file, 3-line edit: 40,128 -> 318 chars) |
