@@ -181,6 +181,65 @@ Phase 6-7 produce trajectories worth keeping.
 | 8c    | inter-step verify gate                             | 6d, 8b     | SHIPPED c191a43 |
 | 8e    | end-to-end eval: longrun baseline vs full harness  | 8a-8c      | MEASURED (PASS, saturated — see below) |
 | 9     | verified-trajectory exemplar library (sketch)      | 6-7 live   | SHIPPED (anvil-fusion-traj; admission gate = verified wins only; opt-in :exemplars / :store-trajectory) |
+| 7'    | sonnet-solo panel (sonnet-tier twin of opus-solo)  | 7          | IN-PROGRESS |
+| 8f    | agentic members: member-extras passthrough (permission/tools/sandbox) + tool-using panel members | 7, 8e | DESIGNED (below) |
+| 10    | multi-round debate (critique loop depth > 1)       | 6d         | DESIGNED (below) |
+| 11    | router auto-calibration from the decision log      | Doc62 Ph2  | DESIGNED (below) |
+
+** 8f. Agentic members + execution-permission passthrough (design)
+
+8e's operational finding and the "agentic member" gap are the same root
+defect: `anvil-fusion-panel-tasks` builds member task plists carrying only
+:provider :prompt :name [:model] [:cwd], while the orchestrator already
+honors per-task :permission-mode (claude path) and :sandbox (codex path) —
+members simply never receive them, so a panel member (or a longrun coding
+step's claude child under the default acceptEdits) cannot run its own
+build/tests or consult tools.
+
+Design:
+- `anvil-fusion-panel-tasks` gains an optional MEMBER-EXTRAS plist merged
+  into every member task (whitelist: :permission-mode :allowed-tools
+  :sandbox :no-worktree :timeout-sec). Providers ignore keys they do not
+  read, so one merged plist serves all member providers safely.
+- `anvil-fusion-ask` gains :member-extras (passthrough) and :agentic
+  (convenience: a safe preset — claude members get :permission-mode
+  "bypassPermissions" ONLY when a scratch :cwd outside any user repo is
+  supplied, else :allowed-tools grant for the build command; codex members
+  get :sandbox "workspace-write"). Member prompts under :agentic get an
+  appended instruction block: you may run commands/tools in CWD to check
+  your answer before finalizing it.
+- `anvil-fusion-longrun-run` / async / plan: passthrough of :member-extras
+  to their panel calls; longrun's own single-provider step task accepts
+  the same extras (this is the 8e permission-knob follow-up, closed here).
+- Sovereignty: local-only panels reject extras that would grant network
+  egress tools; local execution remains allowed.
+- Safety: :agentic defaults nil everywhere; docstrings must spell out the
+  bypassPermissions blast radius and the scratch-cwd requirement.
+
+** 10. Multi-round debate (design)
+
+Today's critique loop is a single divergence-triggered re-round. Deepen it
+into a bounded debate: when candidates diverge after round 1, each member
+receives the OTHER candidates' answers (deduped per Doc 62 Phase 7
+rendering) plus the verified-claims table, and must either defend or
+revise; re-judge after each round. Termination: convergence
+(should-loop-p), max-rounds (existing defcustom now meaning debate depth),
+or a judge-declared resolution. Verify runs once on round 1 claims plus
+incrementally on NEW claims surfacing in later rounds (extraction diff by
+claim-key hash — reuses the Phase 4 cache so re-verification is cheap).
+Cost note: each debate round ~ one member fan-out + judge; router should
+only enable depth > 1 at the HIGH tier.
+
+** 11. Router auto-calibration (design)
+
+The Doc 62 Phase 2 router logs every decision (risk, reason, tier). Close
+the loop offline: a calibration command reads the log joined with
+follow-up outcome signals — verify verdicts of the escalated runs (were
+HIGH escalations justified: did claims get refuted?), user re-ask within
+the session (proxy for a wrong LOW), cost per decision — and proposes (not
+auto-applies) threshold/mapping changes as a diff to
+`anvil-fusion-route-escalation` with the supporting counts. Manual apply
+keeps the human in the calibration loop until enough log volume exists.
 
 Phase 8 implementation notes (2026-07-03/04, codex via orchestrator — 8a on
 the daemon orchestrator, 8b/8c on the Doc 43 standalone batch orchestrator
