@@ -171,7 +171,7 @@ Phase 6-7 produce trajectories worth keeping.
 | 6a    | claim extraction pass                              | —          | SHIPPED a2a4b11 |
 | 6a'   | haiku default pin + per-side/NONE template harden  | 6a, spike  | SHIPPED b414185 |
 | 6b    | evidence check (KB + skeptic vote)                 | 6a         | SHIPPED de5ebb7 |
-| 6c    | execution verification for code candidates         | 6a         | TODO   |
+| 6c    | execution verification for code candidates         | 6a         | SHIPPED (anvil-fusion-exec; exec results as 6d claims + hard exclusion) |
 | 6d    | verdict-annotated judge template + plumbing        | 6b         | SHIPPED 281aa63 |
 | 6d'   | debt bundle (async loop, egress inference, :verify)| 6d         | SHIPPED da51e05 |
 | 6e    | unsaturated eval battery + verify-effect run       | 6d         | MEASURED (PASS, saturated — see below) |
