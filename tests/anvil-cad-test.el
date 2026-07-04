@@ -127,6 +127,12 @@
   "Read a handler's printed-plist RES string back into a plist."
   (car (read-from-string res)))
 
+(defun anvil-cad-test--temp-file (prefix suffix content)
+  "Create a temp file from CONTENT using anvil-cad's UTF-8 write path."
+  (let ((f (make-temp-file prefix nil suffix)))
+    (anvil-cad--write f content)
+    f))
+
 (ert-deftest anvil-cad-test-fmt-num ()
   "Numbers serialize with a decimal point; strings pass through."
   (should (equal (anvil-cad--fmt-num 3) "3.0"))
@@ -169,12 +175,35 @@ This is the guarantee that makes in-place edits safe."
 
 ;;;; --- Phase 2: handlers (end-to-end, temp files) -------------------------
 
+(ert-deftest anvil-cad-test-read-outline-public-wrapper ()
+  "cad-read-outline public wrapper returns the compact drawing summary."
+  (let ((f (anvil-cad-test--temp-file "anvil-cad-" ".dxf" anvil-cad-test--dxf)))
+    (unwind-protect
+        (let ((res (anvil-cad-test--plist (anvil-cad-read-outline f))))
+          (should (eq (plist-get res :format) 'dxf))
+          (should (= (plist-get res :entity-count) 3))
+          (should (member "ELEC" (plist-get res :layers))))
+      (delete-file f))))
+
+(ert-deftest anvil-cad-test-extract-public-wrapper ()
+  "cad-extract public wrapper filters entities without exposing raw pairs."
+  (let ((f (anvil-cad-test--temp-file "anvil-cad-" ".dxf" anvil-cad-test--dxf)))
+    (unwind-protect
+        (let* ((res (anvil-cad-test--plist (anvil-cad-extract f "LABEL" "text")))
+               (entity (car (plist-get res :entities))))
+          (should (eq (plist-get res :format) 'dxf))
+          (should (= (plist-get res :count) 1))
+          (should (eq (plist-get entity :type) 'text))
+          (should (equal (plist-get entity :layer) "LABEL"))
+          (should-not (plist-member entity :pairs)))
+      (delete-file f))))
+
 (ert-deftest anvil-cad-test-annotate ()
   "cad-annotate appends a TEXT entity and preserves the rest in place."
-  (let ((f (make-temp-file "anvil-cad-" nil ".dxf" anvil-cad-test--dxf)))
+  (let ((f (anvil-cad-test--temp-file "anvil-cad-" ".dxf" anvil-cad-test--dxf)))
     (unwind-protect
         (let* ((res (anvil-cad-test--plist
-                     (anvil-cad--tool-annotate f "新規注記" "5" "7" "NOTES" "3.0")))
+                     (anvil-cad-annotate f "新規注記" "5" "7" "NOTES" "3.0")))
                (es (plist-get (anvil-cad--dxf-parse (anvil-cad--slurp f)) :entities))
                (added (car (last es))))
           (should (plist-get res :ok))
@@ -187,10 +216,10 @@ This is the guarantee that makes in-place edits safe."
 
 (ert-deftest anvil-cad-test-batch-update-text ()
   "cad-batch-update does literal find/replace on text entities."
-  (let ((f (make-temp-file "anvil-cad-" nil ".dxf" anvil-cad-test--dxf)))
+  (let ((f (anvil-cad-test--temp-file "anvil-cad-" ".dxf" anvil-cad-test--dxf)))
     (unwind-protect
         (let* ((res (anvil-cad-test--plist
-                     (anvil-cad--tool-batch-update f nil "text" nil
+                     (anvil-cad-batch-update f nil "text" nil
                                                    "受電" "高圧受電")))
                (txt (nth 1 (plist-get (anvil-cad--dxf-parse (anvil-cad--slurp f))
                                       :entities))))
@@ -200,10 +229,10 @@ This is the guarantee that makes in-place edits safe."
 
 (ert-deftest anvil-cad-test-batch-update-set-layer ()
   "cad-batch-update moves filtered entities to a new layer."
-  (let ((f (make-temp-file "anvil-cad-" nil ".dxf" anvil-cad-test--dxf)))
+  (let ((f (anvil-cad-test--temp-file "anvil-cad-" ".dxf" anvil-cad-test--dxf)))
     (unwind-protect
         (let* ((res (anvil-cad-test--plist
-                     (anvil-cad--tool-batch-update f "ELEC" nil nil nil nil
+                     (anvil-cad-batch-update f "ELEC" nil nil nil nil
                                                    "POWER")))
                (parsed (anvil-cad--dxf-parse (anvil-cad--slurp f))))
           (should (= (plist-get res :changed) 2))
@@ -222,7 +251,7 @@ This is the guarantee that makes in-place edits safe."
                              "{\"type\":\"circle\",\"layer\":\"L\","
                              "\"center\":[5,5],\"radius\":3}]"))
                (res (anvil-cad-test--plist
-                     (anvil-cad--tool-generate f json nil "1")))
+                     (anvil-cad-generate f json nil "1")))
                (es (plist-get (anvil-cad--dxf-parse (anvil-cad--slurp f)) :entities)))
           (should (= (plist-get res :generated) 3))
           (should (= (length es) 3))
@@ -235,13 +264,13 @@ This is the guarantee that makes in-place edits safe."
 
 (ert-deftest anvil-cad-test-generate-append ()
   "cad-generate appends to a base drawing, preserving its sections."
-  (let ((base (make-temp-file "anvil-cad-base-" nil ".dxf" anvil-cad-test--dxf))
+  (let ((base (anvil-cad-test--temp-file "anvil-cad-base-" ".dxf" anvil-cad-test--dxf))
         (out (make-temp-file "anvil-cad-out-" nil ".dxf")))
     (unwind-protect
         (let* ((json (concat "[{\"type\":\"text\",\"layer\":\"NEW\","
                              "\"text\":\"追加\",\"p1\":[9,9]}]"))
                (res (anvil-cad-test--plist
-                     (anvil-cad--tool-generate out json base "1")))
+                     (anvil-cad-generate out json base "1")))
                (parsed (anvil-cad--dxf-parse (anvil-cad--slurp out)))
                (es (plist-get parsed :entities)))
           (should (= (plist-get res :generated) 1))
@@ -254,10 +283,10 @@ This is the guarantee that makes in-place edits safe."
 (ert-deftest anvil-cad-test-generate-refuses-clobber ()
   "cad-generate refuses to overwrite an existing file without the flag.
 The handler signals (via `anvil-server-tool-throw') rather than writing."
-  (let ((f (make-temp-file "anvil-cad-gen-" nil ".dxf" "existing")))
+  (let ((f (anvil-cad-test--temp-file "anvil-cad-gen-" ".dxf" "existing")))
     (unwind-protect
         (should-error
-         (anvil-cad--tool-generate
+         (anvil-cad-generate
           f "[{\"type\":\"text\",\"text\":\"x\",\"p1\":[0,0]}]"))
       (delete-file f))))
 
@@ -324,10 +353,10 @@ with a line + entity-bearing text, and a top-level circle.")
 
 (ert-deftest anvil-cad-test-svg-annotate ()
   "cad-annotate adds a <text> to an SVG; data-layer becomes its layer."
-  (let ((f (make-temp-file "anvil-cad-" nil ".svg" anvil-cad-test--svg)))
+  (let ((f (anvil-cad-test--temp-file "anvil-cad-" ".svg" anvil-cad-test--svg)))
     (unwind-protect
         (let* ((res (anvil-cad-test--plist
-                     (anvil-cad--tool-annotate f "注記" "5" "7" "NOTES" "3")))
+                     (anvil-cad-annotate f "注記" "5" "7" "NOTES" "3")))
                (es (plist-get (anvil-cad--svg-parse (anvil-cad--slurp f))
                               :entities))
                (added (car (last es))))
@@ -341,16 +370,57 @@ with a line + entity-bearing text, and a top-level circle.")
 
 (ert-deftest anvil-cad-test-svg-batch-update-text ()
   "cad-batch-update does literal find/replace on SVG <text> content."
-  (let ((f (make-temp-file "anvil-cad-" nil ".svg" anvil-cad-test--svg)))
+  (let ((f (anvil-cad-test--temp-file "anvil-cad-" ".svg" anvil-cad-test--svg)))
     (unwind-protect
         (let* ((res (anvil-cad-test--plist
-                     (anvil-cad--tool-batch-update f nil nil nil
+                     (anvil-cad-batch-update f nil nil nil
                                                    "受電" "高圧受電")))
                (txt (nth 1 (plist-get (anvil-cad--svg-parse (anvil-cad--slurp f))
                                       :entities))))
           (should (= (plist-get res :changed) 1))
           (should (equal (plist-get txt :text) "R1 & 高圧受電")))
       (delete-file f))))
+
+(ert-deftest anvil-cad-test-svg-batch-update-class-layer-and-decoded-match ()
+  "SVG DOM batch update treats class as layer and matches decoded text."
+  (let ((f (anvil-cad-test--temp-file
+            "anvil-cad-" ".svg"
+            "<svg xmlns=\"http://www.w3.org/2000/svg\"><text class=\"codex\">A &amp; B</text></svg>")))
+    (unwind-protect
+        (let* ((res (anvil-cad-test--plist
+                     (anvil-cad-batch-update f "codex" "text" "A & B"
+                                                   "&" "and" "codex2")))
+               (out (anvil-cad--slurp f))
+               (txt (car (plist-get (anvil-cad--svg-parse out) :entities))))
+          (should (= (plist-get res :changed) 1))
+          (should (string-match-p "A and B" out))
+          (should (string-match-p "class=\"codex2\"" out))
+          (should (equal (plist-get txt :text) "A and B"))
+          (should (equal (plist-get txt :layer) "codex2")))
+      (delete-file f))))
+
+(ert-deftest anvil-cad-test-svg-fast-extract-class-layer-and-decoded-text ()
+  "Standalone fast SVG extract treats class as layer and decodes entities."
+  (let* ((src "<svg><text class=\"codex\">A &amp; B</text></svg>")
+         (entities (anvil-cad--svg-extract-fast src "codex" 'text))
+         (txt (car entities)))
+    (should (= (length entities) 1))
+    (should (eq (plist-get txt :type) 'text))
+    (should (equal (plist-get txt :layer) "codex"))
+    (should (equal (plist-get txt :text) "A & B"))))
+
+(ert-deftest anvil-cad-test-svg-fast-batch-update-class-layer-and-late-text ()
+  "Standalone fast SVG batch update matches decoded text late in the file."
+  (let* ((pad (make-string 9000 ?x))
+         (src (concat "<svg><rect x=\"1\" y=\"1\"/><!--" pad
+                      "--><text class=\"codex-late\">NELISP &amp; LATE</text></svg>"))
+         (edit (anvil-cad--svg-batch-update-fast
+                src "codex-late" "&" "and" "codex-late-batch" "NELISP & LATE"))
+         (out (cdr edit)))
+    (should (= (car edit) 1))
+    (should (string-match-p "NELISP and LATE" out))
+    (should (string-match-p "class=\"codex-late-batch\"" out))
+    (should-not (string-match-p "NELISP &amp; LATE" out))))
 
 (ert-deftest anvil-cad-test-svg-generate-standalone ()
   "cad-generate builds a standalone SVG from a JSON spec."
@@ -363,7 +433,7 @@ with a line + entity-bearing text, and a top-level circle.")
                              "{\"type\":\"circle\",\"layer\":\"L\","
                              "\"center\":[5,5],\"radius\":3}]"))
                (res (anvil-cad-test--plist
-                     (anvil-cad--tool-generate f json nil "1")))
+                     (anvil-cad-generate f json nil "1")))
                (es (plist-get (anvil-cad--svg-parse (anvil-cad--slurp f))
                               :entities)))
           (should (eq (plist-get res :format) 'svg))
@@ -376,12 +446,12 @@ with a line + entity-bearing text, and a top-level circle.")
 
 (ert-deftest anvil-cad-test-svg-generate-append ()
   "cad-generate appends to a base SVG and preserves existing entities."
-  (let ((base (make-temp-file "anvil-cad-base-" nil ".svg" anvil-cad-test--svg))
+  (let ((base (anvil-cad-test--temp-file "anvil-cad-base-" ".svg" anvil-cad-test--svg))
         (out (make-temp-file "anvil-cad-out-" nil ".svg")))
     (unwind-protect
         (let* ((json "[{\"type\":\"circle\",\"layer\":\"DEV\",\"center\":[1,1],\"radius\":2}]")
                (res (anvil-cad-test--plist
-                     (anvil-cad--tool-generate out json base "1")))
+                     (anvil-cad-generate out json base "1")))
                (es (plist-get (anvil-cad--svg-parse (anvil-cad--slurp out))
                               :entities)))
           (should (= (plist-get res :generated) 1))
@@ -392,11 +462,11 @@ with a line + entity-bearing text, and a top-level circle.")
 
 (ert-deftest anvil-cad-test-svg-generate-format-mismatch ()
   "cad-generate refuses a base whose format differs from out-path."
-  (let ((base (make-temp-file "anvil-cad-base-" nil ".dxf" anvil-cad-test--dxf))
+  (let ((base (anvil-cad-test--temp-file "anvil-cad-base-" ".dxf" anvil-cad-test--dxf))
         (out (make-temp-file "anvil-cad-out-" nil ".svg")))
     (unwind-protect
         (should-error
-         (anvil-cad--tool-generate
+         (anvil-cad-generate
           out "[{\"type\":\"text\",\"text\":\"x\",\"p1\":[0,0]}]" base "1"))
       (delete-file base)
       (delete-file out))))

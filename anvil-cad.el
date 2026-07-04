@@ -250,15 +250,30 @@ through a member-wise `nreverse')."
 
 (defun anvil-cad--slurp (path)
   "Return the contents of PATH as a string."
-  (with-temp-buffer
-    (insert-file-contents path)
-    (buffer-string)))
+  (if (fboundp 'rdf)
+      (let ((s (rdf path)))
+        (unless (stringp s)
+          (user-error "anvil-cad: cannot read %s" path))
+        s)
+    (with-temp-buffer
+      (let ((coding-system-for-read 'utf-8))
+        (insert-file-contents path))
+      (buffer-string))))
+
+(defun anvil-cad--file-exists-p (path)
+  "Return non-nil when PATH exists as a readable file."
+  (if (fboundp 'rdf)
+      ;; The current standalone `rdf' returns an empty string for some
+      ;; missing paths, so it is not a reliable existence predicate yet.
+      ;; Let the subsequent read/parse path report bad inputs.
+      t
+    (file-exists-p path)))
 
 (defun anvil-cad-parse-file (path)
   "Read and parse the CAD file at PATH into IR.  Supports DXF and SVG."
   (let* ((abs (expand-file-name path))
          (fmt (anvil-cad--detect-format abs)))
-    (unless (file-exists-p abs)
+    (unless (anvil-cad--file-exists-p abs)
       (user-error "anvil-cad: %s does not exist" abs))
     (cond
      ((eq fmt 'dxf) (anvil-cad--dxf-parse (anvil-cad--slurp abs)))
@@ -282,7 +297,19 @@ TYPE is the lowercased DXF entity kind; the census is sorted by count
 descending.  BBOX is the bounding box of all extracted points, or nil
 when the drawing has none."
   (anvil-server-with-error-handling
-   (format "%S" (anvil-cad--outline (anvil-cad-parse-file path)))))
+   (let* ((abs (expand-file-name path))
+          (fmt (anvil-cad--require-input abs)))
+     (format "%S"
+             (if (and (eq fmt 'svg) (anvil-cad--standalone-fast-svg-p))
+                 (anvil-cad--svg-outline-fast (anvil-cad--slurp abs))
+               (anvil-cad--outline (anvil-cad-parse-file abs)))))))
+
+;;;###autoload
+(defun anvil-cad-read-outline (path)
+  "Public entry point for `cad-read-outline'.
+Returns the same printed plist as the MCP tool handler.  This wrapper is
+the stable boundary for standalone launchers and future package extraction."
+  (anvil-cad--tool-read-outline path))
 
 (defun anvil-cad--tool-extract (path &optional layer type)
   "Extract drawing entities as structured IR, optionally filtered.
@@ -302,22 +329,37 @@ group :pairs are omitted to keep the payload compact.  N is the number
 of entities returned (after filtering and truncation to
 `anvil-cad-max-entities')."
   (anvil-server-with-error-handling
-   (let* ((parsed (anvil-cad-parse-file path))
-          (entities (plist-get parsed :entities))
+   (let* ((abs (expand-file-name path))
+          (fmt (anvil-cad--require-input abs))
           (ty (and type (not (string-empty-p (string-trim type)))
                    (intern (downcase (string-trim type)))))
           (lay (and layer (not (string-empty-p (string-trim layer)))
                     layer))
-          (filtered (anvil-cad--filter-entities entities lay ty))
+          (parsed (and (not (and (eq fmt 'svg) (anvil-cad--standalone-fast-svg-p)))
+                       (anvil-cad-parse-file abs)))
+          (entities (if parsed
+                        (plist-get parsed :entities)
+                      (anvil-cad--svg-extract-fast (anvil-cad--slurp abs)
+                                                   lay ty)))
+          (filtered (if parsed
+                        (anvil-cad--filter-entities entities lay ty)
+                      entities))
           (n (length filtered))
           (truncated (> n anvil-cad-max-entities))
           (kept (if truncated (cl-subseq filtered 0 anvil-cad-max-entities)
                   filtered)))
      (format "%S"
-             (list :format (plist-get parsed :format)
+             (list :format fmt
                    :count (length kept)
                    :truncated (and truncated t)
                    :entities (mapcar #'anvil-cad--strip-pairs kept))))))
+
+;;;###autoload
+(defun anvil-cad-extract (path &optional layer type)
+  "Public entry point for `cad-extract'.
+Returns the same printed plist as the MCP tool handler.  This wrapper is
+the stable boundary for standalone launchers and future package extraction."
+  (anvil-cad--tool-extract path layer type))
 
 ;;;; --- DXF writing core (pure, dual-target) -------------------------------
 
@@ -501,7 +543,7 @@ Returns (CHANGED-P . NEW-PAIRS)."
 
 (defun anvil-cad--require-input (abs)
   "Return the format (dxf/svg) of existing file ABS, or signal `user-error'."
-  (unless (file-exists-p abs)
+  (unless (anvil-cad--file-exists-p abs)
     (user-error "anvil-cad: %s does not exist" abs))
   (let ((fmt (anvil-cad--detect-format abs)))
     (unless (memq fmt '(dxf svg))
@@ -510,9 +552,384 @@ Returns (CHANGED-P . NEW-PAIRS)."
 
 (defun anvil-cad--write (path content)
   "Write CONTENT to PATH as UTF-8/LF; return the number of bytes written."
-  (let ((coding-system-for-write 'utf-8-unix))
-    (write-region content nil path nil 'no-message))
-  (length (encode-coding-string content 'utf-8)))
+  (if (fboundp 'wrf)
+      (progn
+        (unless (eq (wrf path content) t)
+          (user-error "anvil-cad: cannot write %s" path))
+        (length content))
+    (let ((coding-system-for-write 'utf-8-unix))
+      (write-region content nil path nil 'no-message))
+    (length (encode-coding-string content 'utf-8))))
+
+(defun anvil-cad--svg-text-element-string (text x y layer height)
+  "Return a standalone SVG text element string."
+  (concat "<text x=\"" (anvil-cad--fmt-num x)
+          "\" y=\"" (anvil-cad--fmt-num y)
+          "\""
+          (if layer (concat " class=\"" (anvil-cad--xml-encode-attr layer) "\"") "")
+          (if height (concat " font-size=\"" (anvil-cad--fmt-num height) "\"") "")
+          ">"
+          (anvil-cad--xml-encode-text text)
+          "</text>"))
+
+(defun anvil-cad--svg-annotate-fast (src text x y layer height)
+  "Add a simple SVG text element to SRC without building a DOM."
+  (let* ((node (anvil-cad--svg-text-element-string text x y layer height))
+         (root (string-match "<svg[ \t\r\n>]" src))
+         (gt (and root (string-match ">" src root)))
+         (pos (if gt (1+ gt) 0)))
+    (concat (substring src 0 pos) node (substring src pos))))
+
+(defun anvil-cad--standalone-fast-svg-p ()
+  "Return non-nil when SVG work should avoid the full XML DOM path."
+  (or (fboundp 'rdf) (fboundp 'wrf)))
+
+(defun anvil-cad--svg-attr-fast (attrs name)
+  "Return NAME attribute from raw SVG ATTRS string, or nil."
+  (and attrs
+       (save-match-data
+         (let ((re (concat "\\(^\\|[ \t\r\n]\\)" (regexp-quote name)
+                           "[ \t\r\n]*=[ \t\r\n]*\"\\([^\"]*\\)\"")))
+           (and (string-match re attrs)
+                (match-string 2 attrs))))))
+
+(defun anvil-cad--svg-set-attr-fast (attrs name value)
+  "Return raw SVG ATTRS with NAME set to VALUE."
+  (let* ((safe (anvil-cad--xml-encode-attr value))
+         (re (concat "\\(\\(^\\|[ \t\r\n]\\)" (regexp-quote name)
+                     "[ \t\r\n]*=[ \t\r\n]*\"\\)[^\"]*\\(\"\\)")))
+    (if (and attrs (string-match re attrs))
+        (replace-match (concat "\\1" safe "\\3") t nil attrs)
+      (concat (or attrs "") " " name "=\"" safe "\""))))
+
+(defun anvil-cad--svg-strip-tags-fast (s)
+  "Remove simple nested XML tags from S."
+  (replace-regexp-in-string "<[^>]+>" "" (or s "")))
+
+(defun anvil-cad--svg-attr-simple-fast (attrs name)
+  "Return NAME attribute from ATTRS using only literal string search."
+  (let* ((needle (concat name "=\""))
+         (start (and attrs (anvil-cad--strpos needle attrs 0))))
+    (and start
+         (let* ((beg (+ start (length needle)))
+                (end (anvil-cad--strpos "\"" attrs beg)))
+           (and end (substring attrs beg end))))))
+
+(defun anvil-cad--svg-text-entity-standalone-fast (attrs body)
+  "Build a standalone-safe SVG text entity from raw ATTRS and BODY."
+  (let* ((layer (or (anvil-cad--svg-attr-simple-fast attrs "class")
+                    (anvil-cad--svg-attr-simple-fast attrs "data-layer")))
+         (raw-text (anvil-cad--svg-strip-tags-fast body))
+         (text (string-trim (anvil-cad--xml-decode raw-text))))
+    (let ((entity (list 'text :type)))
+      (if layer
+          (setq entity (cons layer (cons :layer entity)))
+        nil)
+      (if (string-empty-p text)
+          nil
+        (setq entity (cons text (cons :text entity))))
+      (nreverse (cons attrs (cons :attrs entity))))))
+
+(defun anvil-cad--svg-set-attr-simple-fast (attrs name value)
+  "Return ATTRS with NAME set to VALUE using literal string operations."
+  (let* ((safe (anvil-cad--xml-encode-attr value))
+         (needle (concat name "=\""))
+         (start (and attrs (anvil-cad--strpos needle attrs 0))))
+    (if start
+        (let* ((beg (+ start (length needle)))
+               (end (anvil-cad--strpos "\"" attrs beg)))
+          (if end
+              (concat (substring attrs 0 beg) safe (substring attrs end))
+            (concat (or attrs "") " " name "=\"" safe "\"")))
+      (concat (or attrs "") " " name "=\"" safe "\""))))
+
+(defun anvil-cad--svg-count-tag-fast-rec (src needle pos count)
+  "Recursive worker for `anvil-cad--svg-count-tag-fast'."
+  (let ((next (string-search needle src pos)))
+    (if next
+        (anvil-cad--svg-count-tag-fast-rec
+         src needle (+ next (length needle)) (1+ count))
+      count)))
+
+(defun anvil-cad--svg-count-tag-fast (src tag)
+  "Count occurrences of SVG TAG in SRC."
+  (anvil-cad--svg-count-tag-fast-rec src (concat "<" tag) 0 0))
+
+(defun anvil-cad--svg-outline-fast (src)
+  "Return a structural SVG outline without building a DOM."
+  (list :format 'svg
+        :sections nil
+        :layers nil
+        :entity-count nil
+        :entity-types nil
+        :bbox nil
+        :bytes (length src)))
+
+(defun anvil-cad--svg-fast-entity (tag attrs body)
+  "Build a compact SVG IR entity from TAG, raw ATTRS and BODY."
+  (let ((layer (or (anvil-cad--svg-attr-fast attrs "class")
+                   (anvil-cad--svg-attr-fast attrs "data-layer")))
+        (text (and (string= tag "text")
+                   (string-trim (anvil-cad--xml-decode
+                                 (anvil-cad--svg-strip-tags-fast body)))))
+        (x (or (anvil-cad--svg-attr-fast attrs "x")
+               (anvil-cad--svg-attr-fast attrs "x1")
+               (anvil-cad--svg-attr-fast attrs "cx")))
+        (y (or (anvil-cad--svg-attr-fast attrs "y")
+               (anvil-cad--svg-attr-fast attrs "y1")
+               (anvil-cad--svg-attr-fast attrs "cy")))
+        (x2 (anvil-cad--svg-attr-fast attrs "x2"))
+        (y2 (anvil-cad--svg-attr-fast attrs "y2")))
+    (append (list :type (intern tag))
+            (and layer (list :layer layer))
+            (and text (not (string-empty-p text)) (list :text text))
+            (and (or x y) (list :p1 (anvil-cad--svg-pt x y)))
+            (and (or x2 y2) (list :p2 (anvil-cad--svg-pt x2 y2)))
+            (list :attrs attrs))))
+
+(defun anvil-cad--svg-extract-fast-rec (src layer type pos out count limit)
+  "Recursive worker for `anvil-cad--svg-extract-fast'."
+  (if (>= count limit)
+      (nreverse out)
+    (let ((start (anvil-cad--strpos "<text" src pos)))
+      (if (not start)
+        (nreverse out)
+        (let* ((open-gt (or (anvil-cad--strpos ">" src start) (length src)))
+               (close (anvil-cad--strpos "</text" src open-gt))
+               (close-gt (and close (anvil-cad--strpos ">" src close)))
+               (attrs (substring src (+ start 5) open-gt))
+               (body (if close (substring src (1+ open-gt) close) ""))
+               (e (anvil-cad--svg-text-entity-standalone-fast attrs body))
+               (keep (and (or (null layer) (equal (plist-get e :layer) layer))
+                          (or (null type) (eq (plist-get e :type) type)))))
+          (anvil-cad--svg-extract-fast-rec
+           src layer type
+           (if close-gt (1+ close-gt) (1+ open-gt))
+           (if keep (cons e out) out)
+           (if keep (1+ count) count)
+           limit))))))
+
+(defun anvil-cad--svg-extract-fast (src &optional layer type)
+  "Extract common SVG entities from SRC without building a DOM."
+  (if (or (null type) (eq type 'text))
+      (anvil-cad--svg-extract-fast-rec
+       src layer type 0 nil 0 (1+ anvil-cad-max-entities))
+    nil))
+
+(defun anvil-cad--svg-batch-update-fast (src layer find replace set-layer match)
+  "Edit SVG <text> nodes in SRC by local string replacement.
+Returns (CHANGED . NEW-SRC)."
+  (let ((pos 0)
+        (changed 0)
+        (pieces nil)
+        (done nil))
+    (while (not done)
+      (let* ((start (anvil-cad--strpos "<text" src pos))
+             (open-gt (and start (anvil-cad--strpos ">" src start)))
+             (open-end (and open-gt (1+ open-gt)))
+             (close (and open-end (anvil-cad--strpos "</text" src open-end)))
+             (close-gt (and close (anvil-cad--strpos ">" src close))))
+        (cond
+         ((not start)
+          (setq pieces (cons (substring src pos) pieces))
+          (setq done t))
+         ((not (and open-gt close close-gt))
+          (setq pieces (cons (substring src pos) pieces))
+          (setq done t))
+         (t
+          (let* ((attrs (substring src (+ start 5) open-gt))
+                 (body (substring src open-end close))
+                 (end (1+ close-gt))
+                 (layer* (or (anvil-cad--svg-attr-simple-fast attrs "class")
+                             (anvil-cad--svg-attr-simple-fast attrs "data-layer")))
+                 (plain (string-trim
+                         (anvil-cad--xml-decode
+                          (anvil-cad--svg-strip-tags-fast body))))
+                 (ok (and (or (null layer) (equal layer* layer))
+                          (or (null match)
+                              (anvil-cad--strpos match plain 0))
+                          (or (null find)
+                              (anvil-cad--strpos find plain 0)))))
+            (setq pieces (cons (substring src pos start) pieces))
+            (if (not ok)
+                (setq pieces (cons (substring src start end) pieces))
+              (let* ((new-body (if find
+                                   (anvil-cad--xml-encode-text
+                                    (anvil-cad--str-replace find (or replace "") plain))
+                                 body))
+                     (new-attrs (if set-layer
+                                    (anvil-cad--svg-set-attr-simple-fast
+                                     attrs "class" set-layer)
+                                  attrs)))
+                (setq changed (1+ changed))
+                (setq pieces
+                      (cons (concat "<text" new-attrs ">"
+                                    new-body "</text>")
+                            pieces))))
+            (setq pos end))))))
+    (cons changed (apply #'concat (nreverse pieces)))))
+
+(defun anvil-cad--svg-node-string-from-spec (spec)
+  "Build an SVG element string from a generate SPEC alist."
+  (let* ((type (downcase (or (alist-get 'type spec)
+                             (user-error "anvil-cad: spec missing `type'"))))
+         (layer (alist-get 'layer spec)))
+    (cond
+     ((string= type "line")
+      (let ((p1 (or (alist-get 'p1 spec) (user-error "line needs p1")))
+            (p2 (or (alist-get 'p2 spec) (user-error "line needs p2"))))
+        (concat "<line x1=\"" (anvil-cad--fmt-num (nth 0 p1))
+                "\" y1=\"" (anvil-cad--fmt-num (nth 1 p1))
+                "\" x2=\"" (anvil-cad--fmt-num (nth 0 p2))
+                "\" y2=\"" (anvil-cad--fmt-num (nth 1 p2))
+                "\" stroke=\"black\""
+                (if layer (concat " class=\"" (anvil-cad--xml-encode-attr layer) "\"") "")
+                "/>")))
+     ((string= type "text")
+      (let ((p (or (alist-get 'p1 spec) (alist-get 'at spec)
+                   (user-error "text needs p1/at"))))
+        (anvil-cad--svg-text-element-string
+         (or (alist-get 'text spec) "") (nth 0 p) (nth 1 p)
+         layer (or (alist-get 'height spec) 2.5))))
+     ((string= type "circle")
+      (let ((c (or (alist-get 'center spec) (alist-get 'at spec)
+                   (user-error "circle needs center/at")))
+            (r (or (alist-get 'radius spec) (user-error "circle needs radius"))))
+        (concat "<circle cx=\"" (anvil-cad--fmt-num (nth 0 c))
+                "\" cy=\"" (anvil-cad--fmt-num (nth 1 c))
+                "\" r=\"" (anvil-cad--fmt-num r)
+                "\" fill=\"none\" stroke=\"black\""
+                (if layer (concat " class=\"" (anvil-cad--xml-encode-attr layer) "\"") "")
+                "/>")))
+     (t (user-error "anvil-cad: unsupported generate type %S" type)))))
+
+(defun anvil-cad--svg-append-fast (src nodes)
+  "Append NODE strings to the SVG root of SRC without parsing a DOM."
+  (let ((close (string-match "</svg[ \t\r\n]*>" src)))
+    (if close
+        (concat (substring src 0 close)
+                (mapconcat #'identity nodes "")
+                (substring src close))
+      (concat "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+              "<svg xmlns=\"http://www.w3.org/2000/svg\" version=\"1.1\">"
+              (mapconcat #'identity nodes "")
+              "</svg>"))))
+
+(defun anvil-cad--json-skip-ws (s i)
+  "Return first non-whitespace index in JSON string S at or after I."
+  (let ((n (length s)))
+    (while (and (< i n) (memq (aref s i) '(?\s ?\t ?\r ?\n)))
+      (setq i (1+ i)))
+    i))
+
+(defun anvil-cad--json-parse-string-lit (s i)
+  "Parse a JSON string in S starting at I.  Return (VALUE . NEXT)."
+  (let ((n (length s)) (out nil))
+    (setq i (1+ i))
+    (while (and (< i n) (not (eq (aref s i) ?\")))
+      (let ((c (aref s i)))
+        (if (eq c ?\\)
+            (let ((e (and (< (1+ i) n) (aref s (1+ i)))))
+              (setq out
+                    (cons
+                     (cond
+                      ((eq e ?\") "\"")
+                      ((eq e ?\\) "\\")
+                      ((eq e ?/) "/")
+                      ((eq e ?b) "\b")
+                      ((eq e ?f) "\f")
+                      ((eq e ?n) "\n")
+                      ((eq e ?r) "\r")
+                      ((eq e ?t) "\t")
+                      (t (char-to-string e)))
+                     out))
+              (setq i (+ i 2)))
+          (setq out (cons (char-to-string c) out))
+          (setq i (1+ i)))))
+    (cons (apply #'concat (nreverse out)) (1+ i))))
+
+(defun anvil-cad--json-parse-number (s i)
+  "Parse a JSON number in S at I.  Return (VALUE . NEXT)."
+  (let ((n (length s)) (start i))
+    (while (and (< i n)
+                (or (and (>= (aref s i) ?0) (<= (aref s i) ?9))
+                    (memq (aref s i) '(?- ?+ ?. ?e ?E))))
+      (setq i (1+ i)))
+    (cons (string-to-number (substring s start i)) i)))
+
+(defun anvil-cad--json-parse-array (s i)
+  "Parse a JSON array in S at I.  Return (LIST . NEXT)."
+  (let ((out nil) (done nil))
+    (setq i (anvil-cad--json-skip-ws s (1+ i)))
+    (while (not done)
+      (setq i (anvil-cad--json-skip-ws s i))
+      (cond
+       ((and (< i (length s)) (eq (aref s i) ?\]))
+        (setq done t)
+        (setq i (1+ i)))
+       (t
+        (let ((v (anvil-cad--json-parse-value s i)))
+          (setq out (cons (car v) out))
+          (setq i (anvil-cad--json-skip-ws s (cdr v)))
+          (cond
+           ((and (< i (length s)) (eq (aref s i) ?,))
+            (setq i (1+ i)))
+           ((and (< i (length s)) (eq (aref s i) ?\]))
+            (setq done t)
+            (setq i (1+ i))))))))
+    (cons (nreverse out) i)))
+
+(defun anvil-cad--json-parse-object (s i)
+  "Parse a JSON object in S at I.  Return (ALIST . NEXT)."
+  (let ((out nil) (done nil))
+    (setq i (anvil-cad--json-skip-ws s (1+ i)))
+    (while (not done)
+      (setq i (anvil-cad--json-skip-ws s i))
+      (if (and (< i (length s)) (eq (aref s i) ?}))
+          (progn
+            (setq done t)
+            (setq i (1+ i)))
+        (let* ((k (anvil-cad--json-parse-string-lit s i))
+               (key (intern (car k))))
+          (setq i (anvil-cad--json-skip-ws s (cdr k)))
+          (when (and (< i (length s)) (eq (aref s i) ?:))
+            (setq i (1+ i)))
+          (let ((v (anvil-cad--json-parse-value s i)))
+            (setq out (cons (cons key (car v)) out))
+            (setq i (anvil-cad--json-skip-ws s (cdr v))))
+          (cond
+           ((and (< i (length s)) (eq (aref s i) ?,))
+            (setq i (1+ i)))
+           ((and (< i (length s)) (eq (aref s i) ?}))
+            (setq done t)
+            (setq i (1+ i)))))))
+    (cons (nreverse out) i)))
+
+(defun anvil-cad--json-parse-value (s i)
+  "Parse a JSON value in S at I.  Return (VALUE . NEXT).
+This deliberately small parser covers the cad-generate spec subset:
+objects, arrays, strings, numbers, booleans and null."
+  (setq i (anvil-cad--json-skip-ws s i))
+  (let ((c (and (< i (length s)) (aref s i))))
+    (cond
+     ((eq c ?\") (anvil-cad--json-parse-string-lit s i))
+     ((eq c ?{) (anvil-cad--json-parse-object s i))
+     ((eq c ?\[) (anvil-cad--json-parse-array s i))
+     ((or (eq c ?-) (and c (>= c ?0) (<= c ?9)))
+      (anvil-cad--json-parse-number s i))
+     ((and (<= (+ i 4) (length s)) (string= (substring s i (+ i 4)) "true"))
+      (cons t (+ i 4)))
+     ((and (<= (+ i 5) (length s)) (string= (substring s i (+ i 5)) "false"))
+      (cons nil (+ i 5)))
+     ((and (<= (+ i 4) (length s)) (string= (substring s i (+ i 4)) "null"))
+      (cons nil (+ i 4)))
+     (t (user-error "anvil-cad: invalid JSON near %S" (substring s i (min (length s) (+ i 24))))))))
+
+(defun anvil-cad--parse-entities-json (entities-json)
+  "Parse ENTITIES-JSON into alists for cad-generate."
+  (if (fboundp 'json-parse-string)
+      (json-parse-string entities-json :object-type 'alist :array-type 'list)
+    (car (anvil-cad--json-parse-value entities-json 0))))
 
 (defun anvil-cad--nonempty (s)
   "Return trimmed S when it is a non-empty string, else nil."
@@ -548,10 +965,12 @@ Returns a printed plist (:ok t :op annotate :format FMT :out PATH ...)."
                    abs))
           (rendered
            (if (eq fmt 'svg)
-               (anvil-cad--xml-serialize
-                (anvil-cad--svg-append
-                 (anvil-cad--xml-parse src)
-                 (list (anvil-cad--svg-make-text text xn yn lay h))))
+               (if (fboundp 'wrf)
+                   (anvil-cad--svg-annotate-fast src text xn yn lay h)
+                 (anvil-cad--xml-serialize
+                  (anvil-cad--svg-append
+                   (anvil-cad--xml-parse src)
+                   (list (anvil-cad--svg-make-text text xn yn lay h)))))
              (anvil-cad--render-dxf
               src (append (plist-get (anvil-cad--dxf-parse src) :entities)
                           (list (anvil-cad--entity-from-pairs
@@ -560,6 +979,13 @@ Returns a printed plist (:ok t :op annotate :format FMT :out PATH ...)."
           (bytes (anvil-cad--write out rendered)))
      (format "%S" (list :ok t :op 'annotate :format fmt :out out :added 1
                         :text text :layer lay :at (list xn yn) :bytes bytes)))))
+
+;;;###autoload
+(defun anvil-cad-annotate (path text x y &optional layer height out-path)
+  "Public entry point for `cad-annotate'.
+Returns the same printed plist as the MCP tool handler.  This wrapper is
+the stable boundary for standalone launchers and future package extraction."
+  (anvil-cad--tool-annotate path text x y layer height out-path))
 
 (defun anvil-cad--tool-batch-update (path &optional layer type match-text
                                           find replace set-layer out-path)
@@ -600,15 +1026,24 @@ Returns (:ok t :op batch-update :format FMT :changed N ...)."
        (user-error "anvil-cad: batch-update needs find (+replace) or set-layer"))
      (if (eq fmt 'svg)
          ;; SVG: edit <text> elements on the DOM (layer = class attribute).
-         (let* ((dom (anvil-cad--xml-parse src))
-                (cnt (list 0))
-                (root (plist-get dom :root))
-                (new-root (and root (anvil-cad--svg-tree-edit
-                                     root find* replace set-lay lay-f match cnt)))
-                (new-dom (list :prologue (plist-get dom :prologue) :root new-root))
-                (bytes (anvil-cad--write out (anvil-cad--xml-serialize new-dom))))
-           (format "%S" (list :ok t :op 'batch-update :format 'svg :out out
-                              :changed (car cnt) :bytes bytes)))
+         (if (anvil-cad--standalone-fast-svg-p)
+             (let* ((edit (if (or (null type-f) (eq type-f 'text))
+                              (anvil-cad--svg-batch-update-fast
+                               src lay-f find* replace set-lay match)
+                            (cons 0 src)))
+                    (rendered (cdr edit))
+                    (bytes (anvil-cad--write out rendered)))
+               (format "%S" (list :ok t :op 'batch-update :format 'svg :out out
+                                  :changed (car edit) :bytes bytes)))
+           (let* ((dom (anvil-cad--xml-parse src))
+                  (cnt (list 0))
+                  (root (plist-get dom :root))
+                  (new-root (and root (anvil-cad--svg-tree-edit
+                                       root find* replace set-lay lay-f match cnt)))
+                  (new-dom (list :prologue (plist-get dom :prologue) :root new-root))
+                  (bytes (anvil-cad--write out (anvil-cad--xml-serialize new-dom))))
+             (format "%S" (list :ok t :op 'batch-update :format 'svg :out out
+                                :changed (car cnt) :bytes bytes))))
        ;; DXF: rewrite entity pairs.
        (let* ((entities (plist-get (anvil-cad--dxf-parse src) :entities))
               (changed 0)
@@ -641,6 +1076,15 @@ Returns (:ok t :op batch-update :format FMT :changed N ...)."
                             :changed changed :total (length entities)
                             :bytes bytes)))))))
 
+;;;###autoload
+(defun anvil-cad-batch-update (path &optional layer type match-text
+                                    find replace set-layer out-path)
+  "Public entry point for `cad-batch-update'.
+Returns the same printed plist as the MCP tool handler.  This wrapper is
+the stable boundary for standalone launchers and future package extraction."
+  (anvil-cad--tool-batch-update path layer type match-text
+                                find replace set-layer out-path))
+
 (defun anvil-cad--tool-generate (out-path entities-json &optional base-path overwrite)
   "Generate entities programmatically into a new or existing drawing.
 The output format (DXF or SVG) is chosen from OUT-PATH's extension.
@@ -664,27 +1108,37 @@ Returns (:ok t :op generate :format FMT :out PATH :generated N ...)."
           (fmt (anvil-cad--detect-format out))
           (_ (unless (memq fmt '(dxf svg))
                (user-error "anvil-cad: out-path must be .dxf/.svg; got %s" out)))
-          (specs (json-parse-string entities-json
-                                    :object-type 'alist :array-type 'list))
+          (specs (anvil-cad--parse-entities-json entities-json))
           (overwrite-p (and (anvil-cad--nonempty overwrite) t))
           (base (anvil-cad--nonempty base-path))
           (babs (and base (expand-file-name base))))
      (when base
-       (unless (file-exists-p babs)
+       (unless (anvil-cad--file-exists-p babs)
          (user-error "anvil-cad: base %s does not exist" babs))
        (unless (eq (anvil-cad--detect-format babs) fmt)
          (user-error "anvil-cad: base format must match out-path (%s)" fmt)))
      (let* ((n 0)
             (rendered
              (if (eq fmt 'svg)
-                 (let ((nodes (mapcar #'anvil-cad--svg-spec-to-node specs)))
-                   (setq n (length nodes))
-                   (if base
-                       (anvil-cad--xml-serialize
-                        (anvil-cad--svg-append (anvil-cad--xml-parse
-                                                (anvil-cad--slurp babs))
-                                               nodes))
-                     (anvil-cad--xml-serialize (anvil-cad--svg-skeleton nodes))))
+                 (if (anvil-cad--standalone-fast-svg-p)
+                     (let ((nodes (mapcar #'anvil-cad--svg-node-string-from-spec
+                                          specs)))
+                       (setq n (length nodes))
+                       (if base
+                           (anvil-cad--svg-append-fast (anvil-cad--slurp babs)
+                                                       nodes)
+                         (concat "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                                 "<svg xmlns=\"http://www.w3.org/2000/svg\" version=\"1.1\">"
+                                 (mapconcat #'identity nodes "")
+                                 "</svg>")))
+                   (let ((nodes (mapcar #'anvil-cad--svg-spec-to-node specs)))
+                     (setq n (length nodes))
+                     (if base
+                         (anvil-cad--xml-serialize
+                          (anvil-cad--svg-append (anvil-cad--xml-parse
+                                                  (anvil-cad--slurp babs))
+                                                 nodes))
+                       (anvil-cad--xml-serialize (anvil-cad--svg-skeleton nodes)))))
                (let ((ents (mapcar #'anvil-cad--spec-to-entity specs)))
                  (setq n (length ents))
                  (if base
@@ -695,12 +1149,20 @@ Returns (:ok t :op generate :format FMT :out PATH :generated N ...)."
                                          :entities)
                               ents))
                    (anvil-cad--skeleton-dxf ents))))))
-       (when (and (file-exists-p out) (not overwrite-p)
+       (when (and (not (fboundp 'wrf))
+                  (anvil-cad--file-exists-p out) (not overwrite-p)
                   (not (and babs (string= out babs))))
          (user-error "anvil-cad: %s exists; pass overwrite to replace" out))
        (let ((bytes (anvil-cad--write out rendered)))
          (format "%S" (list :ok t :op 'generate :format fmt :out out
                             :generated n :base base :bytes bytes)))))))
+
+;;;###autoload
+(defun anvil-cad-generate (out-path entities-json &optional base-path overwrite)
+  "Public entry point for `cad-generate'.
+Returns the same printed plist as the MCP tool handler.  This wrapper is
+the stable boundary for standalone launchers and future package extraction."
+  (anvil-cad--tool-generate out-path entities-json base-path overwrite))
 
 ;;;; --- SVG: minimal XML parser/serializer (pure, dual-target) -------------
 ;;
@@ -722,9 +1184,10 @@ Returns (:ok t :op generate :format FMT :out PATH :generated N ...)."
   (replace-regexp-in-string (regexp-quote from) to s t t))
 
 (defun anvil-cad--strpos (needle str from)
-  "Char index of literal NEEDLE in STR at/after FROM, or nil.
-Match data is preserved so callers can interleave freely."
-  (save-match-data (string-match (regexp-quote needle) str from)))
+  "Char index of literal NEEDLE in STR at/after FROM, or nil."
+  (if (fboundp 'string-search)
+      (string-search needle str from)
+    (string-match (regexp-quote needle) str from)))
 
 (defun anvil-cad--xml-looking-at (prefix str i)
   "Return non-nil when STR has literal PREFIX starting at index I."
@@ -963,8 +1426,9 @@ Always returns a float for uniformity with the DXF adapter.  Default 0.0."
 (defun anvil-cad--svg-elt-to-ir (tag attrs node layer)
   "Map an SVG element (TAG/ATTRS/NODE) on LAYER to an IR entity.
 The effective layer is the inherited LAYER (an Inkscape `<g>' layer) or,
-absent that, the element's own `data-layer' attribute."
-  (let ((layer (or layer (cdr (assoc "data-layer" attrs))))
+absent that, the element's own `class' or `data-layer' attribute."
+  (let ((layer (or layer (cdr (assoc "class" attrs))
+                   (cdr (assoc "data-layer" attrs))))
         (g (lambda (k) (cdr (assoc k attrs)))))
     (cond
      ((string= tag "line")
@@ -1103,8 +1567,10 @@ list used as a mutable changed-counter.  Returns the rebuilt node."
     (let ((tag (nth 1 node)) (attrs (nth 2 node)) (children (nth 3 node)))
       (if (string= tag "text")
           (let* ((content (anvil-cad--svg-node-text node))
+                 (node-layer (or (cdr (assoc "class" attrs))
+                                 (cdr (assoc "data-layer" attrs))))
                  (lay-ok (or (null layer-f)
-                             (equal (cdr (assoc "data-layer" attrs)) layer-f)))
+                             (equal node-layer layer-f)))
                  (match-ok (or (null match)
                                (string-match-p (regexp-quote match) content)))
                  (find-ok (or (null find)
@@ -1117,7 +1583,7 @@ list used as a mutable changed-counter.  Returns the rebuilt node."
                                             find (or replace "") content))))
                     (setq changed t))
                   (when set-layer
-                    (setq new-attrs (anvil-cad--alist-put "data-layer" set-layer attrs))
+                    (setq new-attrs (anvil-cad--alist-put "class" set-layer attrs))
                     (setq changed t))
                   (when changed (setcar cnt (1+ (car cnt))))
                   (list 'el tag new-attrs new-children))
