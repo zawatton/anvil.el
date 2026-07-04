@@ -18,6 +18,7 @@
 (require 'anvil-fusion-panels)
 (or (require 'anvil-orchestrator nil t) ;; load the real module when present (anvil.el)
     (provide 'anvil-orchestrator))  ;; else fake it (fusion standalone repo)
+(require 'anvil-fusion-exec)
 (require 'anvil-fusion-ask)
 
 (defmacro anvil-fusion-ask-test--with-fake-orchestrator
@@ -278,6 +279,119 @@ provider/model into both extraction and verification, and passes
                           :verify-base-template base :max-rounds 0)
         (let ((jprompt (plist-get (car (car submitted)) :prompt)))
           (should (string-match-p "DISTINCT-PLAN-BASE" jprompt)))))))
+
+;;;; ============================================================
+;;;; Phase 6c — :exec-check keyword
+;;;; ============================================================
+
+(defconst anvil-fusion-ask-test--exec-cands
+  '((:id "m1" :name "pass" :provider ollama :status done :summary "PASSING-CAND")
+    (:id "m2" :name "fail" :provider ollama :status done :summary "FAILING-CAND")
+    (:id "m3" :name "nopatch" :provider ollama :status done :summary "NOPATCH-CAND"))
+  "Three candidates used for :exec-check tests.")
+
+(defconst anvil-fusion-ask-test--exec-claims
+  '((:claim "候補 pass のパッチは検証コマンドに合格した"
+     :kind code :candidates ("pass") :verdict confirmed :evidence "exit 0")
+    (:claim "候補 fail のパッチは検証コマンドに不合格だった"
+     :kind code :candidates ("fail") :verdict refuted :evidence "check failed")
+    (:claim "候補 nopatch の回答には検証可能なパッチが見つからなかった"
+     :kind code :candidates ("nopatch") :verdict unverified :evidence "no patch block"))
+  "Execution-verification claims used by stubs.")
+
+(defconst anvil-fusion-ask-test--exec-results
+  '((:name "pass" :status pass :detail "exit 0")
+    (:name "fail" :status fail :detail "check failed")
+    (:name "nopatch" :status no-patch :detail "no patch block"))
+  "Execution-verification results used by stubs.")
+
+(ert-deftest anvil-fusion-ask-test-exec-check-nil-skips-exec ()
+  "With :exec-check nil, execution verification is not invoked."
+  (let (exec-called)
+    (cl-letf (((symbol-function 'anvil-fusion-exec-verify-candidates)
+               (lambda (&rest _) (setq exec-called t) nil)))
+      (anvil-fusion-ask-test--with-fake-orchestrator
+          anvil-fusion-ask-test--exec-cands
+        (let ((res (anvil-fusion-ask "Q" :panel 'sovereign :max-rounds 0)))
+          (should-not exec-called)
+          (should (null (plist-get res :exec-results))))))))
+
+(ert-deftest anvil-fusion-ask-test-exec-check-filters-failed-candidates ()
+  "Failed candidates are excluded from the first judge call and exec claims merge into the template."
+  (cl-letf (((symbol-function 'anvil-fusion-exec-verify-candidates)
+             (lambda (_candidates &rest _)
+               (list :results anvil-fusion-ask-test--exec-results
+                     :claims anvil-fusion-ask-test--exec-claims)))
+            ((symbol-function 'anvil-fusion-verify-extract-claims)
+             (lambda (&rest _) anvil-fusion-ask-test--claims-raw))
+            ((symbol-function 'anvil-fusion-verify-claims)
+             (lambda (&rest _) anvil-fusion-ask-test--claims-annotated)))
+    (anvil-fusion-ask-test--with-fake-orchestrator
+        anvil-fusion-ask-test--exec-cands
+      (let ((res (anvil-fusion-ask "Q" :panel 'sovereign
+                                   :verify t
+                                   :exec-check '(:repo-root "/tmp/repo"
+                                                 :check-cmd "make test")
+                                   :max-rounds 0)))
+        (let ((jprompt (plist-get (car (car submitted)) :prompt)))
+          (should (string-match-p "PASSING-CAND" jprompt))
+          (should (string-match-p "NOPATCH-CAND" jprompt))
+          (should-not (string-match-p "FAILING-CAND" jprompt))
+          (should (string-match-p "候補 fail のパッチは検証コマンドに不合格だった" jprompt))
+          (should (string-match-p "DGR を使う" jprompt)))
+        (should (equal anvil-fusion-ask-test--exec-results
+                       (plist-get res :exec-results)))
+        (should (equal (append anvil-fusion-ask-test--claims-annotated
+                               anvil-fusion-ask-test--exec-claims)
+                       (plist-get res :claims)))))))
+
+(ert-deftest anvil-fusion-ask-test-exec-check-all-fail-keeps-all-candidates ()
+  "If every candidate fails/errors, exclusion is suppressed."
+  (let ((all-fail-results
+         '((:name "pass" :status fail :detail "bad")
+           (:name "fail" :status error :detail "boom")
+           (:name "nopatch" :status fail :detail "bad2")))
+        (all-fail-claims
+         '((:claim "候補 pass のパッチは検証コマンドに不合格だった"
+            :kind code :candidates ("pass") :verdict refuted :evidence "bad")
+           (:claim "候補 fail のパッチは実行エラーになった"
+            :kind code :candidates ("fail") :verdict refuted :evidence "boom")
+           (:claim "候補 nopatch のパッチは検証コマンドに不合格だった"
+            :kind code :candidates ("nopatch") :verdict refuted :evidence "bad2"))))
+    (cl-letf (((symbol-function 'anvil-fusion-exec-verify-candidates)
+               (lambda (&rest _)
+                 (list :results all-fail-results :claims all-fail-claims))))
+      (anvil-fusion-ask-test--with-fake-orchestrator
+          anvil-fusion-ask-test--exec-cands
+        (let ((res (anvil-fusion-ask "Q" :panel 'sovereign
+                                     :exec-check '(:repo-root "/tmp/repo"
+                                                   :check-cmd "make test")
+                                     :max-rounds 0)))
+          (let ((jprompt (plist-get (car (car submitted)) :prompt)))
+            (should (string-match-p "PASSING-CAND" jprompt))
+            (should (string-match-p "FAILING-CAND" jprompt))
+            (should (string-match-p "NOPATCH-CAND" jprompt))
+            (should (string-match-p "候補 fail のパッチは実行エラーになった" jprompt)))
+          (should (equal all-fail-results (plist-get res :exec-results)))
+          (should (equal all-fail-claims (plist-get res :claims))))))))
+
+(ert-deftest anvil-fusion-ask-test-exec-check-without-verify-still-uses-verified-template ()
+  "Exec claims alone still drive the verified judge template when :verify is nil."
+  (cl-letf (((symbol-function 'anvil-fusion-exec-verify-candidates)
+             (lambda (&rest _)
+               (list :results anvil-fusion-ask-test--exec-results
+                     :claims anvil-fusion-ask-test--exec-claims))))
+    (anvil-fusion-ask-test--with-fake-orchestrator
+        anvil-fusion-ask-test--exec-cands
+      (let ((res (anvil-fusion-ask "Q" :panel 'sovereign
+                                   :exec-check '(:repo-root "/tmp/repo"
+                                                 :check-cmd "make test")
+                                   :max-rounds 0)))
+        (let ((jprompt (plist-get (car (car submitted)) :prompt)))
+          (should (string-match-p "検証済み主張表" jprompt))
+          (should (string-match-p "候補 pass のパッチは検証コマンドに合格した" jprompt)))
+        (should (equal anvil-fusion-ask-test--exec-claims
+                       (plist-get res :claims)))))))
 
 (provide 'anvil-fusion-ask-test)
 ;;; anvil-fusion-ask-test.el ends here

@@ -133,7 +133,7 @@ candidates before judging.  Returns (:answer :candidates
 (cl-defun anvil-fusion-ask
     (prompt &key panel fidelity judge judge-model extra lenses cwd
             max-rounds converge-threshold timeout-sec (max-wait-sec 1800)
-            template verify verify-args verify-base-template)
+            template verify verify-args verify-base-template exec-check)
   "Answer PROMPT by fusing a panel of models into one synthesized reply.
 
 PANEL names a panel in `anvil-fusion-panels' (default
@@ -199,11 +199,27 @@ template remain in force.  One `message' notes the fallback.
 Everything degrades to the pre-Phase-6d behavior when VERIFY is nil
 -- zero behavior change for existing callers.
 
+EXEC-CHECK (default nil) runs the Doc 61 Phase 6c local execution
+verifier once, on the FIRST round only, after member collection and
+before the judge call.  The value is a plist
+`(:repo-root STR :check-cmd STR [:timeout-sec N])'.  When non-nil,
+`anvil-fusion-exec-verify-candidates' is called lazily (this module
+does not require `anvil-fusion-exec' at load time), its claims are
+merged into the verified-claims list used for
+`anvil-fusion-verify-judge-template-for', and candidates whose exec
+status is `fail' or `error' are excluded from the FIRST judge call
+unless that would exclude all candidates, in which case none are
+excluded.  `no-patch' never excludes a candidate.  Critique rounds
+reuse the same template and do not re-run execution.  Sovereignty note:
+execution is local only (git + the caller's check command), so it is
+allowed for local-only panels too.
+
 Returns a plist: :answer :panel :egress :fidelity :rounds :looped
 :members-batch :judge-batch :judge-task-id :judge-provider
-:judge-model :candidates :prompt-chars :claims.  :CLAIMS is the
-annotated claim list when VERIFY produced one, else nil (always nil
-when VERIFY is nil)."
+:judge-model :candidates :prompt-chars :claims :exec-results.  :CLAIMS
+is the merged annotated claim list when VERIFY and/or EXEC-CHECK
+produced one, else nil.  :EXEC-RESULTS is the per-candidate execution
+result list, else nil."
   (require 'anvil-orchestrator)
   (let ((pname (or panel anvil-fusion-default-panel)))
     (anvil-fusion-panel-validate pname)
@@ -223,7 +239,9 @@ when VERIFY is nil)."
       (let* ((mresult    (anvil-fusion--run-members prompt body lenses cwd
                                                      :max-wait-sec max-wait-sec))
              (candidates (plist-get mresult :candidates))
+             (judge-candidates candidates)
              (claims     nil)
+             (exec-results nil)
              (etemplate  template))
         (when verify
           (let* ((local-panel (eq egress 'local-only))
@@ -280,12 +298,40 @@ when VERIFY is nil)."
                     (setq etemplate
                           (anvil-fusion-verify-judge-template-for
                            nil verify-base-template))))))))
+        (when exec-check
+          (require 'anvil-fusion-exec)
+          (let* ((exec-fn (symbol-function 'anvil-fusion-exec-verify-candidates))
+                 (exec-plist (funcall exec-fn
+                                      candidates
+                                      :repo-root (plist-get exec-check :repo-root)
+                                      :check-cmd (plist-get exec-check :check-cmd)
+                                      :timeout-sec (plist-get exec-check :timeout-sec)))
+                 (exec-claims (plist-get exec-plist :claims))
+                 (excluded-names
+                  (mapcar (lambda (row) (plist-get row :name))
+                          (seq-filter
+                           (lambda (row)
+                             (memq (plist-get row :status) '(fail error)))
+                           (plist-get exec-plist :results))))
+                 (filtered
+                  (seq-remove
+                   (lambda (candidate)
+                     (member (plist-get candidate :name) excluded-names))
+                   candidates)))
+            (setq exec-results (plist-get exec-plist :results))
+            (setq claims (append claims exec-claims))
+            (unless (or (null excluded-names) (null filtered))
+              (setq judge-candidates filtered))
+            (when (and (null template) claims)
+              (setq etemplate
+                    (anvil-fusion-verify-judge-template-for
+                     claims verify-base-template)))))
         (let* ((jresult (anvil-fusion--run-judge
-                         prompt candidates jprov jmodel
+                         prompt judge-candidates jprov jmodel
                          :fidelity fidelity :extra extra :template etemplate
                          :cwd cwd :timeout-sec timeout-sec :max-wait-sec max-wait-sec))
                (round (list :answer        (plist-get jresult :answer)
-                            :candidates    candidates
+                            :candidates    judge-candidates
                             :judge-task-id (plist-get jresult :judge-task-id)
                             :judge-batch   (plist-get jresult :judge-batch)
                             :members-batch (plist-get mresult :members-batch)
@@ -315,7 +361,8 @@ when VERIFY is nil)."
                 :judge-model   jmodel
                 :candidates    (plist-get round :candidates)
                 :prompt-chars  (plist-get round :prompt-chars)
-                :claims        claims))))))
+                :claims        claims
+                :exec-results  exec-results))))))
 
 (provide 'anvil-fusion-ask)
 ;;; anvil-fusion-ask.el ends here
