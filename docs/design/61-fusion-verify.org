@@ -184,7 +184,7 @@ Phase 6-7 produce trajectories worth keeping.
 | 7'    | sonnet-solo panel (sonnet-tier twin of opus-solo)  | 7          | SHIPPED b87ad70 |
 | 8f    | agentic members: member-extras passthrough (permission/tools/sandbox) + tool-using panel members | 7, 8e | SHIPPED (member-extras + :agentic; longrun step permission fix; async/plan passthrough = follow-up) |
 | 10    | multi-round debate (critique loop depth > 1)       | 6d         | SHIPPED (anvil-fusion-debate; cross-candidate rounds + incremental verify; HIGH-tier gated) |
-| 11    | router auto-calibration from the decision log      | Doc62 Ph2  | DESIGNED (below) |
+| 11    | router auto-calibration from the decision log      | Doc62 Ph2  | SHIPPED (anvil-fusion-route-calibrate; propose-only, manual apply) |
 
 ** 8f. Agentic members + execution-permission passthrough (design)
 
