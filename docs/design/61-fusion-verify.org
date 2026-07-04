@@ -179,6 +179,7 @@ Phase 6-7 produce trajectories worth keeping.
 | 8a    | plan fusion                                        | 6d         | SHIPPED 9b4fdc4 |
 | 8b    | longrun step = fusion panel                        | 8a         | SHIPPED 543295c |
 | 8c    | inter-step verify gate                             | 6d, 8b     | SHIPPED c191a43 |
+| 8e    | end-to-end eval: longrun baseline vs full harness  | 8a-8c      | MEASURED (PASS, saturated — see below) |
 | 9     | verified-trajectory exemplar library (sketch)      | 6-7 live   | SHIPPED (anvil-fusion-traj; admission gate = verified wins only; opt-in :exemplars / :store-trajectory) |
 
 Phase 8 implementation notes (2026-07-03/04, codex via orchestrator — 8a on
@@ -214,6 +215,32 @@ a verdict. Follow-ups filed: de-saturation re-run with a small/local judge
 (runner supports it), KB evidence-relevance threshold (irrelevant file:line
 sources mislead even when verdicts are right — "6f" candidate), hedging
 candidates getting REFUTED.
+
+8e measured 2026-07-04 (benchmarks/doc61-phase8e/, ~$5.15 incl. one voided
+smoke, results-8e-2026-07-04.org + raw/ in that dir; HEAD 4ed3cd8). Both
+arms of anvil-fusion-longrun-run (baseline single-provider vs :step-panel
+'opus-solo hard-only + :verify-steps t) completed 3/3 tasks on the HIDDEN
+acceptance tests — no separation: the benchmark saturated (a sonnet step
+agent with shell access solved every fixture in 1-2 steps and never took
+the visible-test overfit bait). All 3 full-arm verify gates passed first
+try (0 retried-pass / 0 failed / 0 :gate-failures — no REFUTED claim ever
+fired), and :panel-steps was 0 everywhere (hard-only never panels step 1
+and every quest finished at step 1, so 8b's panel path got zero
+end-to-end exercise). Verdict: proves the full harness is plumbed
+correctly end-to-end and its cost discipline holds (+$0.03-0.16/run,
+panel budget untouched), but demonstrates no uplift at this task
+difficulty. MOST CONSEQUENTIAL finding is operational, not comparative:
+under the orchestrator default --permission-mode acceptEdits a
+non-interactive claude child CANNOT run Bash, so a longrun coding quest
+that must run its own build/test never reaches STATUS: DONE (smoke
+attempt burned $2.65 across 4+ steps of static re-verification before
+kill; the produced patch was already hidden-passing). Any code-task use
+of longrun needs an explicit permission decision (bypassPermissions in a
+sandboxed scratch cwd, as the 8e harness did, or an --allowedTools grant
+covering the build command). Follow-ups filed: de-saturate with harder /
+larger-codebase fixtures or a weaker baseline step model; an 8e re-run
+that forces the panel path (:step-panel-mode 'always or multi-step
+tasks); surface the permission knob in anvil-fusion-longrun docs.
 
 Recommended order: 6 -> 7 -> 8 (Phase 6 fixes a recorded, harmful failure mode
 and is measurable immediately; Phase 7 is a small addition on top; Phase 8 is
