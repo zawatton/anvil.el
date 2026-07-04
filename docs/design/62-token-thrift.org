@@ -44,7 +44,7 @@ patterns (test runs, re-reads) return unbounded text.
 | Phase | Deliverable                                            | Layer   | Status |
 |-------+--------------------------------------------------------+---------+--------|
 | 1     | token telemetry: per-tool volume accounting + report   | server  | SHIPPED 9ad1435 |
-| 2     | hard-prompt router: auto-escalate single -> pair -> opus-solo+verify | fusion | TODO |
+| 2     | hard-prompt router: auto-escalate single -> pair -> opus-solo+verify | fusion | SHIPPED bc291d4 (cascade: single -> haiku probe -> escalate; fail-to-middle) |
 | 3     | test-run distiller tool (ERT batch -> fixed digest)    | dev     | TODO |
 | 4     | verdict cache (SQLite, TTL) for verified claims        | verify  | TODO |
 | 5     | sequential (early-exit) skeptics                       | verify  | TODO |
