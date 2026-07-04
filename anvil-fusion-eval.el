@@ -37,6 +37,7 @@
 (declare-function anvil-orchestrator-collect "anvil-orchestrator" (batch-id &rest _))
 (declare-function anvil-orchestrator-status "anvil-orchestrator" (id))
 (declare-function anvil-orchestrator-extract-result "anvil-orchestrator" (task-id &optional full))
+(declare-function anvil-fusion-provider-local-p "anvil-fusion-panels" (provider))
 
 ;;;; --- eval cases ----------------------------------------------------------
 
@@ -211,9 +212,20 @@ Uses the same public orchestrator calls as the panel path so the
 baseline is comparable.  Optional CWD sets the task working dir —
 use a neutral dir (e.g. \"/tmp\") for a claude baseline so the
 nested Claude Code session does not inherit project hooks /
-CLAUDE.md.  Egress is reported as `external'."
+CLAUDE.md.
+
+Egress is INFERRED from PROVIDER via `anvil-fusion-provider-local-p'
+(Doc 54 §12 residual item, docs/design/54-fusion-harness.org):
+`anvil-fusion-panels' is required lazily inside the closure (this
+module keeps its own load-time footprint unchanged — no eager
+dependency on the panels module is added at the top of this file)
+so a local / self-hosted PROVIDER (e.g. `ollama', per
+`anvil-fusion-local-providers') reports `local-only'; every other
+PROVIDER (claude / codex / gemini / …) reports `external', matching
+the prior hard-coded behavior for those providers exactly."
   (lambda (prompt)
     (require 'anvil-orchestrator)
+    (require 'anvil-fusion-panels)
     (let* ((t0 (float-time))
            (task (append (list :provider provider :prompt prompt
                                :name "fusion-eval-single")
@@ -226,7 +238,7 @@ CLAUDE.md.  Egress is reported as `external'."
              (res    (anvil-orchestrator-extract-result id t))
              (ms     (round (* 1000 (- (float-time) t0)))))
         (list :answer (plist-get res :summary)
-              :egress 'external
+              :egress (if (anvil-fusion-provider-local-p provider) 'local-only 'external)
               :elapsed-ms ms)))))
 
 (provide 'anvil-fusion-eval)

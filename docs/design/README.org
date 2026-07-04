@@ -175,6 +175,27 @@ Phase A / B / C の 3 段、Phase A は単独 ship 可能。
 | 59 | [[file:59-office-cli.org][Office Document Tools (OfficeCLI)]] | 03, 07     | 中       | 条件付き (PILOT gate) | DRAFT |
 | 60 | [[file:60-orchestrator-gates.org][Orchestrator Gates]]       | 10, 19, 23 | 小       | コード見送り / 概念2点 | DRAFT |
 
+** Fusion Verification Wave (Doc 61, DRAFT, 2026-07-03)
+
+Doc 54/55 (fusion harness / longrun, Phase 1-5 SHIPPED) の eval で記録された
+failure mode (judge が正答候補を棄却し幻覚候補を採用、fusion が単体強モデル
+に未勝利) への対策。合成前検証 (verifier-grounded judge) を中核に、Opus 4.8
+のみで Fable-5 級を狙う。
+
+| #  | Doc                                                          | 依存       | 想定工数 | 判定 | 状態  |
+|----+--------------------------------------------------------------+------------+----------+------+-------|
+| 61 | [[file:61-fusion-verify.org][Fusion Verify — Verifier-Grounded Judge / opus-solo / Agentic Fusion]] | 54, 55, 10 | 中-大 | — | DRAFT |
+
+** Token Thrift Wave 2 (Doc 62, DRAFT, 2026-07-04)
+
+Doc 26-29 の既存省トークン層が触れていない消費 — fusion/verify 実行時
+コスト (opus-solo+verify ≈ 4x) とセッション側の反復トラフィック (テスト
+出力・再読・大型ツール結果) — を、計測 (Phase 1 telemetry) を起点に削減。
+
+| #  | Doc                                                          | 依存       | 想定工数 | 判定 | 状態  |
+|----+--------------------------------------------------------------+------------+----------+------+-------|
+| 62 | [[file:62-token-thrift.org][Token Thrift Wave 2 — telemetry / router / distiller / caches]] | 61, 26-28, 36 | 中 | — | DRAFT (Ph1 進行中) |
+
 監査元 → 取り込み先:
 
 | 監査元 (X OSS)         | 取り込み先 / 判定                         |

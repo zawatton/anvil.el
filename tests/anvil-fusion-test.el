@@ -22,6 +22,36 @@
          :summary "方向性を持たせるため DGR(地絡方向継電器) が適切。"))
   "Two healthy candidate slim plists.")
 
+(defconst anvil-fusion-test--dedup-seed
+  (let ((shared-head
+         (mapconcat (lambda (n)
+                      (format "Shared context line %02d: same grounding." n))
+                    (number-sequence 1 24)
+                    "\n"))
+        (shared-tail
+         (mapconcat (lambda (n)
+                      (format "Shared tail line %02d: same conclusion." n))
+                    (number-sequence 25 48)
+                    "\n")))
+    (mapconcat #'identity
+               (list shared-head
+                     "Keep this line."
+                     shared-tail)
+               "\n"))
+  "Base text used by dedup rendering tests.")
+
+(defconst anvil-fusion-test--dedup-near
+  (replace-regexp-in-string
+   "Keep this line\\."
+   "Keep this line!"
+   anvil-fusion-test--dedup-seed
+   t t)
+  "Near-duplicate text used by dedup rendering tests.")
+
+(defconst anvil-fusion-test--dedup-different
+  "A materially different answer that should remain a singleton cluster."
+  "Dissimilar text used by dedup rendering tests.")
+
 ;;;; --- candidate text ------------------------------------------------------
 
 (ert-deftest anvil-fusion-test-candidate-text-summary ()
@@ -77,6 +107,103 @@
   "Empty candidate list does not crash."
   (should (equal "(no candidates)"
                  (anvil-fusion--format-candidates nil 'summary))))
+
+(ert-deftest anvil-fusion-test-format-candidates-default-off-byte-identical ()
+  "Default dedup setting preserves the historical candidate block bytes."
+  (let ((block (anvil-fusion--format-candidates
+                anvil-fusion-test--candidates 'summary)))
+    (should
+     (equal
+      block
+      (concat
+       "1. [provider: claude, status: done]\n"
+       "地絡継電器は OCGR ではなく DGR を使う。\n\n"
+       "2. [provider: gemini, status: done]\n"
+       "方向性を持たせるため DGR(地絡方向継電器) が適切。")))))
+
+(ert-deftest anvil-fusion-test-dedup-clusters-greedy-order-preserving ()
+  "Near-duplicates cluster under the first seed, preserving input order."
+  (let* ((clusters (anvil-fusion--dedup-clusters
+                    (list (cons "A" anvil-fusion-test--dedup-seed)
+                          (cons "B" anvil-fusion-test--dedup-near)
+                          (cons "C" anvil-fusion-test--dedup-different))
+                    0.9)))
+    (should (= (length clusters) 2))
+    (should (equal (plist-get (car clusters) :seed)
+                   (cons "A" anvil-fusion-test--dedup-seed)))
+    (should (equal (plist-get (car clusters) :members)
+                   (list (cons "B" anvil-fusion-test--dedup-near))))
+    (should (equal (plist-get (cadr clusters) :seed)
+                   (cons "C" anvil-fusion-test--dedup-different)))
+    (should (equal (plist-get (cadr clusters) :members) nil))))
+
+(ert-deftest anvil-fusion-test-format-candidates-deduped-rendering ()
+  "Dedup rendering keeps the seed full, shows delta notes, and preserves singletons."
+  (let* ((candidates
+          `((:provider claude :status done :summary ,anvil-fusion-test--dedup-seed)
+            (:provider gemini :status done :summary ,anvil-fusion-test--dedup-near)
+            (:provider mistral :status done :summary ,anvil-fusion-test--dedup-seed)
+            (:provider qwen :status done :summary ,anvil-fusion-test--dedup-different)))
+         (block (let ((anvil-fusion-judge-dedup-threshold 0.9))
+                  (anvil-fusion--format-candidates-deduped candidates 'summary))))
+    (should (string-match-p
+             (regexp-quote
+              (format "1. [provider: claude, status: done]\n%s"
+                      anvil-fusion-test--dedup-seed))
+             block))
+    (should (string-match-p
+             (regexp-quote
+              "### 2. [provider: gemini, status: done]\n（1. [provider: claude, status: done] とほぼ同一の回答。差分のみ:）")
+             block))
+    (should (string-match-p "^\\+Keep this line!$" block))
+    (should (string-match-p
+             (regexp-quote
+              "### 3. [provider: mistral, status: done]\n（1. [provider: claude, status: done] とほぼ同一の回答。差分なし・実質同一）")
+             block))
+    (should (string-match-p
+             (regexp-quote
+              (format "4. [provider: qwen, status: done]\n%s"
+                      anvil-fusion-test--dedup-different))
+             block))))
+
+(ert-deftest anvil-fusion-test-format-candidates-deduped-diff-failure-falls-back ()
+  "Diff helper errors degrade to full rendering without signaling."
+  (let* ((candidates
+          `((:provider claude :status done :summary ,anvil-fusion-test--dedup-seed)
+            (:provider gemini :status done :summary ,anvil-fusion-test--dedup-near)))
+         (block
+          (cl-letf (((symbol-function 'anvil-fusion--judge-dedup-diff)
+                     (lambda (&rest _) (error "boom"))))
+            (anvil-fusion--format-candidates-deduped candidates 'summary))))
+    (should (string-match-p
+             (regexp-quote
+              (format "2. [provider: gemini, status: done]\n%s"
+                      anvil-fusion-test--dedup-near))
+             block))
+    (should-not (string-match-p "差分のみ" block))))
+
+(ert-deftest anvil-fusion-test-format-candidates-deduped-size-cut ()
+  "A one-line delta shrinks the judge block substantially."
+  (let* ((lines (mapcar (lambda (n)
+                          (format "Common line %03d: stable content." n))
+                        (number-sequence 1 200)))
+         (seed (mapconcat #'identity lines "\n"))
+         (near (mapconcat
+                #'identity
+                (mapcar (lambda (line)
+                          (if (equal line "Common line 030: stable content.")
+                              "Common line 030: stable content!"
+                            line))
+                        lines)
+                "\n"))
+         (candidates `((:provider claude :status done :summary ,seed)
+                       (:provider gemini :status done :summary ,near)))
+         (full (let ((anvil-fusion-judge-dedup nil))
+                 (anvil-fusion--format-candidates candidates 'summary)))
+         (dedup (let ((anvil-fusion-judge-dedup t)
+                      (anvil-fusion-judge-dedup-threshold 0.9))
+                  (anvil-fusion--format-candidates candidates 'summary))))
+    (should (< (length dedup) (* 0.6 (length full))))))
 
 ;;;; --- judge prompt --------------------------------------------------------
 

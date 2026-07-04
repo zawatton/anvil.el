@@ -815,6 +815,269 @@ picks up the freshest bytes."
       (when (and src-elc (file-exists-p src-elc))
         (ignore-errors (delete-file src-elc))))))
 
+(defun anvil-elisp--truthy-arg (value)
+  "Return non-nil when VALUE is a truthy MCP argument."
+  (cond
+   ((null value) nil)
+   ((or (eq value :json-false) (eq value :false)) nil)
+   ((stringp value)
+    (not (member (string-trim (downcase value))
+                 '("" "nil" "false" "0"))))
+   (t value)))
+
+(defun anvil-elisp--listify-arg (value)
+  "Return VALUE as a list.
+Vectors are converted to lists; nil stays nil; scalars become a
+single-element list."
+  (cond
+   ((null value) nil)
+   ((vectorp value) (append value nil))
+   ((listp value) value)
+   (t (list value))))
+
+(defun anvil-elisp--ensure-string-list (value key)
+  "Normalize VALUE into a list of strings or signal for KEY."
+  (let ((items (anvil-elisp--listify-arg value)))
+    (unless items
+      (signal 'anvil-server-tool-error
+              (list (format "%s is required" key))))
+    (dolist (item items)
+      (unless (stringp item)
+        (signal 'anvil-server-tool-error
+                (list (format "%s must be a string list" key)))))
+    items))
+
+(defun anvil-elisp--repo-root-for-file (file)
+  "Return the repo root for FILE, or its directory if no git root exists."
+  (let* ((path (expand-file-name file))
+         (root (locate-dominating-file path ".git")))
+    (expand-file-name (or root (file-name-directory path) default-directory))))
+
+(defun anvil-elisp--expand-path-under-root (path root)
+  "Expand PATH under ROOT unless PATH is already absolute."
+  (if (file-name-absolute-p path)
+      (expand-file-name path)
+    (expand-file-name path root)))
+
+(defun anvil-elisp--ert-distilled-command (files load-path-dirs selector)
+  "Build an `emacs --batch -Q' command for FILES, LOAD-PATH-DIRS, and SELECTOR."
+  (let ((command (list invocation-name "--batch" "-Q")))
+    (dolist (dir load-path-dirs)
+      (setq command (append command (list "-L" dir))))
+    (setq command (append command (list "-l" "ert")))
+    (dolist (file files)
+      (setq command (append command (list "-l" file))))
+    (if selector
+        (append command
+                (list "--eval"
+                      (format "(ert-run-tests-batch-and-exit %S)"
+                              (read selector))))
+      (append command (list "-f" "ert-run-tests-batch-and-exit")))))
+
+(defun anvil-elisp--process-shell-command (argv log-path)
+  "Return a shell command string that runs ARGV and writes to LOG-PATH."
+  (format "exec %s >%s 2>&1"
+          (mapconcat #'shell-quote-argument argv " ")
+          (shell-quote-argument log-path)))
+
+(defun anvil-elisp--process-exit-code (process)
+  "Return PROCESS exit code, using 128+signal for signalled exits."
+  (if (eq (process-status process) 'signal)
+      (+ 128 (process-exit-status process))
+    (process-exit-status process)))
+
+(defun anvil-elisp--read-file-string (path)
+  "Return PATH contents as a string."
+  (with-temp-buffer
+    (insert-file-contents path)
+    (buffer-string)))
+
+(defun anvil-elisp--truncate-tail (text limit &optional from-start)
+  "Return TEXT truncated to LIMIT chars.
+When FROM-START is non-nil, keep the head; otherwise keep the tail."
+  (if (<= (length text) limit)
+      text
+    (if from-start
+        (substring text 0 limit)
+      (substring text (- (length text) limit)))))
+
+(defun anvil-elisp--ert-distilled-summary (output)
+  "Parse the stable batch ERT summary line from OUTPUT."
+  (when (string-match
+         (concat
+          "Ran \\([0-9]+\\) tests, [0-9]+ results as expected, "
+          "\\([0-9]+\\) unexpected"
+          "\\(?:, \\([0-9]+\\) skipped\\)?"
+          " ([^,]+, \\([0-9.]+\\) sec)")
+         output)
+    (list :ran (string-to-number (match-string 1 output))
+          :unexpected (string-to-number (match-string 2 output))
+          :skipped (string-to-number (or (match-string 3 output) "0"))
+          :duration-sec (string-to-number (match-string 4 output)))))
+
+(defun anvil-elisp--ert-distilled-parse-failures (output)
+  "Parse failing test names, condition heads, and first backtrace from OUTPUT."
+  (let ((lines (split-string output "\n"))
+        (failures nil)
+        (order nil)
+        (first-backtrace nil)
+        (full-backtrace nil)
+        collect-backtrace
+        collect-condition
+        current-backtrace)
+    (dolist (line lines)
+      (cond
+       ((string-match "^Test \\([^[:space:]]+\\) backtrace:$" line)
+        (setq collect-backtrace t
+              collect-condition nil
+              current-backtrace nil))
+       ((and collect-backtrace
+             (string-match "^Test \\([^[:space:]]+\\) condition:$" line))
+        (let ((name (match-string 1 line))
+              (joined (string-join (nreverse current-backtrace) "\n")))
+          (setq collect-backtrace nil
+                collect-condition name)
+          (when (and joined (not (string-empty-p joined))
+                     (null first-backtrace))
+            (setq first-backtrace
+                  (anvil-elisp--truncate-tail joined 600 t)
+                  full-backtrace
+                  (anvil-elisp--truncate-tail joined 8000 t)))))
+       (collect-backtrace
+        (push line current-backtrace))
+       ((and collect-condition
+             (not (string-empty-p (string-trim line))))
+        (unless (assoc collect-condition failures)
+          (push collect-condition order)
+          (push (cons collect-condition (string-trim line)) failures))
+        (setq collect-condition nil))
+       ((string-match "^   FAILED  [0-9]+/[0-9]+  \\([^[:space:]]+\\)" line)
+        (let ((name (match-string 1 line)))
+          (unless (assoc name failures)
+            (push name order)
+            (push (cons name nil) failures))))))
+    (list :failed
+          (mapcar (lambda (name)
+                    (list :name name
+                          :error (or (cdr (assoc name failures))
+                                     "unknown failure")))
+                  (nreverse order))
+          :first-backtrace first-backtrace
+          :full-backtrace full-backtrace)))
+
+(defun anvil-elisp--ert-run-distilled
+    (files &optional load_path root selector timeout_sec full)
+  "Run FILES in a fresh batch Emacs and return a fixed-shape digest.
+
+MCP Parameters:
+  files       - Required list of ERT test files to load.
+  load_path   - Optional list of `-L' directories.  Defaults to the
+                repo root inferred from the first file plus its `tests/'
+                directory.
+  root        - Optional working directory.  Defaults to the repo root
+                inferred from the first file.
+  selector    - Optional ERT selector string passed to
+                `ert-run-tests-batch-and-exit'.
+  timeout_sec - Optional timeout in seconds (default 300).
+  full        - Optional truthy flag; when set, include the bounded raw
+                backtrace section under `:backtrace'.
+
+Returns a printed plist digest rather than the full ERT transcript.
+The raw log is always written to `:log-path'.  Timeout or crash returns
+`(:exit-code CODE :error STRING :tail STRING :log-path PATH)'."
+  (let* ((file-list (anvil-elisp--ensure-string-list files "files"))
+         (base-root (anvil-elisp--repo-root-for-file (car file-list)))
+         (root-dir (expand-file-name (or root base-root)))
+         (expanded-files
+          (mapcar (lambda (file)
+                    (anvil-elisp--expand-path-under-root file root-dir))
+                  file-list))
+         (expanded-load-path
+          (mapcar (lambda (dir)
+                    (anvil-elisp--expand-path-under-root dir root-dir))
+                  (or (anvil-elisp--listify-arg load_path)
+                      (list root-dir (expand-file-name "tests" root-dir)))))
+         (timeout (if timeout_sec
+                      (max 1 (truncate (if (numberp timeout_sec)
+                                           timeout_sec
+                                         (string-to-number timeout_sec))))
+                    300))
+         (log-path (make-temp-file "anvil-ert-distilled-" nil ".log"))
+         (result nil)
+         (argv nil)
+         (process nil)
+         (output "")
+         (exit-code 0))
+    (condition-case err
+        (setq argv (anvil-elisp--ert-distilled-command
+                    expanded-files expanded-load-path selector))
+      (error
+       (setq result
+             (list :exit-code 2
+                   :error (format "Invalid ert selector: %s"
+                                  (error-message-string err))
+                   :tail ""
+                   :log-path log-path))))
+    (unless result
+      (let ((default-directory root-dir)
+            (deadline (+ (float-time) timeout)))
+        (setq process
+              (make-process
+               :name "anvil-ert-distilled"
+               :command
+               (list shell-file-name shell-command-switch
+                     (anvil-elisp--process-shell-command argv log-path))
+               :noquery t))
+        (while (and (process-live-p process)
+                    (< (float-time) deadline))
+          (accept-process-output process 0.1))
+        (when (process-live-p process)
+          (ignore-errors (kill-process process))
+          (while (process-live-p process)
+            (accept-process-output process 0.05))
+          (setq exit-code 124
+                result
+                (list :exit-code 124
+                      :error (format "ERT subprocess timed out after %s seconds"
+                                     timeout)
+                      :tail ""
+                      :log-path log-path))))
+      (setq output (anvil-elisp--read-file-string log-path))
+      (when (and result (plist-member result :tail))
+        (setf (plist-get result :tail)
+              (anvil-elisp--truncate-tail output 1000)))
+      (unless result
+        (setq exit-code (anvil-elisp--process-exit-code process))
+        (let ((summary (anvil-elisp--ert-distilled-summary output)))
+          (if (null summary)
+              (setq result
+                    (list :exit-code exit-code
+                          :error (format "ERT subprocess failed without a parsable summary (exit %s)"
+                                         exit-code)
+                          :tail (anvil-elisp--truncate-tail output 1000)
+                          :log-path log-path))
+            (let ((failure-data
+                   (anvil-elisp--ert-distilled-parse-failures output)))
+              (setq result
+                    (list :ran (plist-get summary :ran)
+                          :unexpected (plist-get summary :unexpected)
+                          :skipped (plist-get summary :skipped)
+                          :duration-sec (plist-get summary :duration-sec)
+                          :exit-code exit-code
+                          :log-path log-path))
+              (when (> (plist-get summary :unexpected) 0)
+                (setq result
+                      (append result
+                              (list :failed (plist-get failure-data :failed)
+                                    :first-backtrace
+                                    (plist-get failure-data :first-backtrace))))
+                (when (anvil-elisp--truthy-arg full)
+                  (setq result
+                        (append result
+                                (list :backtrace
+                                      (plist-get failure-data :full-backtrace)))))))))))
+    (format "%S" result)))
+
 (defun anvil-elisp--ert-run (file &optional selector fresh)
   "Run ERT tests from FILE and return a compact result plist.
 
@@ -1060,6 +1323,22 @@ Intended for tight test/fix loops during development — far cheaper
 in tokens than shelling out and parsing stdout."
    :read-only t)
   (anvil-server-register-tool
+   #'anvil-elisp--ert-run-distilled
+   :id "ert-run-distilled"
+   :intent '(elisp-test)
+   :layer 'dev
+   :server-id anvil-elisp--server-id
+   :description
+   "Run batch ERT in a fresh `emacs --batch -Q' subprocess and return
+a fixed-shape digest:
+\(:ran N :unexpected N :skipped N :duration-sec F :exit-code N
+ :log-path PATH ...).  Unexpected runs add failing test names plus the
+first backtrace head; `full' truthy includes the bounded raw backtrace
+section too.  Timeouts and crashes return only `:exit-code', `:error',
+`:tail', and `:log-path', so the response stays small even for large
+suites."
+   :read-only t)
+  (anvil-server-register-tool
    #'anvil-elisp--byte-compile-file
    :id "elisp-byte-compile-file"
    :intent '(elisp-build)
@@ -1243,6 +1522,8 @@ Error cases:
   "Disable the Elisp development MCP tools."
   (anvil-server-unregister-tool
    "elisp-ert-run" anvil-elisp--server-id)
+  (anvil-server-unregister-tool
+   "ert-run-distilled" anvil-elisp--server-id)
   (anvil-server-unregister-tool
    "elisp-byte-compile-file" anvil-elisp--server-id)
   (anvil-server-unregister-tool

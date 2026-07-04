@@ -1,0 +1,164 @@
+#+TITLE: Doc 62 — Token Thrift Wave 2: measure-first reduction of MCP and fusion token spend
+#+AUTHOR: zawatton + Claude
+#+DATE: <2026-07-04>
+#+STATUS: ALL PHASES SHIPPED (1-9, 2026-07-04); pending ops decisions: budget default-on, dedup default-on, natural-traffic re-validation, sequential-skeptic quality re-measure
+#+OPTIONS: toc:2 num:t
+
+* 0. Executive summary
+
+anvil.el already ships a token-efficiency layer (Doc 26-29: manifest
+tools/list filter, progressive disclosure, intent discovery; Doc 36
+auto-compact; anvil-context; longrun O(1) digests; fusion :fidelity summary
+clamp). This wave targets the spend that layer does not touch, motivated by
+two concrete observations from the 2026-07-03 Doc 61 session:
+
+1. The fusion/verify pipeline itself is expensive at run time (opus-solo +
+   verify ~= 4x a single ask; the 6e battery cost $15.01) while the 6e
+   measurement showed a strong single model is already saturated on easy
+   prompts — paying the multiplier unconditionally is pure waste.
+2. Session-side tool traffic is dominated by a few repetitive patterns:
+   full test-suite output re-read on every verification round, full file
+   re-reads during review cycles, and large tool results consumed whole.
+
+Discipline: measure first (Phase 1), then cut the measured hotspots — the
+same evidence-first approach that Doc 61 6e used for verification value.
+
+* 1. Existing layer (do not duplicate)
+
+| Shipped | What it already saves |
+|---------+-----------------------|
+| Doc 26 manifest / Doc 34 discovery | tools/list volume, tool-choice prompts |
+| Doc 27/28 progressive disclosure + URI | 3-layer read contracts on wired tools |
+| Doc 36 anvil-compact | context compaction orchestration |
+| anvil-context | reversible context compression for agents |
+| Doc 55 longrun digests | O(1) multi-step context |
+| fusion :fidelity 'summary | judge input clamp (4000 chars) |
+| orchestrator cost tables / stats | USD accounting per provider/task |
+
+Gap: no per-tool token/volume accounting (what actually costs), no
+spend-gating for the fusion multiplier, and several high-frequency session
+patterns (test runs, re-reads) return unbounded text.
+
+* 2. Phase table
+
+| Phase | Deliverable                                            | Layer   | Status |
+|-------+--------------------------------------------------------+---------+--------|
+| 1     | token telemetry: per-tool volume accounting + report   | server  | SHIPPED 9ad1435 |
+| 2     | hard-prompt router: auto-escalate single -> pair -> opus-solo+verify | fusion | SHIPPED bc291d4 (cascade: single -> haiku probe -> escalate; fail-to-middle) |
+| 3     | test-run distiller tool (ERT batch -> fixed digest)    | elisp   | SHIPPED 4e18908 (13-test digest = 118 chars; raw log via :log-path) |
+| 4     | verdict cache (SQLite, TTL) for verified claims        | verify  | SHIPPED (anvil-state KV; decisive-only; skeptic-skip on hit) |
+| 5     | sequential (early-exit) skeptics                       | verify  | SHIPPED (1 skeptic first; escalate on unverified / KB-conflict / weak reason) |
+| 6     | KB numeric-match mechanical checker                    | verify  | SHIPPED (zero-LLM confirms for :kind number; opt-in checker) |
+| 7     | judge-input dedup (representative + delta for agreeing candidates) | fusion | SHIPPED (opt-in; 2-cand fixture 13.3K -> 7.1K = 53.5%) |
+| 8     | diff-first re-read tool (session content-hash cache)   | file    | SHIPPED 13adeb2 (40K file, 3-line edit: 40,128 -> 318 chars) |
+| 9     | disclosure budget as repo-wide default for heavy tools | server  | SHIPPED 9408e79 + b8c9f3b (search clamps: 28.5K -> 3.7K per 10-hit search; generic budget ships disabled, file-read exempt) |
+
+Order: 1 first (it decides the real order of 3/8/9); 2 is independent and
+already evidence-backed by 6e; 4/5/6 shrink the verify pipeline itself and
+compose (6 removes claims from the LLM path entirely, 5 halves what
+remains, 4 amortizes across sessions).
+
+** Phase 1 findings (2026-07-04, provisional) — re-prioritization
+
+Sample: 9 representative calls driven through the real dispatch seam
+(synthetic FREQUENCY mix — natural traffic pending since no MCP client was
+attached post-reload — but per-call volumes are the real handler outputs).
+Est tokens = chars/4.
+
+| tool             | calls | response-chars | max single | est tokens |
+|------------------+-------+----------------+------------+------------|
+| file-read        | 3     | 86,981         | 53,996     | 21,806     |
+| worklog-search   | 2     | 56,310         | 28,523     | 14,087     |
+| org-read-outline | 1     | 17,613         | 17,613     | 4,418      |
+| worklog-list     | 1     | 11,668         | 11,668     | 2,920      |
+| memory-search    | 2     | 8,136          | 4,151      | 2,045      |
+
+Findings:
+1. *Search tools are the surprise hotspot*: one worklog-search response is
+   ~28.5K chars (~7K tokens) — a "search" returning what should be
+   snippets at document scale. org-read-outline 17.6K/call similarly.
+2. file-read dominates absolute volume as expected (54K single read).
+3. Bash-side traffic (test-suite output, subprocess logs) is INVISIBLE to
+   this telemetry — Phase 3's case rests on session observation, not
+   these numbers.
+
+Revised order (after shipped Phase 1):
+- *9 first* (disclosure budget as default) — the measured top lever; hits
+  both search-tool dumps and large file reads in one mechanism. Include a
+  sub-item: per-search snippet clamps (worklog-search / org-read-outline
+  result caps with expand handles) even before the generic budget lands.
+- *8 second* (diff-first re-read) — compounds with 9 on the file-read
+  volume during review cycles.
+- *2 stays high* (hard-prompt router) — orthogonal to MCP volume (LLM
+  spend), evidence already in from 6e; can proceed in parallel.
+- 3 (test distiller) unchanged priority but justified by session
+  observation only. 4/5/6/7 after the above.
+Caveat: frequency mix is synthetic; re-validate the ranking from natural
+traffic after a few real sessions (counters were reset post-sample).
+
+* 3. Phase 1 — token telemetry (the measurement)
+
+Goal: answer "which tools/flows consume how much" with numbers, per
+session, before optimizing anything else.
+
+Design:
+- Extend =anvil-server-metrics.el= (NOT a new module): at the dispatch
+  seam it already instruments, accumulate per tool-id: call count, total
+  request chars, total response chars, max single response, and an
+  estimated-token column (chars/4, clearly labeled as an estimate).
+- New MCP tool =metrics-token-report=: returns session totals + top-N
+  tools by response volume (default N=10) + the same for request volume,
+  as a compact table-shaped plist. Optional =reset= parameter.
+- Zero overhead goal: counting lengths of strings already in hand; no
+  extra serialization passes.
+- Non-goal: measuring Claude-side context tokens (invisible to anvil);
+  MCP request/response volume is the proxy this phase commits to.
+
+Acceptance: after a normal work session, the report identifies the top-3
+volume sources; the numbers drive re-prioritization of Phases 3/8/9 in
+this doc (update §2 with findings).
+
+* 4. Phase sketches (2-9, design detail deferred until Phase 1 numbers)
+
+- Phase 2 (router): difficulty probe = claim-extraction disagreement
+  density on a haiku pre-pass, or panel-free heuristics (question length,
+  domain markers, prior-session verdict cache hits). Escalation ladder
+  single -> claude-pair -> opus-solo+verify; thresholds defcustom;
+  decision logged for later calibration. Evidence: 6e Tier A saturation
+  (plain judge 10/10) vs Tier B uplift (79->100%).
+- Phase 3 (test distiller): MCP tool running batch ERT and returning only
+  {ran, unexpected, failing test names, first backtrace head}; pattern
+  proven manually throughout the Doc 61 session.
+- Phase 4 (verdict cache): key = sha1 of normalized claim text + kind;
+  value = verdict/evidence/timestamp; TTL defcustom; invalidation on KB
+  root mtime change is best-effort. Skips the skeptic batch on hit.
+- Phase 5 (sequential skeptics): submit 1 skeptic; escalate to N only when
+  the verdict is REFUTED-with-weak-reason or conflicts with KB evidence.
+- Phase 6 (numeric-match checker): claim :kind number + KB line containing
+  the same number+unit within a small window of the claim's entity terms
+  -> confirmed with file:line evidence, zero LLM calls. Follows the 8a
+  checker contract (confirm-or-hint only).
+- Phase 7 (judge dedup): pairwise Jaccard (already computed for consensus)
+  >= threshold -> send representative + unified diff of the others.
+- Phase 8 (diff-first read): session-scoped {path -> content hash + last
+  body}; re-read returns a unified diff against the cached body. Reuses
+  anvil-disk divergence machinery.
+- Phase 9 (disclosure budget): any tool response > budget chars returns
+  digest + disclosure URI instead of the body; opt-out per tool. Extends
+  Doc 28 to a default rather than per-tool wiring.
+
+* 5. Constraints / conventions
+- ;;; anvil-audit: tools-wrapped-at-registration on touched modules.
+- MCP schema = dispatcher (auto-generated from handler arglist +
+  docstring): keep them in one edit.
+- Verify-layer phases (4/5/6) must preserve the 8a checker contract and
+  the 6b egress gate; caches must never leak content externally.
+- All numbers reported by Phase 1 are estimates (chars/4) — label them.
+
+* 6. Open questions
+- Whether Claude-side context spend (not visible here) tracks MCP response
+  volume closely enough for prioritization — sanity-check against
+  /cost-style session stats once after Phase 1 ships.
+- Phase 2 probe cost vs saving: the probe itself must stay <= ~1/20 of a
+  panel ask.
+- Phase 4 invalidation: KB mtime heuristics vs explicit cache-bust tool.

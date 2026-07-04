@@ -107,6 +107,21 @@ call with the :judge argument to `anvil-fusion-judge-consensus'."
   :type 'symbol
   :group 'anvil-fusion)
 
+(defcustom anvil-fusion-judge-dedup nil
+  "When non-nil, compress near-duplicate candidate answers for the judge.
+This is OFF by default so judge prompts remain byte-identical to
+the pre-dedup behavior unless explicitly enabled."
+  :type 'boolean
+  :group 'anvil-fusion)
+
+(defcustom anvil-fusion-judge-dedup-threshold 0.9
+  "Minimum Jaccard similarity to cluster two judge candidates together.
+Two candidate texts whose `anvil-fusion--jaccard' score meets or
+exceeds this threshold are treated as near-duplicates for
+judge-input deduplication."
+  :type 'float
+  :group 'anvil-fusion)
+
 ;;;; --- pure prompt-building layer (no orchestrator load needed) ------------
 
 (defun anvil-fusion--candidate-text (candidate &optional fidelity)
@@ -137,22 +152,141 @@ string, or the candidate :error, or \"(no output)\"."
         text
       (or (plist-get candidate :error) "(no output)"))))
 
+(defun anvil-fusion--candidate-label (candidate index)
+  "Return the existing judge label string for CANDIDATE at INDEX."
+  (format "%d. [provider: %s, status: %s]"
+          (1+ index)
+          (or (plist-get candidate :provider) "?")
+          (or (plist-get candidate :status) "?")))
+
+(defun anvil-fusion--format-labeled-candidate (label text)
+  "Return LABEL and TEXT formatted exactly like the normal judge block."
+  (format "%s\n%s" label text))
+
+(defun anvil-fusion--candidate-labeled-texts (candidates &optional fidelity)
+  "Return CANDIDATES as a list of (LABEL . TEXT) for judge rendering."
+  (let ((i 0)
+        acc)
+    (dolist (candidate candidates)
+      (push (cons (anvil-fusion--candidate-label candidate i)
+                  (anvil-fusion--candidate-text candidate fidelity))
+            acc)
+      (setq i (1+ i)))
+    (nreverse acc)))
+
+(defun anvil-fusion--judge-dedup-diff (seed-label seed-text member-label member-text)
+  "Return a unified diff from SEED-TEXT to MEMBER-TEXT, or nil on failure."
+  (let ((old-file (make-temp-file "anvil-fusion-dedup-old-"))
+        (new-file (make-temp-file "anvil-fusion-dedup-new-")))
+    (unwind-protect
+        (progn
+          (with-temp-file old-file
+            (insert seed-text))
+          (with-temp-file new-file
+            (insert member-text))
+          (with-temp-buffer
+            (let ((status (call-process "diff" nil (current-buffer) nil
+                                        "--label" seed-label
+                                        "--label" member-label
+                                        "-u"
+                                        old-file
+                                        new-file)))
+              (when (memq status '(0 1))
+                (buffer-string)))))
+      (ignore-errors (delete-file old-file))
+      (ignore-errors (delete-file new-file)))))
+
+(defun anvil-fusion--dedup-clusters (labeled-texts threshold)
+  "Greedily cluster LABELED-TEXTS by seed similarity at THRESHOLD.
+LABELED-TEXTS is a list of (LABEL . TEXT).  Each cluster preserves
+input order and has the form (:seed (LABEL . TEXT) :members ...),
+where :members excludes the seed itself."
+  (let ((remaining labeled-texts)
+        clusters)
+    (while remaining
+      (let* ((seed (car remaining))
+             (seed-text (cdr seed))
+             (rest (cdr remaining))
+             members
+             next-remaining)
+        (dolist (item rest)
+          (if (>= (anvil-fusion--jaccard seed-text (cdr item)) threshold)
+              (push item members)
+            (push item next-remaining)))
+        (push (list :seed seed :members (nreverse members)) clusters)
+        (setq remaining (nreverse next-remaining))))
+    (nreverse clusters)))
+
+(defun anvil-fusion--format-candidates-deduped (candidates &optional fidelity)
+  "Format CANDIDATES with near-duplicates collapsed to representative deltas."
+  (if (null candidates)
+      "(no candidates)"
+    (let* ((labeled-texts (anvil-fusion--candidate-labeled-texts candidates fidelity))
+           (clusters (anvil-fusion--dedup-clusters
+                      labeled-texts
+                      anvil-fusion-judge-dedup-threshold)))
+      (mapconcat
+       (lambda (cluster)
+         (let* ((seed (plist-get cluster :seed))
+                (seed-label (car seed))
+                (seed-text (cdr seed))
+                (seed-block (anvil-fusion--format-labeled-candidate
+                             seed-label seed-text))
+                (member-blocks
+                 (mapcar
+                  (lambda (member)
+                    (let* ((member-label (car member))
+                           (member-text (cdr member))
+                           (full-block (anvil-fusion--format-labeled-candidate
+                                        member-label member-text)))
+                      (condition-case nil
+                          (let ((diff (anvil-fusion--judge-dedup-diff
+                                       seed-label seed-text member-label member-text)))
+                            (cond
+                             ((null diff) full-block)
+                             ((string-empty-p diff)
+                              (format
+                               "### %s\n（%s とほぼ同一の回答。差分なし・実質同一）"
+                               member-label seed-label))
+                             ((>= (length diff)
+                                  (* 0.8 (max 1 (length member-text))))
+                              full-block)
+                             (t
+                              (format
+                               (concat
+                                "### %s\n"
+                                "（%s とほぼ同一の回答。差分のみ:）\n"
+                                "%s")
+                               member-label seed-label diff))))
+                        (error full-block))))
+                  (plist-get cluster :members))))
+           (mapconcat #'identity
+                      (cons seed-block member-blocks)
+                      "\n\n")))
+       clusters
+       "\n\n"))))
+
 (defun anvil-fusion--format-candidates (candidates &optional fidelity)
   "Format CANDIDATES (slim plist list) into a numbered judge block.
 Each entry shows its 1-based index, provider, status and answer
 text (per FIDELITY).  Returns \"(no candidates)\" when empty."
   (if (null candidates)
       "(no candidates)"
-    (let ((i 0) acc)
-      (dolist (c candidates)
-        (setq i (1+ i))
-        (push (format "%d. [provider: %s, status: %s]\n%s"
-                      i
-                      (or (plist-get c :provider) "?")
-                      (or (plist-get c :status) "?")
-                      (anvil-fusion--candidate-text c fidelity))
-              acc))
-      (mapconcat #'identity (nreverse acc) "\n\n"))))
+    (or (and anvil-fusion-judge-dedup
+             (>= (length candidates) 2)
+             (condition-case nil
+                 (anvil-fusion--format-candidates-deduped candidates fidelity)
+               (error nil)))
+        (let ((i 0) acc)
+          (dolist (c candidates)
+            (setq i (1+ i))
+            (push (format "%d. [provider: %s, status: %s]\n%s"
+                          i
+                          (or (plist-get c :provider) "?")
+                          (or (plist-get c :status) "?")
+                          (anvil-fusion--candidate-text c fidelity))
+                  acc))
+          (mapconcat #'identity (nreverse acc) "\n\n")))))
 
 (cl-defun anvil-fusion-build-judge-prompt
     (original-prompt candidates &key template fidelity extra)

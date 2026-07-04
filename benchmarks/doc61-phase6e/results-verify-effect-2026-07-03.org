@@ -1,0 +1,254 @@
+#+title: Doc 61 Phase 6e — verify-effect measurement results
+#+date: 2026-07-03
+#+author: zawatton + Claude
+
+* Run conditions
+
+- Repo HEAD: =80431a5= (develop; Phases 6a/6a'/6b/6d committed), modules
+  loaded live from the main worktree via =-L .= — no worktree copy.
+- Runner: =benchmarks/doc61-phase6e/run.el= (this directory), executed
+  =emacs --batch= from a non-git scratch cwd with =anvil-state-db-path=
+  / =anvil-orchestrator-work-dir= sandboxed per condition (separate
+  state DBs so parallel conditions never share a task pool) — the
+  proven doc61-phase6a harness pattern.
+- Providers: =claude= CLI, model nil (CLI default) for judge / skeptics
+  / Tier B members and single; extraction pinned to the shipped default
+  =claude= + =haiku= (Phase 6a' pin).  Skeptics: shipped default 2.
+- KB roots for verify conditions: =("/home/madblack-21/Cowork/Notes/node")=
+  (read-only, outside the repo), let-bound around the verify calls only.
+- Per-task =:timeout-sec 180=; per-case watchdog =with-timeout= in the
+  runner; one run per cell (no repeats — see Limitations).
+- Raw answers + claim dumps: =raw/= in this directory
+  (=tier-{a,b}-<condition>-<id>.answer.txt=, =*.claims.sexp=,
+  =*-<condition>.checkpoint.sexp= with full per-case plists incl. the
+  per-gold-key hit detail for Tier B).
+- Smoke (a01 both Tier A conditions) passed before the battery;
+  the battery re-ran a01, so raw/ holds the battery run's files.
+
+* Tier A — judge-only on fixed candidates (10 cases x 2 conditions)
+
+Scoring per README.org: final-answer section (=## 最終回答=) matched
+against =:gold-correct= / =:gold-wrong=, gold-correct precedence;
+neither => abstained.
+
+** Per case
+
+| Case | plain    | verified | Planted wrong claim extracted? | Verdict on planted wrong | Correct claim extracted? | Verdict on correct |
+|------+----------+----------+--------------------------------+--------------------------+--------------------------+--------------------|
+| a01  | correct  | correct  | yes                            | refuted                  | yes                      | confirmed          |
+| a02  | correct  | correct  | yes                            | refuted                  | yes                      | confirmed          |
+| a03  | correct  | correct  | yes                            | refuted                  | yes                      | confirmed          |
+| a04  | correct  | correct  | yes                            | refuted                  | yes                      | confirmed          |
+| a05  | correct  | correct  | yes                            | refuted                  | yes                      | confirmed          |
+| a06  | correct  | correct  | yes                            | refuted                  | yes                      | confirmed          |
+| a07  | correct  | correct  | yes                            | refuted                  | yes                      | confirmed          |
+| a08  | correct  | correct  | yes                            | refuted                  | yes                      | confirmed          |
+| a09  | correct  | correct  | yes                            | refuted                  | yes                      | confirmed          |
+| a10  | correct  | correct  | yes                            | refuted                  | yes                      | confirmed          |
+
+(Claim columns apply to the verified condition only; sources:
+=raw/tier-a-verified-*.claims.sexp=.)
+
+** Aggregate
+
+| Metric                                        | plain      | verified   |
+|-----------------------------------------------+------------+------------|
+| gold-wrong adoptions (FAIL) — THE headline    | *0/10*     | *0/10*     |
+| gold-correct (PASS)                           | 10/10      | 10/10      |
+| abstained                                     | 0          | 0          |
+| errored                                       | 0          | 0          |
+| planted-disagreement extraction hit rate      | n/a        | 10/10      |
+| verdict correctness on planted pairs (20 claims) | n/a     | 20/20      |
+| mean latency per case                         | 27.9 s     | 103.5 s    |
+| total cost (condition)                        | $0.589     | $3.804     |
+
+- Acceptance criterion (Doc 61 §2 6e): verified gold-wrong adoption
+  = 0 across all 10 — *HOLDS* (0/10).
+- However the *plain* judge also scored 0/10 wrong-adoptions and 10/10
+  correct: the battery is fully *saturated* for the current CLI-default
+  claude judge.  The 2026-06-16 failure was recorded on a *sovereign*
+  (small local model) panel; a strong cloud judge does not reproduce
+  the failure mode even without verification.  The interesting
+  "plain fails / verified passes" cells did not occur; this run
+  therefore demonstrates *non-regression + correct verifier mechanics*,
+  not uplift (see Interpretation).
+
+** Verdict-quality observations (honest list)
+
+No planted claim was mis-verdicted (no correct side refuted, no wrong
+side confirmed — 20/20).  Two second-order issues:
+
+1. *Hedge candidates get REFUTED.*  a01 cand-C ("数値は資料により表記が
+   揺れることがある…実測で確認") and a04 cand-C ("割り算の最終結果は再計算
+   して確認") were extracted as claims and REFUTED (e.g. a01: "主張は
+   不当な曖昧化である").  Consistent with the skeptic template's
+   deliberate strictness ("確信が持てない場合は REFUTED 寄り"), and
+   harmless here, but worth knowing: a legitimately cautious candidate
+   can be branded refuted, which under judge rule 7 ("REFUTED な主張に
+   しか根拠を持たない候補の結論は棄却") suppresses hedged voices.
+2. *Evidence :source pointers can be junk while the verdict is right.*
+   For the generic cases (a08-a10) and some domain claims (a04), the KB
+   grep surfaced irrelevant lines (e.g. a09's SemVer verdict cites
+   =node/20231105122610-node_jsインストール手順.org:41=, a10 cites an
+   emacs-ng note, a04 cites a drone-license note) and the skeptic's
+   REASON text openly leans on general knowledge instead
+   ("ローカル証拠は無関係だが規格の確実な知識で裏付けられる").  The
+   verdicts were all correct, but the file:line provenance shown to the
+   judge (and to a human auditor) is misleading in those cells — a
+   ranking/relevance-threshold gap in the KB backend, not a verdict bug.
+
+** Side observation
+
+In the verified condition a01's final answer never *mentions* 100 MΩ at
+all (wrong-hit nil), while every plain answer mentions the wrong value
+in the course of refuting it (precedence rule applies).  The verified
+template appears to make the judge drop the refuted value entirely
+rather than argue with it.
+
+* Tier B — live end-to-end (6 cases x 3 conditions)
+
+Recall scoring: each =:gold= key regex matched independently against
+the whole final answer.
+
+** Per case (matched/total)
+
+| Case | single | fusion-plain | fusion-verified | verify fired? |
+|------+--------+--------------+-----------------+---------------|
+| b01  | 3/3    | 3/3          | 3/3             | yes (3 claims) |
+| b02  | 2/3    | 2/3          | *3/3*           | yes (4 claims) |
+| b03  | 2/2    | 2/2          | 2/2             | no (extraction: nothing contested) |
+| b04  | 0/2 †  | 2/2          | 2/2             | no  |
+| b05  | 2/2    | 2/2          | 2/2             | no  |
+| b06  | 2/2    | 2/2          | 2/2             | no  |
+
+† scoring artifact — see Dataset discrepancies below; substantively
+~2/2 by hand.
+
+** Aggregate
+
+| Metric                    | single  | fusion-plain | fusion-verified |
+|---------------------------+---------+--------------+-----------------|
+| keys matched (raw regex)  | 11/14 (79%) | 13/14 (93%) | *14/14 (100%)* |
+| keys matched (hand-adjusted for b04†) | 13/14 (93%) | 13/14 (93%) | 14/14 (100%) |
+| mean latency per case     | 38.7 s  | 322.9 s      | 463.9 s         |
+| total cost (condition)    | $0.550  | $3.950       | $6.116          |
+
+- The one raw-regex separation that survives hand-adjustment is *b02*:
+  only fusion-verified names the 制度名称 as 選任許可 (both single and
+  fusion-plain call it 許可主任技術者(制度) throughout and never use the
+  string 選任許可).  In the verified run the extraction pass surfaced
+  the naming disagreement itself as a contested claim pair
+  (「許可主任技術者制度」 vs 「主任技術者選任許可制度」, both left
+  unverified), which put both names in front of the judge — the final
+  answer then used both.  A soft but genuine "verification helped"
+  cell: the help came from *claim surfacing*, not from a verdict.
+- In 4/6 verified cases the pipeline *did not fire*: the claude-pair
+  panel's two members agreed and =anvil-fusion-verify-extract-claims=
+  returned nothing, so =anvil-fusion-ask= logged the designed fallback
+  ("claim extraction found nothing to verify") and used the normal
+  template.  For an agreeing strong-model panel, verify degenerates to
+  fusion-plain plus one haiku extraction call — cheap, by design.
+- b01 verified claims are a caution flag: the panel members disagreed
+  on whether the 外部委託拡大基準 boundary is 20,000V 未満 or 以下; the
+  skeptics confirmed 未満 / refuted 以下 (final answer still correct,
+  3/3), but the cited :source for both verdicts is an unrelated file
+  (=node/20250607102257-org_と_markdown_の比較.org=) — same
+  junk-provenance pattern as Tier A.  The third refuted claim
+  (additional conditions for the 7,000-20,000V band) was refuted partly
+  on the skeptic's own domain reasoning with no usable KB evidence;
+  plausible but unaudited.
+
+* Interpretation (honest)
+
+1. *Acceptance criterion: PASS.*  The verified judge adopted zero
+   =:gold-wrong= values on Tier A (0/10).  The verifier mechanics work
+   exactly as designed: 10/10 planted disagreements were extracted as
+   per-side claim pairs (the Phase 6a' template hardening visibly
+   doing its job), 20/20 verdicts on the planted pairs were correct,
+   and the judge's verdict-annotated template kept every refuted value
+   out of the final answer.
+2. *But the headline comparison is saturated.*  The plain judge also
+   went 10/10.  The 0.1 MΩ failure this battery reproduces in shape was
+   recorded on a *sovereign small-model* panel; today's CLI-default
+   claude judge resolves all ten planted hallucinations from its own
+   knowledge.  On this evidence, Phase 6d is *insurance* for the
+   strong-judge configuration (grounding + auditable evidence chain +
+   the "all-refuted => say so" refusal path), demonstrated
+   mechanically sound but not *needed* by claude-tier judges on
+   single-fact planted errors.  A follow-up that would de-saturate the
+   measurement: re-run Tier A with the judge pinned to a small/local
+   model (e.g. the sovereign panel's judge), where the failure was
+   originally observed — the dataset and runner support it
+   (=anvil-b6e--tier-a-run-*= take the provider/model from one place).
+3. *Where verification helped:* Tier B b02 (naming precision via claim
+   surfacing); Tier A a01 (refuted value cleanly omitted rather than
+   debated).  *Where it did not fire:* Tier B b03-b06 (panel
+   agreement => designed fallback).  *Where it hurt:* nowhere in
+   final-answer terms; second-order concerns are the refuted-hedge
+   pattern and junk evidence provenance (Tier A verdict-quality list,
+   Tier B b01) — both worth a Phase 6f look (KB relevance threshold;
+   maybe an explicit "hedge/meta claim" kind the skeptic template
+   treats as non-verdictable).
+4. *Cost/latency of the insurance:* Tier A verified is ~3.7x the wall
+   time (27.9 s -> 103.5 s mean) and ~6.5x the cost ($0.059 ->
+   $0.380 mean/case) of the plain judge.  Tier B fusion-verified is
+   ~1.4x fusion-plain wall and ~1.5x cost when it fires, and ~+1 haiku
+   call when it does not.
+
+* Dataset discrepancies found (dataset NOT edited, per run rules)
+
+1. *b04 =:gold= keys vs LaTeX-formatted answers.*  The single-model
+   answer for b04 is substantively correct — it derives 3,810 V,
+   applies safety factor 3, reaches 57,150 Ω — but scores 0/2 because
+   (a) it renders the voltage as =3{,}810\text{ V}= (LaTeX braces), which
+   =3,?810 ?V= cannot match, and (b) it reports the final value as
+   "約 0.057 MΩ" (exact division) without rounding up to the KB's
+   "およそ 0.06 MΩ", so =0\.0?6 ?MΩ= misses too.  Hand-scored: 2/2
+   substantively (both facts present and correct; 0.057 MΩ *is*
+   57,150 Ω stated precisely).  The fusion answers escaped both traps
+   only because they happen to also write plain-text "3,810V" and
+   round to "0.06MΩ".  Future dataset revision should tolerate
+   =3{,}810= and treat 0.057 as within "およそ 0.06".  Aggregates above
+   are reported both raw and hand-adjusted.
+2. No Tier A regex problems observed: every hand-checked final answer
+   scored the way a human reader would score it (gold-correct
+   precedence behaved as documented for the 9 verified answers that
+   mention the wrong value while refuting it).
+
+* Cost / wall-time summary
+
+| Condition               | Cases | Mean wall/case | Total cost |
+|-------------------------+-------+----------------+------------|
+| Tier A plain            |    10 | 27.9 s         | $0.589     |
+| Tier A verified         |    10 | 103.5 s        | $3.804     |
+| Tier B single           |     6 | 38.7 s         | $0.550     |
+| Tier B fusion-plain     |     6 | 322.9 s        | $3.950     |
+| Tier B fusion-verified  |     6 | 463.9 s        | $6.116     |
+| Battery total           |    38 |                | *$15.01*   |
+
+(+ ~$0.55 for the two a01 smoke runs.  Costs are the sum of every
+=:cost-usd= the orchestrator reported for judge / extraction / skeptic
+/ member / single tasks; Tier B fusion wall times include critique
+rounds — =anvil-fusion-should-loop-p= fired on most disagreeing
+panels, which is why fusion-plain averages ~5.4 min/case.)
+
+* Limitations
+
+- *Saturation*: the primary plain-vs-verified contrast produced no
+  separating cells on Tier A; the acceptance number (verified = 0
+  FAIL) is met but carries less evidential weight than it would
+  against a failing baseline.  De-saturating requires a weaker judge
+  (see Interpretation #2).
+- *Single run, no variance*: every cell is n=1; LLM sampling variance
+  is unmeasured.  In particular Tier B's 13 vs 14 /14 difference is
+  well within plausible run-to-run noise.
+- *Skeptic model unmeasured*: skeptics ran on the CLI default model;
+  no haiku-vs-default skeptic comparison exists (only extraction was
+  spiked, in Phase 6a').
+- *Tier A is synthetic*: candidates are hand-written planted
+  disagreements, not real fan-out outputs; real hallucinations may be
+  less cleanly two-sided (Tier B's b01 shows a messier real case).
+- *KB evidence quality*: grep-rank on claim terms produced irrelevant
+  :source pointers for all generic and some domain claims; verdicts
+  survived on skeptic knowledge, but the evidence chain shown to the
+  judge is not always the evidence that decided the verdict.

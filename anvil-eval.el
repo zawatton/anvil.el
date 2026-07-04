@@ -83,7 +83,16 @@ Set automatically for the duration of each MCP tool call.")
 
 (defun anvil-eval--org-mode-fast-advice (orig-fn &rest args)
   "Make `org-mode' setup minimal when called inside an MCP tool."
-  (if (and anvil-eval-org-fast-mode anvil-eval--in-org-fast-mode)
+  (if (and anvil-eval-org-fast-mode anvil-eval--in-org-fast-mode
+           ;; Skip the fast path for user agenda files: those buffers
+           ;; outlive the MCP tool call, and `(font-lock-mode -1)' on
+           ;; them sets `font-lock-mode-set-explicitly' so
+           ;; `global-font-lock-mode' never re-enables fontification —
+           ;; the buffer stays uncoloured for the rest of the session.
+           (not (and buffer-file-name
+                     (member (expand-file-name buffer-file-name)
+                             (mapcar #'expand-file-name
+                                     (org-agenda-files t t))))))
       (progn
         ;; setq-local, not let: Emacs 30's define-derived-mode calls
         ;; (make-local-variable 'delay-mode-hooks) inside org-mode, which
@@ -388,6 +397,42 @@ MCP Parameters: (none)"
 (defvar anvil-eval--server-id "anvil"
   "Server ID used when registering eval tools.")
 
+(declare-function server-quote-arg "server")
+
+(defun anvil-eval--server-execute-cleanup-advice (orig-fn &rest args)
+  "Guarantee emacsclient teardown when `server-execute' exits abnormally.
+Without this, a non-local exit during the eval body — e.g.
+`(top-level)' selected in the debugger, or any unwound `throw' —
+skips the reply / `server-delete-client' step at the end of
+`server-execute'.  The emacsclient process is then blocked in
+`recvfrom' on a still-open server connection that will never
+receive its `-print' reply, hanging whatever owns it (for the MCP
+stdio transport, the anvil-stdio.sh bridge and its client).
+
+We wrap the call in an `unwind-protect': on abnormal unwind, if
+this looks like a wait-for-reply client (`dontkill' is nil and the
+connection is still open), synthesise an `-error' reply and tear
+the connection down so emacsclient can exit cleanly.  When
+`dontkill' is non-nil — `-window-system' / `-tty' / `-resume' /
+`-suspend' clients — we leave the connection alone, matching
+upstream `server-execute' behaviour."
+  (let ((proc (nth 0 args))
+        (dontkill (nth 4 args)))
+    (unwind-protect
+        (apply orig-fn args)
+      (when (and (null dontkill)
+                 (processp proc)
+                 (process-live-p proc)
+                 (eq (process-status proc) 'open))
+        (ignore-errors
+          (process-send-string
+           proc
+           (concat "-error "
+                   (server-quote-arg
+                    "anvil: server-execute aborted by non-local exit")
+                   "\n")))
+        (ignore-errors (delete-process proc))))))
+
 (defun anvil-eval-enable ()
   "Register eval tools and install advice."
   (setq anvil-eval--server-id
@@ -400,6 +445,8 @@ MCP Parameters: (none)"
   (advice-add 'org-mode :around #'anvil-eval--org-mode-fast-advice)
   (advice-add 'anvil-server-process-jsonrpc
               :around #'anvil-eval--request-mutex-advice)
+  (advice-add 'server-execute
+              :around #'anvil-eval--server-execute-cleanup-advice)
   ;; Register tools
   (anvil-server-register-tool
    #'anvil-eval--sync
@@ -474,7 +521,9 @@ NeLisp globals across calls, so it behaves as a practical MCP REPL."
                  #'anvil-eval--org-fast-mode-wrapper)
   (advice-remove 'org-mode #'anvil-eval--org-mode-fast-advice)
   (advice-remove 'anvil-server-process-jsonrpc
-                 #'anvil-eval--request-mutex-advice))
+                 #'anvil-eval--request-mutex-advice)
+  (advice-remove 'server-execute
+                 #'anvil-eval--server-execute-cleanup-advice))
 
 (provide 'anvil-eval)
 ;;; anvil-eval.el ends here

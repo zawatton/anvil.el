@@ -26,6 +26,11 @@
 ;; `anvil-fusion-ask' consults this flag to disable web/browser tools for
 ;; sovereign runs.
 ;;
+;; Doc 61 §3 adds `opus-solo': a k=3 self-consistency panel using one
+;; strong Claude Opus 4.8 model three times under different role lenses,
+;; then judged by the same model.  This keeps the panel operational even
+;; when cross-vendor auth or wiring is unavailable.
+;;
 ;; This module is pure: it has no load-time dependency on
 ;; anvil-orchestrator.  `anvil-fusion-panel-tasks' produces orchestrator
 ;; task plists that Phase 3 feeds to `anvil-orchestrator-submit'.
@@ -76,7 +81,14 @@ additional local runtimes."
     (claude-pair
      (members . ((claude) (claude)))
      (judge   . (claude))
-     (egress  . external)))
+     (egress  . external))
+    (opus-solo
+     (members . ((claude . "claude-opus-4-8")
+                 (claude . "claude-opus-4-8")
+                 (claude . "claude-opus-4-8")))
+     (judge   . (claude . "claude-opus-4-8"))
+     (egress  . external)
+     (lenses  . (correctness completeness skeptic))))
   "Named fusion panels.
 An alist NAME -> BODY where BODY is an alist with keys:
 
@@ -87,13 +99,20 @@ An alist NAME -> BODY where BODY is an alist with keys:
   judge    a single (PROVIDER . MODEL) cons used to synthesize.
   egress   `external' or `local-only'.  `local-only' is validated
            to contain only `anvil-fusion-local-providers'.
+  lenses   optional list of role lenses applied by member position.
 
 The model strings for non-local panels are sensible defaults;
 tune them to whatever your account exposes.  The sovereign
 defaults (llama3.1:8b + llama3.2:3b + gemma4:e4b, judged by
 llama3.1:8b) are validated to run via Ollama on a GTX 1060 6GB /
 62GB-RAM box (8b/3b fit VRAM; gemma4:e4b spills to CPU).  Swap
-for whatever your local install pulls; see docs/design/01 §9."
+for whatever your local install pulls; see docs/design/01 §9.
+
+`opus-solo' is the k-member single-model self-consistency panel
+(Doc 61 Phase 7): one strong model asked k=3 times under
+different role lenses, judged by the same model -- no
+cross-vendor wiring dependency; pair with the Phase 6d `:verify'
+flag for the verifier-grounded judge."
   :type '(alist :key-type symbol :value-type sexp)
   :group 'anvil-fusion)
 

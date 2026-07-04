@@ -53,6 +53,7 @@
 
 ;; `anvil-offload' is an optional module — loaded on demand in
 ;; `anvil-server--offload-apply'.  Declare to silence byte-compile warnings.
+(declare-function anvil-server-start "anvil-server-commands" ())
 (declare-function anvil-offload "anvil-offload" (form &rest keys))
 (declare-function anvil-future-await "anvil-offload" (future &optional timeout))
 (declare-function anvil-future-cancel "anvil-offload" (future))
@@ -860,7 +861,13 @@ Parameters prefixed with `_' (the Elisp unused-arg convention) are
 hidden from the client-facing schema — `anvil-server--handle-tools-call'
 fills them with nil at dispatch time.
 If ARGLIST is provided, reuse it instead of calling
-`help-function-arglist'."
+`help-function-arglist'.
+
+A description in the docstring's \"MCP Parameters:\" section may start
+with a \"(TYPE) \" prefix — one of (boolean), (integer), (number),
+(array), (object) — to set the parameter's JSON schema type.  The
+prefix is stripped from the client-facing description.  Without a
+recognised prefix the type defaults to \"string\"."
   (let ((arglist (or arglist (help-function-arglist func t))))
     (when (memq '&rest arglist)
       (error "MCP tool handlers do not support &rest parameters"))
@@ -883,9 +890,26 @@ If ARGLIST is provided, reuse it instead of calling
                     ;; Mark that we've seen &optional
                     (setq seen-optional t)
                   ;; Regular parameter - add to properties
-                  (let* ((description
+                  (let* ((raw-description
                           (cdr (assoc param-name param-descriptions)))
-                         (property-schema `((type . "string"))))
+                         ;; Infer the JSON type from a "(TYPE) ..." prefix
+                         ;; in the docstring description.  Recognised:
+                         ;; boolean integer number array object.  Absent
+                         ;; or unrecognised prefixes keep type "string".
+                         (type-match
+                          (and raw-description
+                               (string-match
+                                "\\`(\\(boolean\\|integer\\|number\\|array\\|object\\)) "
+                                raw-description)))
+                         (json-type
+                          (if type-match
+                              (match-string 1 raw-description)
+                            "string"))
+                         (description
+                          (if type-match
+                              (substring raw-description (match-end 0))
+                            raw-description))
+                         (property-schema `((type . ,json-type))))
                     ;; Add description if provided
                     (when description
                       (setq property-schema
@@ -1701,8 +1725,15 @@ virtual server-ids share the same handler pool."
                           (signal
                            'anvil-server-invalid-params
                            (list
-                            (format "Missing required parameter: %s"
-                                    required)))))
+                            (format
+                             (concat
+                              "Missing required parameter: %s. "
+                              "Each parameter must be a separate field "
+                              "in the JSON input object — do not embed "
+                              "XML-style tags such as </%s> or "
+                              "<parameter name=\"%s\"> inside another "
+                              "parameter's string value.")
+                             required required required)))))
                       ;; Check for unexpected parameters.  `_'-prefixed
                       ;; names are silently accepted even when not in
                       ;; `expected-params' — a stale client that still has
@@ -1778,6 +1809,10 @@ virtual server-ids share the same handler pool."
                           " value (string / nil / plist / list /"
                           " hash-table / vector), got: %s")
                          (type-of result)))))))
+                   (result-text
+                    (if (fboundp 'anvil-disclosure-budget-apply)
+                        (anvil-disclosure-budget-apply tool-name result-text)
+                      result-text))
                    ;; Wrap the handler result in the MCP format
                    (formatted-result
                     `((content
@@ -1785,6 +1820,8 @@ virtual server-ids share the same handler pool."
                        ,(vector
                          `((type . "text") (text . ,result-text))))
                       (isError . :json-false))))
+                (anvil-server-metrics--track-tool-payload
+                 tool-name tool-args result-text)
                 (anvil-server-metrics--track-tool-call tool-name)
                 (condition-case hook-err
                     (run-hook-with-args
@@ -1953,7 +1990,8 @@ See also: `anvil-server-tool-throw'"
        (progn
          ,@body)
      (quit
-      (anvil-server-tool-throw (format "Quit: %S" err)))
+      (anvil-server-tool-throw
+       "Interrupted (quit) — the user pressed C-g.  Avoid running code that blocks the Emacs UI."))
      (error
       (anvil-server--run-tool-error-hook
        err anvil-server--current-tool-name 'tool-body)

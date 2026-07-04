@@ -1,0 +1,28 @@
+## 分析
+
+**1. 合意点**
+両候補とも「Promiseは特定のECMAScriptバージョンで標準化された」という前提は共有しているが、具体的なバージョンについては一致していない。共通の主張はほぼない。
+
+**2. 矛盾点**
+- 候補1:ES6(ECMAScript 2015)で標準化、西暦2015年
+- 候補2:ES5.1(2011年)の時点で標準機能として含まれていた
+
+これは事実として明確に矛盾しており、**候補1が正しい**。PromiseはjQueryのDeferredやBluebird、Q.jsなどのライブラリで先行実装されていたが、ECMAScript仕様への正式な組み込みはECMAScript 2015(ES6、通称ES2015)で行われた。ES5.1(2011年策定)の仕様書には`Promise`オブジェクトは存在しない。候補2は誤りである。
+
+**3. 部分カバー**
+候補1のみが「ES6」と「ECMAScript 2015」という2つの呼称を併記しており、通称と正式名称の対応が分かる点で有用。
+
+**4. 独自洞察**
+どちらの候補にも、Promise標準化の背景(先行するライブラリ実装の存在など)についての言及はなく、独自の価値ある洞察は見られない。
+
+**5. 見落とし**
+- 両候補とも、ES6以前にPromiseライクな概念(jQuery.Deferred、Q、Bluebirdなどのライブラリ)が存在し、それらがネイティブ仕様策定の土台になったという経緯に触れていない。
+- ES6のPromiseは`Promise.all`や`Promise.race`などの基本APIのみを含み、`Promise.finally`はES2018(ES9)、`Promise.allSettled`/`Promise.any`はそれぞれES2020・ES2021で追加された、という仕様の発展的側面にも触れられていない。
+
+## 最終回答
+
+JavaScriptのPromiseがECMAScript仕様にネイティブ機能として標準化されたのは、**ECMAScript 2015(ES6)**、西暦でいうと**2015年**です。
+
+補足:
+- ES5.1(2011年)にはPromiseは含まれておらず、候補2の主張は誤りです。ES6以前は、jQueryの`Deferred`やQ、Bluebirdといったサードパーティライブラリでのみ同様の概念が利用可能でした。
+- ES6で標準化されたのは`Promise`コンストラクタと`then`/`catch`、`Promise.all`/`Promise.race`などの基本APIです。その後、`Promise.prototype.finally`がECMAScript 2018(ES9)で、`Promise.allSettled`がECMAScript 2020(ES11)で、`Promise.any`がECMAScript 2021(ES12)で追加されるなど、仕様は段階的に拡張されています。

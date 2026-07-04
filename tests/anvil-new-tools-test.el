@@ -23,6 +23,20 @@
   "Parse STR (output of `format \"%S\"' on a plist) back to a plist."
   (car (read-from-string str)))
 
+(defun anvil-new-tools-test--write-ert-suite (path body)
+  "Write BODY as a self-contained ERT suite to PATH."
+  (anvil-new-tools-test--write
+   path
+   (concat "(require 'ert)\n" body)))
+
+(defun anvil-new-tools-test--make-ert-test-lines (prefix count)
+  "Return COUNT passing ERT definitions named with PREFIX."
+  (mapconcat
+   (lambda (i)
+     (format "(ert-deftest %s-%03d () (should t))" prefix i))
+   (number-sequence 1 count)
+   "\n"))
+
 ;;;; --- elisp-ert-run --------------------------------------------------------
 
 (ert-deftest anvil-tools-test-ert-run-all-pass ()
@@ -124,6 +138,133 @@
             (anvil-elisp--ert-run tmp nil ""))
           (should (= 0 called)))
       (ignore-errors (delete-file tmp)))))
+
+;;;; --- ert-run-distilled ---------------------------------------------------
+
+(ert-deftest anvil-tools-test-ert-run-distilled-pass ()
+  "Two passing temp files return a small fixed-shape digest."
+  (let* ((dir (make-temp-file "anvil-ert-distilled-pass-" t))
+         (file-a (expand-file-name "pass-a-test.el" dir))
+         (file-b (expand-file-name "pass-b-test.el" dir)))
+    (unwind-protect
+        (progn
+          (anvil-new-tools-test--write-ert-suite
+           file-a
+           (anvil-new-tools-test--make-ert-test-lines
+            "anvil-tools-distilled-pass-a" 100))
+          (anvil-new-tools-test--write-ert-suite
+           file-b
+           (anvil-new-tools-test--make-ert-test-lines
+            "anvil-tools-distilled-pass-b" 100))
+          (let* ((out (anvil-elisp--ert-run-distilled
+                       (list file-a file-b) (list dir) dir nil 300 nil))
+                 (res (anvil-new-tools-test--read-plist out))
+                 (log-path (plist-get res :log-path)))
+            (should (= 200 (plist-get res :ran)))
+            (should (= 0 (plist-get res :unexpected)))
+            (should (= 0 (plist-get res :skipped)))
+            (should-not (plist-member res :failed))
+            (should-not (plist-member res :first-backtrace))
+            (should (< (length out) 400))
+            (should (file-exists-p log-path))
+            (should (string-match-p
+                     "Ran 200 tests"
+                     (with-temp-buffer
+                       (insert-file-contents log-path)
+                       (buffer-string))))))
+      (ignore-errors (delete-directory dir t)))))
+
+(ert-deftest anvil-tools-test-ert-run-distilled-failure ()
+  "A failing test reports the failure digest and a bounded backtrace head."
+  (let* ((dir (make-temp-file "anvil-ert-distilled-fail-" t))
+         (file (expand-file-name "fail-test.el" dir)))
+    (unwind-protect
+        (progn
+          (anvil-new-tools-test--write-ert-suite
+           file
+           "(ert-deftest anvil-tools-distilled-fail () (should (= 1 2)))\n")
+          (let* ((out (anvil-elisp--ert-run-distilled
+                       (list file) (list dir) dir nil 300 nil))
+                 (res (anvil-new-tools-test--read-plist out))
+                 (failed (plist-get res :failed))
+                 (entry (car failed)))
+            (should (= 1 (plist-get res :ran)))
+            (should (= 1 (plist-get res :unexpected)))
+            (should (/= 0 (plist-get res :exit-code)))
+            (should (= 1 (length failed)))
+            (should (equal "anvil-tools-distilled-fail"
+                           (plist-get entry :name)))
+            (should (string-match-p "ert-test-failed"
+                                    (plist-get entry :error)))
+            (should (<= (length (plist-get res :first-backtrace)) 600))
+            (should (< (length out) 2500))))
+      (ignore-errors (delete-directory dir t)))))
+
+(ert-deftest anvil-tools-test-ert-run-distilled-selector ()
+  "Selector limits the batch run to the requested test."
+  (let* ((dir (make-temp-file "anvil-ert-distilled-sel-" t))
+         (file (expand-file-name "selector-test.el" dir)))
+    (unwind-protect
+        (progn
+          (anvil-new-tools-test--write-ert-suite
+           file
+           (concat
+            "(ert-deftest anvil-tools-distilled-selector-a () (should t))\n"
+            "(ert-deftest anvil-tools-distilled-selector-b () (should t))\n"))
+          (let* ((out (anvil-elisp--ert-run-distilled
+                       (list file) (list dir) dir
+                       "\"anvil-tools-distilled-selector-b\"" 300 nil))
+                 (res (anvil-new-tools-test--read-plist out)))
+            (should (= 1 (plist-get res :ran)))
+            (should (= 0 (plist-get res :unexpected)))))
+      (ignore-errors (delete-directory dir t)))))
+
+(ert-deftest anvil-tools-test-ert-run-distilled-timeout ()
+  "Timeout returns a digest instead of signalling."
+  (let* ((dir (make-temp-file "anvil-ert-distilled-timeout-" t))
+         (file (expand-file-name "timeout-test.el" dir)))
+    (unwind-protect
+        (progn
+          (anvil-new-tools-test--write-ert-suite
+           file
+           (concat
+            "(ert-deftest anvil-tools-distilled-timeout ()\n"
+            "  (sleep-for 5)\n"
+            "  (should t))\n"))
+          (let* ((out (anvil-elisp--ert-run-distilled
+                       (list file) (list dir) dir nil 3 nil))
+                 (res (anvil-new-tools-test--read-plist out)))
+            (should (= 124 (plist-get res :exit-code)))
+            (should (string-match-p "timed out"
+                                    (plist-get res :error)))
+            (should (stringp (plist-get res :tail)))
+            (should (file-exists-p (plist-get res :log-path)))))
+      (ignore-errors (delete-directory dir t)))))
+
+(ert-deftest anvil-tools-test-ert-run-distilled-full-flag ()
+  "Truthy full adds the bounded raw backtrace; falsey variants do not."
+  (let* ((dir (make-temp-file "anvil-ert-distilled-full-" t))
+         (file (expand-file-name "full-test.el" dir)))
+    (unwind-protect
+        (progn
+          (anvil-new-tools-test--write-ert-suite
+           file
+           "(ert-deftest anvil-tools-distilled-full () (should (= 1 2)))\n")
+          (let* ((full-out (anvil-elisp--ert-run-distilled
+                            (list file) (list dir) dir nil 300 t))
+                 (full-res (anvil-new-tools-test--read-plist full-out))
+                 (false-out (anvil-elisp--ert-run-distilled
+                             (list file) (list dir) dir nil 300 :false))
+                 (false-res (anvil-new-tools-test--read-plist false-out))
+                 (string-false-out (anvil-elisp--ert-run-distilled
+                                    (list file) (list dir) dir nil 300 "false"))
+                 (string-false-res
+                  (anvil-new-tools-test--read-plist string-false-out)))
+            (should (stringp (plist-get full-res :backtrace)))
+            (should (<= (length (plist-get full-res :backtrace)) 8000))
+            (should-not (plist-member false-res :backtrace))
+            (should-not (plist-member string-false-res :backtrace))))
+      (ignore-errors (delete-directory dir t)))))
 
 ;;;; --- elisp-byte-compile-file ---------------------------------------------
 

@@ -1,0 +1,252 @@
+#+TITLE: Doc 61 — anvil-fusion-verify: Verifier-Grounded Judge, Opus Self-Consistency, Agentic Fusion
+#+AUTHOR: zawatton + Claude
+#+DATE: <2026-07-03>
+#+STATUS: ALL PHASES SHIPPED (6a-9, 2026-07-03/04); 6e acceptance PASS (saturated); ops follow-ups: de-saturation re-run, KB relevance threshold (6f), traj library needs live trajectories
+#+OPTIONS: toc:2 num:t
+
+* 0. Executive summary
+
+Doc 54 (fusion harness) and Doc 55 (longrun) shipped a working fan-out -> judge
+ensemble, but the 2026-06-15/16 evals recorded three hard findings:
+
+1. *Fusion never beat a strong single model in any tested condition*
+   (=eval/results-hard-2026-06-15.org=): cloud members saturate the benchmark,
+   local members collectively lack the knowledge the judge would need.
+2. *The judge can discard a correct candidate in favor of a hallucinated one*
+   (=eval/results-panel-compare-2026-06-16.org=: sovereign panel answered
+   100 MOhm where a member had the correct 0.1 MOhm). The judge selects on
+   plausibility of prose, not on verified truth.
+3. Weak-provider distillation loses tails mechanically
+   (=results-longrun-weakdistill-2026-06-16.org=).
+
+This doc addresses the goal behind Doc 54 — *reproduce Fable-5-class capability
+on Opus 4.8* — by shifting the design center from "synthesize better prose" to
+"*verify before synthesizing*". The Fable 5 / Opus 4.8 gap observed in practice
+is less about one-shot knowledge and more about long-horizon planning,
+verification, and self-correction accuracy. Three phases (numbering continues
+Doc 54's 1-5):
+
+- *Phase 6 — Verifier-grounded judge*: extract contested claims, check them
+  against evidence (local KB tools, execution for code), feed verdicts to the
+  judge. Directly kills failure mode (2).
+- *Phase 7 — Opus self-consistency panel (=opus-solo=)*: claude x k members
+  diversified by role-lens + temperature, judged by the Phase 6 verifier judge.
+  No codex/gemini wiring dependency (both broke during the 06-15 evals).
+- *Phase 8 — Agentic fusion (deep x wide)*: plan-level fusion + "longrun step =
+  fusion panel" (deferred in Doc 55 as Phase 4+), with a verify gate between
+  steps to stop error propagation.
+
+Plus a debt bundle (Phase 6d'): async-path critique loop, eval egress
+inference, and an unsaturated eval battery.
+
+* 1. Evidence -> design mapping
+
+| Finding (source)                                              | Design response                                    |
+|---------------------------------------------------------------+----------------------------------------------------|
+| Judge picked hallucinated 100 MOhm over correct 0.1 MOhm      | Phase 6: claim-level verification before synthesis |
+| Cloud panels saturate easy benchmarks; no measurable uplift   | Phase 6e: harder, unsaturated eval battery         |
+| codex auth / gemini wiring broke mid-eval                     | Phase 7: pure-Claude panel with intra-model diversity |
+| "3/4 of lift is synthesis" (Doc 54) but synthesis is ungrounded | Phase 6: grounding is the missing 3/4 multiplier |
+| Doc 55 open item: "step = fusion panel" deferred              | Phase 8: deep x wide composite                     |
+| nelisp-llm agent loop: execution-based reward keeps only wins | Phase 6c: execution is the strongest verifier for code |
+| STaR / expert iteration (dev/nelisp-llm, Doc 05 agent harness) | Phase 9 (sketch): verified-trajectory exemplar library |
+
+* 2. Phase 6 — Verifier-grounded judge
+
+Layered on the orchestrator public API only (same discipline as Doc 54).
+New module =anvil-fusion-verify.el=.
+
+** 6a. Claim extraction (divergence mining)
+- After =consensus-collect=, run a cheap extraction pass (judge provider,
+  =haiku=-tier acceptable) that lists *contested claims*: factual assertions on
+  which candidates disagree or that only one candidate makes.
+- Output: list of plists =(:claim STR :candidates (NAME...) :kind fact|number|code|citation)=.
+- Cap: =anvil-fusion-verify-max-claims= (default 5) — verify only the claims
+  that would change the final answer.
+
+** 6b. Evidence check per claim
+Per-claim verification strategies, dispatched by =:kind= and panel egress:
+- =citation= / =fact= (domain): query local KB — =notes-lexical-search=
+  (tools/semantic-search lexical mode), hourei org DB under =node/=. Local
+  tools are egress-safe, so *sovereign panels get verification too*.
+- =number=: KB lookup first; if the panel is =external=, optionally one web
+  check (=anvil-http=). Never for =local-only= panels.
+- Adversarial refutation vote: fan the claim to N skeptics
+  ("try to refute; default to refuted when uncertain") via
+  =orchestrator-consensus-submit=; majority-refuted claims are marked FALSE.
+  N = =anvil-fusion-verify-skeptics= (default 2; 3 for =rigorous=).
+- Verdicts: =CONFIRMED= / =REFUTED= / =UNVERIFIED= with a one-line evidence
+  pointer (file:line or refutation summary).
+
+** 6c. Execution-based verification (code tasks)
+Port of the nelisp-llm agent-harness principle (execution reward > text
+judging):
+- When the task is code (=:task-kind 'code= or heuristic detection), run each
+  candidate patch in an isolated worktree (=anvil-git= worktree helpers, same
+  plumbing as orchestrator =:worktree=) and gate on build / ERT / user-supplied
+  check command (=:check-cmd=).
+- A candidate that fails execution is excluded from synthesis regardless of
+  prose quality. Judge receives pass/fail per candidate.
+
+** 6d. Verdict-annotated synthesis
+- Extend the Doc 54 structured judge template: the judge prompt now includes
+  the claim table with verdicts and *must not adopt a REFUTED claim*; when all
+  candidates carry a REFUTED load-bearing claim, the judge must say so rather
+  than synthesize confidently.
+- This is a prompt-template + data-plumbing change in =anvil-fusion.el=;
+  the old template remains as fallback (=anvil-fusion-judge-template= untouched,
+  new =anvil-fusion-verify-judge-template=).
+
+** 6d'. Debt bundle (small, shipped with Phase 6)
+- Critique loop in the async/MCP path (Doc 54 §12c — async is still
+  single-round).
+- =anvil-fusion-eval= egress inference from provider (ollama currently
+  hard-coded =external=, Doc 54 §12b).
+- =fusion-ask= MCP tool grows =:verify= flag (default on for =quality= /
+  =claude-pair=; on-with-local-tools-only for =sovereign=).
+
+** 6e. Unsaturated eval battery
+- New =eval/cases-agentic.el= + harder domain cases where single Opus is
+  measurably below ceiling (target: single-model score 0.4-0.7 band, so uplift
+  is observable). Re-run panel-compare; acceptance = the 0.1 MOhm class of
+  failure no longer occurs (verified judge refuses the hallucinated number).
+
+* 3. Phase 7 — Opus self-consistency panel (=opus-solo=)
+
+- New panel in =anvil-fusion-panels=:
+  =(opus-solo . ((members . ((claude . "claude-opus-4-8") x3)) (judge . (claude . "claude-opus-4-8")) (egress . external)))=
+  with per-member diversity injected by:
+  - role-lens (existing =anvil-fusion-lens=: correctness / completeness /
+    domain / skeptic), and
+  - sampling diversity where the provider CLI allows it (temperature /
+    "consider an unconventional approach" lens as fallback).
+- Rationale: evals showed cross-vendor diversity is fragile operationally
+  (auth, wiring) and unnecessary when the base model is strong; claude-pair
+  was the most robust panel. =opus-solo= is claude-pair generalized to k
+  members + verifier judge — the most direct answer to "Fable 5 performance on
+  Opus 4.8 only".
+- Cost note: k=3 + judge ~= 4x single ask; router/preset should keep this for
+  hard/important prompts (existing =anvil-orchestrator-presets= mechanism).
+
+* 4. Phase 8 — Agentic fusion (deep x wide)
+
+Where the real Fable-gap lives: multi-step tasks.
+
+** 8a. Plan fusion
+- =anvil-fusion-plan=: fan out *plans* (not answers) for a task, judge merges
+  into one plan (verifier judge checks plan claims against repo/KB reality:
+  files exist, APIs exist).
+
+** 8b. Longrun step = fusion panel
+- Implement the Doc 55 deferred composite: a longrun quest step may execute as
+  a fusion ask (=:step-panel= option). Bounded by budget guards (Doc 47) —
+  panel steps only where the step is marked =:hard=, single provider otherwise.
+
+** 8c. Verify gate between steps
+- After each step, run the Phase 6 verifier on the step's digest before it
+  enters the state (stops error propagation into subsequent steps — the
+  distill-tail-loss analog for correctness). Failed gate -> step retried once
+  with the refutation as feedback, then surfaced.
+
+* 5. Phase 9 (sketch, not committed) — Verified-trajectory library
+
+STaR / expert-iteration without weight updates (nelisp-llm pattern, API-model
+version): store (question, plan, verified answer, verdict evidence) tuples that
+*passed the Phase 6 gate* into a SQLite store (anvil-memory or its own table);
+retrieve top-k similar exemplars (FTS5) and prepend to future panel prompts.
+Quality control is inherent: only verified wins enter. Design in detail after
+Phase 6-7 produce trajectories worth keeping.
+
+* 6. Non-goals
+- No access to Fable 5 / Mythos 5 (Doc 54 non-goal, unchanged; capability
+  reproduction only, no jailbreak).
+- No local model training in anvil (nelisp-llm stays a separate lab; we import
+  its *harness patterns* — execution reward, constrained output — not weights).
+- No streaming; async remains submit+poll.
+
+* 7. Phase table
+
+| Phase | Deliverable                                        | Depends on | Status |
+|-------+----------------------------------------------------+------------+--------|
+| 6a    | claim extraction pass                              | —          | SHIPPED a2a4b11 |
+| 6a'   | haiku default pin + per-side/NONE template harden  | 6a, spike  | SHIPPED b414185 |
+| 6b    | evidence check (KB + skeptic vote)                 | 6a         | SHIPPED de5ebb7 |
+| 6c    | execution verification for code candidates         | 6a         | SHIPPED (anvil-fusion-exec; exec results as 6d claims + hard exclusion) |
+| 6d    | verdict-annotated judge template + plumbing        | 6b         | SHIPPED 281aa63 |
+| 6d'   | debt bundle (async loop, egress inference, :verify)| 6d         | SHIPPED da51e05 |
+| 6e    | unsaturated eval battery + verify-effect run       | 6d         | MEASURED (PASS, saturated — see below) |
+| 7     | opus-solo panel (k-member self-consistency)        | 6d         | SHIPPED c9fe0ff |
+| 8a    | plan fusion                                        | 6d         | SHIPPED 9b4fdc4 |
+| 8b    | longrun step = fusion panel                        | 8a         | SHIPPED 543295c |
+| 8c    | inter-step verify gate                             | 6d, 8b     | SHIPPED c191a43 |
+| 9     | verified-trajectory exemplar library (sketch)      | 6-7 live   | SHIPPED (anvil-fusion-traj; admission gate = verified wins only; opt-in :exemplars / :store-trajectory) |
+
+Phase 8 implementation notes (2026-07-03/04, codex via orchestrator — 8a on
+the daemon orchestrator, 8b/8c on the Doc 43 standalone batch orchestrator
+after in-daemon anvil re-enables twice broke task tracking):
+- 8a: mechanical-checker seam in the verify layer (confirm-or-hint contract,
+  never mechanical refutation) + repo-reality checker (path existence, elisp
+  definition grep under anvil-fusion-verify-repo-root); anvil-fusion-plan
+  wraps anvil-fusion-ask with a plan-eliciting member template and a
+  {{CLAIMS}}-bearing plan-merge judge template via :verify-base-template.
+- 8b: hardness originates from the distiller (trailing NEXT-HARD: yes|no
+  line, end-anchored parse; parse-distill now returns a plist); hard steps
+  execute as fusion panels (:step-panel / :step-panel-mode), capped by
+  anvil-fusion-longrun-max-panel-steps (v1 budget guard — Doc 47 :budget
+  threading through ask deferred); async panels/verify are bounded-blocking
+  poll advances.
+- 8c: gate on the fresh digest before it becomes state; fail = any REFUTED
+  claim; one feedback retry (「前回試行への反証」 block) of the same step
+  (no double panel-budget decrement), then surfaced via meta :gate 'failed
+  and result :gate-failures — the quest never wedges.
+
+6e measured 2026-07-03 (benchmarks/doc61-phase6e/, $15.01, results org in
+that dir). Acceptance PASS: verified-judge gold-wrong adoption 0/10; claim
+extraction hit the planted disagreement 10/10 and verdicts were 20/20
+(correct side confirmed, hallucinated side refuted — the 6a' per-side
+template works). CAVEAT: the battery saturated — the plain claude judge
+also went 10/10, so this run proves correctness + non-regression, not
+uplift (the 2026-06-16 failure was recorded on a small-local sovereign
+judge). Tier B: single 79% / fusion-plain 93% / fusion-verified 100% gold
+recall; the one real differential cell (b02) came from claim SURFACING
+(an unverified naming dispute placed in the judge's claim table), not from
+a verdict. Follow-ups filed: de-saturation re-run with a small/local judge
+(runner supports it), KB evidence-relevance threshold (irrelevant file:line
+sources mislead even when verdicts are right — "6f" candidate), hedging
+candidates getting REFUTED.
+
+Recommended order: 6 -> 7 -> 8 (Phase 6 fixes a recorded, harmful failure mode
+and is measurable immediately; Phase 7 is a small addition on top; Phase 8 is
+the heavyweight design).
+
+* 8. Constraints / conventions (inherited)
+- Modules carry =;;; anvil-audit: tools-wrapped-at-registration=.
+- Depend on orchestrator *public API only*; =(require 'anvil-orchestrator)=
+  explicit where its macros/functions are used.
+- Dual-target (architecture alpha): degrade gracefully under NeLisp standalone
+  — 6c worktree execution is Emacs-path-first, standalone may stub to
+  UNVERIFIED.
+- Sovereignty: =local-only= panels never trigger web evidence checks; local KB
+  tools are permitted (no egress).
+- ERT for every module; byte-compile 0 warnings.
+
+* 9. Open questions
+- [RESOLVED 2026-07-03] 6a extraction provider: measured haiku vs sonnet on 8
+  synthetic cases / 14 gold claims (=benchmarks/doc61-phase6a/=, 16 live
+  calls). haiku recall 11/14 (79%) vs sonnet 12/14 (86%) — within the ~10%
+  bar; format collapse 0/16 (the weakdistill structure-mangling concern does
+  not reproduce on this narrow, templated task); haiku 1.6x slower but 0.6x
+  cost; sonnet's single big miss was a FALSE NONE (dropped a whole
+  disagreement), worse for 6b than haiku's one-sided extractions. Decision:
+  pin the extraction default to the haiku tier. Residual (both models):
+  one-sided extraction of a disagreement + 2-3 false positives on the NONE
+  control — a prompt-template issue, tracked as follow-up 6a' (each side of a
+  disagreement as its own CLAIM line; stricter NONE criteria).
+- 6b KB coverage: hourei/node KB is strong for the electrical domain; for
+  general questions the skeptic vote is the only verifier — is N=2 enough?
+- 8b cost envelope: panel-per-step multiplies longrun cost; define the =:hard=
+  step marking heuristic (divergent digest? prior step retried?).
+- [RESOLVED 2026-07-03] Phase 7 sampling diversity: the claude CLI exposes no
+  per-invocation temperature/sampling flag (checked v2.1.199 --help) —
+  opus-solo diversity is lens-only (correctness / completeness / skeptic by
+  position; the domain lens stays opt-in per ask).

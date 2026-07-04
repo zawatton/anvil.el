@@ -104,6 +104,7 @@
 (declare-function org-habit-scheduled "org-habit" (habit))
 (declare-function org-habit-scheduled-repeat "org-habit" (habit))
 (declare-function org-is-habit-p "org-habit" (&optional pom))
+(declare-function anvil--buffer-first-viable-p "anvil" (path))
 
 (defcustom anvil-org-allowed-files nil
   "List of absolute paths to Org files that can be accessed via MCP."
@@ -124,6 +125,14 @@ disable the fast-path entirely (e.g. while comparing behaviour)."
   "When non-nil, restrict file access to `anvil-org-allowed-files'.
 Set to nil to allow access to any file."
   :type 'boolean
+  :group 'anvil-org)
+
+(defcustom anvil-org-outline-max-chars 8000
+  "Default character budget for `org-read-outline' MCP replies.
+When non-zero, the MCP wrapper trims the serialized outline at the
+last whole top-level entry that fits and appends a note naming how
+many entries were omitted.  Set to 0 for unlimited output."
+  :type 'integer
   :group 'anvil-org)
 
 (defconst anvil-org--server-id "emacs-eval"
@@ -853,6 +862,25 @@ Empty or nil VALUE returns nil."
          "%s must be a positive integer, got: %s" field value))
       n)))
 
+(defun anvil-org--parse-nonnegative-integer (value field)
+  "Parse VALUE as a non-negative integer named FIELD, or return nil."
+  (when value
+    (let ((n (cond
+              ((integerp value) value)
+              ((and (stringp value)
+                    (not (string-empty-p (string-trim value)))
+                    (string-match-p "\\`[0-9]+\\'" (string-trim value)))
+               (string-to-number value))
+              ((stringp value) nil)
+              (t nil))))
+      (when (and value (null n))
+        (anvil-org--tool-validation-error
+         "%s must be a non-negative integer, got: %s" field value))
+      (when (and n (< n 0))
+        (anvil-org--tool-validation-error
+         "%s must be a non-negative integer, got: %s" field value))
+      n)))
+
 (defun anvil-org--capture-target-file (target)
   "Return capture TARGET file when TARGET is statically inspectable."
   (pcase target
@@ -1019,14 +1047,30 @@ Assumes point is in an Org buffer."
         (forward-line)))
     nil))
 
-(defun anvil-org--position-for-new-child (after-uri parent-end)
+(defun anvil-org--position-for-new-child (after-uri parent-end &optional position)
   "Position point for inserting a new child under current heading.
 AFTER-URI is an optional org-id:// URI of a sibling to insert after.
 PARENT-END is the end position of the parent's subtree.
 Assumes point is at parent heading.
-If AFTER-URI is non-nil, positions after that sibling.
-If nil, positions at end of parent's subtree.
+If POSITION is \"first\", positions point immediately after the parent's
+meta-data so a heading inserted here becomes the first child;
+combining it with AFTER-URI is a validation error.
+Otherwise: if AFTER-URI is non-nil, positions after that sibling;
+if nil, positions at end of parent's subtree.
 Throws validation error if AFTER-URI is invalid or sibling not found."
+  (when (and position
+             (not (string-empty-p position))
+             (not (equal position "first")))
+    (anvil-org--tool-validation-error
+     "Field position must be \"first\" when provided: %s"
+     position))
+  (when (and (equal position "first")
+             after-uri
+             (not (string-empty-p after-uri)))
+    (anvil-org--tool-validation-error
+     "position=\"first\" is mutually exclusive with after_uri"))
+  (if (equal position "first")
+      (progn (org-back-to-heading t) (org-end-of-meta-data t))
   (if (and after-uri (not (string-empty-p after-uri)))
       (progn
         ;; Parse afterUri to get the ID
@@ -1067,7 +1111,7 @@ Throws validation error if AFTER-URI is invalid or sibling not found."
     ;; If we're at the start of a sibling, go back one char
     ;; to be at the end of parent's content
     (when (looking-at "^\\*+ ")
-      (backward-char 1))))
+      (backward-char 1)))))
 
 (defun anvil-org--ensure-newline ()
   "Ensure there is a newline or buffer start before point."
@@ -1377,7 +1421,7 @@ MCP Parameters:
 
 ;; PHASE-C-IDE-SPLIT-CANDIDATE: inserts heading + ID + tags + body in real buffer
 (defun anvil-org--tool-add-todo
-    (title todo_state parent_uri &optional body after_uri tags)
+    (title todo_state parent_uri &optional body after_uri tags position)
   "Add a new TODO item to an Org file.
 Creates an Org ID for the new headline and returns its ID-based URI.
 TITLE is the headline text.
@@ -1402,7 +1446,9 @@ MCP Parameters:
                 - org-headline://{absolute-path}#{headline-path}
                 - org-id://{id}
   tags - Tags to add (single string, JSON array string, or empty for
-         none; optional)"
+         none; optional)
+  position - \"first\" to insert as parent's first child (optional;
+             mutually exclusive with after_uri)"
   (anvil-org--validate-headline-title title)
   (anvil-org--validate-todo-state todo_state)
   (let* ((tag-list (anvil-org--validate-and-normalize-tags tags))
@@ -1444,7 +1490,7 @@ MCP Parameters:
                  (save-excursion
                    (org-end-of-subtree t t)
                    (point))))
-            (anvil-org--position-for-new-child after_uri parent-end)))
+            (anvil-org--position-for-new-child after_uri parent-end position)))
 
         ;; Validate body before inserting heading
         ;; Calculate the target level for validation
@@ -1729,7 +1775,46 @@ MCP Parameters:
   file - Absolute path to an Org file"
   (anvil-org--handle-file-resource `(("filename" . ,file))))
 
-(defun anvil-org--tool-read-outline (file &optional max_depth)
+(defun anvil-org--outline-note (omitted)
+  "Return the truncation note string for OMITTED top-level entries."
+  (format
+   "outline truncated; %d top-level entries omitted. Narrow with max_depth or pass max_chars=0 for the full result."
+   omitted))
+
+(defun anvil-org--render-outline-json (headings &optional note)
+  "Return the canonical JSON outline string for HEADINGS and NOTE."
+  (concat
+   "{\"headings\":["
+   (mapconcat #'json-encode headings ",")
+   "]"
+   (when note
+     (concat ",\"note\":" (json-encode note)))
+   "}"))
+
+(defun anvil-org--clamp-outline-json (json-text max-chars)
+  "Clamp JSON-TEXT to MAX-CHARS at whole top-level outline entries."
+  (if (or (null max-chars) (zerop max-chars)
+          (<= (length json-text) max-chars))
+      json-text
+    (let* ((json-object-type 'alist)
+           (json-array-type 'list)
+           (obj (json-read-from-string json-text))
+           (headings (alist-get 'headings obj))
+           (total (length headings))
+           (kept total)
+           (result nil))
+      (while (and (>= kept 0) (null result))
+        (let* ((prefix (cl-subseq headings 0 kept))
+               (omitted (- total kept))
+               (note (and (> omitted 0) (anvil-org--outline-note omitted)))
+               (candidate (anvil-org--render-outline-json prefix note)))
+          (when (<= (length candidate) max-chars)
+            (setq result candidate))
+          (setq kept (1- kept))))
+      (or result
+          (anvil-org--render-outline-json nil (anvil-org--outline-note total))))))
+
+(defun anvil-org--tool-read-outline (file &optional max_depth max_chars)
   "Tool wrapper for org-outline://{filename} resource template.
 FILE is the absolute path to an Org file.  When MAX_DEPTH is a
 string that parses as a positive integer, only headlines at that
@@ -1740,16 +1825,23 @@ its historical 2-level structure.
 MCP Parameters:
   file      - Absolute path to an Org file
   max_depth - Optional integer string (e.g. \"1\", \"3\") capping
-              the outline depth; omit for full depth."
+              the outline depth; omit for full depth.
+  max_chars - Optional non-negative integer string overriding
+              `anvil-org-outline-max-chars'.  Use \"0\" for unlimited."
   (let ((depth (and max_depth
                     (stringp max_depth)
                     (not (string-empty-p (string-trim max_depth)))
-                    (string-to-number max_depth))))
+                    (string-to-number max_depth)))
+        (budget (or (anvil-org--parse-nonnegative-integer
+                     max_chars "max_chars")
+                    anvil-org-outline-max-chars)))
     (when (and depth (<= depth 0)) (setq depth nil))
-    (or (anvil-org--try-index-read-outline file depth)
-        (anvil-org--handle-outline-resource `(("filename" . ,file))))))
+    (anvil-org--clamp-outline-json
+     (or (anvil-org--try-index-read-outline file depth)
+         (anvil-org--handle-outline-resource `(("filename" . ,file))))
+     budget)))
 
-(declare-function anvil-org-index-read-by-id       "anvil-org-index" (org-id))
+(declare-function anvil-org-index-read-by-id       "anvil-org-index" (org-id &optional max-depth))
 (declare-function anvil-org-index-read-headline    "anvil-org-index" (file path))
 (declare-function anvil-org-index-read-outline-json "anvil-org-index" (file &optional max-depth))
 
@@ -1767,16 +1859,17 @@ the specific delegate they intend to call before invoking it."
        (boundp 'anvil-org-index--db)
        anvil-org-index--db))
 
-(defun anvil-org--try-index-read-by-id (uuid)
+(defun anvil-org--try-index-read-by-id (uuid &optional max-depth)
   "Try `anvil-org-index-read-by-id' for UUID; return the body or nil.
-A nil return means fall back to the org-element handler.
+A nil return means fall back to the org-element handler.  MAX-DEPTH,
+when a positive integer, caps the depth of included headings.
 
 Doc 38 Phase B4: :headline-only delegate — the index resolves
 ID→(file, line-range) without ever parsing the org tree."
   (when (and (anvil-org--index-available-p)
              (fboundp 'anvil-org-index-read-by-id))
     (condition-case _err
-        (anvil-org-index-read-by-id uuid)
+        (anvil-org-index-read-by-id uuid max-depth)
       (error nil))))
 
 (defun anvil-org--try-index-read-headline (file headline-path)
@@ -1831,15 +1924,106 @@ org-read-file tool to read entire files"))
       (let ((full-path (concat file "#" headline_path)))
         (anvil-org--handle-headline-resource `(("filename" . ,full-path))))))
 
-(defun anvil-org--tool-read-by-id (uuid)
+(defun anvil-org--try-index-read-by-id-with-children (uuid &optional max-depth)
+  "Try the with-children index variant; return a plist or nil on failure."
+  (when (and (anvil-org--index-available-p)
+             (fboundp 'anvil-org-index-read-by-id-with-children))
+    (condition-case _err
+        (anvil-org-index-read-by-id-with-children uuid max-depth)
+      (error nil))))
+
+
+(defun anvil-org--parse-max-depth (max_depth default)
+  "Parse a string MAX_DEPTH into an integer, falling back to DEFAULT.
+Returns nil (meaning: full subtree) for zero or negative values."
+  (let* ((s (and (stringp max_depth) (string-trim max_depth)))
+         (n (cond
+             ((null max_depth) default)
+             ((and s (string-empty-p s)) default)
+             ((stringp max_depth) (string-to-number max_depth))
+             ((integerp max_depth) max_depth)
+             (t default))))
+    (when (and (integerp n) (> n 0)) n)))
+
+
+(defun anvil-org--bounded-subtree-from-text (full-text max-depth)
+  "Truncate FULL-TEXT to the first MAX-DEPTH heading levels.
+Returns (BOUNDED-TEXT . CHILDREN-TITLES).  CHILDREN-TITLES are the
+titles of the target heading's immediate children, with trailing tag
+strings stripped."
+  (let ((children nil)
+        (target-level nil)
+        (cap-level (and max-depth (integerp max-depth) (> max-depth 0)
+                        max-depth)))
+    (with-temp-buffer
+      (insert full-text)
+      (goto-char (point-min))
+      (when (looking-at "^\\(\\*+\\) ")
+        (setq target-level (length (match-string 1))))
+      (forward-line 1)
+      (let ((cut-point nil))
+        (while (not (eobp))
+          (when (looking-at "^\\(\\*+\\) +\\(.*\\)$")
+            (let ((lv (length (match-string 1)))
+                  (title (match-string 2)))
+              (when (and target-level (= lv (1+ target-level)))
+                (push (replace-regexp-in-string
+                       "[ \t]+:[[:alnum:]_@:]+:[ \t]*$" "" title)
+                      children))
+              (when (and (not cut-point) cap-level target-level
+                         (> lv (+ target-level (1- cap-level))))
+                (setq cut-point (line-beginning-position)))))
+          (forward-line 1))
+        (cons (if cut-point
+                  (buffer-substring-no-properties (point-min) cut-point)
+                full-text)
+              (nreverse children))))))
+
+
+(defun anvil-org--format-read-by-id-result (body children max-depth truncated)
+  "Render BODY plus CHILDREN listing as the MCP tool's return text.
+MAX-DEPTH and TRUNCATED annotate the footer so the caller knows
+whether subtrees were cut off."
+  (let ((body-trimmed (or body ""))
+        (n (length children)))
+    (concat
+     body-trimmed
+     (unless (string-suffix-p "\n" body-trimmed) "\n")
+     "\n"
+     (format
+      "------ Child headlines (%d)%s ------\n"
+      n
+      (cond ((null max-depth) "")
+            (truncated (format ", max_depth=%d (subtrees truncated)" max-depth))
+            (t (format ", max_depth=%d" max-depth))))
+     (if (zerop n)
+         "(none)\n"
+       (mapconcat (lambda (title) (concat "- " title)) children "\n"))
+     (when (> n 0) "\n"))))
+
+
+(defun anvil-org--tool-read-by-id (uuid &optional max_depth)
   "Tool wrapper for Layer-3 Org ID reads.
-UUID is the UUID from a headline's ID property.  Accepts either the
-raw UUID or an `org://UUID' citation URI emitted by the
+UUID is the UUID from a headline's ID property.  Accepts either the raw
+UUID or an `org://UUID' citation URI emitted by the
 progressive-disclosure Layer-1 / Layer-2 tools.  The `org-id://UUID'
 form is the MCP resource URI and is not accepted here.
 
+MAX_DEPTH is an optional integer string capping the depth of headings
+included in the returned text, relative to the target heading.  \"1\"
+(the default) returns just the target heading and its body — no child
+subtrees.  \"2\" includes immediate children; \"3\" adds grandchildren;
+and so on.  Pass \"0\" or a negative number to request the full subtree.
+
+Regardless of MAX_DEPTH, the response always ends with a \"Child
+headlines\" listing that names the immediate children of the target
+heading so the caller knows which subtrees it could descend into next.
+
 MCP Parameters:
-  uuid - UUID (or org://UUID citation URI) from headline's ID property"
+  uuid - UUID (or org://UUID citation URI) from headline's ID property
+  max_depth - Optional integer string capping the included heading
+              depth, default \"1\".  Use \"0\" or a negative value for
+              the full subtree."
   (when-let* ((id-resource
                (and (stringp uuid)
                     (anvil-org--extract-uri-suffix
@@ -1847,12 +2031,26 @@ MCP Parameters:
     (anvil-org--tool-validation-error
      "Parameter uuid does not accept org-id:// resource URIs.  Use the raw UUID \"%s\" or the org:// citation URI \"org://%s\" instead"
      id-resource id-resource))
-  (let ((id (if (and (stringp uuid)
-                     (string-prefix-p "org://" uuid))
-                (substring uuid (length "org://"))
-              uuid)))
-    (or (anvil-org--try-index-read-by-id id)
-        (anvil-org--handle-id-resource `(("uuid" . ,id))))))
+  (let* ((id (if (and (stringp uuid)
+                      (string-prefix-p "org://" uuid))
+                 (substring uuid (length "org://"))
+               uuid))
+         (depth (anvil-org--parse-max-depth max_depth 1)))
+    (or
+     (when-let* ((plist (anvil-org--try-index-read-by-id-with-children
+                         id depth)))
+       (anvil-org--format-read-by-id-result
+        (plist-get plist :body)
+        (plist-get plist :children)
+        depth
+        (plist-get plist :truncated)))
+     (let* ((full (anvil-org--handle-id-resource `(("uuid" . ,id))))
+            (bc (anvil-org--bounded-subtree-from-text full depth))
+            (bounded (car bc))
+            (children (cdr bc))
+            (truncated (and depth (not (string= bounded full)))))
+       (anvil-org--format-read-by-id-result
+        bounded children depth truncated)))))
 
 (defun anvil-org-enable ()
   "Enable the anvil-org module."
@@ -2100,6 +2298,8 @@ Parameters:
   after_uri - Sibling to insert after (string, optional)
               Must be org-id://{uuid} format
               If omitted, appends as last child of parent
+  position - \"first\" inserts as parent's first child (string, optional)
+             Mutually exclusive with after_uri
 
 Returns JSON object:
   success - Always true on success (boolean)
@@ -2260,8 +2460,15 @@ be in anvil-org-allowed-files.
 Parameters:
   uuid - UUID (or org://UUID citation URI) from headline's ID
          property (string, required)
+  max_depth - Optional integer string capping the included heading
+              depth relative to the target heading.  \"1\" (default)
+              returns the heading and its body only; \"2\" adds
+              immediate children; \"0\" or negative returns the full
+              subtree.
 
-Returns: Plain text content of the headline and its subtree"
+Returns: Plain text content of the bounded subtree followed by a
+\"------ Child headlines (N) ------\" footer naming the immediate
+children, so the caller knows which subtrees to descend into next"
    :read-only t
    :server-id anvil-org--server-id)
 
