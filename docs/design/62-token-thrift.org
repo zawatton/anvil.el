@@ -58,6 +58,44 @@ already evidence-backed by 6e; 4/5/6 shrink the verify pipeline itself and
 compose (6 removes claims from the LLM path entirely, 5 halves what
 remains, 4 amortizes across sessions).
 
+** Phase 1 findings (2026-07-04, provisional) — re-prioritization
+
+Sample: 9 representative calls driven through the real dispatch seam
+(synthetic FREQUENCY mix — natural traffic pending since no MCP client was
+attached post-reload — but per-call volumes are the real handler outputs).
+Est tokens = chars/4.
+
+| tool             | calls | response-chars | max single | est tokens |
+|------------------+-------+----------------+------------+------------|
+| file-read        | 3     | 86,981         | 53,996     | 21,806     |
+| worklog-search   | 2     | 56,310         | 28,523     | 14,087     |
+| org-read-outline | 1     | 17,613         | 17,613     | 4,418      |
+| worklog-list     | 1     | 11,668         | 11,668     | 2,920      |
+| memory-search    | 2     | 8,136          | 4,151      | 2,045      |
+
+Findings:
+1. *Search tools are the surprise hotspot*: one worklog-search response is
+   ~28.5K chars (~7K tokens) — a "search" returning what should be
+   snippets at document scale. org-read-outline 17.6K/call similarly.
+2. file-read dominates absolute volume as expected (54K single read).
+3. Bash-side traffic (test-suite output, subprocess logs) is INVISIBLE to
+   this telemetry — Phase 3's case rests on session observation, not
+   these numbers.
+
+Revised order (after shipped Phase 1):
+- *9 first* (disclosure budget as default) — the measured top lever; hits
+  both search-tool dumps and large file reads in one mechanism. Include a
+  sub-item: per-search snippet clamps (worklog-search / org-read-outline
+  result caps with expand handles) even before the generic budget lands.
+- *8 second* (diff-first re-read) — compounds with 9 on the file-read
+  volume during review cycles.
+- *2 stays high* (hard-prompt router) — orthogonal to MCP volume (LLM
+  spend), evidence already in from 6e; can proceed in parallel.
+- 3 (test distiller) unchanged priority but justified by session
+  observation only. 4/5/6/7 after the above.
+Caveat: frequency mix is synthetic; re-validate the ranking from natural
+traffic after a few real sessions (counters were reset post-sample).
+
 * 3. Phase 1 — token telemetry (the measurement)
 
 Goal: answer "which tools/flows consume how much" with numbers, per
