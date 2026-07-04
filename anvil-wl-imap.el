@@ -146,6 +146,24 @@ Plist keys: :tag :status (\"OK\"/\"NO\"/\"BAD\"/nil) :text (full slice since sen
         t
       (error "anvil-wl-imap: LOGIN failed (%s)" (plist-get res :status)))))
 
+(defun anvil-wl-imap--xoauth2-initial-response (user access-token)
+  "Return a SASL XOAUTH2 initial response for USER and ACCESS-TOKEN."
+  (base64-encode-string
+   (concat "user=" user "\1auth=Bearer " access-token "\1\1")
+   t))
+
+(defun anvil-wl-imap-authenticate-xoauth2 (conn user access-token)
+  "AUTHENTICATE CONN as USER with ACCESS-TOKEN using XOAUTH2.
+Return t on success, else signal without including the token in the error."
+  (let ((res (anvil-wl-imap-command
+              conn (format "AUTHENTICATE XOAUTH2 %s"
+                           (anvil-wl-imap--xoauth2-initial-response
+                            user access-token)))))
+    (if (equal (plist-get res :status) "OK")
+        t
+      (error "anvil-wl-imap: XOAUTH2 authentication failed (%s)"
+             (plist-get res :status)))))
+
 (defun anvil-wl-imap-select (conn mailbox)
   "SELECT MAILBOX on CONN.  Return the EXISTS count (integer) or signal."
   (let* ((res (anvil-wl-imap-command conn (format "SELECT %s"
@@ -192,6 +210,10 @@ Return a unibyte string of exactly the literal byte count, or nil."
     (let ((coding-system-for-read (or (anvil-wl-imap--binary-coding) 'no-conversion)))
       (insert-file-contents-literally path))
     (replace-regexp-in-string "[ \r\n]" "" (buffer-string))))
+
+(defun anvil-wl-imap-read-access-token (path)
+  "Read an OAuth2 access token from PATH, stripping spaces and line endings."
+  (anvil-wl-imap-read-app-password path))
 
 (provide 'anvil-wl-imap)
 ;;; anvil-wl-imap.el ends here

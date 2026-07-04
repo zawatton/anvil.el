@@ -425,6 +425,15 @@ These are not loaded by default.  Available modules:
                 NeLisp execute path (Phase E), and ephemeral /
                 permanent promotion (Phase F) stay DRAFT until
                 Doc 35 reaches LOCKED.
+- `wl'        — Wanderlust-oriented Maildir tools.  Adds wl-search /
+                wl-list-mails / wl-read-mail / wl-compose-draft /
+                wl-send over a locally synced Maildir.  Install the
+                `wanderlust' package for its WL UI and FLIM/SEMI MIME
+                support; `bin/anvil emacs-package-install-wanderlust'
+                installs it into the package dir used by
+                `anvil mcp serve'.  Enable the tools with
+                `anvil mcp serve --module=wl' or
+                ANVIL_OPTIONAL_MODULES=wl.
 - `semantic'  — Local search over a configurable corpus of org / text
                 / code files, backed by built-in SQLite FTS5 (trigram
                 tokenizer for CJK substring matching).  Pure-Lisp and

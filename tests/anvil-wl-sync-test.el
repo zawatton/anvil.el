@@ -11,6 +11,7 @@
 
 (require 'ert)
 (require 'cl-lib)
+(require 'anvil-wl)
 (require 'anvil-wl-maildir)
 (require 'anvil-wl-sync)
 
@@ -27,7 +28,7 @@
   "Write the canned message for UID into MDIR/SUB; return its path."
   (let* ((d (expand-file-name sub mdir))
          (name (format "170000%04d.%d_%d.host%s" uid (emacs-pid) uid
-                       (if (equal sub "cur") ":2,S" "")))
+                       (if (equal sub "cur") (anvil-wl--info-suffix "S") "")))
          (p (expand-file-name name d))
          (coding-system-for-write 'binary))
     (make-directory d t)
@@ -47,7 +48,9 @@
   (declare (indent 1))
   `(cl-letf (((symbol-function 'anvil-wl-imap-open-tunnel) (lambda (&rest _) 'conn))
              ((symbol-function 'anvil-wl-imap-login) (lambda (&rest _) t))
+             ((symbol-function 'anvil-wl-imap-authenticate-xoauth2) (lambda (&rest _) t))
              ((symbol-function 'anvil-wl-imap-read-app-password) (lambda (&rest _) "pw"))
+             ((symbol-function 'anvil-wl-imap-read-access-token) (lambda (&rest _) "token"))
              ((symbol-function 'anvil-wl-imap-logout) (lambda (&rest _) t))
              ((symbol-function 'anvil-wl-sync--select-info)
               (lambda (&rest _) (list :exists (length ,server-uids)
@@ -96,6 +99,36 @@
 (defun anvil-wl-sync-test--save-state (root plist)
   (with-temp-file (anvil-wl-sync--state-path root "INBOX")
     (prin1 plist (current-buffer))))
+
+(ert-deftest anvil-wl-sync-test-authenticate-xoauth2-uses-token-file ()
+  "XOAUTH2 authentication reads TOKEN-FILE and does not use PASSWORD-FILE."
+  (let (login-called token-path auth-call)
+    (cl-letf (((symbol-function 'anvil-wl-imap-login)
+               (lambda (&rest _) (setq login-called t)))
+              ((symbol-function 'anvil-wl-imap-read-app-password)
+               (lambda (&rest _) (error "password reader should not run")))
+              ((symbol-function 'anvil-wl-imap-read-access-token)
+               (lambda (path) (setq token-path path) "tok"))
+              ((symbol-function 'anvil-wl-imap-authenticate-xoauth2)
+               (lambda (conn user token) (setq auth-call (list conn user token)) t)))
+      (should (anvil-wl-sync--authenticate
+               'conn 'xoauth2 "user@example.com" "/pw" "/token")))
+    (should-not login-called)
+    (should (equal token-path (expand-file-name "/token")))
+    (should (equal auth-call '(conn "user@example.com" "tok")))))
+
+(ert-deftest anvil-wl-sync-test-xoauth2-initial-response ()
+  "XOAUTH2 command uses the standard user/auth bearer SASL payload."
+  (let (sent)
+    (cl-letf (((symbol-function 'anvil-wl-imap-command)
+               (lambda (_conn cmd &rest _)
+                 (setq sent cmd)
+                 (list :status "OK"))))
+      (should (anvil-wl-imap-authenticate-xoauth2 'conn "u@example.com" "abc123")))
+    (should (string-match-p "\\`AUTHENTICATE XOAUTH2 " sent))
+    (should (equal (base64-decode-string
+                    (car (last (split-string sent " "))))
+                   "user=u@example.com\1auth=Bearer abc123\1\1"))))
 
 (ert-deftest anvil-wl-sync-test-backfill-fetches-older-uids ()
   "Backfill walks below the floor (estimated from held count) to UID 1."

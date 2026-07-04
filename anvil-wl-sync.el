@@ -45,21 +45,40 @@
           :uidnext (when (string-match "\\[UIDNEXT \\([0-9]+\\)\\]" text)
                      (string-to-number (match-string 1 text))))))
 
-(cl-defun anvil-wl-sync-mailbox (&key host port user password-file root mailbox (max 0))
+(defun anvil-wl-sync--authenticate (conn auth user password-file token-file)
+  "Authenticate CONN as USER using AUTH.
+AUTH defaults to `login'.  `login' reads PASSWORD-FILE; `xoauth2' reads
+TOKEN-FILE."
+  (pcase (or auth 'login)
+    ('login
+     (anvil-wl-imap-login
+      conn user
+      (anvil-wl-imap-read-app-password (expand-file-name password-file))))
+    ('xoauth2
+     (anvil-wl-imap-authenticate-xoauth2
+      conn user
+      (anvil-wl-imap-read-access-token (expand-file-name token-file))))
+    (other
+     (error "anvil-wl-sync: unsupported auth method %S" other))))
+
+(cl-defun anvil-wl-sync-mailbox (&key host port user password-file token-file
+                                      root mailbox local-folder (max 0) auth)
   "Incrementally sync MAILBOX from HOST:PORT into the Maildir ROOT/<mailbox>.
-USER authenticates with the app password read from PASSWORD-FILE.
+USER authenticates with AUTH.  AUTH defaults to `login', reading the app
+password from PASSWORD-FILE.  AUTH `xoauth2' reads an OAuth2 access token from
+TOKEN-FILE.
 With MAX>0, fetch at most the MAX newest messages (for bounded testing);
 MAX=0 means no cap.  Returns a summary plist."
-  (let* ((mdir (expand-file-name (anvil-wl-sync--folder-key mailbox) root))
+  (let* ((mdir (expand-file-name (or local-folder
+                                     (anvil-wl-sync--folder-key mailbox))
+                                 root))
          (spath (anvil-wl-sync--state-path root mailbox))
          (conn nil))
     (anvil-wl-maildir-ensure mdir)
     (unwind-protect
         (progn
           (setq conn (anvil-wl-imap-open-tunnel host port))
-          (anvil-wl-imap-login
-           conn user
-           (anvil-wl-imap-read-app-password (expand-file-name password-file)))
+          (anvil-wl-sync--authenticate conn auth user password-file token-file)
           (let* ((info (anvil-wl-sync--select-info conn mailbox))
                  (uidnext (plist-get info :uidnext))
                  (uidvalidity (plist-get info :uidvalidity))
@@ -98,8 +117,9 @@ MAX=0 means no cap.  Returns a summary plist."
                     :last-uid newlast :maildir mdir))))
       (when conn (ignore-errors (anvil-wl-imap-logout conn))))))
 
-(cl-defun anvil-wl-sync-backfill (&key host port user password-file root mailbox
-                                       (batch 200) (rounds 1))
+(cl-defun anvil-wl-sync-backfill (&key host port user password-file token-file
+                                       root mailbox local-folder
+                                       (batch 200) (rounds 1) auth)
   "Backfill older messages (UIDs below the floor) into ROOT/<mailbox>.
 Forward `anvil-wl-sync-mailbox' tracks the newest mail; this walks DOWNWARD
 from the lowest UID held toward UID 1, fetching up to ROUNDS batches of at
@@ -107,16 +127,16 @@ most BATCH messages each.  The floor (lowest UID held) is persisted; when it
 is not yet recorded it is estimated from the held message count (UIDs are
 roughly sequential), and Message-ID dedup makes any over-estimate harmless.
 Returns a summary plist."
-  (let* ((mdir (expand-file-name (anvil-wl-sync--folder-key mailbox) root))
+  (let* ((mdir (expand-file-name (or local-folder
+                                     (anvil-wl-sync--folder-key mailbox))
+                                 root))
          (spath (anvil-wl-sync--state-path root mailbox))
          (conn nil))
     (anvil-wl-maildir-ensure mdir)
     (unwind-protect
         (progn
           (setq conn (anvil-wl-imap-open-tunnel host port))
-          (anvil-wl-imap-login
-           conn user
-           (anvil-wl-imap-read-app-password (expand-file-name password-file)))
+          (anvil-wl-sync--authenticate conn auth user password-file token-file)
           (let* ((info (anvil-wl-sync--select-info conn mailbox))
                  (uidvalidity (plist-get info :uidvalidity))
                  (state (anvil-wl-sync--load-state spath))

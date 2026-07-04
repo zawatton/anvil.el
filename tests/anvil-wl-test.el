@@ -31,8 +31,8 @@
   (base64-encode-string (encode-coding-string s 'utf-8) t))
 
 (defun anvil-wl-test--write (inbox base flags content)
-  "Write CONTENT (string) as INBOX/cur/BASE:2,FLAGS (binary); return BASE."
-  (let* ((name (concat base ":2," flags))
+  "Write CONTENT as INBOX/cur/BASE with Maildir FLAGS; return BASE."
+  (let* ((name (concat base (anvil-wl--info-suffix flags)))
          (path (expand-file-name (concat "cur/" name) inbox))
          (coding-system-for-write 'binary))
     (make-directory (file-name-directory path) t)
@@ -98,7 +98,36 @@
     "Content-Type: text/plain; charset=UTF-8\n"
     "Content-Transfer-Encoding: quoted-printable\n"
     "\n"
-    "Let us meet at the Caf=C3=A9 tomorrow.\n")))
+    "Let us meet at the Caf=C3=A9 tomorrow.\n"))
+  (anvil-wl-test--write
+   inbox "msg5" "S"
+   (concat
+    "From: Outlook <outlook@example.com>\n"
+    "To: me@example.com\n"
+    "Subject: Nested multipart\n"
+    "Date: Fri, 05 Jun 2026 14:00:00 +0900\n"
+    "Message-ID: <nested@example.com>\n"
+    "MIME-Version: 1.0\n"
+    "Content-Type: multipart/related; boundary=\"REL\"; type=\"multipart/alternative\"\n"
+    "\n"
+    "--REL\n"
+    "Content-Type: multipart/alternative; boundary=\"ALT\"\n"
+    "\n"
+    "--ALT\n"
+    "Content-Type: text/plain; charset=us-ascii\n"
+    "\n"
+    "Nested PLAIN part.\n"
+    "--ALT\n"
+    "Content-Type: text/html; charset=us-ascii\n"
+    "\n"
+    "<html><body><p>Nested HTML part.</p></body></html>\n"
+    "--ALT--\n"
+    "--REL\n"
+    "Content-Type: image/png\n"
+    "Content-Transfer-Encoding: base64\n"
+    "\n"
+    "AAAA\n"
+    "--REL--\n")))
 
 (defmacro anvil-wl-test--with-maildir (&rest body)
   "Run BODY with a throwaway Maildir populated with the fixture messages.
@@ -157,17 +186,17 @@ yield garbage (the original bug)."
   (anvil-wl-test--with-maildir
     (let* ((resp (anvil-wl-test--parse (anvil-wl--tool-list-mails)))
            (msgs (alist-get 'messages resp)))
-      (should (= 4 (alist-get 'total resp)))
-      (should (= 4 (alist-get 'count resp)))
-      (should (= 4 (length msgs)))
-      (should (equal "msg4" (alist-get 'message_id (aref msgs 0))))
-      (should (equal "msg1" (alist-get 'message_id (aref msgs 3)))))))
+      (should (= 5 (alist-get 'total resp)))
+      (should (= 5 (alist-get 'count resp)))
+      (should (= 5 (length msgs)))
+      (should (equal "msg5" (alist-get 'message_id (aref msgs 0))))
+      (should (equal "msg1" (alist-get 'message_id (aref msgs 4)))))))
 
 (ert-deftest anvil-wl-test-list-mails-respects-max-results ()
   (anvil-wl-test--with-maildir
     (let ((resp (anvil-wl-test--parse (anvil-wl--tool-list-mails nil 2))))
       (should (= 2 (alist-get 'count resp)))
-      (should (= 4 (alist-get 'total resp))))))
+      (should (= 5 (alist-get 'total resp))))))
 
 ;;;; --- search --------------------------------------------------------------
 
@@ -222,6 +251,13 @@ yield garbage (the original bug)."
     (let ((body (alist-get 'body_plain
                            (anvil-wl-test--parse (anvil-wl--tool-read-mail "msg4")))))
       (should (string-match-p "Café" body)))))
+
+(ert-deftest anvil-wl-test-read-mail-nested-multipart-related ()
+  (anvil-wl-test--with-maildir
+    (let ((body (alist-get 'body_plain
+                           (anvil-wl-test--parse (anvil-wl--tool-read-mail "msg5")))))
+      (should (string-match-p "Nested PLAIN part" body))
+      (should-not (string-match-p "Nested HTML part" body)))))
 
 (ert-deftest anvil-wl-test-read-mail-unknown-id-errors ()
   (anvil-wl-test--with-maildir

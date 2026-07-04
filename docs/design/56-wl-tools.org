@@ -52,6 +52,17 @@ Module placement: =anvil-optional-modules= (opt-in).  The loader maps the
 symbol =wl= to =anvil-wl.el= by convention (=require 'anvil-wl= then
 =anvil-wl-enable=), so no central registration is needed.
 
+Stage D launcher integration (2026-06-26): on Windows or source checkouts,
+=bin/anvil emacs-package-install-wanderlust= installs the MELPA
+=wanderlust= package into the package directory used by =anvil mcp serve=.
+The headless server accepts =--module=wl= (or =ANVIL_OPTIONAL_MODULES=wl) to
+enable the MCP tools without editing the user's normal Emacs init file:
+
+#+begin_src powershell
+& .\bin\anvil.cmd emacs-package-install-wanderlust
+& .\bin\anvil.cmd mcp serve --module=wl
+#+end_src
+
 * Motivation
 
 anvil already ships =anvil-mu4e= (Doc 53) for agents that drive a mu4e +

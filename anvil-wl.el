@@ -23,6 +23,21 @@
 (declare-function eword-encode-string "eword-encode" (string &optional column mode))
 (declare-function anvil-wl-smtp-send "anvil-wl-smtp"
                   (host port user pass from recipients message))
+(declare-function wl-draft-reply "wl-draft" (buf with-arg summary-buf &optional number))
+(declare-function wl-draft-yank-from-mail-reply-buffer "wl-draft"
+                  (decode-it &optional ignored-fields))
+
+(defvar elmo-localdir-folder-path)
+(defvar wl-auto-flush-queue)
+(defvar wl-draft-add-in-reply-to)
+(defvar wl-draft-add-references)
+(defvar wl-draft-buffer-style)
+(defvar wl-draft-folder)
+(defvar wl-draft-reply-buffer-style)
+(defvar wl-draft-use-frame)
+(defvar wl-from)
+(defvar wl-mail-reply-buffer)
+(defvar wl-queue-folder)
 
 (defconst anvil-wl--server-id "emacs-eval"
   "MCP server id the anvil-wl tools register under (the main eval server).")
@@ -113,14 +128,23 @@ Must signal on failure and return non-nil on success."
 (defun anvil-wl--folder-dir (folder)
   (expand-file-name folder anvil-wl-maildir-root))
 
+(defun anvil-wl--info-suffix (flags)
+  "Return a Maildir info suffix for FLAGS.
+Windows file systems reject `:', so use a private `!2,' variant there.
+Readers accept both the standard `:2,' suffix and this Windows-safe form."
+  (concat (if (eq system-type 'windows-nt) "!2," ":2,") (or flags "")))
+
 (defun anvil-wl--base (filename)
-  "Maildir base name of FILENAME (strip the :2,FLAGS info section)."
-  (if (string-match ":2,[A-Za-z]*\\'" filename)
+  "Maildir base name of FILENAME (strip the :2,FLAGS info section).
+Also accepts the Windows-safe !2,FLAGS suffix produced by anvil-wl."
+  (if (string-match "[!:]2,[A-Za-z]*\\'" filename)
       (substring filename 0 (match-beginning 0))
     filename))
 
 (defun anvil-wl--flags (filename)
-  (if (string-match ":2,\\([A-Za-z]*\\)\\'" filename)
+  "Return the Maildir flags from FILENAME.
+Accepts both standard :2,FLAGS and Windows-safe !2,FLAGS suffixes."
+  (if (string-match "[!:]2,\\([A-Za-z]*\\)\\'" filename)
       (match-string 1 filename)
     ""))
 
@@ -197,7 +221,13 @@ Must signal on failure and return non-nil on success."
                   (replace-regexp-in-string "[^A-Za-z0-9+/=]" "" body)))
                body))
           ((and (equal e "quoted-printable") (fboundp 'quoted-printable-decode-string))
-           (or (ignore-errors (quoted-printable-decode-string body)) body))
+           (or (ignore-errors
+                 (with-temp-buffer
+                   (set-buffer-multibyte nil)
+                   (insert body)
+                   (quoted-printable-decode-region (point-min) (point-max))
+                   (buffer-string)))
+               body))
           (t body))))
 
 (defun anvil-wl--strip-html (s)
@@ -209,8 +239,14 @@ Must signal on failure and return non-nil on success."
 
 (defun anvil-wl--split-multipart (body boundary)
   "Split multipart BODY into raw part strings by BOUNDARY."
-  (let ((delim (concat "--" (regexp-quote boundary))))
-    (cdr (split-string body (concat "\r?\n?" delim "\\(--\\)?\r?\n?") t))))
+  (let* ((delim (concat "--" (regexp-quote boundary)))
+         (regexp (concat "\r?\n?" delim "\\(--\\)?\r?\n?"))
+         (chunks (split-string body regexp t))
+         (starts-at-boundary
+          (string-match-p (concat "\\`" delim "\\(--\\)?\r?\n?") body)))
+    (if starts-at-boundary
+        chunks
+      (cdr chunks))))
 
 (defun anvil-wl--part-text (body ct cte &optional depth)
   "Return decoded text of a MIME part with Content-Type CT, encoding CTE.
@@ -420,7 +456,8 @@ MCP Parameters:
          (drafts (anvil-wl--folder-dir anvil-wl-drafts-folder))
          (name (anvil-wl--unique-name))
          (tmp (expand-file-name (concat "tmp/" name) drafts))
-         (cur (expand-file-name (concat "cur/" name ":2,D") drafts))
+         (draft-id (concat name (anvil-wl--info-suffix "D")))
+         (cur (expand-file-name (concat "cur/" draft-id) drafts))
          (msg (concat
                "Date: " (format-time-string "%a, %d %b %Y %H:%M:%S %z") "\n"
                "From: " from "\n"
@@ -440,7 +477,7 @@ MCP Parameters:
       (write-region msg nil tmp nil 'silent))
     (rename-file tmp cur t)
     (json-encode
-     `((draft_id . ,(concat name ":2,D"))
+     `((draft_id . ,draft-id)
        (message_id . ,mid)
        (from . ,from)
        (to . ,(or to ""))
@@ -450,6 +487,172 @@ MCP Parameters:
        (folder . ,anvil-wl-drafts-folder)
        (saved . t)
        (sent . :json-false)))))
+
+(defun anvil-wl--save-draft-message (message &optional folder)
+  "Save RFC822 MESSAGE under FOLDER's cur/ and return (DRAFT-ID PATH)."
+  (let* ((drafts (anvil-wl--folder-dir (or folder anvil-wl-drafts-folder)))
+         (name (anvil-wl--unique-name))
+         (tmp (expand-file-name (concat "tmp/" name) drafts))
+         (draft-id (concat name (anvil-wl--info-suffix "D")))
+         (cur (expand-file-name (concat "cur/" draft-id) drafts)))
+    (dolist (sub '("tmp" "new" "cur"))
+      (make-directory (expand-file-name sub drafts) t))
+    (let ((coding-system-for-write 'utf-8-unix))
+      (write-region message nil tmp nil 'silent))
+    (rename-file tmp cur t)
+    (list draft-id cur)))
+
+(defun anvil-wl--draft-buffer-rfc822 (&optional body)
+  "Return current Wanderlust draft buffer as an RFC822 message string.
+BODY, when non-empty, is placed at the top of the RFC822 body."
+  (let ((headers '())
+        (rest '())
+        (last-was-header nil))
+    (dolist (line (split-string (buffer-string) "\n"))
+      (cond
+       ((and (not (string-empty-p (or mail-header-separator "")))
+             (string= line mail-header-separator))
+        (setq last-was-header nil))
+       ((string-match-p "\\`[[:alnum:]-]+:" line)
+        (push line headers)
+        (setq last-was-header t))
+       ((and last-was-header
+             (string-match-p "\\`[ \t]" line))
+        (push line headers))
+       ((not (string-empty-p (string-trim line)))
+        (push line rest)
+        (setq last-was-header nil))))
+    (let ((body-parts (delq nil
+                            (list (and body
+                                       (not (string-empty-p body))
+                                       (string-trim-right body))
+                                  (and rest
+                                       (string-join (nreverse rest) "\n"))))))
+      (setq headers (nreverse headers))
+      (unless (seq-some (lambda (line) (string-match-p "\\`Date:" line)) headers)
+        (setq headers
+              (append headers
+                      (list (concat "Date: "
+                                    (let ((system-time-locale "C"))
+                                      (format-time-string "%a, %d %b %Y %H:%M:%S %z")))))))
+      (unless (seq-some (lambda (line) (string-match-p "\\`Message-ID:" line)) headers)
+        (setq headers (append headers (list (concat "Message-ID: " (anvil-wl--gen-message-id anvil-wl-from))))))
+      (unless (seq-some (lambda (line) (string-match-p "\\`MIME-Version:" line)) headers)
+        (setq headers (append headers (list "MIME-Version: 1.0"))))
+      (unless (seq-some (lambda (line) (string-match-p "\\`Content-Type:" line)) headers)
+        (setq headers (append headers (list "Content-Type: text/plain; charset=utf-8"))))
+      (unless (seq-some (lambda (line) (string-match-p "\\`Content-Transfer-Encoding:" line)) headers)
+        (setq headers (append headers (list "Content-Transfer-Encoding: 8bit"))))
+      (concat (string-join headers "\n")
+              "\n\n"
+              (string-join body-parts "\n")))))
+
+(defun anvil-wl--insert-draft-body-at-top (body)
+  "Insert BODY at the top of the current Wanderlust draft body."
+  (when (and body (not (string-empty-p body)))
+    (goto-char (point-min))
+    (cond
+     ((re-search-forward
+       (concat "^" (regexp-quote mail-header-separator) "[ \t]*$") nil t)
+      (forward-line 1))
+     ((search-forward "\n\n" nil t))
+     (t (goto-char (point-max)) (insert "\n\n")))
+    (insert body)
+    (unless (string-suffix-p "\n" body)
+      (insert "\n"))))
+
+(defun anvil-wl--yank-reply-citation (path)
+  "Insert a Wanderlust citation for the message at PATH into current draft."
+  (let* ((headers (anvil-wl--slurp path t))
+         (date (anvil-wl--field headers "Date"))
+         (from (anvil-wl--decode-hdr (anvil-wl--field headers "From")))
+         (body (anvil-wl--decode-body path))
+         (citation-buffer (generate-new-buffer " *anvil-wl-reply-citation*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer citation-buffer
+            (when (and date (not (string-empty-p date)))
+              (insert "Date: " date "\n"))
+            (when (and from (not (string-empty-p from)))
+              (insert "From: " from "\n"))
+            (insert "\n")
+            (insert body))
+          (goto-char (point-max))
+          (let ((wl-mail-reply-buffer citation-buffer)
+                (wl-draft-add-references nil)
+                (wl-draft-add-in-reply-to nil))
+            (wl-draft-yank-from-mail-reply-buffer nil)))
+      (when (buffer-live-p citation-buffer)
+        (kill-buffer citation-buffer)))))
+
+(defun anvil-wl--tool-reply-draft (message_id &optional folder body with_arg without_citation)
+  "Create a Wanderlust reply draft for MESSAGE-ID.  NEVER sends.
+
+MCP Parameters:
+  message_id - The Maildir id returned by wl-list-mails/wl-search.
+  folder - Optional source folder (default `anvil-wl-inbox-folder').
+  body - Optional plain-text body inserted at the top of the reply body.
+  with_arg - Optional truthy value; use Wanderlust's alternate reply rules.
+  without_citation - Optional truthy value; omit quoted source body."
+  (let* ((fld (if (and folder (stringp folder) (not (string-empty-p (string-trim folder))))
+                  folder anvil-wl-inbox-folder))
+         (entry (anvil-wl--find-by-id message_id fld)))
+    (unless entry
+      (error "anvil-wl: no message %S in folder %s" message_id fld))
+    (require 'wl-draft)
+    (let* ((path (nth 0 entry))
+           (source (generate-new-buffer " *anvil-wl-reply-source*"))
+           (draft-buffer nil))
+      (catch 'anvil-wl-reply-result
+        (unwind-protect
+            (progn
+              (with-current-buffer source
+                (let ((coding-system-for-read 'utf-8))
+                  (insert-file-contents path))
+                (goto-char (point-min))
+                (while (looking-at-p "[ \t\r]*\n")
+                  (delete-region (point) (line-beginning-position 2))))
+              (make-directory (expand-file-name "draft" anvil-wl-maildir-root) t)
+              (make-directory (expand-file-name "queue" anvil-wl-maildir-root) t)
+              (let ((this-command 'wl-summary-reply)
+                    (wl-draft-use-frame nil)
+                    (wl-draft-reply-buffer-style 'keep)
+                    (wl-draft-buffer-style 'keep)
+                    (wl-auto-flush-queue nil)
+                    (elmo-localdir-folder-path anvil-wl-maildir-root)
+                    (wl-from anvil-wl-from)
+                    (wl-draft-folder "+draft")
+                    (wl-queue-folder "+queue"))
+                (wl-draft-reply source (anvil-wl--truthy with_arg) nil nil)
+                (setq draft-buffer (current-buffer)))
+              (with-current-buffer draft-buffer
+                (unless (anvil-wl--truthy without_citation)
+                  (anvil-wl--yank-reply-citation path))
+                (let* ((message (anvil-wl--draft-buffer-rfc822 body))
+                       (saved (anvil-wl--save-draft-message message))
+                       (draft-id (nth 0 saved))
+                       (draft-path (nth 1 saved)))
+                  (throw
+                   'anvil-wl-reply-result
+                   (json-encode
+                    `((draft_id . ,draft-id)
+                      (message_id . ,(or (anvil-wl--header-value draft-path "Message-ID") ""))
+                      (from . ,(or (anvil-wl--header-value draft-path "From") ""))
+                      (to . ,(or (anvil-wl--header-value draft-path "To") ""))
+                      (cc . ,(or (anvil-wl--header-value draft-path "Cc") ""))
+                      (subject . ,(or (anvil-wl--decode-hdr
+                                       (anvil-wl--header-value draft-path "Subject")) ""))
+                      (in_reply_to . ,(or (anvil-wl--header-value draft-path "In-Reply-To") ""))
+                      (references . ,(or (anvil-wl--header-value draft-path "References") ""))
+                      (folder . ,anvil-wl-drafts-folder)
+                      (source_folder . ,fld)
+                      (source_message_id . ,message_id)
+                      (saved . t)
+                      (sent . :json-false)))))))
+          (when (buffer-live-p source)
+            (kill-buffer source))
+          (when (buffer-live-p draft-buffer)
+            (kill-buffer draft-buffer)))))))
 
 ;;;; --- tools: send (gated, irreversible) -----------------------------------
 
@@ -645,6 +848,24 @@ Returns JSON: draft_id, message_id, from, to, cc, subject, in_reply_to,
 folder, saved=true, sent=false.")
 
   (anvil-server-register-tool
+   #'anvil-wl--tool-reply-draft
+   :id "wl-reply-draft" :intent '(mail reply compose draft) :layer 'workflow
+   :server-id anvil-wl--server-id
+   :description
+   "Create a Wanderlust reply draft for a local Maildir message.  NEVER sends.
+This uses Wanderlust's `wl-draft-reply' recipient and threading logic.
+
+Parameters:
+  message_id - The Maildir id from wl-list-mails/wl-search.
+  folder - Optional source folder (default INBOX).
+  body - Optional plain-text body inserted at the top of the reply body.
+  with_arg - Optional truthy value; use Wanderlust's alternate reply rules.
+  without_citation - Optional truthy value; omit quoted source body.
+
+Returns JSON: draft_id, message_id, from, to, cc, subject, in_reply_to,
+references, source_folder, source_message_id, saved=true, sent=false.")
+
+  (anvil-server-register-tool
    #'anvil-wl--tool-send
    :id "wl-send" :intent '(mail compose send) :layer 'workflow
    :server-id anvil-wl--server-id
@@ -664,7 +885,8 @@ the recipients and subject."))
 
 (defun anvil-wl-disable ()
   "Unregister the anvil-wl MCP tools."
-  (dolist (id '("wl-search" "wl-list-mails" "wl-read-mail" "wl-compose-draft" "wl-send"))
+  (dolist (id '("wl-search" "wl-list-mails" "wl-read-mail"
+                "wl-compose-draft" "wl-reply-draft" "wl-send"))
     (anvil-server-unregister-tool id anvil-wl--server-id)))
 
 (provide 'anvil-wl)
