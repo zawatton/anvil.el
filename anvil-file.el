@@ -38,8 +38,16 @@
 (require 'cl-lib)
 (require 'subr-x)
 (require 'json)
+(require 'org)
 (require 'anvil-disk)
 (require 'anvil-server)   ; provides `anvil-server-with-error-handling' macro
+(eval-when-compile
+  (require 'org))
+
+(defvar org-heading-regexp)
+(defvar org-after-todo-state-change-hook)
+(defvar org-log-done)
+(defvar org-log-repeat)
 
 ;;;; --- internal -----------------------------------------------------------
 
@@ -68,6 +76,82 @@ codepoints. Forcing utf-8 here makes string-equal predictable for
 all anvil-file-* and anvil-org-* helpers."
   (let ((coding-system-for-read 'utf-8))
     (insert-file-contents path)))
+
+(defun anvil-file--arg-bool (value default)
+  "Coerce a JSON-sourced boolean VALUE to Lisp t/nil.
+VALUE nil means the caller omitted the argument entirely, so
+DEFAULT is returned.  Explicit JSON false may arrive as the
+keyword `:false' or the string \"false\" and returns nil.
+Anything else explicitly provided is truthy."
+  (cond
+   ((eq value :false) nil)
+   ((equal value "false") nil)
+   ((null value) default)
+   (t t)))
+
+(defcustom anvil-file-delta-cache-max-entries 16
+  "Maximum number of session baselines retained for `anvil-file-read-delta'."
+  :type 'integer
+  :group 'anvil)
+
+(defcustom anvil-file-delta-cache-max-entry-chars 524288
+  "Maximum cached baseline size for `anvil-file-read-delta', in characters."
+  :type 'integer
+  :group 'anvil)
+
+(defvar anvil-file--delta-cache (make-hash-table :test 'equal)
+  "Session-scoped path -> baseline plist for `anvil-file-read-delta'.")
+
+(defvar anvil-file--delta-cache-order nil
+  "FIFO insertion order for `anvil-file--delta-cache'.")
+
+(defun anvil-file--delta-cache-remove (path)
+  "Drop PATH from the delta cache."
+  (remhash path anvil-file--delta-cache)
+  (setq anvil-file--delta-cache-order
+        (delete path anvil-file--delta-cache-order)))
+
+(defun anvil-file--delta-cache-put (path hash body stamp)
+  "Store PATH baseline HASH/BODY/STAMP and evict old FIFO entries."
+  (anvil-file--delta-cache-remove path)
+  (puthash path (list :hash hash :body body :stamp stamp) anvil-file--delta-cache)
+  (setq anvil-file--delta-cache-order
+        (append anvil-file--delta-cache-order (list path)))
+  (while (> (hash-table-count anvil-file--delta-cache)
+            anvil-file-delta-cache-max-entries)
+    (anvil-file--delta-cache-remove (car anvil-file--delta-cache-order))))
+
+(defun anvil-file--delta-full-response (path body hash &optional note)
+  "Return a full-mode plist for PATH/BODY/HASH, optionally with NOTE."
+  (append
+   (list :file path
+         :mode "full"
+         :content body
+         :hash hash
+         :size (length body))
+   (and note (list :note note))))
+
+(defun anvil-file--delta-diff (old-body new-body)
+  "Return a unified diff string from OLD-BODY to NEW-BODY, or nil on failure."
+  (let ((old-file (make-temp-file "anvil-file-delta-old-"))
+        (new-file (make-temp-file "anvil-file-delta-new-")))
+    (unwind-protect
+        (progn
+          (with-temp-file old-file
+            (insert old-body))
+          (with-temp-file new-file
+            (insert new-body))
+          (with-temp-buffer
+            (let ((status (call-process "diff" nil (current-buffer) nil
+                                        "--label" "cached"
+                                        "--label" "current"
+                                        "-u"
+                                        old-file
+                                        new-file)))
+              (when (memq status '(0 1))
+                (buffer-string)))))
+      (ignore-errors (delete-file old-file))
+      (ignore-errors (delete-file new-file)))))
 
 ;;;; --- file: read ---------------------------------------------------------
 
@@ -99,6 +183,62 @@ otherwise a list of human-readable strings flagging divergence
                 :total-lines total :offset off
                 :lines-returned lines-returned
                 :warnings warnings))))))
+
+(defun anvil-file-read-delta (path &optional reset)
+  "Read PATH with a session baseline cache and return full/delta states.
+The first successful read for PATH returns full content and stores a
+baseline.  Later reads return either `:mode \"unchanged\"' when the file
+hash matches the baseline, or `:mode \"delta\"' with a unified diff from
+the cached baseline to current content when that diff is materially
+smaller than the current file.  Any reset request, cache eviction, read
+failure, diff failure, or large diff degrades to `:mode \"full\"'.
+
+The cache is session-scoped and capped by
+`anvil-file-delta-cache-max-entries'.  Files larger than
+`anvil-file-delta-cache-max-entry-chars' are always served in full,
+annotated with a note, and never cached.  This function never signals:
+error cases return a human-readable string and clear any stale cache
+entry for PATH."
+  (condition-case err
+      (let* ((abs (anvil--prepare-path path))
+             (_ (when (anvil-file--arg-bool reset nil)
+                  (anvil-file--delta-cache-remove abs)))
+             (body (with-temp-buffer
+                     (anvil--insert-file abs)
+                     (buffer-string)))
+             (hash (secure-hash 'sha1 body))
+             (size (length body))
+             (cached (gethash abs anvil-file--delta-cache)))
+        (cond
+         ((> size anvil-file-delta-cache-max-entry-chars)
+          (anvil-file--delta-cache-remove abs)
+          (anvil-file--delta-full-response
+           abs body hash "too large for delta cache"))
+         ((null cached)
+          (anvil-file--delta-cache-put abs hash body (current-time))
+          (anvil-file--delta-full-response abs body hash))
+         ((equal hash (plist-get cached :hash))
+          (list :file abs :mode "unchanged" :hash hash :size size))
+         (t
+          (let* ((old-hash (plist-get cached :hash))
+                 (diff (anvil-file--delta-diff (plist-get cached :body) body)))
+            (if (and (stringp diff)
+                     (< (length diff) (* size 0.8)))
+                (progn
+                  (anvil-file--delta-cache-put abs hash body (current-time))
+                  (list :file abs
+                        :mode "delta"
+                        :diff diff
+                        :hash hash
+                        :size size
+                        :base-hash old-hash))
+              (anvil-file--delta-cache-put abs hash body (current-time))
+              (anvil-file--delta-full-response abs body hash))))))
+    (error
+     (let ((abs (expand-file-name path)))
+       (anvil-file--delta-cache-remove abs)
+       (format "my-cc: file-read-delta failed for %s: %s"
+               abs (error-message-string err))))))
 
 (defun anvil-file-read-region (path start-line end-line)
   "Read PATH from START-LINE to END-LINE inclusive (1-indexed).
@@ -736,7 +876,8 @@ Returns (:file PATH :outline <nested-list>)."
 (defun anvil-org-read-headline (path heading-path)
   "Read heading at HEADING-PATH in org file PATH.
 HEADING-PATH is a list of title strings from outermost to innermost.
-Returns plist: (:file :title :level :todo :tags :body :properties :children-titles)."
+Returns plist:
+(:file :title :level :todo :tags :body :properties :children-titles)."
   (require 'org)
   (let ((abs (anvil--prepare-path path)))
     (with-temp-buffer
@@ -1105,6 +1246,32 @@ MCP Parameters:
                    nil)))
         (format "%S" (anvil-file-read p off lim))))))
 
+(defun anvil-file--tool-read-delta (path &optional reset)
+  "Read file at PATH using a diff-first session baseline cache.
+Returns one of three modes:
+  - `(:mode \"full\" :content FULL-TEXT :hash SHA1
+      :size N ...)'
+  - `(:mode \"unchanged\" :hash SHA1
+      :size N)'
+  - `(:mode \"delta\" :diff UNIFIED-DIFF :hash NEW-SHA1 :size N
+      :base-hash OLD-SHA1)'
+
+Callers apply the unified diff to their previously received full
+content.  When in doubt call with reset=true to force a fresh full
+baseline.  PATH may also be a `file://PATH[#L<s>-<e>]' citation URI,
+but this tool always operates on the whole file rather than line
+snippets.
+
+MCP Parameters:
+  path - Absolute path to the file to read (or `file://' citation URI)
+  reset - (boolean) When true, drop PATH's cached baseline and force
+          a fresh full read"
+  (anvil-server-with-error-handling
+    (require 'anvil-uri nil t)
+    (pcase-let ((`(,p ,_off ,_lim)
+                 (anvil-file--read-normalize-uri-args path nil nil)))
+      (format "%S" (anvil-file-read-delta p reset)))))
+
 (defun anvil-file--tool-append (path content)
   "Append CONTENT to end of file at PATH.
 
@@ -1126,7 +1293,8 @@ file creation in a single MCP call.
 MCP Parameters:
   path - Absolute path to the new file
   content - Initial content of the file
-  overwrite - Optional. Non-empty string to overwrite an existing file (e.g. \"1\")"
+  overwrite - Optional. Non-empty string to overwrite an existing
+              file (e.g. \"1\")"
   (anvil-server-with-error-handling
     (let ((ow (and overwrite (stringp overwrite) (not (string-empty-p overwrite)))))
       (format "%S" (anvil-file-create path content ow)))))
@@ -1440,7 +1608,8 @@ OPTS plist:
   :position SYMBOL     `after-last-match' (default) | `before-first-match'
                        | `top' (very first line) | `bottom'.
 
-Returns plist (:inserted BOOL :line N :already-present BOOL :file PATH :warnings LIST)."
+Returns plist:
+(:inserted BOOL :line N :already-present BOOL :file PATH :warnings LIST)."
   (let* ((abs (anvil--prepare-path path))
          (warnings (anvil-file-warn-if-diverged abs))
          (after-regex (if (plist-member opts :after-regex)
@@ -2050,7 +2219,8 @@ MCP Parameters:
   path - Absolute path to the JSON file to edit
   pairs-json - JSON array of [key, value] pairs or {key, value} objects
   on-duplicate - \"skip\" (default), \"overwrite\", or \"error\"
-  indent - Optional indentation width as a string (e.g. \"2\"); auto-detected if omitted"
+  indent - Optional indentation width as a string (e.g. \"2\");
+           auto-detected if omitted"
   (anvil-server-with-error-handling
    (let* ((parsed (json-parse-string pairs-json
                                      :object-type 'alist
@@ -2087,9 +2257,12 @@ POSITION overrides insertion location.
 
 MCP Parameters:
   path - Absolute path to the file to edit
-  import-line - The full line of text to ensure (e.g. \"import x from 'y';\")
-  after-regex - Optional regexp; insert after the last matching line (default: \"^import \")
-  position - Optional: \"after-last-match\" (default), \"before-first-match\", \"top\", or \"bottom\""
+  import-line - The full line of text to ensure
+                (e.g. \"import x from \\\"y\\\";\")
+  after-regex - Optional regexp; insert after the last matching line
+                (default: \"^import \")
+  position - Optional: \"after-last-match\" (default),
+             \"before-first-match\", \"top\", or \"bottom\""
   (anvil-server-with-error-handling
    (let ((opts (append
                 (when after-regex (list :after-regex after-regex))
@@ -2104,7 +2277,8 @@ FILE-OPS-JSON is a JSON array of objects, each with a `path' and an
 do not abort the rest; per-file results are returned.
 
 MCP Parameters:
-  file-ops-json - JSON array of {\"path\":...,\"operations\":[...]} objects"
+  file-ops-json - JSON array of
+                  {\"path\":...,\"operations\":[...]} objects"
   (anvil-server-with-error-handling
    (let ((file-ops (json-parse-string file-ops-json
                                       :object-type 'alist
@@ -2124,8 +2298,11 @@ regexp syntax, so capture groups must be written as `\\(...\\)'.
     \"block-start\":  \"^ITEM \\\\([0-9]+\\\\)\",
     \"block-end\":    \"brace-balance\",
     \"fields\": [
-      {\"name\": \"name\",  \"regexp\": \"name *= *\\\"\\\\([^\\\"]*\\\\)\\\"\"},
-      {\"name\": \"price\", \"regexp\": \"price *= *\\\\([0-9]+\\\\)\", \"required\": true}
+      {\"name\": \"name\",
+       \"regexp\": \"name *= *\\\"\\\\([^\\\"]*\\\\)\\\"\"},
+      {\"name\": \"price\",
+       \"regexp\": \"price *= *\\\\([0-9]+\\\\)\",
+       \"required\": true}
     ],
     \"max-blocks\": 100,
     \"on-missing-required\": \"skip-block\"
@@ -2138,7 +2315,8 @@ This tool is read-only — the file is never modified.
 
 MCP Parameters:
   path - Absolute path to the file to scan
-  spec-json - JSON object specifying block-start, block-end, fields, etc."
+  spec-json - JSON object specifying block-start, block-end, fields,
+              and related options."
   (anvil-server-with-error-handling
    (let* ((parsed (json-parse-string spec-json
                                      :object-type 'alist
@@ -2189,7 +2367,8 @@ MCP Parameters:
 (defun anvil-file--tool-code-add-field-by-map
     (path lookup-key add-key map-json
           &optional on-existing on-missing scope-regex apply)
-  "Add ADD-KEY to single-line `{...}' object literals in PATH by mapping LOOKUP-KEY values.
+  "Add ADD-KEY to single-line `{...}' object literals in PATH by
+mapping LOOKUP-KEY values.
 
 For each occurrence of `LOOKUP-KEY: \"VALUE\"' inside a `{...}' block,
 look up VALUE in MAP-JSON and insert `ADD-KEY: \"MAPPED-VALUE\"' before
@@ -2205,7 +2384,8 @@ MCP Parameters:
   map-json - JSON object or array of [lookup-value, add-value] pairs
   on-existing - \"error\" (default), \"skip\", or \"overwrite\"
   on-missing - \"skip\" (default) or \"error\"
-  scope-regex - Optional regexp; only edit within substrings matching it
+  scope-regex - Optional regexp; only edit within substrings
+                matching it
   apply - \"t\" to write the file; otherwise (default) preview only"
   (anvil-server-with-error-handling
    (let* ((parsed (json-parse-string map-json
@@ -2380,7 +2560,24 @@ citation URI emitted by Layer 1 (`file-outline') / Layer 2
 (`file-read-snippet') — the URI's line range becomes the default
 offset/limit.  Returns the file content as a string.  For large
 files, use `file-read-snippet' (Layer 2) or pass offset/limit to
-read specific sections."
+   read specific sections."
+   :read-only t
+   :server-id anvil-file--server-id)
+
+  (anvil-server-register-tool
+   #'anvil-file--tool-read-delta
+   :id "file-read-delta"
+   :intent '(file-read structure)
+   :layer 'core
+   :description
+   "Read a whole file through a session baseline cache optimized for
+re-reads.  First read returns full content plus a SHA1 hash.  A byte-
+identical re-read returns only mode/hash/size.  A small edit returns a
+unified diff against the last full or delta-updated baseline, plus the
+new hash and the base hash.  Callers apply the diff to their previously
+received full content; when uncertain, pass reset=true to force a fresh
+full baseline.  Oversized files fall back to full mode and are not
+cached."
    :read-only t
    :server-id anvil-file--server-id)
 
@@ -2531,6 +2728,7 @@ restricts edits to substrings matching the pattern.  Returns plist with
   (anvil-server-unregister-tool "file-insert-at-line" anvil-file--server-id)
   (anvil-server-unregister-tool "file-delete-lines" anvil-file--server-id)
   (anvil-server-unregister-tool "file-read" anvil-file--server-id)
+  (anvil-server-unregister-tool "file-read-delta" anvil-file--server-id)
   (anvil-server-unregister-tool "file-outline" anvil-file--server-id)
   (anvil-server-unregister-tool "file-append" anvil-file--server-id)
   (anvil-server-unregister-tool "file-batch" anvil-file--server-id)

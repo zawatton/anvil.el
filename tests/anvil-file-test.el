@@ -34,6 +34,40 @@
       (set-buffer-modified-p nil))
     (kill-buffer buf)))
 
+(defmacro anvil-file-test--with-delta-cache (bindings &rest body)
+  "Run BODY with a fresh delta cache and optional BINDINGS.
+BINDINGS is a `let' binding list for delta-cache defcustoms."
+  (declare (indent 1) (debug (sexp body)))
+  `(let ((anvil-file--delta-cache (make-hash-table :test 'equal))
+         (anvil-file--delta-cache-order nil)
+         ,@bindings)
+     ,@body))
+
+(defun anvil-file-test--serialize (value)
+  "Serialize VALUE with `format' for MCP-size assertions."
+  (format "%S" value))
+
+(defun anvil-file-test--apply-unified-diff (old-body diff)
+  "Apply unified DIFF to OLD-BODY with external `patch' and return the result."
+  (let ((path (make-temp-file "anvil-file-delta-patch-" nil ".txt")))
+    (unwind-protect
+        (progn
+          (let ((coding-system-for-write 'utf-8-unix))
+            (write-region old-body nil path nil 'silent))
+          (with-temp-buffer
+            (insert diff)
+            (let ((status (call-process-region (point-min) (point-max)
+                                               "patch" nil nil nil
+                                               "--quiet" path)))
+              (should (eq 0 status))))
+          (anvil-file-test--read path))
+      (when (file-exists-p path) (delete-file path)))))
+
+(defun anvil-file-test--write (path content)
+  "Overwrite PATH with CONTENT using UTF-8."
+  (let ((coding-system-for-write 'utf-8-unix))
+    (write-region content nil path nil 'silent)))
+
 ;;;; --- json-object-add ------------------------------------------------------
 
 (ert-deftest anvil-file-test-json-add-empty-object ()
@@ -258,10 +292,132 @@
              (let* ((res (anvil-file-read path))
                     (ws  (plist-get res :warnings)))
                (should (= 1 (length ws)))
-               (should (string-match-p "buffer-newer" (car ws)))
-               ;; Disk content unchanged.
-               (should (equal "hello\n" (plist-get res :content)))))
+             (should (string-match-p "buffer-newer" (car ws)))
+             ;; Disk content unchanged.
+             (should (equal "hello\n" (plist-get res :content)))))
          (anvil-file-test--discard-buffer buf))))))
+
+(ert-deftest anvil-file-test-read-delta-first-full-then-unchanged ()
+  "First read returns full content; identical re-read returns a tiny unchanged payload."
+  (anvil-file-test--with-delta-cache ()
+    (anvil-file-test--with-tmp
+     "alpha\nbeta\ngamma\n"
+     (lambda (path)
+       (let* ((full (anvil-file-read-delta path))
+              (unchanged (anvil-file-read-delta path)))
+         (should (equal "full" (plist-get full :mode)))
+         (should (equal "alpha\nbeta\ngamma\n" (plist-get full :content)))
+         (should (stringp (plist-get full :hash)))
+         (should (equal "unchanged" (plist-get unchanged :mode)))
+         (should (equal (plist-get full :hash) (plist-get unchanged :hash)))
+         (should (< (length (anvil-file-test--serialize unchanged)) 200)))))))
+
+(ert-deftest anvil-file-test-read-delta-small-edit-returns-applicable-diff ()
+  "A small edit returns a unified diff that reconstructs the new content."
+  (anvil-file-test--with-delta-cache ()
+    (anvil-file-test--with-tmp
+     (mapconcat (lambda (n) (format "line-%02d" n)) (number-sequence 1 30) "\n")
+     (lambda (path)
+       (let* ((full (anvil-file-read-delta path))
+              (old-body (plist-get full :content))
+              (old-hash (plist-get full :hash))
+              (new-lines (mapcar (lambda (n) (format "line-%02d" n))
+                                 (number-sequence 1 30)))
+              (new-body
+               (mapconcat #'identity
+                          (append (seq-take new-lines 9)
+                                  '("line-10 updated"
+                                    "line-11 updated"
+                                    "line-12 updated")
+                                  (nthcdr 12 new-lines))
+                          "\n")))
+         (anvil-file-test--write path new-body)
+         (let* ((delta (anvil-file-read-delta path))
+                (diff (plist-get delta :diff)))
+           (should (equal "delta" (plist-get delta :mode)))
+           (should (equal old-hash (plist-get delta :base-hash)))
+           (should (string-match-p "^--- cached\n" diff))
+           (should (string-match-p "^\\+\\+\\+ current\n" diff))
+           (should (string-match-p "^-line-10$" diff))
+           (should (string-match-p "^\\+line-10 updated$" diff))
+           (should (string-match-p "^\\+line-12 updated$" diff))
+           (should (equal new-body
+                          (anvil-file-test--apply-unified-diff old-body diff)))
+           (should (equal (secure-hash 'sha1 new-body)
+                          (plist-get delta :hash)))))))))
+
+(ert-deftest anvil-file-test-read-delta-large-rewrite-falls-back-to-full ()
+  "Large rewrites do not return a delta when the diff is too expensive."
+  (anvil-file-test--with-delta-cache ()
+    (anvil-file-test--with-tmp
+     (mapconcat (lambda (n) (format "line-%02d" n)) (number-sequence 1 20) "\n")
+     (lambda (path)
+       (anvil-file-read-delta path)
+       (let ((new-body (mapconcat (lambda (n) (format "rewrite-%02d" n))
+                                  (number-sequence 1 20) "\n")))
+         (anvil-file-test--write path new-body)
+         (let ((res (anvil-file-read-delta path)))
+           (should (equal "full" (plist-get res :mode)))
+           (should (equal new-body (plist-get res :content)))
+           (should-not (plist-get res :diff))))))))
+
+(ert-deftest anvil-file-test-read-delta-reset-and-oversized-bypass-cache ()
+  "reset=true forces a fresh full baseline; oversized files stay uncached."
+  (anvil-file-test--with-delta-cache
+      ((anvil-file-delta-cache-max-entry-chars 8))
+    (anvil-file-test--with-tmp
+     "small\n"
+     (lambda (path)
+       (let* ((full (anvil-file-read-delta path))
+              (wrapped (read (anvil-file--tool-read-delta path "true"))))
+         (should (equal "full" (plist-get full :mode)))
+         (should (equal "full" (plist-get wrapped :mode)))
+         (should (equal (plist-get full :content) (plist-get wrapped :content))))
+       (anvil-file-test--write path "0123456789\n")
+       (let ((large1 (anvil-file-read-delta path))
+             (large2 (anvil-file-read-delta path)))
+         (should (equal "full" (plist-get large1 :mode)))
+         (should (equal "too large for delta cache" (plist-get large1 :note)))
+         (should (equal "full" (plist-get large2 :mode)))
+         (should (equal "too large for delta cache" (plist-get large2 :note)))
+         (should-not (gethash (expand-file-name path) anvil-file--delta-cache)))))))
+
+(ert-deftest anvil-file-test-read-delta-eviction-is-fifo ()
+  "Reading past the entry limit evicts the oldest cached baseline."
+  (anvil-file-test--with-delta-cache
+      ((anvil-file-delta-cache-max-entries 2))
+    (let ((p1 (make-temp-file "anvil-file-delta-a-" nil ".txt"))
+          (p2 (make-temp-file "anvil-file-delta-b-" nil ".txt"))
+          (p3 (make-temp-file "anvil-file-delta-c-" nil ".txt")))
+      (unwind-protect
+          (progn
+            (anvil-file-test--write p1 "a\n")
+            (anvil-file-test--write p2 "b\n")
+            (anvil-file-test--write p3 "c\n")
+            (anvil-file-read-delta p1)
+            (anvil-file-read-delta p2)
+            (anvil-file-read-delta p3)
+            (should-not (gethash (expand-file-name p1) anvil-file--delta-cache))
+            (should (equal "full" (plist-get (anvil-file-read-delta p1) :mode))))
+        (dolist (path (list p1 p2 p3))
+          (when (file-exists-p path) (delete-file path)))))))
+
+(ert-deftest anvil-file-test-read-delta-unreadable-path-returns-string-and-drops-stale-cache ()
+  "Missing/unreadable paths return a string result and clear stale cache state."
+  (anvil-file-test--with-delta-cache ()
+    (let ((path (make-temp-file "anvil-file-delta-missing-" nil ".txt")))
+      (unwind-protect
+          (progn
+            (anvil-file-test--write path "baseline\n")
+            (should (equal "full" (plist-get (anvil-file-read-delta path) :mode)))
+            (delete-file path)
+            (let ((res (anvil-file-read-delta path)))
+              (should (stringp res))
+              (should (string-match-p "file-read-delta failed" res))
+              (should-not (gethash (expand-file-name path) anvil-file--delta-cache)))
+            (anvil-file-test--write path "rebuilt\n")
+            (should (equal "full" (plist-get (anvil-file-read-delta path) :mode))))
+        (when (file-exists-p path) (delete-file path))))))
 
 (ert-deftest anvil-file-test-replace-string-warnings-empty ()
   "anvil-file-replace-string returns :warnings nil when no buffer visits."
