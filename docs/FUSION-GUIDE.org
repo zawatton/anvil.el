@@ -1,0 +1,161 @@
+#+TITLE: Fusion Guide — verified multi-model answers, efficiently
+#+OPTIONS: toc:2 num:nil
+
+How to use Anvil's fusion stack (the 2026-07 wave: verifier-grounded
+judge, cascade router, execution verification, plan fusion, agentic
+long-runs, trajectory library) without wasting money or context.
+Design docs: =docs/design/61-fusion-verify.org= and
+=docs/design/62-token-thrift.org=; measurements:
+=benchmarks/doc61-phase6a/= and =benchmarks/doc61-phase6e/=.
+
+* The one rule that matters: don't pay the multiplier by default
+
+A strong single model already answers most prompts correctly — our
+eval battery showed a plain single-model judge rejecting 10/10 planted
+hallucinations without any help, while fusion + verification costs
+roughly 4-8x a single ask. The stack pays off on three things only:
+
+1. *Hard multi-constraint tasks* — gold-fact recall measured 79%
+   (single) → 93% (plain fusion) → 100% (fusion + verify).
+2. *Insurance on fact-critical answers* — the verifier pipeline
+   mechanically prevents the "judge adopts a confident hallucination"
+   failure class (0/10 adoptions in the acceptance run).
+3. *Weak-judge setups* — small local (sovereign) panels, where an
+   unverified judge measurably discards correct answers.
+
+So: answer normally by default; escalate deliberately.
+
+| Entry point | Rough cost | Reach for it when |
+|-------------+-----------+--------------------|
+| plain answer, no fusion | 1x | the default |
+| =anvil-fusion-route-ask= | ~1.1x on easy prompts | important but difficulty unknown |
+| =anvil-fusion-ask :panel 'claude-pair= | ~3x | moderate stakes, want a second pass |
+| =… :panel 'opus-solo :verify t= | ~8x | fact-critical, highest stakes |
+| =… + :exec-check= | + runtime | comparing CODE patches (execution beats prose judging) |
+| =anvil-fusion-plan :verify t :repo-root R= | ~8x | implementation planning against a real repo |
+| =anvil-fusion-longrun-run :step-panel … :verify-steps t= | varies | long multi-step tasks |
+
+* Decision flow
+
+1. Can you just answer? Answer. (No fusion.)
+2. Important, difficulty unknown → =anvil-fusion-route-ask=. It answers
+   once, risk-probes its own answer with a haiku-tier call
+   (=RISK: LOW|MEDIUM|HIGH=), and escalates only when risky. Decisions
+   land in =anvil-fusion-route-log= for threshold calibration.
+3. Known-critical + facts must hold → =:panel 'opus-solo :verify t=:
+   three lens-diversified members of one strong model, contested claims
+   extracted, checked against your local knowledge base and an
+   adversarial skeptic vote, and a judge that is forbidden from
+   adopting refuted claims.
+4. The candidates are code patches → add
+   =:exec-check '(:repo-root "/path/to/repo" :check-cmd "make test")=.
+   Each patch runs in a disposable git worktree; failing candidates are
+   excluded from synthesis and their failures appear in the judge's
+   claim table.
+5. Before implementing something sizable →
+   =(anvil-fusion-plan "task" :verify t :repo-root "/path/to/repo")= —
+   members produce PLANS, mechanical checkers confirm that the files
+   and APIs a plan names actually exist, the judge merges into one plan.
+6. Hours-long autonomous work → =anvil-fusion-longrun-run= with
+   =:step-panel 'opus-solo :step-panel-mode 'hard-only= (the distiller
+   flags hard steps itself) and =:verify-steps t= (each step's digest is
+   claim-checked before it becomes state; one feedback retry on
+   refutation).
+7. Confidential content, zero egress → =:panel 'sovereign=. Be honest
+   about its limits: small local models measurably lack factual
+   quality; keep a human in the loop.
+
+* Wiring (once, in your init)
+
+#+begin_src elisp
+;; Point claim verification at your local knowledge base directories:
+(setq anvil-fusion-verify-kb-roots '("~/kb"))
+
+;; Optional: zero-LLM confirmation of numeric claims straight from the KB:
+(add-to-list 'anvil-fusion-verify-mechanical-checkers
+             #'anvil-fusion-verify-checker-kb-numeric)
+#+end_src
+
+Already on by default: the verdict cache (decisive verdicts, 7-day
+TTL — repeat claims skip the skeptic vote) and sequential skeptics
+(one skeptic first, more only on weak/conflicting signals).
+
+* Calling it
+
+- MCP (recommended, non-blocking): the =fusion-ask= tool (with its
+  =verify= parameter) returns a job id; poll =fusion-result=. Long-run
+  quests: =longrun-start= / =longrun-resume= / =longrun-status=.
+- Elisp (blocking): =(anvil-fusion-ask "…" :panel 'opus-solo :verify t)=
+  → plist with =:answer=, =:claims= (the verdict table), =:route= /
+  =:exec-results= / =:trajectory-id= when those features ran.
+
+* The trajectory library (it gets better with use)
+
+Verified wins can be stored and reused as exemplars — self-improvement
+without weight updates:
+
+- add =:store-trajectory t= to asks that went well; an admission gate
+  keeps only clean wins (≥1 confirmed claim, zero refuted);
+- add =:exemplars t= on similar future tasks to prepend retrieved
+  verified examples to the panel members' prompts;
+- manage with =anvil-fusion-traj-search= / =-count= / =-delete=.
+
+* Token-thrift habits (measured)
+
+- Run test suites through the =ert-run-distilled= tool, not raw shell:
+  a passing run reports in ~120 characters; the raw log stays one call
+  away via =:log-path=.
+- Re-read changed files with =file-read-delta=: a 3-line edit to a 40K
+  file comes back as ~320 characters of diff instead of the whole file.
+- =worklog-search= / =org-read-outline= return clamped snippets by
+  default (a 10-hit search dropped from ~28K to ~3.7K characters); pass
+  =full=true= / =max_chars=0= only when you truly need everything.
+- Check where your volume actually goes with =metrics-token-report=
+  before tuning anything else.
+- Oversized responses can be budget-truncated with a continuation
+  handle (=disclosure-fetch=); the mechanism ships disabled — enable
+  =anvil-disclosure-response-budget-chars= deliberately.
+
+* Building an agent harness around this
+
+If you drive Anvil from an agentic CLI (Claude Code, Codex CLI, …),
+encode the decision flow above as a skill / AGENTS.md section so the
+agent reaches for the right tier without re-deriving it. A minimal
+skeleton:
+
+#+begin_example
+# skill: fusion
+- Default: answer directly. Escalate deliberately (cost table).
+- Unknown difficulty → route-ask. Fact-critical → opus-solo + verify.
+- Code candidates → exec-check. Plans → fusion-plan. Long tasks →
+  longrun with hard-only panels and verify-steps.
+- Store wins (:store-trajectory), reuse them (:exemplars).
+- Tests via ert-run-distilled; re-reads via file-read-delta.
+#+end_example
+
+For delegating IMPLEMENTATION work to a second agent (e.g. Codex CLI)
+through =anvil-orchestrator=, two field-tested rules:
+
+1. Run the orchestrator in a *standalone batch process* (=emacs --batch
+   -Q -L <anvil> -l anvil-orchestrator= + submit/collect in-process)
+   rather than inside a long-lived daemon another session may reload —
+   a daemon-side module reload resets task tracking mid-run (the
+   subprocess survives; the bookkeeping does not).
+2. Give the implementer a *self-contained spec* with hard safety rules:
+   an explicit file allowlist, no in-place restructuring of large
+   functions (extract new helpers instead), a parenthesis/load check
+   after every file write, no commits (the reviewer applies and
+   verifies), and "report deviations explicitly — never claim
+   completion if verification did not pass."
+
+* Honest limits
+
+- No direct benchmark against a stronger frontier model exists here;
+  this stack narrows the gap on measurable axes (verified facts, hard
+  multi-constraint recall, long-run error propagation) — it is not an
+  equivalence proof.
+- An ensemble cannot synthesize what no member knows, and insights that
+  only emerge from one deep coherent reasoning chain do not decompose
+  into fan-out + verify.
+- Local (sovereign) panels trade quality for zero egress; verify helps
+  but does not close that gap.
