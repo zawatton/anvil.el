@@ -856,6 +856,20 @@ claim unverified without signaling to the caller."
           (funcall fn root))
       (delete-directory root t))))
 
+(defun anvil-fusion-verify-test--with-kb-fixture (files fn)
+  "Create KB FILES under a temp dir, call FN with that root, then clean up.
+FILES is an alist of (RELATIVE-PATH . CONTENTS)."
+  (let ((root (make-temp-file "anvil-fusion-verify-kb-" t)))
+    (unwind-protect
+        (progn
+          (dolist (file files)
+            (let ((path (expand-file-name (car file) root)))
+              (make-directory (file-name-directory path) t)
+              (with-temp-file path
+                (insert (cdr file)))))
+          (funcall fn root))
+      (delete-directory root t))))
+
 (ert-deftest anvil-fusion-verify-test-repo-reality-checker-path-confirmed ()
   "An existing path token confirms the claim."
   (anvil-fusion-verify-test--with-repo-fixture
@@ -911,6 +925,93 @@ claim unverified without signaling to the caller."
     (should (null (anvil-fusion-verify-checker-repo-reality
                    '(:claim "see sub/x.org"))))))
 
+(ert-deftest anvil-fusion-verify-test-kb-numeric-checker-kind-gated ()
+  "Non-number claims are ignored by the KB numeric checker."
+  (skip-unless (or (executable-find "rg") (executable-find "grep")))
+  (anvil-fusion-verify-test--with-kb-fixture
+   '(("kb.org" . "低圧回路の絶縁抵抗は 0.1MΩ 以上。\n"))
+   (lambda (root)
+     (let ((anvil-fusion-verify-kb-roots (list root)))
+       (should (null (anvil-fusion-verify-checker-kb-numeric
+                      '(:claim "低圧回路の絶縁抵抗は 0.1MΩ 以上" :kind fact))))))))
+
+(ert-deftest anvil-fusion-verify-test-kb-numeric-checker-confirmed ()
+  "A matching number plus local entity context confirms the claim."
+  (skip-unless (or (executable-find "rg") (executable-find "grep")))
+  (anvil-fusion-verify-test--with-kb-fixture
+   '(("rules.org" . "低圧回路の絶縁抵抗は 0.1MΩ 以上。\n"))
+   (lambda (root)
+     (let* ((anvil-fusion-verify-kb-roots (list root))
+            (result (anvil-fusion-verify-checker-kb-numeric
+                     '(:claim "低圧回路の絶縁抵抗は 0.1MΩ 以上" :kind number))))
+       (should (eq 'confirmed (plist-get result :verdict)))
+       (should (string-match-p "\\`.+rules\\.org:1 — .*0\\.1MΩ"
+                               (plist-get result :evidence)))))))
+
+(ert-deftest anvil-fusion-verify-test-kb-numeric-checker-space-variant ()
+  "A spaced KB unit still matches a compact claim token."
+  (skip-unless (or (executable-find "rg") (executable-find "grep")))
+  (anvil-fusion-verify-test--with-kb-fixture
+   '(("rules.org" . "低圧回路の絶縁抵抗は 0.1 MΩ 以上。\n"))
+   (lambda (root)
+     (let* ((anvil-fusion-verify-kb-roots (list root))
+            (result (anvil-fusion-verify-checker-kb-numeric
+                     '(:claim "低圧回路の絶縁抵抗は 0.1MΩ 以上" :kind number))))
+       (should (eq 'confirmed (plist-get result :verdict)))
+       (should (string-match-p "\\`.+rules\\.org:1 — .*0\\.1 MΩ"
+                               (plist-get result :evidence)))))))
+
+(ert-deftest anvil-fusion-verify-test-kb-numeric-checker-window-plus-2-confirms ()
+  "Entity context two lines away still confirms via the +/-2-line window."
+  (skip-unless (or (executable-find "rg") (executable-find "grep")))
+  (anvil-fusion-verify-test--with-kb-fixture
+   '(("rules.org" . "注意書き\n0.1MΩ\n別の行\n絶縁抵抗\n"))
+   (lambda (root)
+     (let* ((anvil-fusion-verify-kb-roots (list root))
+            (result (anvil-fusion-verify-checker-kb-numeric
+                     '(:claim "低圧回路の絶縁抵抗は 0.1MΩ 以上" :kind number))))
+       (should (eq 'confirmed (plist-get result :verdict)))
+       (should (string-match-p "rules\\.org:2" (plist-get result :evidence)))))))
+
+(ert-deftest anvil-fusion-verify-test-kb-numeric-checker-window-too-far-hints ()
+  "Entity terms outside the +/-2-line window do not confirm the claim."
+  (skip-unless (or (executable-find "rg") (executable-find "grep")))
+  (anvil-fusion-verify-test--with-kb-fixture
+   '(("rules.org" . "注意書き\n0.1MΩ\n二行目\n三行目\n四行目\n絶縁抵抗\n"))
+   (lambda (root)
+     (let* ((anvil-fusion-verify-kb-roots (list root))
+            (result (anvil-fusion-verify-checker-kb-numeric
+                     '(:claim "低圧回路の絶縁抵抗は 0.1MΩ 以上" :kind number))))
+       (should (null (plist-get result :verdict)))
+       (should (string-match-p "number found without entity context: .*rules\\.org:2"
+                               (plist-get result :evidence)))))))
+
+(ert-deftest anvil-fusion-verify-test-kb-numeric-checker-number-not-found-hint ()
+  "A missing numeric token yields only a hint, never a refutation."
+  (skip-unless (or (executable-find "rg") (executable-find "grep")))
+  (anvil-fusion-verify-test--with-kb-fixture
+   '(("rules.org" . "低圧回路の絶縁抵抗は 0.1MΩ 以上。\n"))
+   (lambda (root)
+     (let* ((anvil-fusion-verify-kb-roots (list root))
+            (result (anvil-fusion-verify-checker-kb-numeric
+                     '(:claim "低圧回路の絶縁抵抗は 100MΩ 以上" :kind number))))
+       (should (null (plist-get result :verdict)))
+       (should (equal "number not found in KB: 100MΩ"
+                      (plist-get result :evidence)))))))
+
+(ert-deftest anvil-fusion-verify-test-kb-numeric-checker-root-nil-and-unreadable-safe ()
+  "Nil roots disable the checker; unreadable roots do not signal."
+  (skip-unless (or (executable-find "rg") (executable-find "grep")))
+  (let ((anvil-fusion-verify-kb-roots nil))
+    (should (null (anvil-fusion-verify-checker-kb-numeric
+                   '(:claim "低圧回路の絶縁抵抗は 0.1MΩ 以上" :kind number)))))
+  (let ((anvil-fusion-verify-kb-roots (list "/nonexistent/anvil-fusion-verify-kb-root")))
+    (let ((result (anvil-fusion-verify-checker-kb-numeric
+                   '(:claim "低圧回路の絶縁抵抗は 0.1MΩ 以上" :kind number))))
+      (should (null (plist-get result :verdict)))
+      (should (equal "number not found in KB: 0.1MΩ"
+                     (plist-get result :evidence))))))
+
 (ert-deftest anvil-fusion-verify-test-verify-claims-mechanical-confirmed-prunes-batch ()
   "Mechanically confirmed claims are excluded from the skeptic batch."
   (let ((anvil-fusion-verify-skeptics 2)
@@ -948,6 +1049,48 @@ claim unverified without signaling to the caller."
         (should (eq 'confirmed (plist-get (car result) :verdict)))
         (should (equal "exists: sub/x.org"
                        (plist-get (car result) :evidence)))))))
+
+(ert-deftest anvil-fusion-verify-test-verify-claims-kb-numeric-confirmed-prunes-batch ()
+  "A KB numeric mechanical confirmation skips the skeptic batch."
+  (skip-unless (or (executable-find "rg") (executable-find "grep")))
+  (anvil-fusion-verify-test--with-kb-fixture
+   '(("rules.org" . "低圧回路の絶縁抵抗は 0.1MΩ 以上。\n"))
+   (lambda (root)
+     (let ((anvil-fusion-verify-skeptics 2)
+           (anvil-fusion-verify-sequential-skeptics nil)
+           (anvil-fusion-verify-kb-roots (list root))
+           (anvil-fusion-verify-mechanical-checkers
+            (list #'anvil-fusion-verify-checker-kb-numeric))
+           (submitted-tasks nil))
+       (cl-letf (((symbol-function 'anvil-orchestrator-submit)
+                  (lambda (tasks)
+                    (setq submitted-tasks tasks)
+                    "b1"))
+                 ((symbol-function 'anvil-orchestrator-collect)
+                  (lambda (&rest _) t))
+                 ((symbol-function 'anvil-orchestrator-status)
+                  (lambda (_id)
+                    (list :tasks
+                          (mapcar (lambda (task)
+                                    (list :id (plist-get task :name)
+                                          :name (plist-get task :name)))
+                                  submitted-tasks))))
+                 ((symbol-function 'anvil-orchestrator-extract-result)
+                  (lambda (_id _full)
+                    (list :status 'done :summary "VERDICT: UNVERIFIED\nREASON: "))))
+         (let ((result (anvil-fusion-verify-claims
+                        (list (list :claim "低圧回路の絶縁抵抗は 0.1MΩ 以上"
+                                    :kind 'number :candidates '("A"))
+                              (list :claim "unknown" :kind 'fact :candidates '("B")))
+                        :question "Q")))
+           (should (= 2 (length submitted-tasks)))
+           (should (cl-every (lambda (task)
+                               (string-prefix-p "fusion-verify-skeptic-1-"
+                                                (plist-get task :name)))
+                             submitted-tasks))
+           (should (eq 'confirmed (plist-get (car result) :verdict)))
+           (should (string-match-p "rules\\.org:1"
+                                   (plist-get (car result) :evidence)))))))))
 
 (ert-deftest anvil-fusion-verify-test-verify-claims-mechanical-all-confirmed-no-submit ()
   "All mechanically confirmed claims skip the orchestrator entirely."

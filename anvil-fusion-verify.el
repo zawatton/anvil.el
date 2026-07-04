@@ -50,6 +50,13 @@
 ;;      N independent tasks per claim, each told to try to refute it;
 ;;      `anvil-fusion-verify--aggregate-verdicts' majority-decides
 ;;      `confirmed' / `refuted' / `unverified'.
+;;   3. Optional mechanical checkers
+;;      (`anvil-fusion-verify-mechanical-checkers') — zero-LLM local
+;;      checks that may confirm a claim or feed a hint into the skeptic
+;;      prompt.  For KB-backed numeric facts, enable
+;;      `anvil-fusion-verify-checker-kb-numeric' explicitly in user
+;;      config; `anvil-fusion-ask' :verify flows pick it up
+;;      automatically once set.
 ;;
 ;; `anvil-fusion-verify-claims' enforces the same sovereignty
 ;; discipline as `anvil-fusion-ask': for a `local-only' egress request
@@ -419,6 +426,14 @@ fed into the skeptic prompt's evidence block."
   :type 'integer
   :group 'anvil-fusion)
 
+(defcustom anvil-fusion-verify-kb-numeric-min-entity-hits 1
+  "Minimum distinct entity terms a KB numeric hit window must carry.
+`anvil-fusion-verify-checker-kb-numeric' confirms only when a line that
+matches the claim's number token also carries at least this many
+distinct non-numeric claim terms within that line's +/-2-line window."
+  :type 'integer
+  :group 'anvil-fusion)
+
 (defvar anvil-fusion-verify--cache-now-fn #'float-time
   "Function returning the current unix timestamp as a float.
 Tests bind this to a fake clock so cache expiry can be exercised
@@ -447,7 +462,15 @@ built and must return one of:
 Checkers are strictly additive: they must never signal and must never
 return :verdict `refuted' or `unverified'.  Mechanical checks may only
 confirm or hint; anything negative is left to the skeptic vote, which
-can judge the hint in context."
+can judge the hint in context.
+
+Shipped checkers are opt-in, not default-on.  For example:
+use `add-to-list' to add
+`anvil-fusion-verify-checker-kb-numeric' to
+`anvil-fusion-verify-mechanical-checkers'.
+
+Once added, `anvil-fusion-ask' :verify flows pick the checker up
+automatically through `anvil-fusion-verify-claims'."
   :type '(repeat function)
   :group 'anvil-fusion)
 
@@ -608,6 +631,79 @@ non-directory root is skipped silently.  Never signals."
               (mapcar (lambda (e) (list :source (plist-get e :source) :text (plist-get e :text)))
                       (cl-subseq ranked 0 (min (length ranked)
                                                 anvil-fusion-verify-max-evidence))))))))))
+
+(defconst anvil-fusion-verify--kb-numeric-token-regexp
+  "\\([0-9][0-9,]*\\(?:\\.[0-9]+\\)?\\)[ \t]*\\([A-Za-zΩµμ℃°%]+\\)?"
+  "Regexp matching a number token plus an optional adjacent unit run.
+Normalization for `anvil-fusion-verify-checker-kb-numeric' strips comma
+grouping and accepts only with/without-one-space number-unit variants;
+it does not attempt broader unit synonym expansion.")
+
+(defun anvil-fusion-verify--kb-numeric-variants (claim-text)
+  "Return normalized numeric token descriptors extracted from CLAIM-TEXT.
+Each entry is a plist (:raw RAW :needle NEEDLE :variants (SURFACE...)),
+where NEEDLE is the comma-stripped canonical number+unit form used for
+deduping and VARIANTS contains the accepted surface forms for matching:
+the canonical compact form, plus a one-space form when a unit exists.
+Nil/empty CLAIM-TEXT, or text with no numeric token, yields nil."
+  (let ((start 0)
+        (text (or claim-text ""))
+        (seen nil)
+        (tokens nil))
+    (while (string-match anvil-fusion-verify--kb-numeric-token-regexp text start)
+      (let* ((num (replace-regexp-in-string "," "" (match-string 1 text)))
+             (unit (or (match-string 2 text) ""))
+             (needle (concat num unit)))
+        (unless (or (string-empty-p num) (member needle seen))
+          (setq seen (append seen (list needle)))
+          (setq tokens
+                (append tokens
+                        (list (list :raw (match-string 0 text)
+                                    :needle needle
+                                    :variants (if (string-empty-p unit)
+                                                  (list num)
+                                                (list needle
+                                                      (concat num " " unit)))))))))
+      (setq start (match-end 0)))
+    tokens))
+
+(defun anvil-fusion-verify--kb-source-file-line (source)
+  "Return (FILE . LINE) parsed from KB hit SOURCE, or nil."
+  (when (and (stringp source)
+             (string-match "\\`\\(.*\\):\\([0-9]+\\)\\'" source))
+    (cons (match-string 1 source)
+          (string-to-number (match-string 2 source)))))
+
+(defun anvil-fusion-verify--kb-window-text (source &optional radius)
+  "Return SOURCE's surrounding KB window text, or nil on any failure.
+SOURCE is a \"PATH:LINE\" string.  The returned window spans the hit line
+plus +/-RADIUS neighboring lines; RADIUS defaults to 2.  This is
+best-effort and never signals."
+  (condition-case nil
+      (let* ((parts (anvil-fusion-verify--kb-source-file-line source))
+             (file (car parts))
+             (line (cdr parts))
+             (r (or radius 2)))
+        (when (and file (> line 0) (file-readable-p file))
+          (with-temp-buffer
+            (insert-file-contents file)
+            (goto-char (point-min))
+            (forward-line (max 0 (- line 1 r)))
+            (let ((start (point)))
+              (forward-line (1+ (* 2 r)))
+              (buffer-substring-no-properties start (point))))))
+    (error nil)))
+
+(defun anvil-fusion-verify--kb-window-entity-hit-count (source entity-terms)
+  "Count distinct ENTITY-TERMS found in SOURCE's +/-2-line KB window."
+  (let ((window (anvil-fusion-verify--kb-window-text source)))
+    (if (not (stringp window))
+        0
+      (cl-count-if (lambda (term)
+                     (and (stringp term)
+                          (not (string-empty-p term))
+                          (string-match-p (regexp-quote term) window)))
+                   entity-terms))))
 
 (defconst anvil-fusion-verify--repo-path-token-regexp
   "\\(?:[[:alnum:]_.-]+/\\)+[[:alnum:]_.-]+\\.\\(?:el\\|org\\|md\\|txt\\|py\\|ts\\|js\\|json\\|sh\\|yml\\)\\b"
@@ -956,6 +1052,68 @@ missing, or on any internal failure.  Never signals."
                       (list :evidence
                             (format "symbol(s) not found under %s: %s"
                                     root (mapconcat #'identity symbols ", ")))))))))))
+    (error nil)))
+
+(defun anvil-fusion-verify-checker-kb-numeric (claim)
+  "Best-effort KB numeric checker for CLAIM.
+Applies only to `number' claims and only when
+`anvil-fusion-verify-kb-roots' is non-nil.  Extracts normalized
+number+unit tokens from the claim text, greps KB roots for their
+surface variants via `anvil-fusion-verify--kb-search-term', and counts
+how many distinct non-numeric claim terms occur within each hit's
+line-centered +/-2-line window.  Returns a mechanical confirmation when
+some hit reaches
+`anvil-fusion-verify-kb-numeric-min-entity-hits'; otherwise returns a
+mechanical hint stating either that the number was found without entity
+context or that the number was not found at all.  Never signals."
+  (condition-case nil
+      (let* ((kind (plist-get claim :kind))
+             (text (plist-get claim :claim))
+             (numbers (and (eq kind 'number)
+                           anvil-fusion-verify-kb-roots
+                           (anvil-fusion-verify--kb-numeric-variants text))))
+        (when numbers
+          (let* ((number-needles
+                  (mapcar (lambda (entry) (plist-get entry :needle)) numbers))
+                 (filtered-terms
+                  (cl-remove-if
+                   (lambda (term)
+                     (member (replace-regexp-in-string "[ \t,]" "" term)
+                             number-needles))
+                   (anvil-fusion-verify--claim-search-terms text)))
+                 (entity-terms
+                  (cl-subseq filtered-terms 0 (min 4 (length filtered-terms))))
+                 (program (anvil-fusion-verify--kb-grep-program))
+                 (first-hit nil))
+            (catch 'result
+              (dolist (root anvil-fusion-verify-kb-roots)
+                (when (and (stringp root) (file-directory-p root))
+                  (dolist (entry numbers)
+                    (dolist (surface (plist-get entry :variants))
+                      (dolist (hit (anvil-fusion-verify--kb-search-term root surface program))
+                        (unless first-hit
+                          (setq first-hit hit))
+                        (when (>= (anvil-fusion-verify--kb-window-entity-hit-count
+                                   (plist-get hit :source) entity-terms)
+                                  anvil-fusion-verify-kb-numeric-min-entity-hits)
+                          (throw
+                           'result
+                           (list :verdict 'confirmed
+                                 :evidence
+                                 (format "%s — %s"
+                                         (plist-get hit :source)
+                                         (anvil-fusion-verify--truncate-evidence
+                                          (plist-get hit :text)))))))))))
+              (throw 'result
+                     (if first-hit
+                         (list :evidence
+                               (format "number found without entity context: %s — %s"
+                                       (plist-get first-hit :source)
+                                       (anvil-fusion-verify--truncate-evidence
+                                        (plist-get first-hit :text))))
+                       (list :evidence
+                             (format "number not found in KB: %s"
+                                     (plist-get (car numbers) :needle)))))))))
     (error nil)))
 ;;;; --- orchestration wrapper (6b, lazy require of anvil-orchestrator) -------
 
