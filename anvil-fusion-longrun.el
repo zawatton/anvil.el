@@ -348,12 +348,13 @@ injects a read-only --mcp-config for the step."
      model cwd timeout-sec max-wait-sec allowed-tools manifest-profile
      member-extras)))
 
-(defun anvil-fusion-longrun--default-distill-fn (provider model cwd timeout-sec max-wait-sec)
+(defun anvil-fusion-longrun--default-distill-fn
+    (provider model cwd timeout-sec max-wait-sec &optional member-extras)
   "Return a distill-fn closure that runs one isolated orchestrator task."
   (lambda (prompt step-n)
     (anvil-fusion-longrun--run-one
      provider prompt (format "longrun-distill-%d" step-n)
-     model cwd timeout-sec max-wait-sec)))
+     model cwd timeout-sec max-wait-sec nil nil member-extras)))
 
 (defun anvil-fusion-longrun--panel-step-p (step-panel step-panel-mode next-hard panel-budget-left)
   "Return non-nil when the current step should execute as a panel step.
@@ -500,7 +501,8 @@ digest-chars / digest-head), not the full outputs."
                      member-extras)))
          (dfn   (or distill-fn
                     (anvil-fusion-longrun--default-distill-fn
-                     dprov dmod cwd timeout-sec max-wait-sec)))
+                     dprov dmod cwd timeout-sec max-wait-sec
+                     member-extras)))
          (digest resume-digest)
          (trace  nil)
          (step   (or resume-step 0))

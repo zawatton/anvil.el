@@ -71,6 +71,24 @@
   '("WebFetch" "WebSearch")
   "Tool names treated as network egress for local-only panels.")
 
+(defcustom anvil-fusion-ask-deadline-sec nil
+  "Best-effort total wall-clock budget for `anvil-fusion-ask', in seconds.
+Nil keeps today's unbounded behavior.  When set, the deadline is
+checked only between phases: after the round-0 member fan-out (to
+skip the optional verification pass) and before each new
+critique/debate round (to stop looping and return the best answer so
+far).  It is not a hard per-batch timeout; use `:timeout-sec' /
+`:max-wait-sec' for that."
+  :type '(choice (const :tag "Unlimited" nil) number)
+  :group 'anvil-fusion)
+
+(defun anvil-fusion--deadline-exceeded-p (start deadline)
+  "Return non-nil when START + DEADLINE has been reached.
+START is a `float-time' timestamp captured at entry.  DEADLINE is a
+number of seconds or nil.  Pure."
+  (and (numberp deadline)
+       (>= (- (float-time) start) deadline)))
+
 (defun anvil-fusion--agentic-extras (agentic cwd)
   "Return the default member extras plist for AGENTIC and CWD.
 Nil AGENTIC returns nil.  Scratch temp CWDs get Claude's
@@ -255,7 +273,8 @@ candidates before judging.  Returns (:answer :candidates
     (prompt &key panel fidelity judge judge-model extra lenses cwd
             max-rounds converge-threshold timeout-sec (max-wait-sec 1800)
             template verify verify-args verify-base-template exec-check
-            exemplars store-trajectory member-extras agentic)
+            exemplars store-trajectory member-extras agentic
+            (deadline-sec nil deadline-sec-p))
   "Answer PROMPT by fusing a panel of models into one synthesized reply.
 
 PANEL names a panel in `anvil-fusion-panels' (default
@@ -353,10 +372,20 @@ downgrades to a minimal `:allowed-tools \"Bash\"' grant and logs one
 `message'.  Local-only panels refuse known network-egress
 `:allowed-tools' grants before submission.
 
+DEADLINE-SEC overrides `anvil-fusion-ask-deadline-sec' with a
+best-effort total wall-clock budget for the whole ask.  Unlike
+`:timeout-sec' / `:max-wait-sec', this is checked only BETWEEN phases:
+after the round-0 member fan-out but before starting verification, and
+before each new critique/debate round.  When the deadline is exceeded,
+the ask degrades gracefully by skipping verification and/or later
+rounds and returns the best answer available so far instead of
+signaling.
+
 Returns a plist: :answer :panel :egress :fidelity :rounds :looped
 :debate-rounds
 :members-batch :judge-batch :judge-task-id :judge-provider
 :judge-model :candidates :prompt-chars :claims :exec-results
+:deadline-exceeded
 :trajectory-id.  :CLAIMS
 is the merged annotated claim list when VERIFY and/or EXEC-CHECK
 produced one, else nil.  :EXEC-RESULTS is the per-candidate execution
@@ -377,6 +406,10 @@ against the ORIGINAL PROMPT and adds :TRAJECTORY-ID (id or nil)."
            (member-extras
             (append (anvil-fusion--member-extras-plist member-extras)
                     agentic-extras))
+           (deadline (if deadline-sec-p
+                         deadline-sec
+                       anvil-fusion-ask-deadline-sec))
+           (start-time (float-time))
            (cap     (or max-rounds anvil-fusion-max-rounds))
            (thr     converge-threshold)
            (debate-enabled anvil-fusion-debate))
@@ -421,6 +454,7 @@ against the ORIGINAL PROMPT and adds :TRAJECTORY-ID (id or nil)."
              (claims     nil)
              (exec-results nil)
              (etemplate  template)
+             (deadline-exceeded nil)
              (local-panel (eq egress 'local-only))
              (vargs       (or verify-args nil))
              (ex-provider (or (plist-get vargs :provider) (and local-panel jprov)))
@@ -445,7 +479,10 @@ against the ORIGINAL PROMPT and adds :TRAJECTORY-ID (id or nil)."
                              (list :timeout-sec (plist-get vargs :timeout-sec)))
                         (and (plist-get vargs :max-wait-sec)
                              (list :max-wait-sec (plist-get vargs :max-wait-sec)))))))
-        (when verify
+        (when (and verify
+                   (anvil-fusion--deadline-exceeded-p start-time deadline))
+          (setq deadline-exceeded t))
+        (when (and verify (not deadline-exceeded))
           (when (and local-panel ex-provider
                      (not (anvil-fusion-provider-local-p ex-provider)))
             (user-error
@@ -517,84 +554,94 @@ against the ORIGINAL PROMPT and adds :TRAJECTORY-ID (id or nil)."
                             :prompt-chars  (plist-get jresult :prompt-chars)))
                (rounds 0)
                (debate-rounds 0))
-          (while (and (< rounds cap)
+          (when (and (< rounds cap)
+                     (anvil-fusion-should-loop-p
+                      (plist-get round :candidates) thr)
+                     (anvil-fusion--deadline-exceeded-p start-time deadline))
+            (setq deadline-exceeded t))
+          (while (and (not deadline-exceeded)
+                      (< rounds cap)
                       (anvil-fusion-should-loop-p
                        (plist-get round :candidates) thr))
-            (if debate-enabled
-                (let* ((prior-candidates (plist-get round :candidates))
-                       (claims-block (anvil-fusion--claims-block-for-debate claims))
-                       (member-prompts
-                        (cl-loop for i from 0 below (length (anvil-fusion-panel-members body))
-                                 for own = (nth i prior-candidates)
-                                 collect
-                                 (anvil-fusion-build-debate-prompt
-                                  prompt
-                                  (and own (plist-get own :summary))
-                                  (if own
-                                      (append (cl-subseq prior-candidates 0 i)
-                                              (nthcdr (1+ i) prior-candidates))
-                                    prior-candidates)
-                                  claims-block
-                                  fidelity)))
-                       (mresult (anvil-fusion--run-debate-members
+            (if (anvil-fusion--deadline-exceeded-p start-time deadline)
+                (setq deadline-exceeded t
+                      rounds cap)
+              (progn
+                (if debate-enabled
+                    (let* ((prior-candidates (plist-get round :candidates))
+                           (claims-block (anvil-fusion--claims-block-for-debate claims))
+                           (member-prompts
+                            (cl-loop for i from 0 below (length (anvil-fusion-panel-members body))
+                                     for own = (nth i prior-candidates)
+                                     collect
+                                     (anvil-fusion-build-debate-prompt
+                                      prompt
+                                      (and own (plist-get own :summary))
+                                      (if own
+                                          (append (cl-subseq prior-candidates 0 i)
+                                                  (nthcdr (1+ i) prior-candidates))
+                                        prior-candidates)
+                                      claims-block
+                                      fidelity)))
+                           (mresult (anvil-fusion--run-debate-members
+                                     (if agentic
+                                         (mapcar
+                                          (lambda (mp)
+                                            (concat mp "\n\n"
+                                                    anvil-fusion--agentic-member-prompt-block))
+                                          member-prompts)
+                                       member-prompts)
+                                     body lenses cwd
+                                     :member-extras member-extras
+                                     :max-wait-sec max-wait-sec))
+                           (round-candidates (plist-get mresult :candidates))
+                           (round-claims claims)
+                           (round-template etemplate))
+                      (when verify
+                        (let* ((raw-claims (apply #'anvil-fusion-verify-extract-claims
+                                                  prompt round-candidates extract-kwargs))
+                               (new-claims (anvil-fusion--new-claims-only raw-claims claims))
+                               (annotated-new
+                                (and new-claims
+                                     (apply #'anvil-fusion-verify-claims
+                                            new-claims verify-kwargs))))
+                          (when annotated-new
+                            (setq round-claims
+                                  (anvil-fusion--merge-claims-by-key
+                                   claims annotated-new)))
+                          (when (and (null template)
+                                     (or round-claims verify-base-template))
+                            (setq round-template
+                                  (anvil-fusion-verify-judge-template-for
+                                   round-claims verify-base-template)))))
+                      (let ((jresult (anvil-fusion--run-judge
+                                      prompt round-candidates jprov jmodel
+                                      :fidelity fidelity :extra extra :template round-template
+                                      :cwd cwd :timeout-sec timeout-sec
+                                      :max-wait-sec max-wait-sec)))
+                        (setq claims round-claims)
+                        (setq etemplate round-template)
+                        (setq round
+                              (list :answer        (plist-get jresult :answer)
+                                    :candidates    round-candidates
+                                    :judge-task-id (plist-get jresult :judge-task-id)
+                                    :judge-batch   (plist-get jresult :judge-batch)
+                                    :members-batch (plist-get mresult :members-batch)
+                                    :prompt-chars  (plist-get jresult :prompt-chars))))
+                      (setq debate-rounds (1+ debate-rounds)))
+                  (let ((critique (anvil-fusion-build-critique-prompt
+                                   prompt (plist-get round :answer))))
+                    (setq round (anvil-fusion--run-round
                                  (if agentic
-                                     (mapcar
-                                      (lambda (mp)
-                                        (concat mp "\n\n"
-                                                anvil-fusion--agentic-member-prompt-block))
-                                      member-prompts)
-                                   member-prompts)
-                                 body lenses cwd
+                                     (concat critique "\n\n"
+                                             anvil-fusion--agentic-member-prompt-block)
+                                   critique)
+                                 prompt body jprov jmodel
+                                 :fidelity fidelity :extra extra :template etemplate
+                                 :lenses lenses :cwd cwd
                                  :member-extras member-extras
-                                 :max-wait-sec max-wait-sec))
-                       (round-candidates (plist-get mresult :candidates))
-                       (round-claims claims)
-                       (round-template etemplate))
-                  (when verify
-                    (let* ((raw-claims (apply #'anvil-fusion-verify-extract-claims
-                                              prompt round-candidates extract-kwargs))
-                           (new-claims (anvil-fusion--new-claims-only raw-claims claims))
-                           (annotated-new
-                            (and new-claims
-                                 (apply #'anvil-fusion-verify-claims
-                                        new-claims verify-kwargs))))
-                      (when annotated-new
-                        (setq round-claims
-                              (anvil-fusion--merge-claims-by-key
-                               claims annotated-new)))
-                      (when (and (null template)
-                                 (or round-claims verify-base-template))
-                        (setq round-template
-                              (anvil-fusion-verify-judge-template-for
-                               round-claims verify-base-template)))))
-                  (let ((jresult (anvil-fusion--run-judge
-                                  prompt round-candidates jprov jmodel
-                                  :fidelity fidelity :extra extra :template round-template
-                                  :cwd cwd :timeout-sec timeout-sec
-                                  :max-wait-sec max-wait-sec)))
-                    (setq claims round-claims)
-                    (setq etemplate round-template)
-                    (setq round
-                          (list :answer        (plist-get jresult :answer)
-                                :candidates    round-candidates
-                                :judge-task-id (plist-get jresult :judge-task-id)
-                                :judge-batch   (plist-get jresult :judge-batch)
-                                :members-batch (plist-get mresult :members-batch)
-                                :prompt-chars  (plist-get jresult :prompt-chars))))
-                  (setq debate-rounds (1+ debate-rounds)))
-              (let ((critique (anvil-fusion-build-critique-prompt
-                               prompt (plist-get round :answer))))
-                (setq round (anvil-fusion--run-round
-                             (if agentic
-                                 (concat critique "\n\n"
-                                         anvil-fusion--agentic-member-prompt-block)
-                               critique)
-                             prompt body jprov jmodel
-                             :fidelity fidelity :extra extra :template etemplate
-                             :lenses lenses :cwd cwd
-                             :member-extras member-extras
-                             :timeout-sec timeout-sec :max-wait-sec max-wait-sec))))
-            (setq rounds (1+ rounds)))
+                                 :timeout-sec timeout-sec :max-wait-sec max-wait-sec))))
+                (setq rounds (1+ rounds)))))
           (let ((result
                  (list :answer        (plist-get round :answer)
                        :panel         pname
@@ -612,6 +659,8 @@ against the ORIGINAL PROMPT and adds :TRAJECTORY-ID (id or nil)."
                        :prompt-chars  (plist-get round :prompt-chars)
                        :claims        claims
                        :exec-results  exec-results)))
+            (when deadline-exceeded
+              (setq result (plist-put result :deadline-exceeded t)))
             (when store-trajectory
               (setq result
                     (plist-put
