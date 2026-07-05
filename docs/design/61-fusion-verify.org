@@ -330,6 +330,37 @@ phase already ran the build) but a real wall if distill/verify is ever
 given execution duties. Follow-up: thread member-extras into the distill
 fn.
 
+8g measured 2026-07-05 (benchmarks/doc61-phase8g/, results-8g-2026-07-05.org,
+$22.20, 6 KB-verifiable domain questions x 4 arms). FIRST non-saturated,
+positive C-axis signal in the campaign — these questions have no cheap
+execution oracle, so a wrong intermediate is caught only by KB grounding.
+Mean rubric score (score/max): single-weak 0.40, single-strong 0.50,
+verify-weak 0.37, verify-strong 0.60. Deltas: verify-strong minus
+single-strong = +0.10 (+0.18 excluding q6's errored run) — real uplift
+concentrated where the plain sonnet answer had headroom (q3 4/8 -> 8/8);
+verify-weak minus single-weak = -0.03 (NO help at the haiku tier; haiku
+judge/synthesis too unreliable, though the KB-refutation mechanism itself
+fired correctly once). Mechanism demonstrated, not asserted: on q3
+verify-weak a haiku member claimed "測定電圧は直流750V"; the skeptic vote
+REFUTED it against node/20260614220903_catchall_box.org:2349 (JIS C 1302
+rated voltages 25/50/100/125/250/500/1000V, no 750V) and the synthesis
+adopted 500V. Trap adoption: single-strong 0/6, verify-strong ~0 — at the
+strong tier the uplift is added completeness, not trap avoidance (sonnet
+already dodges traps). Honest bounds: single run, 6 questions, rubric-grep,
+one scorer false-positive ("25Ω" is a rejected in-text alternative), and q6
+verify-strong hard-killed twice by the 20-min cap with zero completions
+(panel + verify + critique can exceed 20 min on a hard question — follow-up:
+bound verify-strong wall/cost).
+
+Campaign conclusion (8e / 8e-hard / 8g): the fusion verify harness adds
+measurable capability specifically where there is NO cheap verification
+oracle and the base model is strong-but-not-saturated — grounded domain
+Q&A (+0.10-0.18 here; 6e's 0/10 hallucination adoption). It saturates on
+coding (execution self-corrects — 8e/8e-hard) and does not lift a weak
+(haiku) model. So "raise Opus/Sonnet toward Fable" is TRUE but scoped:
+modestly and measurably on fact/citation/KB-grounded work; not on tasks a
+strong model with tools already nails, and not by rescuing a weak model.
+
 Recommended order: 6 -> 7 -> 8 (Phase 6 fixes a recorded, harmful failure mode
 and is measurable immediately; Phase 7 is a small addition on top; Phase 8 is
 the heavyweight design).
