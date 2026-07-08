@@ -633,7 +633,8 @@ recognized prefix it is returned unchanged."
 Required:
   NAME — basename without `.md' (e.g. `feedback_my_rule').  When the
          leading `<type>_' prefix is absent it is added automatically.
-  TYPE — one of `user' / `feedback' / `project' / `reference' / `memo'.
+  TYPE — a symbol (a string is coerced via `intern'): one of `user' /
+         `feedback' / `project' / `reference' / `memo'.
   BODY — body string without YAML frontmatter (frontmatter is
          re-synthesized on `anvil-memory-export-md').
 
@@ -653,11 +654,12 @@ Returns =(:file SYNTHETIC :name BASENAME :type TYPE :description DESC
 :created CREATED :digest SHA1)=."
   (unless (and (stringp name) (not (string-empty-p name)))
     (user-error "anvil-memory-add: NAME must be a non-empty string"))
+  (when (stringp type) (setq type (intern type)))
   (unless (and type (symbolp type)
                (assq type anvil-memory-ttl-policies))
     (user-error
-     "anvil-memory-add: TYPE must be one of %S"
-     (mapcar #'car anvil-memory-ttl-policies)))
+     "anvil-memory-add: TYPE must be a symbol, one of %S (got %S)"
+     (mapcar #'car anvil-memory-ttl-policies) type))
   (unless (stringp body)
     (user-error "anvil-memory-add: BODY must be a string"))
   (let* ((db (anvil-memory--db))
