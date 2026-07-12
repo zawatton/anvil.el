@@ -74,8 +74,8 @@ on Japanese Windows. Other OSes default to utf-8."
     str))
 
 (defun anvil-host--run (command coding cwd timeout)
-  "Run COMMAND in shell asynchronously and wait up to TIMEOUT seconds.
-Returns (EXIT STDOUT STDERR). Errors on timeout.
+  "Run shell COMMAND using CODING in CWD, waiting up to TIMEOUT seconds.
+Return (EXIT STDOUT STDERR).  Signal an error on timeout.
 
 `:connection-type' is forced to `pipe' (rather than the Emacs default
 PTY) so `isatty(0/1/2)' stays false for the shell and any grand-
@@ -99,14 +99,19 @@ new session with no controlling TTY.  That's what `wl-copy' /
 `pbcopy' / `xclip' already do internally for their clipboard-owner
 daemons, which is why clipboard set-then-read works over
 `anvil-shell' in practice.  Callers that need a detached descendant
-for other reasons should invoke `setsid --fork' explicitly."
+for other reasons should invoke `setsid --fork' explicitly.
+
+Stdout and stderr are serviced independently while waiting.
+Nonlocal exits delete both process objects and both temporary
+buffers."
   (let* ((stdout-buf (generate-new-buffer " *anvil-host-stdout*"))
          (stderr-buf (generate-new-buffer " *anvil-host-stderr*"))
          (default-directory (or cwd default-directory))
          (process-coding-system-alist
           (cons (cons "" (cons coding coding))
                 process-coding-system-alist))
-         proc)
+         proc
+         stderr-proc)
     (unwind-protect
         (progn
           (setq proc
@@ -116,49 +121,57 @@ for other reasons should invoke `setsid --fork' explicitly."
                  :stderr stderr-buf
                  :noquery t
                  :connection-type 'pipe
-                 ;; Emacs' default process sentinel writes a
-                 ;; "Process NAME finished" status line into the
-                 ;; process buffer on exit, which then shows up in
-                 ;; the captured stdout.  Silence it so callers can
-                 ;; `string-trim' :stdout and get the actual bytes.
+                 ;; Emacs's default process sentinel writes a status line
+                 ;; into the process buffer.  Silence it so stdout contains
+                 ;; only bytes produced by COMMAND.
                  :sentinel #'ignore
-                 :command (list shell-file-name shell-command-switch command)))
-          ;; `make-process' wraps the :stderr buffer in a pipe process
-          ;; whose default sentinel ALSO writes a status line.  Nuke
-          ;; that too.
-          (let ((stderr-proc (get-buffer-process stderr-buf)))
-            (when (processp stderr-proc)
-              (set-process-sentinel stderr-proc #'ignore))
-            (let ((deadline (+ (float-time) timeout)))
-              (while (and (process-live-p proc)
-                          (< (float-time) deadline))
-                (accept-process-output proc 0.1))
-              (when (process-live-p proc)
-                (delete-process proc)
-                (when (and stderr-proc (process-live-p stderr-proc))
-                  (delete-process stderr-proc))
-                (error "anvil-host: shell timeout after %ss: %s"
-                       timeout command)))
-            ;; Brief bounded drain for late stderr after proc exit.
-            ;; The stderr pipe-proc is independent: when proc dies the
-            ;; kernel pipe may still hold bytes the proc just wrote,
-            ;; and the pipe-proc only goes inactive once we read them.
-            ;; Bound the drain so that a disowned descendant which
-            ;; inherits fd 2 (e.g. `setsid --fork') cannot extend the
-            ;; call past `anvil-host--stderr-drain-budget-sec'.
-            (when (and stderr-proc (process-live-p stderr-proc))
-              (let ((drain-deadline
-                     (+ (float-time)
-                        anvil-host--stderr-drain-budget-sec)))
-                (while (and (process-live-p stderr-proc)
-                            (< (float-time) drain-deadline))
-                  (accept-process-output stderr-proc 0.02)))))
+                 :command
+                 (list shell-file-name shell-command-switch command)))
+          ;; make-process represents stderr with an independent pipe process.
+          ;; It needs its own sentinel and must be serviced separately.
+          (setq stderr-proc (get-buffer-process stderr-buf))
+          (when (processp stderr-proc)
+            (set-process-sentinel stderr-proc #'ignore))
+          (let ((deadline (+ (float-time) timeout)))
+            (while (and (process-live-p proc)
+                        (< (float-time) deadline))
+              ;; JUST-THIS-ONE prevents unrelated process traffic from
+              ;; monopolizing the wait, but timer functions still run.
+              (accept-process-output proc 0.05 nil t)
+              (when (and stderr-proc (process-live-p stderr-proc))
+                (accept-process-output stderr-proc 0.05 nil t)))
+            (when (process-live-p proc)
+              (error "anvil-host: shell timeout after %ss: %s"
+                     timeout command)))
+          ;; Brief bounded drain for bytes written immediately before or
+          ;; after the wrapper shell exited.  The stderr pipe may remain live
+          ;; while the main process has already reported exit, so service
+          ;; stdout after every stderr wait and once more at the end.
+          ;; A detached descendant may retain fd 2; never wait for that pipe
+          ;; without a deadline.
+          (when (and stderr-proc (process-live-p stderr-proc))
+            (let ((drain-deadline
+                   (+ (float-time) anvil-host--stderr-drain-budget-sec)))
+              (while (and (process-live-p stderr-proc)
+                          (< (float-time) drain-deadline))
+                (accept-process-output stderr-proc 0.02 nil t)
+                (accept-process-output proc 0 nil t))))
+          (accept-process-output proc 0.1 nil t)
           (let ((exit (process-exit-status proc))
-                (out  (with-current-buffer stdout-buf (buffer-string)))
-                (err  (with-current-buffer stderr-buf (buffer-string))))
+                (out (with-current-buffer stdout-buf (buffer-string)))
+                (err (with-current-buffer stderr-buf (buffer-string))))
             (list exit out err)))
-      (when (buffer-live-p stdout-buf) (kill-buffer stdout-buf))
-      (when (buffer-live-p stderr-buf) (kill-buffer stderr-buf)))))
+      ;; This cleanup is also the C-g/error path.  Prevent a queued second
+      ;; quit from interrupting it and leaving a child or pipe behind.
+      (let ((inhibit-quit t))
+        (when (processp proc)
+          (ignore-errors (delete-process proc)))
+        (when (processp stderr-proc)
+          (ignore-errors (delete-process stderr-proc)))
+        (when (buffer-live-p stdout-buf)
+          (kill-buffer stdout-buf))
+        (when (buffer-live-p stderr-buf)
+          (kill-buffer stderr-buf))))))
 
 ;;;; --- Layer 1: anvil-shell -----------------------------------------------
 

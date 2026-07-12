@@ -256,23 +256,41 @@ last handed to `anvil-preempt-checkpoint' inside the REPL."
     (other      (error "anvil-offload: unknown status %S" other))))
 
 (defun anvil-future-error (future)
-  "Return the error payload of FUTURE, or nil if not errored."
-  (and (eq 'error (anvil-future--status future))
+  "Return the error payload of FUTURE, or nil if it has no error.
+Both remotely errored and locally killed futures retain a diagnostic
+payload."
+  (and (memq (anvil-future--status future) '(error killed))
        (anvil-future--err future)))
 
 (defun anvil-future-await (future &optional timeout)
   "Block until FUTURE settles or TIMEOUT seconds elapse.
-Return non-nil if settled, nil on timeout."
+Return non-nil if settled, nil on timeout.
+
+Only output from FUTURE's REPL is accepted during each poll, while
+timers (including `keyboard-quit' timers used by callers) remain
+eligible to run.  If the REPL dies, settle its pending futures
+synchronously rather than depending on the sentinel's zero-delay
+fallback timer."
   (let* ((limit (or timeout anvil-offload-default-await-timeout))
          (deadline (and limit (+ (float-time) limit)))
          (proc (anvil-future--process future)))
     (while (and (not (anvil-future-done-p future))
                 (or (null deadline) (< (float-time) deadline))
                 (process-live-p proc))
-      (accept-process-output proc anvil-offload-poll-interval))
+      (accept-process-output
+       proc anvil-offload-poll-interval nil t))
     (when (and (not (anvil-future-done-p future))
                (not (process-live-p proc)))
-      (sit-for 0))
+      ;; Give a final process-filter callback and the sentinel's zero-delay
+      ;; fallback timer one bounded event-loop turn.  If neither settles the
+      ;; future, do so synchronously; no pending future may outlive its REPL.
+      (accept-process-output
+       proc anvil-offload-poll-interval nil t)
+      (unless (anvil-future-done-p future)
+        (anvil-offload--finalize-dead-process
+         proc
+         (or (process-get proc 'anvil-offload-death-reason)
+             (format "offload REPL exited: %s" (process-status proc))))))
     (anvil-future-done-p future)))
 
 (defun anvil-future-cancel (future)
@@ -287,24 +305,34 @@ discarded.  To hard-stop offload work, call `anvil-future-kill'
   future)
 
 (defun anvil-future-kill (future)
-  "Hard-kill the subprocess slot owning FUTURE; settle it as errored.
-Unlike `anvil-future-cancel', this terminates the REPL process so
-a runaway call cannot keep tying up its pool slot.  The sentinel
-nils out the slot; the next `anvil-offload' dispatch respawns it.
+  "Hard-kill the subprocess slot owning pending FUTURE.
+Unlike `anvil-future-cancel', this terminates the REPL process so a
+runaway call cannot keep tying up its pool slot.  The future is
+removed from the pending table and the pool slot is cleared
+synchronously; the next `anvil-offload' dispatch therefore spawns a
+fresh REPL even if the old process sentinel has not run yet.
 
 The elapsed wall time (seconds since the future's `created-at') is
-stored in `anvil-future--err' so callers can report it.  Returns
+stored in `anvil-future--err'.  Repeated calls are idempotent.  Return
 FUTURE."
-  (let ((proc (anvil-future--process future))
-        (elapsed (- (float-time) (anvil-future--created-at future))))
-    (when (and proc (process-live-p proc))
-      (kill-process proc))
-    (when (eq 'pending (anvil-future--status future))
-      (remhash (anvil-future--id future) (anvil-offload--ensure-pending))
+  (when (eq 'pending (anvil-future--status future))
+    (let ((proc (anvil-future--process future))
+          (elapsed (- (float-time) (anvil-future--created-at future))))
+      ;; Settle locally before signalling the child.  A synchronous
+      ;; sentinel/filter callback can no longer race this future into a
+      ;; different terminal state.
+      (remhash (anvil-future--id future)
+               (anvil-offload--ensure-pending))
       (setf (anvil-future--status future) 'killed
             (anvil-future--err future)
             (format "killed after %.2fs" elapsed)
-            (anvil-future--done-at future) (float-time))))
+            (anvil-future--done-at future) (float-time))
+      (when anvil-offload--pool
+        (dotimes (i (length anvil-offload--pool))
+          (when (eq proc (aref anvil-offload--pool i))
+            (aset anvil-offload--pool i nil))))
+      (when (and proc (process-live-p proc))
+        (ignore-errors (kill-process proc)))))
   future)
 
 (defun anvil-future-elapsed (future)
@@ -403,13 +431,16 @@ do not settle it; `:ok'/`:error' replies settle and dehashref."
 
 (defun anvil-offload--sentinel (proc event)
   "Handle death of PROC; fail only the pending futures bound to PROC.
-Filtering by `:process' is load-bearing: if the REPL is stopped
-and a fresh one spawned before this sentinel runs, we must not
-error-settle the new REPL's pending futures."
+Filtering by `:process' is load-bearing: if the REPL is stopped and a
+fresh one spawned before this sentinel runs, we must not error-settle
+the new REPL's pending futures.  EVENT describes the process status."
   (unless (process-live-p proc)
     (let ((reason (format "offload REPL exited: %s" (string-trim event))))
+      (process-put proc 'anvil-offload-death-reason reason)
       ;; Let any final filter callback drain queued bytes before we mark
-      ;; still-pending futures as errored.
+      ;; still-pending futures as errored.  `anvil-future-await' also
+      ;; performs this finalization synchronously after it has serviced
+      ;; PROC, so this timer is an idempotent fallback for other callers.
       (run-at-time 0 nil #'anvil-offload--finalize-dead-process proc reason))
     ;; Clear the dying slot so the next dispatch respawns it.
     (when anvil-offload--pool

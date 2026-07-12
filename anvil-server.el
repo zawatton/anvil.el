@@ -1931,36 +1931,43 @@ Signals `anvil-server-tool-error' on timeout or remote error."
          (future (anvil-offload form
                                 :require requires
                                 :load-path extra-load-path)))
-    (if (not (anvil-future-await future timeout))
-        ;; Budget exceeded — snapshot the latest checkpoint BEFORE the
-        ;; hard-kill (kill clears pending state and we want the last
-        ;; observed partial state), then kill so the subprocess slot
-        ;; does not stay wedged by the runaway call.  Either surface a
-        ;; `partial' plist (for `:resumable t' tools, folding in the
-        ;; checkpoint's :value / :cursor when present) or an error.
-        (let* ((elapsed (anvil-future-elapsed future))
-               (cp (and resumable (anvil-future-checkpoint future))))
-          (anvil-future-kill future)
-          (if resumable
-              (format "%S" (list :status 'partial
-                                 :value (plist-get cp :value)
-                                 :cursor (plist-get cp :cursor)
-                                 :consumed-sec elapsed
-                                 :reason 'budget-exceeded))
-            (signal 'anvil-server-tool-error
-                    (list (format "Offload budget exceeded after %.2fs"
-                                  elapsed)))))
-      (pcase (anvil-future-status future)
-        ('done (anvil-future-value future))
-        ('error (signal 'anvil-server-tool-error
-                        (list (format "Offload error: %s"
-                                      (anvil-future-error future)))))
-        ('killed (signal 'anvil-server-tool-error
-                         (list (format "Offload killed: %s"
-                                       (anvil-future-error future)))))
-        (status (signal 'anvil-server-tool-error
-                        (list (format "Offload unexpected status: %s"
-                                      status))))))))
+    ;; A quit, error, or timeout must never abandon a pending future.  The
+    ;; unwind cleanup clears and hard-kills its pool slot synchronously so
+    ;; the next request cannot queue behind the interrupted REPL form.
+    (unwind-protect
+        (if (not (anvil-future-await future timeout))
+            ;; Budget exceeded — snapshot the latest checkpoint BEFORE the
+            ;; hard-kill (kill clears pending state and we want the last
+            ;; observed partial state), then kill so the subprocess slot
+            ;; does not stay wedged by the runaway call.  Either surface a
+            ;; `partial' plist (for `:resumable t' tools, folding in the
+            ;; checkpoint's :value / :cursor when present) or an error.
+            (let* ((elapsed (anvil-future-elapsed future))
+                   (cp (and resumable (anvil-future-checkpoint future))))
+              (anvil-future-kill future)
+              (if resumable
+                  (format "%S" (list :status 'partial
+                                     :value (plist-get cp :value)
+                                     :cursor (plist-get cp :cursor)
+                                     :consumed-sec elapsed
+                                     :reason 'budget-exceeded))
+                (signal 'anvil-server-tool-error
+                        (list (format "Offload budget exceeded after %.2fs"
+                                      elapsed)))))
+          (pcase (anvil-future-status future)
+            ('done (anvil-future-value future))
+            ('error (signal 'anvil-server-tool-error
+                            (list (format "Offload error: %s"
+                                          (anvil-future-error future)))))
+            ('killed (signal 'anvil-server-tool-error
+                             (list (format "Offload killed: %s"
+                                           (anvil-future-error future)))))
+            (status (signal 'anvil-server-tool-error
+                            (list (format "Offload unexpected status: %s"
+                                          status))))))
+      (when (eq 'pending (anvil-future-status future))
+        (let ((inhibit-quit t))
+          (anvil-future-kill future))))))
 
 ;;; Error handling helpers
 
