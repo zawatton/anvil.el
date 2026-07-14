@@ -5,7 +5,8 @@
 ;; Run the deterministic stdio post-dispatch regression under a hard outer
 ;; deadline.  The Python helper owns the negative control, same-pipe,
 ;; pre-dispatch loader freeze, at-most-once, UTF-8/uppercase framing,
-;; partial-byte/NUL input, guarded cumulative-frame-budget, truncated-frame,
+;; partial-byte/NUL input, large Unicode staging, pipelined framing,
+;; guarded cumulative-frame-budget, truncated-frame,
 ;; guard-loader, runner/owner-death,
 ;; same-pipe recovery, debug-path race,
 ;; sink-FD, and process-group cleanup assertions.  Run both
@@ -89,6 +90,12 @@
          (string-match-p
           (regexp-quote "\"$ANVIL_MCP_REQUEST_PARSE_TIMEOUT\" 10")
           source))
+        (should
+         (string-match-p
+          (regexp-quote "readonly ANVIL_MCP_INLINE_REQUEST_BYTES=16384")
+          source))
+        (should (string-match-p "anvil_mcp_stage_request()" source))
+        (should-not (string-match-p "ANVIL_MCP_HEAD" source))
         (should
          (string-match-p
           (regexp-quote "mcp_debug_log \"INIT-RC\" \"$INIT_RC\"")

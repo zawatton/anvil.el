@@ -288,6 +288,18 @@ ANVIL_EMACSCLIENT_KILL_AFTER_TIMEOUT=${ANVIL_EMACSCLIENT_KILL_AFTER_TIMEOUT:-1}
 ANVIL_MCP_REQUEST_PARSE_TIMEOUT=${ANVIL_MCP_REQUEST_PARSE_TIMEOUT:-10}
 ANVIL_MCP_FRAME_READ_TIMEOUT=${ANVIL_MCP_FRAME_READ_TIMEOUT:-10}
 readonly ANVIL_MCP_MAX_REQUEST_BYTES=16777216
+# Linux limits each exec argument to 128 KiB even when ARG_MAX is much larger.
+# Keep inline request expressions comfortably below that boundary; larger
+# requests travel through one private bridge-owned staging directory instead.
+readonly ANVIL_MCP_INLINE_REQUEST_BYTES=16384
+_anvil_request_tmp=${TMPDIR:-/tmp}
+case "$_anvil_request_tmp" in
+/) ANVIL_MCP_REQUEST_DIRECTORY="/anvil-mcp.$$.$RANDOM$RANDOM$RANDOM$RANDOM" ;;
+*) ANVIL_MCP_REQUEST_DIRECTORY="${_anvil_request_tmp%/}/anvil-mcp.$$.$RANDOM$RANDOM$RANDOM$RANDOM" ;;
+esac
+readonly ANVIL_MCP_REQUEST_DIRECTORY
+unset _anvil_request_tmp
+ANVIL_MCP_REQUEST_SEQUENCE=0
 
 anvil_mcp_validate_timeout() {
 	local name="$1" value="$2" maximum="$3"
@@ -320,16 +332,15 @@ anvil_mcp_validate_timeout ANVIL_MCP_FRAME_READ_TIMEOUT \
 
 ANVIL_MCP_PYTHON=$(type -P python3 || :)
 ANVIL_MCP_EMACSCLIENT=$(type -P emacsclient || :)
-ANVIL_MCP_HEAD=$(type -P head || :)
 ANVIL_MCP_SLEEP=$(type -P sleep || :)
 for _anvil_program in \
-	ANVIL_MCP_PYTHON ANVIL_MCP_EMACSCLIENT ANVIL_MCP_HEAD ANVIL_MCP_SLEEP; do
+	ANVIL_MCP_PYTHON ANVIL_MCP_EMACSCLIENT ANVIL_MCP_SLEEP; do
 	if [ -z "${!_anvil_program}" ]; then
 		echo "anvil-mcp: ${_anvil_program#ANVIL_MCP_} is required" >&2
 		exit 69
 	fi
 done
-readonly ANVIL_MCP_PYTHON ANVIL_MCP_EMACSCLIENT ANVIL_MCP_HEAD ANVIL_MCP_SLEEP
+readonly ANVIL_MCP_PYTHON ANVIL_MCP_EMACSCLIENT ANVIL_MCP_SLEEP
 unset _anvil_program
 if [ -n "$ANVIL_MCP_PARENT_GUARD" ]; then
 	[ -n "$ANVIL_MCP_PARENT_GUARD_PYTHON" ] \
@@ -619,14 +630,31 @@ anvil_mcp_read_framed_message() {
 
 	# Read exactly content_length bytes within the unspent frame budget.  The
 	# bounded runner preserves trailing newlines that command substitution would
-	# strip and kills a loader-stuck `head' before any stateful dispatch.
+	# strip.  The unbuffered reader never asks the pipe for more than the frame's
+	# remaining bytes; `head -c' may over-read and discard a pipelined request.
 	frame_remaining=$((frame_deadline - SECONDS))
 	[ "$frame_remaining" -gt 0 ] || return 1
 	mcp_debug_log "FRAMING" \
 		"body reader start bytes=$content_length remaining=$frame_remaining"
 	exec 5<&0
 	anvil_mcp_run_bounded "$frame_remaining" merge descriptor "" \
-		"$ANVIL_MCP_HEAD" -c "$content_length"
+		"$ANVIL_MCP_PYTHON" -I -S -c '
+import os
+import sys
+
+remaining = int(sys.argv[1])
+while remaining:
+    chunk = os.read(0, min(65536, remaining))
+    if not chunk:
+        raise SystemExit(1)
+    view = memoryview(chunk)
+    while view:
+        written = os.write(1, view)
+        if written <= 0:
+            raise SystemExit(1)
+        view = view[written:]
+    remaining -= len(chunk)
+' "$content_length"
 	exec 5<&-
 	if [ "$ANVIL_MCP_RUN_STATUS" -ne 0 ]; then
 		return 1
@@ -691,12 +719,14 @@ anvil_mcp_emit_wire_response() {
 
 # Parse only bounded request metadata outside Emacs.  The root may be dead on
 # the error path, so correlation cannot depend on another emacsclient call.
-# Output is KIND|STARTUP|BASE64(JSON-REQUEST)|JSON-ID.  The request encoding is
-# reused for dispatch, so no separate base64 process starts after parsing.
+# Output is KIND|STARTUP|MODE|PAYLOAD|BYTE-SIZE|JSON-ID.  Small requests use an
+# inline base64 payload.  Large requests are marked for bounded staging only
+# after the readiness probe succeeds, avoiding both exec argument limits and
+# unused files when Emacs is unavailable.
 anvil_mcp_request_metadata() {
 	local request="$1"
 	if [ "${#request}" -gt "$ANVIL_MCP_MAX_REQUEST_BYTES" ]; then
-		printf 'parse-error|0||null'
+		printf 'parse-error|0|none||0|null'
 		return 0
 	fi
 	anvil_mcp_run_bounded "$ANVIL_MCP_REQUEST_PARSE_TIMEOUT" \
@@ -707,16 +737,28 @@ import math
 import sys
 
 maximum = int(sys.argv[1])
+inline_maximum = int(sys.argv[2])
 raw = sys.stdin.buffer.read(maximum + 1)
 
 def emit(kind, startup, request_id):
-    encoded_request = base64.b64encode(raw).decode("ascii")
+    if kind in {"request", "notification"}:
+        if len(raw) <= inline_maximum:
+            mode = "inline"
+            payload = base64.b64encode(raw).decode("ascii")
+        else:
+            mode = "file"
+            payload = ""
+    else:
+        mode = "none"
+        payload = ""
     encoded_id = json.dumps(
         request_id,
         ensure_ascii=True,
         separators=(",", ":"),
     )
-    print(f"{kind}|{1 if startup else 0}|{encoded_request}|{encoded_id}")
+    print(
+        f"{kind}|{1 if startup else 0}|{mode}|{payload}|{len(raw)}|{encoded_id}"
+    )
 
 if len(raw) > maximum:
     emit("parse-error", False, None)
@@ -755,7 +797,97 @@ else:
                     emit("request", startup, request_id)
                 else:
                     emit("invalid-request", startup, None)
-' "$ANVIL_MCP_MAX_REQUEST_BYTES"
+' "$ANVIL_MCP_MAX_REQUEST_BYTES" "$ANVIL_MCP_INLINE_REQUEST_BYTES"
+	printf '%s' "$ANVIL_MCP_RUN_OUTPUT"
+	return "$ANVIL_MCP_RUN_STATUS"
+}
+
+# Stage one already-validated large request in a bridge-private directory.
+# The helper is bounded and runs before stateful dispatch.  It creates both the
+# directory and file without following links, verifies ownership/modes, writes
+# the exact request bytes, and returns only the base64-encoded absolute path.
+anvil_mcp_stage_request() {
+	local request="$1" basename="$2"
+	anvil_mcp_run_bounded "$ANVIL_MCP_REQUEST_PARSE_TIMEOUT" \
+		merge input "$request" "$ANVIL_MCP_PYTHON" -I -S -c '
+import base64
+import os
+import signal
+import stat
+import sys
+
+requested_directory = os.path.abspath(sys.argv[1])
+root = os.path.realpath(os.path.dirname(requested_directory))
+directory = os.path.join(root, os.path.basename(requested_directory))
+basename = sys.argv[2]
+maximum = int(sys.argv[3])
+raw = sys.stdin.buffer.read(maximum + 1)
+if len(raw) > maximum:
+    raise SystemExit(65)
+if not basename.isascii() or not basename.startswith("request."):
+    raise SystemExit(64)
+if "/" in basename or (os.altsep and os.altsep in basename):
+    raise SystemExit(64)
+
+root_stat = os.lstat(root)
+root_mode = stat.S_IMODE(root_stat.st_mode)
+private_root = root_stat.st_uid == os.geteuid() and not (root_mode & 0o022)
+sticky_root = bool(root_mode & stat.S_ISVTX) and root_stat.st_uid in {
+    0,
+    os.geteuid(),
+}
+if not stat.S_ISDIR(root_stat.st_mode) or not (private_root or sticky_root):
+    raise SystemExit(73)
+
+try:
+    os.mkdir(directory, 0o700)
+except FileExistsError:
+    pass
+directory_stat = os.lstat(directory)
+if (
+    not stat.S_ISDIR(directory_stat.st_mode)
+    or directory_stat.st_uid != os.geteuid()
+    or stat.S_IMODE(directory_stat.st_mode) != 0o700
+):
+    raise SystemExit(73)
+
+path = os.path.join(directory, basename)
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+if hasattr(os, "O_NOFOLLOW"):
+    flags |= os.O_NOFOLLOW
+descriptor = -1
+created = False
+
+def interrupted(_signum, _frame):
+    raise TimeoutError("request staging interrupted")
+
+signal.signal(signal.SIGTERM, interrupted)
+try:
+    descriptor = os.open(path, flags, 0o600)
+    created = True
+    file_stat = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(file_stat.st_mode)
+        or file_stat.st_uid != os.geteuid()
+        or file_stat.st_nlink != 1
+        or stat.S_IMODE(file_stat.st_mode) != 0o600
+    ):
+        raise PermissionError("unsafe request staging file")
+    with os.fdopen(descriptor, "wb") as stream:
+        descriptor = -1
+        stream.write(raw)
+    print(base64.b64encode(os.fsencode(path)).decode("ascii"))
+except BaseException:
+    if descriptor >= 0:
+        os.close(descriptor)
+    if created:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    raise
+' "$ANVIL_MCP_REQUEST_DIRECTORY" "$basename" \
+		"$ANVIL_MCP_MAX_REQUEST_BYTES"
 	printf '%s' "$ANVIL_MCP_RUN_OUTPUT"
 	return "$ANVIL_MCP_RUN_STATUS"
 }
@@ -795,6 +927,7 @@ anvil_mcp_synthetic_error() {
 		case "$phase" in
 		readiness) message="daemon readiness probe failed before dispatch" ;;
 		capture) message="bridge capture setup failed before dispatch" ;;
+		stage) message="large request staging failed before dispatch" ;;
 		*) message="daemon response was ambiguous after one dispatch" ;;
 		esac
 		;;
@@ -876,16 +1009,24 @@ while :; do
 			parse false "$_anvil_metadata_rc"
 		continue
 	fi
-	_anvil_metadata_rest=${_anvil_metadata#*|}
-	_anvil_request_kind=${_anvil_metadata%%|*}
-	_anvil_startup=${_anvil_metadata_rest%%|*}
-	_anvil_metadata_rest=${_anvil_metadata_rest#*|}
-	_anvil_request_b64=${_anvil_metadata_rest%%|*}
-	_anvil_request_id=${_anvil_metadata_rest#*|}
-	_anvil_request_id=null
+	# Split the parser record in one linear builtin pass.  Repeated glob-pattern
+	# removal (`${record#*|}') is quadratic for large base64 request fields and
+	# can peg Bash forever before the dispatch watchdog has started.  `read'
+	# assigns all remaining fields to its final variable, preserving `|' inside
+	# a JSON string request id.
+	_anvil_request_kind=""
+	_anvil_startup=""
+	_anvil_request_mode=""
+	_anvil_request_payload=""
+	_anvil_request_size=""
+	_anvil_request_id=""
+	IFS='|' read -r \
+		_anvil_request_kind _anvil_startup \
+		_anvil_request_mode _anvil_request_payload \
+		_anvil_request_size \
+		_anvil_request_id <<<"$_anvil_metadata"
 	case "$_anvil_request_kind" in
 	request)
-		_anvil_request_id=${_anvil_metadata_rest#*|}
 		if [ -z "$_anvil_request_id" ]; then
 			anvil_mcp_synthetic_error unknown null "$_anvil_framed" \
 				parse false 70
@@ -893,12 +1034,37 @@ while :; do
 		fi
 		;;
 	notification)
+		_anvil_request_id=null
 		;;
 	parse-error|invalid-request)
 		anvil_mcp_synthetic_error "$_anvil_request_kind" null \
 			"$_anvil_framed" parse false 0
 		continue
 		;;
+	*)
+		anvil_mcp_synthetic_error unknown null "$_anvil_framed" \
+			parse false 70
+		continue
+		;;
+	esac
+	case "$_anvil_request_size" in
+	""|*[!0-9]*)
+		anvil_mcp_synthetic_error unknown null "$_anvil_framed" \
+			parse false 70
+		continue
+		;;
+	esac
+	case "$_anvil_request_mode" in
+	inline)
+		case "$_anvil_request_payload" in
+		""|*[!A-Za-z0-9+/=]*)
+			anvil_mcp_synthetic_error unknown null "$_anvil_framed" \
+				parse false 70
+			continue
+			;;
+		esac
+		;;
+	file) ;;
 	*)
 		anvil_mcp_synthetic_error unknown null "$_anvil_framed" \
 			parse false 70
@@ -924,16 +1090,6 @@ while :; do
 		continue
 	fi
 
-	# The bounded metadata parser already encoded the raw request.  Reuse that
-	# ASCII value rather than launching a second pre-dispatch helper.
-	base64_input=$_anvil_request_b64
-	mcp_debug_log "BASE64-INPUT" "bytes=${#base64_input}"
-
-	# Process JSON-RPC and return an ASCII percent-byte wire value.  The bridge
-	# decodes this with Bash builtins after dispatch, so a cold sed/tr/grep/base64
-	# process can never wedge the already-dispatched MCP request.
-	elisp_expr="(mapconcat (lambda (byte) (format \"%%%02x\" byte)) (encode-coding-string (or (anvil-server-process-jsonrpc (base64-decode-string \"$base64_input\") \"$SERVER_ID\") \"\") 'utf-8 t) \"\")"
-
 	# Dispatch the potentially stateful request exactly once.  Initialize has
 	# a shorter cap so daemon readiness plus initialization remains inside the
 	# client startup envelope; ordinary tools retain the full dispatch budget.
@@ -947,6 +1103,42 @@ while :; do
 			"$_anvil_framed" capture false 74
 		continue
 	fi
+
+	# Process JSON-RPC and return an ASCII percent-byte wire value.  Inline
+	# requests remain below the per-argument exec ceiling.  Large requests are
+	# staged only now, after readiness and capture setup, and Emacs removes both
+	# the file and its directory even when request processing signals an error.
+	case "$_anvil_request_mode" in
+	inline)
+		base64_input=$_anvil_request_payload
+		mcp_debug_log "BASE64-INPUT" "bytes=${#base64_input}"
+		elisp_expr="(mapconcat (lambda (byte) (format \"%%%02x\" byte)) (encode-coding-string (or (anvil-server-process-jsonrpc (base64-decode-string \"$base64_input\") \"$SERVER_ID\") \"\") 'utf-8 t) \"\")"
+		;;
+	file)
+		ANVIL_MCP_REQUEST_SEQUENCE=$((ANVIL_MCP_REQUEST_SEQUENCE + 1))
+		_anvil_request_basename="request.${ANVIL_MCP_REQUEST_SEQUENCE}.json"
+		set +e
+		_anvil_request_payload=$(anvil_mcp_stage_request \
+			"$line" "$_anvil_request_basename")
+		_anvil_stage_rc=$?
+		set -e
+		case "$_anvil_request_payload" in
+		""|*[!A-Za-z0-9+/=]*) _anvil_stage_rc=70 ;;
+		esac
+		if [ "$_anvil_stage_rc" -ne 0 ]; then
+			anvil_mcp_capture_finish
+			anvil_mcp_synthetic_error \
+				"$_anvil_request_kind" "$_anvil_request_id" \
+				"$_anvil_framed" stage false "$_anvil_stage_rc"
+			continue
+		fi
+		mcp_debug_log "STAGED-INPUT" "bytes=$_anvil_request_size"
+		elisp_expr="(let* ((anvil-request-file (decode-coding-string (base64-decode-string \"$_anvil_request_payload\") 'utf-8 t)) (anvil-request-directory (file-name-directory anvil-request-file)) anvil-request) (unwind-protect (progn (setq anvil-request (with-temp-buffer (set-buffer-multibyte nil) (insert-file-contents-literally anvil-request-file) (unless (= (buffer-size) $_anvil_request_size) (error \"Staged Anvil request size changed\")) (buffer-string))) (delete-file anvil-request-file) (setq anvil-request-file nil) (ignore-errors (delete-directory anvil-request-directory)) (mapconcat (lambda (byte) (format \"%%%02x\" byte)) (encode-coding-string (or (anvil-server-process-jsonrpc anvil-request \"$SERVER_ID\") \"\") 'utf-8 t) \"\")) (when anvil-request-file (ignore-errors (delete-file anvil-request-file))) (ignore-errors (delete-directory anvil-request-directory))))"
+		;;
+	esac
+
+	# No helper process starts beyond this point: response normalization and
+	# decoding use Bash builtins so a delivered stateful response cannot wedge.
 	ANVIL_MCP_RESPONSE_PENDING=1
 	set +e
 	wire_response=$(anvil_emacsclient_dispatch_once \
