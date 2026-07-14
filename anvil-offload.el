@@ -445,11 +445,12 @@ discarded.  To hard-stop offload work, call `anvil-future-kill'
 
 (defun anvil-future-kill (future &optional reason)
   "Hard-kill the subprocess slot owning pending FUTURE.
-Unlike `anvil-future-cancel', this terminates the REPL process so a
-runaway call cannot keep tying up its pool slot.  The future is
-removed from the pending table and the pool slot is cleared
-synchronously; the next `anvil-offload' dispatch therefore spawns a
-fresh REPL even if the old process sentinel has not run yet.
+Unlike `anvil-future-cancel', this attempts to terminate the REPL
+process.  The future is removed from the pending table immediately.
+Pool or isolated-process tracking is cleared only after the child is
+observed dead.  If termination fails, its slot or table entry remains
+tracked so an owned live child cannot become orphaned; the process
+sentinel clears it when the child eventually exits.
 
 The elapsed wall time (seconds since the future's `created-at') is
 stored in `anvil-future--err'.  Repeated calls are idempotent.  Return
