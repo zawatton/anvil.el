@@ -22,6 +22,7 @@ import time
 REPLY_TIMEOUT_SECONDS = 3.0
 BRIDGE_TERM_GRACE_SECONDS = 0.5
 BRIDGE_REAP_TIMEOUT_SECONDS = 10.0
+FRAME_EXIT_TIMEOUT_SECONDS = 5.0
 HELPER_NAMES = (
     "cat",
     "rm",
@@ -618,7 +619,7 @@ def wait_for_bridge_reap(
     process: subprocess.Popen[bytes],
     timeout: float = BRIDGE_REAP_TIMEOUT_SECONDS,
 ) -> None:
-    """Wait boundedly for a signalled bridge leader to become observable."""
+    """Wait boundedly for a bridge leader to become observable."""
     try:
         process.wait(timeout=timeout)
     except subprocess.TimeoutExpired as error:
@@ -664,6 +665,22 @@ def run_bridge_reap_budget_regression() -> None:
     wait_for_bridge_reap(bounded)  # type: ignore[arg-type]
     if bounded.wait_timeouts != [BRIDGE_REAP_TIMEOUT_SECONDS]:
         raise AssertionError(f"wrong bridge reap budget: {bounded.wait_timeouts}")
+
+    frame_too_short = DelayedReapFixture(minimum_timeout=4.0)
+    try:
+        wait_for_bridge_reap(frame_too_short, timeout=3.0)  # type: ignore[arg-type]
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("historical frame-exit budget unexpectedly passed")
+
+    frame_bounded = DelayedReapFixture(minimum_timeout=4.0)
+    wait_for_bridge_reap(  # type: ignore[arg-type]
+        frame_bounded,
+        timeout=FRAME_EXIT_TIMEOUT_SECONDS,
+    )
+    if frame_bounded.wait_timeouts != [FRAME_EXIT_TIMEOUT_SECONDS]:
+        raise AssertionError(f"wrong frame-exit budget: {frame_bounded.wait_timeouts}")
 
 
 def terminate_bridge(process: subprocess.Popen[bytes]) -> None:
@@ -1180,7 +1197,7 @@ def run_guard_loader_owner_death(
                     "guard loader escaped the owner group before it was ready"
                 )
             os.killpg(process.pid, signal.SIGKILL)
-            process.wait(timeout=3)
+            wait_for_bridge_reap(process)
             if not wait_until(lambda: not process_alive(loader_pid), 3):
                 raise AssertionError(
                     f"frozen guard interpreter survived owner death: {loader_pid}"
@@ -1275,7 +1292,7 @@ def run_owner_death_case(
                 raise AssertionError(f"{label} request was not dispatched once")
 
             os.killpg(process.pid, signal.SIGKILL)
-            process.wait(timeout=3)
+            wait_for_bridge_reap(process)
             if guarded:
                 if not wait_until(
                     lambda: not process_group_alive(child_group),
@@ -1491,7 +1508,10 @@ def run_idle_then_partial_first_line(
 
                 process.stdin.write(payload)
                 process.stdin.flush()
-                process.wait(timeout=3)
+                wait_for_bridge_reap(
+                    process,
+                    timeout=FRAME_EXIT_TIMEOUT_SECONDS,
+                )
                 if process.returncode == 0:
                     raise AssertionError(f"{label} first input exited successfully")
                 if read_count(paths["dispatch_count"]) != 0:
