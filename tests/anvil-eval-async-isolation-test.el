@@ -703,6 +703,53 @@
         (delete-process proc)))))
 
 (ert-deftest
+    anvil-eval-async-isolation-pool-resize-preserves-live-tracking ()
+  "A failed resize cannot orphan a pooled child that remains live."
+  (let* ((proc
+          (anvil-eval-async-isolation-test--idle-process
+           "anvil-async-resize-tracking"))
+         (pool (vector proc))
+         (anvil-offload--pool pool)
+         (anvil-offload-pool-size 2))
+    (unwind-protect
+        (progn
+          (cl-letf (((symbol-function 'kill-process) #'ignore)
+                    ((symbol-function 'delete-process) #'ignore))
+            (should (eq pool (anvil-offload--ensure-pool-vector))))
+          (should (= 1 (length anvil-offload--pool)))
+          (should (eq proc (aref anvil-offload--pool 0)))
+          (should (process-live-p proc)))
+      (when (process-live-p proc)
+        (delete-process proc)))))
+
+(ert-deftest
+    anvil-eval-async-isolation-protocol-replacement-preserves-live-tracking ()
+  "A failed protocol upgrade cannot overwrite a still-live old child."
+  (let* ((proc
+          (anvil-eval-async-isolation-test--idle-process
+           "anvil-async-protocol-tracking"))
+         (anvil-offload--pool (vector proc))
+         (anvil-offload-pool-size 1)
+         spawned)
+    (process-put proc 'anvil-offload-protocol-version
+                 (1- anvil-offload--protocol-version))
+    (unwind-protect
+        (progn
+          (cl-letf
+              (((symbol-function 'kill-process) #'ignore)
+               ((symbol-function 'delete-process) #'ignore)
+               ((symbol-function 'anvil-offload--spawn-process)
+                (lambda (_idx)
+                  (setq spawned t)
+                  (error "replacement spawned"))))
+            (should-error (anvil-offload--ensure-slot 0) :type 'error))
+          (should-not spawned)
+          (should (eq proc (aref anvil-offload--pool 0)))
+          (should (process-live-p proc)))
+      (when (process-live-p proc)
+        (delete-process proc)))))
+
+(ert-deftest
     anvil-eval-async-isolation-stop-repl-preserves-live-tracking ()
   "Stopping all REPLs cannot orphan children that resist termination."
   (let* ((pooled

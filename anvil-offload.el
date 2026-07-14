@@ -691,19 +691,27 @@ When ISOLATED is non-nil, record it as a one-shot owned process."
    (format "anvil-offload-job-%d" request-id) t))
 
 (defun anvil-offload--ensure-pool-vector ()
-  "Ensure `anvil-offload--pool' is a vector sized to the current size."
+  "Ensure `anvil-offload--pool' is sized to the current pool size.
+When an old child resists termination, retain the old vector so its
+sole ownership reference is not lost; a later call retries the resize."
   (let ((n (max 1 anvil-offload-pool-size)))
     (unless (and anvil-offload--pool
                  (= (length anvil-offload--pool) n))
       (when anvil-offload--pool
         (dotimes (i (length anvil-offload--pool))
-          (let ((p (aref anvil-offload--pool i)))
-            (when (and p (process-live-p p))
-              (kill-process p)))))
-      (setq anvil-offload--pool (make-vector n nil)))))
+          (let ((proc (aref anvil-offload--pool i)))
+            (when proc
+              (anvil-offload--hard-delete-process proc)))))
+      (unless (and anvil-offload--pool
+                   (cl-some #'identity
+                            (append anvil-offload--pool nil)))
+        (setq anvil-offload--pool (make-vector n nil))))
+    anvil-offload--pool))
 
 (defun anvil-offload--ensure-slot (idx)
-  "Ensure slot IDX holds a live REPL; return it."
+  "Ensure slot IDX holds a live, protocol-compatible REPL; return it.
+Refuse replacement while the old child remains live so the pool cannot
+lose its sole ownership reference."
   (anvil-offload--ensure-pool-vector)
   (let ((cur (aref anvil-offload--pool idx)))
     (if (and cur
@@ -711,8 +719,9 @@ When ISOLATED is non-nil, record it as a one-shot owned process."
              (eq (process-get cur 'anvil-offload-protocol-version)
                  anvil-offload--protocol-version))
         cur
-      (when (and cur (process-live-p cur))
-        (kill-process cur))
+      (when (and cur
+                 (not (anvil-offload--hard-delete-process cur)))
+        (error "anvil-offload: cannot replace live child in slot %d" idx))
       (let ((proc (anvil-offload--spawn-process idx)))
         (aset anvil-offload--pool idx proc)
         proc))))
