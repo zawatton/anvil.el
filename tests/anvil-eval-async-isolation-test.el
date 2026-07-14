@@ -60,19 +60,65 @@
       (accept-process-output nil 0.02))
     (gethash job-id anvil-eval--async-jobs)))
 
+(defun anvil-eval-async-isolation-test--assert-offload-clean ()
+  "Refuse to discard ownership state before subprocess cleanup converges."
+  (let ((deadline (+ (float-time) 1.0)))
+    (while (and (hash-table-p anvil-offload--pending)
+                (> (hash-table-count anvil-offload--pending) 0)
+                (< (float-time) deadline))
+      (accept-process-output nil 0.01)))
+  (let (owned pending)
+    (dolist (table (anvil-offload--registered-ownership-tables))
+      (maphash
+       (lambda (proc value)
+         (push (list table proc value) owned))
+       table))
+    (when (hash-table-p anvil-offload--pending)
+      (maphash (lambda (id _future) (push id pending))
+               anvil-offload--pending))
+    (when (or anvil-offload--pool
+              anvil-offload--pool-retiring-p
+              anvil-offload--pool-cleanup-active-p
+              anvil-offload--submission-active-p
+              anvil-offload--stop-retiring-p
+              anvil-offload--retired-pools
+              owned
+              pending)
+      (error
+       (concat
+        "async isolation cleanup did not converge: "
+        "pool=%S pool-retiring=%S cleanup-active=%S submission-active=%S stop-retiring=%S "
+        "retired=%S owned=%S pending=%S")
+       anvil-offload--pool
+       anvil-offload--pool-retiring-p
+       anvil-offload--pool-cleanup-active-p
+       anvil-offload--submission-active-p
+       anvil-offload--stop-retiring-p
+       anvil-offload--retired-pools
+       owned
+       pending))))
+
 (defun anvil-eval-async-isolation-test--reset ()
-  "Cancel jobs and reset all async/offload state."
+  "Cancel jobs and reset all async/offload state after custody converges."
   (anvil-eval--async-cancel-all)
   (anvil-offload-stop-repl)
+  (anvil-eval-async-isolation-test--assert-offload-clean)
   (setq anvil-eval--async-shutting-down nil
         anvil-eval--async-jobs (make-hash-table :test 'equal)
         anvil-eval--async-queue nil
         anvil-eval--async-active-count 0
         anvil-eval--async-pump-timer nil
         anvil-eval--async-counter 0
+        anvil-offload--pool nil
+        anvil-offload--round-robin 0
         anvil-offload--pending (make-hash-table :test 'eql)
         anvil-offload--isolated-processes (make-hash-table :test 'eq)
         anvil-offload--pool-retiring-p nil
+        anvil-offload--pool-cleanup-active-p nil
+        anvil-offload--submission-active-p nil
+        anvil-offload--stop-retiring-p nil
+        anvil-offload--retired-pools nil
+        anvil-offload--ownership-table-registry nil
         anvil-offload--next-id 0)
   (accept-process-output nil 0.05))
 
@@ -475,6 +521,17 @@
    :noquery t
    :sentinel #'ignore))
 
+(defun anvil-eval-async-isolation-test--cleanup-owned-processes
+    (&rest processes)
+  "Hard-delete PROCESSES and prove all dynamically bound custody converged."
+  (dolist (proc processes)
+    (when (processp proc)
+      (when (process-live-p proc)
+        (set-process-sentinel proc #'anvil-offload--sentinel))
+      (anvil-offload--hard-delete-process proc)))
+  (anvil-offload-stop-repl)
+  (anvil-eval-async-isolation-test--assert-offload-clean))
+
 (defun anvil-eval-async-isolation-test--frame (message)
   "Encode MESSAGE as one complete offload protocol frame."
   (concat anvil-offload--frame-prefix
@@ -672,7 +729,14 @@
           (anvil-eval-async-isolation-test--idle-process
            "anvil-async-hard-delete-tracking"))
          (anvil-offload--pool (vector proc))
-         (anvil-offload--isolated-processes (make-hash-table :test 'eq)))
+         (anvil-offload--pool-retiring-p nil)
+         (anvil-offload--pool-cleanup-active-p nil)
+         (anvil-offload--isolated-processes (make-hash-table :test 'eq))
+         (anvil-offload--submission-active-p nil)
+         (anvil-offload--stop-retiring-p nil)
+         (anvil-offload--retired-pools nil)
+         (anvil-offload--ownership-table-registry nil)
+         (anvil-offload--pending (make-hash-table :test 'eql)))
     (puthash proc t anvil-offload--isolated-processes)
     (unwind-protect
         (progn
@@ -691,17 +755,11 @@
           (should (process-live-p proc))
           (should (eq proc (aref anvil-offload--pool 0)))
           (should (gethash proc anvil-offload--isolated-processes))
-          (delete-process proc)
-          (let ((deadline (+ (float-time) 1)))
-            (while (and (process-live-p proc)
-                        (< (float-time) deadline))
-              (accept-process-output proc 0.01 nil t)))
+          (should (anvil-offload--hard-delete-process proc))
           (should-not (process-live-p proc))
-          (anvil-offload--hard-delete-process proc)
           (should-not (aref anvil-offload--pool 0))
           (should-not (gethash proc anvil-offload--isolated-processes)))
-      (when (process-live-p proc)
-        (delete-process proc)))))
+      (anvil-eval-async-isolation-test--cleanup-owned-processes proc))))
 
 (ert-deftest
     anvil-eval-async-isolation-pool-resize-preserves-live-tracking ()
@@ -712,9 +770,14 @@
          (disposable
           (anvil-eval-async-isolation-test--idle-process
            "anvil-async-resize-disposable"))
-         (pool (vector stubborn disposable))
+         (pool (vector disposable stubborn))
          (anvil-offload--pool pool)
          (anvil-offload--pool-retiring-p nil)
+         (anvil-offload--pool-cleanup-active-p nil)
+         (anvil-offload--submission-active-p nil)
+         (anvil-offload--stop-retiring-p nil)
+         (anvil-offload--retired-pools nil)
+         (anvil-offload--ownership-table-registry nil)
          (anvil-offload-pool-size 1)
          (real-delete (symbol-function 'delete-process))
          spawned)
@@ -734,9 +797,10 @@
              (anvil-offload--ensure-pool-vector)
              :type 'error)
             (should anvil-offload--pool-retiring-p)
+            (should-not anvil-offload--pool-cleanup-active-p)
             (should (eq pool anvil-offload--pool))
-            (should (eq stubborn (aref anvil-offload--pool 0)))
-            (should-not (aref anvil-offload--pool 1))
+            (should-not (aref anvil-offload--pool 0))
+            (should (eq stubborn (aref anvil-offload--pool 1)))
             (should-error (anvil-offload--pick-worker) :type 'error))
           (should-not spawned)
           (should (process-live-p stubborn))
@@ -744,37 +808,334 @@
           (should (= 1 (length (anvil-offload--ensure-pool-vector))))
           (should-not anvil-offload--pool-retiring-p)
           (should-not (aref anvil-offload--pool 0)))
-      (dolist (proc (list stubborn disposable))
-        (when (process-live-p proc)
-          (delete-process proc))))))
+      (anvil-eval-async-isolation-test--cleanup-owned-processes
+       stubborn disposable))))
 
 (ert-deftest
-    anvil-eval-async-isolation-protocol-replacement-preserves-live-tracking ()
-  "A failed protocol upgrade cannot overwrite a still-live old child."
-  (let* ((proc
+    anvil-eval-async-isolation-retirement-reentrancy-never-spawns ()
+  "Pool retirement marks its generation and rejects reentrant dispatch."
+  (let* ((first
           (anvil-eval-async-isolation-test--idle-process
-           "anvil-async-protocol-tracking"))
-         (anvil-offload--pool (vector proc))
+           "anvil-async-retire-reentrant-first"))
+         (second
+          (anvil-eval-async-isolation-test--idle-process
+           "anvil-async-retire-reentrant-second"))
+         (pool (vector first second))
+         (anvil-offload--pool pool)
          (anvil-offload--pool-retiring-p nil)
+         (anvil-offload--pool-cleanup-active-p nil)
+         (anvil-offload--submission-active-p nil)
+         (anvil-offload--stop-retiring-p nil)
+         (anvil-offload--retired-pools nil)
+         (anvil-offload--ownership-table-registry nil)
          (anvil-offload-pool-size 1)
+         observed
+         reentrant-error
          spawned)
-    (process-put proc 'anvil-offload-protocol-version
-                 (1- anvil-offload--protocol-version))
     (unwind-protect
         (progn
           (cl-letf
-              (((symbol-function 'kill-process) #'ignore)
+              (((symbol-function 'kill-process)
+                (lambda (_proc)
+                  (unless observed
+                    (setq observed
+                          (list anvil-offload--pool-retiring-p
+                                anvil-offload--pool-cleanup-active-p
+                                (process-get first 'anvil-offload-retiring)
+                                (process-get second 'anvil-offload-retiring))
+                          reentrant-error
+                          (should-error
+                           (anvil-offload--pick-worker)
+                           :type 'error)))))
                ((symbol-function 'delete-process) #'ignore)
+               ((symbol-function 'anvil-offload--spawn-process)
+                (lambda (_idx)
+                  (setq spawned t)
+                  (error "replacement spawned"))))
+            (should-error
+             (anvil-offload--ensure-pool-vector)
+             :type 'error))
+          (should (equal observed '(t t t t)))
+          (should (string-match-p
+                   "cleanup already active"
+                   (error-message-string reentrant-error)))
+          (should-not spawned)
+          (should (eq pool anvil-offload--pool))
+          (should anvil-offload--pool-retiring-p)
+          (should-not anvil-offload--pool-cleanup-active-p))
+      (anvil-eval-async-isolation-test--cleanup-owned-processes
+       first second))))
+
+(ert-deftest
+    anvil-eval-async-isolation-protocol-replacement-preserves-live-tracking ()
+  "A failed slot-local upgrade retains its child and leaves peers usable."
+  (let* ((old
+          (anvil-eval-async-isolation-test--idle-process
+           "anvil-async-protocol-tracking"))
+         (peer
+          (anvil-eval-async-isolation-test--idle-process
+           "anvil-async-protocol-peer"))
+         (pool (vector old peer))
+         (anvil-offload--pool pool)
+         (anvil-offload--pool-retiring-p nil)
+         (anvil-offload--pool-cleanup-active-p nil)
+         (anvil-offload--submission-active-p nil)
+         (anvil-offload--stop-retiring-p nil)
+         (anvil-offload--retired-pools nil)
+         (anvil-offload--ownership-table-registry nil)
+         (anvil-offload-pool-size 2)
+         (anvil-offload--next-id 41)
+         (peer-future
+          (make-anvil-future :id 706 :process peer :status 'pending))
+         spawned
+         isolated-spawned
+         reentrant-error
+         peer-reentrant-error)
+    (process-put old 'anvil-offload-protocol-version
+                 (1- anvil-offload--protocol-version))
+    (process-put peer 'anvil-offload-protocol-version
+                 anvil-offload--protocol-version)
+    (puthash 706 peer-future (anvil-offload--ensure-pending))
+    (unwind-protect
+        (progn
+          (cl-letf
+              (((symbol-function 'kill-process)
+                (lambda (_proc)
+                  (unless reentrant-error
+                    (setq reentrant-error
+                          (should-error
+                           (anvil-offload '(+ 1 2) :isolated t)
+                           :type 'error)
+                          peer-reentrant-error
+                          (should-error
+                           (anvil-offload--ensure-slot 1)
+                           :type 'error)))))
+               ((symbol-function 'delete-process) #'ignore)
+               ((symbol-function 'anvil-offload--spawn-isolated-process)
+                (lambda (_id)
+                  (setq isolated-spawned t)
+                  (error "isolated replacement spawned")))
                ((symbol-function 'anvil-offload--spawn-process)
                 (lambda (_idx)
                   (setq spawned t)
                   (error "replacement spawned"))))
             (should-error (anvil-offload--ensure-slot 0) :type 'error))
           (should-not spawned)
-          (should (eq proc (aref anvil-offload--pool 0)))
-          (should (process-live-p proc)))
-      (when (process-live-p proc)
-        (delete-process proc)))))
+          (should-not isolated-spawned)
+          (should (= 41 anvil-offload--next-id))
+          (dolist (condition (list reentrant-error peer-reentrant-error))
+            (should (string-match-p
+                     "cleanup already active"
+                     (error-message-string condition))))
+          (should (eq pool anvil-offload--pool))
+          (should (eq old (aref anvil-offload--pool 0)))
+          (should (process-get old 'anvil-offload-retiring))
+          (should (process-live-p old))
+          (should-not anvil-offload--pool-retiring-p)
+          (should-not anvil-offload--pool-cleanup-active-p)
+          (should (eq peer (anvil-offload--ensure-slot 1)))
+          (should (eq peer-future
+                      (gethash 706 (anvil-offload--ensure-pending)))))
+      (remhash 706 (anvil-offload--ensure-pending))
+      (anvil-eval-async-isolation-test--cleanup-owned-processes
+       old peer))))
+
+(defun anvil-eval-async-isolation-test--assert-slot-replacement (dead)
+  "Prove one successful slot replacement preserves a pending healthy peer.
+When DEAD is non-nil, replace a dead current-protocol slot; otherwise
+replace a live protocol-incompatible slot."
+  (let* ((target
+          (anvil-eval-async-isolation-test--idle-process
+           (if dead "anvil-async-dead-target" "anvil-async-old-target")))
+         (peer
+          (anvil-eval-async-isolation-test--idle-process
+           "anvil-async-replacement-peer"))
+         (replacement
+          (anvil-eval-async-isolation-test--idle-process
+           "anvil-async-replacement-new"))
+         (pool (vector target peer))
+         (ownership (make-hash-table :test 'eq))
+         (anvil-offload--pool pool)
+         (anvil-offload--pool-retiring-p nil)
+         (anvil-offload--pool-cleanup-active-p nil)
+         (anvil-offload--submission-active-p nil)
+         (anvil-offload--stop-retiring-p nil)
+         (anvil-offload--retired-pools nil)
+         (anvil-offload--ownership-table-registry nil)
+         (anvil-offload-pool-size 2)
+         (anvil-offload--isolated-processes ownership)
+         (peer-future
+          (make-anvil-future :id 707 :process peer :status 'pending))
+         (real-remhash (symbol-function 'remhash))
+         spawn-inhibit
+         publication-observed)
+    (process-put target 'anvil-offload-protocol-version
+                 (if dead
+                     anvil-offload--protocol-version
+                   (1- anvil-offload--protocol-version)))
+    (process-put peer 'anvil-offload-protocol-version
+                 anvil-offload--protocol-version)
+    (process-put replacement 'anvil-offload-protocol-version
+                 anvil-offload--protocol-version)
+    (when dead
+      (delete-process target))
+    (puthash 707 peer-future (anvil-offload--ensure-pending))
+    (unwind-protect
+        (progn
+          (cl-letf
+              (((symbol-function 'anvil-offload--spawn-process)
+                (lambda (_idx)
+                  (setq spawn-inhibit inhibit-quit)
+                  replacement))
+               ((symbol-function 'remhash)
+                (lambda (key table)
+                  (when (and (eq key replacement)
+                             (eq table ownership))
+                    (setq publication-observed
+                          (list (eq replacement (aref pool 0))
+                                (eq :slot-staging
+                                    (gethash replacement ownership))
+                                inhibit-quit)))
+                  (funcall real-remhash key table))))
+            (should (eq replacement (anvil-offload--ensure-slot 0))))
+          (should spawn-inhibit)
+          (should (equal publication-observed '(t t t)))
+          (should (eq pool anvil-offload--pool))
+          (should (eq replacement (aref pool 0)))
+          (should (eq peer (aref pool 1)))
+          (should (eq peer-future
+                      (gethash 707 (anvil-offload--ensure-pending))))
+          (should-not (gethash replacement ownership))
+          (should-not
+           (process-get replacement 'anvil-offload-ownership-tables))
+          (should-not
+           (process-get replacement 'anvil-offload-staged-slot))
+          (should-not anvil-offload--pool-retiring-p)
+          (should-not anvil-offload--pool-cleanup-active-p))
+      (remhash 707 (anvil-offload--ensure-pending))
+      (anvil-eval-async-isolation-test--cleanup-owned-processes
+       target peer replacement))))
+
+(ert-deftest
+    anvil-eval-async-isolation-protocol-replacement-preserves-peer ()
+  "Successful protocol replacement is slot-local."
+  (anvil-eval-async-isolation-test--assert-slot-replacement nil))
+
+(ert-deftest
+    anvil-eval-async-isolation-dead-slot-replacement-preserves-peer ()
+  "Successful dead-slot replacement is slot-local."
+  (anvil-eval-async-isolation-test--assert-slot-replacement t))
+
+(ert-deftest
+    anvil-eval-async-isolation-slot-spawn-rollback-retains-ownership ()
+  "Rollback restages ownership across table swaps until natural death."
+  (let* ((staged
+          (anvil-eval-async-isolation-test--idle-process
+           "anvil-async-slot-staging"))
+         (pool (vector nil))
+         (replacement (vector nil))
+         (initial-table (make-hash-table :test 'eq))
+         (replacement-table (make-hash-table :test 'eq))
+         (anvil-offload--pool pool)
+         (anvil-offload--pool-retiring-p nil)
+         (anvil-offload--pool-cleanup-active-p nil)
+         (anvil-offload--submission-active-p nil)
+         (anvil-offload--stop-retiring-p nil)
+         (anvil-offload--retired-pools nil)
+         (anvil-offload--ownership-table-registry nil)
+         (anvil-offload-pool-size 1)
+         (anvil-offload--isolated-processes initial-table)
+         spawn-inhibit)
+    (unwind-protect
+        (progn
+          (cl-letf
+              (((symbol-function 'anvil-offload--spawn-process)
+                (lambda (_idx)
+                  (setq spawn-inhibit inhibit-quit
+                        anvil-offload--pool replacement
+                        anvil-offload--isolated-processes replacement-table)
+                  staged))
+               ((symbol-function 'kill-process) #'ignore)
+               ((symbol-function 'delete-process) #'ignore))
+            (should-error (anvil-offload--ensure-slot 0) :type 'error))
+          (should spawn-inhibit)
+          (should (eq replacement anvil-offload--pool))
+          (should (eq replacement-table
+                      anvil-offload--isolated-processes))
+          (should (process-live-p staged))
+          (dolist (table (list initial-table replacement-table))
+            (should (eq :slot-staging (gethash staged table))))
+          (let ((tables
+                 (process-get staged 'anvil-offload-ownership-tables)))
+            (should (= 2 (length tables)))
+            (should (memq initial-table tables))
+            (should (memq replacement-table tables)))
+          (should (eql 0 (process-get staged 'anvil-offload-staged-slot)))
+          (should-not anvil-offload--pool-cleanup-active-p)
+          ;; Exercise the sentinel path, not hard-delete's synchronous release.
+          (set-process-sentinel staged #'anvil-offload--sentinel)
+          (delete-process staged)
+          (let ((deadline (+ (float-time) 1.0)))
+            (while (and (process-live-p staged)
+                        (< (float-time) deadline))
+              (accept-process-output staged 0.01 nil t)))
+          (accept-process-output staged 0.01 nil t)
+          (should-not (process-live-p staged))
+          (dolist (table (list initial-table replacement-table))
+            (should-not (gethash staged table)))
+          (should-not
+           (process-get staged 'anvil-offload-ownership-tables))
+          (should-not
+           (process-get staged 'anvil-offload-staged-slot)))
+      (anvil-eval-async-isolation-test--cleanup-owned-processes
+       staged))))
+
+(ert-deftest
+    anvil-eval-async-isolation-slot-spawn-collision-preserves-peer ()
+  "A post-spawn slot collision cannot overwrite a peer or orphan the child."
+  (let* ((staged
+          (anvil-eval-async-isolation-test--idle-process
+           "anvil-async-slot-collision-staged"))
+         (peer
+          (anvil-eval-async-isolation-test--idle-process
+           "anvil-async-slot-collision-peer"))
+         (pool (vector nil))
+         (ownership (make-hash-table :test 'eq))
+         (anvil-offload--pool pool)
+         (anvil-offload--pool-retiring-p nil)
+         (anvil-offload--pool-cleanup-active-p nil)
+         (anvil-offload--submission-active-p nil)
+         (anvil-offload--stop-retiring-p nil)
+         (anvil-offload--retired-pools nil)
+         (anvil-offload--ownership-table-registry nil)
+         (anvil-offload-pool-size 1)
+         (anvil-offload--isolated-processes ownership)
+         spawn-inhibit)
+    (unwind-protect
+        (progn
+          (cl-letf
+              (((symbol-function 'anvil-offload--spawn-process)
+                (lambda (_idx)
+                  (setq spawn-inhibit inhibit-quit)
+                  (aset pool 0 peer)
+                  staged))
+               ((symbol-function 'kill-process) #'ignore)
+               ((symbol-function 'delete-process) #'ignore))
+            (should-error (anvil-offload--ensure-slot 0) :type 'error))
+          (should spawn-inhibit)
+          (should (eq peer (aref pool 0)))
+          (should (process-live-p peer))
+          (should (process-live-p staged))
+          (should (eq :slot-staging (gethash staged ownership)))
+          (should (memq ownership
+                        (process-get
+                         staged 'anvil-offload-ownership-tables)))
+          (should-not anvil-offload--pool-cleanup-active-p)
+          (anvil-offload--hard-delete-process staged)
+          (should-not (process-live-p staged))
+          (should-not (gethash staged ownership)))
+      (anvil-eval-async-isolation-test--cleanup-owned-processes
+       staged peer))))
 
 (ert-deftest
     anvil-eval-async-isolation-stop-repl-preserves-live-tracking ()
@@ -787,21 +1148,48 @@
            "anvil-async-stop-isolated"))
          (anvil-offload--pool (vector pooled))
          (anvil-offload--pool-retiring-p nil)
+         (anvil-offload--pool-cleanup-active-p nil)
+         (anvil-offload--submission-active-p nil)
+         (anvil-offload--stop-retiring-p nil)
+         (anvil-offload--retired-pools nil)
+         (anvil-offload--ownership-table-registry nil)
          (anvil-offload-pool-size 1)
+         (anvil-offload--next-id 41)
          (anvil-offload--isolated-processes (make-hash-table :test 'eq))
-         spawned)
+         spawned
+         isolated-spawned
+         reentrant-error)
+    (process-put pooled 'anvil-offload-protocol-version
+                 anvil-offload--protocol-version)
     (puthash isolated t anvil-offload--isolated-processes)
     (unwind-protect
         (progn
           (cl-letf
-              (((symbol-function 'kill-process) #'ignore)
+              (((symbol-function 'kill-process)
+                (lambda (_proc)
+                  (unless reentrant-error
+                    (setq reentrant-error
+                          (should-error
+                           (anvil-offload '(+ 1 2) :isolated t)
+                           :type 'error)))))
                ((symbol-function 'delete-process) #'ignore)
+               ((symbol-function 'anvil-offload--spawn-isolated-process)
+                (lambda (_id)
+                  (setq isolated-spawned t)
+                  (error "isolated replacement spawned")))
                ((symbol-function 'anvil-offload--spawn-process)
                 (lambda (_idx)
                   (setq spawned t)
                   (error "replacement spawned"))))
             (anvil-offload-stop-repl)
+            (should (string-match-p
+                     "cleanup already active"
+                     (error-message-string reentrant-error)))
+            (should-not isolated-spawned)
+            (should (= 41 anvil-offload--next-id))
             (should anvil-offload--pool-retiring-p)
+            (should-not anvil-offload--pool-cleanup-active-p)
+            (should (process-get pooled 'anvil-offload-retiring))
             (should (process-live-p pooled))
             (should (eq pooled (aref anvil-offload--pool 0)))
             (should (process-live-p isolated))
@@ -809,9 +1197,8 @@
             (should-error (anvil-offload--pick-worker) :type 'error))
           (should-not spawned)
           (should (eq pooled (aref anvil-offload--pool 0))))
-      (dolist (proc (list pooled isolated))
-        (when (process-live-p proc)
-          (delete-process proc))))))
+      (anvil-eval-async-isolation-test--cleanup-owned-processes
+       pooled isolated))))
 
 (ert-deftest anvil-eval-async-isolation-rejects-cross-process-frames ()
   "Started, checkpoint, and terminal frames cannot settle a peer process."
@@ -863,7 +1250,16 @@
            :on-settle
            (lambda (_future)
              (throw 'anvil-async-frame-nonlocal 'escaped))))
-         (anvil-offload-max-frame-bytes 1))
+         (anvil-offload-max-frame-bytes 1)
+         (anvil-offload--pool nil)
+         (anvil-offload--pool-retiring-p nil)
+         (anvil-offload--pool-cleanup-active-p nil)
+         (anvil-offload--submission-active-p nil)
+         (anvil-offload--stop-retiring-p nil)
+         (anvil-offload--retired-pools nil)
+         (anvil-offload--ownership-table-registry nil)
+         (anvil-offload--isolated-processes (make-hash-table :test 'eq))
+         (anvil-offload--pending (make-hash-table :test 'eql)))
     (unwind-protect
         (progn
           (puthash 704 future (anvil-offload--ensure-pending))
@@ -878,8 +1274,7 @@
           (should-not (gethash 704 (anvil-offload--ensure-pending)))
           (should-not (process-live-p proc)))
       (remhash 704 (anvil-offload--ensure-pending))
-      (when (process-live-p proc)
-        (anvil-offload--hard-delete-process proc)))))
+      (anvil-eval-async-isolation-test--cleanup-owned-processes proc))))
 
 (ert-deftest
     anvil-eval-async-isolation-dead-process-settles-all-after-nonlocal ()

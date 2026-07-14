@@ -16,13 +16,59 @@
 ;; so a plain require resolves to sibling sources.
 (require 'anvil-offload)
 
+(defun anvil-offload-test--assert-clean ()
+  "Refuse to discard ownership state before subprocess cleanup converges."
+  (let ((deadline (+ (float-time) 1.0)))
+    (while (and (hash-table-p anvil-offload--pending)
+                (> (hash-table-count anvil-offload--pending) 0)
+                (< (float-time) deadline))
+      (accept-process-output nil 0.01)))
+  (let (owned pending)
+    (dolist (table (anvil-offload--registered-ownership-tables))
+      (maphash
+       (lambda (proc value)
+         (push (list table proc value) owned))
+       table))
+    (when (hash-table-p anvil-offload--pending)
+      (maphash (lambda (id _future) (push id pending))
+               anvil-offload--pending))
+    (when (or anvil-offload--pool
+              anvil-offload--pool-retiring-p
+              anvil-offload--pool-cleanup-active-p
+              anvil-offload--submission-active-p
+              anvil-offload--stop-retiring-p
+              anvil-offload--retired-pools
+              owned
+              pending)
+      (error
+       (concat
+        "offload cleanup did not converge: "
+        "pool=%S pool-retiring=%S cleanup-active=%S submission-active=%S stop-retiring=%S "
+        "retired=%S owned=%S pending=%S")
+       anvil-offload--pool
+       anvil-offload--pool-retiring-p
+       anvil-offload--pool-cleanup-active-p
+       anvil-offload--submission-active-p
+       anvil-offload--stop-retiring-p
+       anvil-offload--retired-pools
+       owned
+       pending))))
+
 (defun anvil-offload-test--reset ()
-  "Force a clean REPL + pending table between tests."
+  "Force clean offload state only after ownership convergence."
   (anvil-offload-stop-repl)
-  (setq anvil-offload--next-id 0
+  (anvil-offload-test--assert-clean)
+  (setq anvil-offload--pool nil
+        anvil-offload--round-robin 0
+        anvil-offload--next-id 0
         anvil-offload--pending (make-hash-table :test 'eql)
-        anvil-offload--isolated-processes (make-hash-table :test 'eq))
-  ;; Give Emacs a tick to reap the killed subprocess.
+        anvil-offload--isolated-processes (make-hash-table :test 'eq)
+        anvil-offload--pool-retiring-p nil
+        anvil-offload--pool-cleanup-active-p nil
+        anvil-offload--submission-active-p nil
+        anvil-offload--stop-retiring-p nil
+        anvil-offload--retired-pools nil
+        anvil-offload--ownership-table-registry nil)
   (sit-for 0.05))
 
 (defmacro anvil-offload-test--with-clean-repl (&rest body)

@@ -39,14 +39,59 @@
              (anvil-offload--ensure-pending))
     found))
 
+(defun anvil-hang-regression-test--assert-offload-clean ()
+  "Refuse to discard ownership state before subprocess cleanup converges."
+  (let ((deadline (+ (float-time) 1.0)))
+    (while (and (hash-table-p anvil-offload--pending)
+                (> (hash-table-count anvil-offload--pending) 0)
+                (< (float-time) deadline))
+      (accept-process-output nil 0.01)))
+  (let (owned pending)
+    (dolist (table (anvil-offload--registered-ownership-tables))
+      (maphash
+       (lambda (proc value)
+         (push (list table proc value) owned))
+       table))
+    (when (hash-table-p anvil-offload--pending)
+      (maphash (lambda (id _future) (push id pending))
+               anvil-offload--pending))
+    (when (or anvil-offload--pool
+              anvil-offload--pool-retiring-p
+              anvil-offload--pool-cleanup-active-p
+              anvil-offload--submission-active-p
+              anvil-offload--stop-retiring-p
+              anvil-offload--retired-pools
+              owned
+              pending)
+      (error
+       (concat
+        "hang regression cleanup did not converge: "
+        "pool=%S pool-retiring=%S cleanup-active=%S submission-active=%S stop-retiring=%S "
+        "retired=%S owned=%S pending=%S")
+       anvil-offload--pool
+       anvil-offload--pool-retiring-p
+       anvil-offload--pool-cleanup-active-p
+       anvil-offload--submission-active-p
+       anvil-offload--stop-retiring-p
+       anvil-offload--retired-pools
+       owned
+       pending))))
+
 (defun anvil-hang-regression-test--reset-offload ()
-  "Kill the offload pool and reset all request state."
-  (when anvil-offload--pool
-    (anvil-offload-stop-repl))
+  "Kill and reset offload state only after ownership convergence."
+  (anvil-offload-stop-repl)
+  (anvil-hang-regression-test--assert-offload-clean)
   (setq anvil-offload--pool nil
         anvil-offload--round-robin 0
         anvil-offload--next-id 0
-        anvil-offload--pending (make-hash-table :test 'eql))
+        anvil-offload--pending (make-hash-table :test 'eql)
+        anvil-offload--isolated-processes (make-hash-table :test 'eq)
+        anvil-offload--pool-retiring-p nil
+        anvil-offload--pool-cleanup-active-p nil
+        anvil-offload--submission-active-p nil
+        anvil-offload--stop-retiring-p nil
+        anvil-offload--retired-pools nil
+        anvil-offload--ownership-table-registry nil)
   (accept-process-output nil 0.05))
 
 (defun anvil-hang-regression-test--stub-tool (&optional timeout)
