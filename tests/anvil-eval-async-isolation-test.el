@@ -23,6 +23,29 @@
 (defconst anvil-eval-async-isolation-test--emacs
   (expand-file-name invocation-name invocation-directory))
 
+(defconst anvil-eval-async-isolation-test--async-timeout 8
+  "Seconds allowed for the non-yielding isolated job.")
+
+(defconst anvil-eval-async-isolation-test--start-timeout 6
+  "Seconds allowed for the non-yielding child to publish its PID.")
+
+(defconst anvil-eval-async-isolation-test--settle-timeout 10
+  "Seconds allowed for the timed job to reach terminal state.")
+
+(defconst anvil-eval-async-isolation-test--death-timeout 5
+  "Seconds allowed for the killed exact child to disappear.")
+
+(defconst anvil-eval-async-isolation-test--good-timeout 10
+  "Seconds allowed for the post-timeout control job.")
+
+(defconst anvil-eval-async-isolation-test--root-timeout
+  (+ anvil-eval-async-isolation-test--start-timeout
+     anvil-eval-async-isolation-test--settle-timeout
+     anvil-eval-async-isolation-test--death-timeout
+     anvil-eval-async-isolation-test--good-timeout
+     5)
+  "Hard outer cap covering every child phase plus five seconds of margin.")
+
 (defun anvil-eval-async-isolation-test--job-id (reply)
   "Extract a job ID from async REPLY."
   (string-remove-prefix "Job started: " reply))
@@ -84,13 +107,16 @@
                    ,anvil-eval-async-isolation-test--emacs
                    anvil-eval-async-max-active 1
                    anvil-eval-async-max-queued 1
-                   anvil-eval-async-timeout 5
+                   anvil-eval-async-timeout
+                   ,anvil-eval-async-isolation-test--async-timeout
                    anvil-eval-async-max-timeout 10
                    anvil-eval-async-retention-seconds 30)
              (let* ((bad-reply (anvil-eval--async ,loop-expression))
                     (bad-id (string-remove-prefix
                              "Job started: " bad-reply))
-                    (start-deadline (+ (float-time) 4)))
+                    (start-deadline
+                     (+ (float-time)
+                        ,anvil-eval-async-isolation-test--start-timeout)))
                (while (and (not (file-exists-p ,started-file))
                            (< (float-time) start-deadline)
                            (eq 'running
@@ -99,7 +125,9 @@
                                 :status)))
                  (accept-process-output nil 0.02))
                (unless (file-exists-p ,started-file)
-                 (error "non-yielding child never wrote its start marker"))
+                 (error
+                  "non-yielding child never wrote its start marker: %S"
+                  (gethash bad-id anvil-eval--async-jobs)))
                (let* ((bad-job (gethash bad-id anvil-eval--async-jobs))
                       (bad-future (plist-get bad-job :future))
                       (bad-proc
@@ -114,7 +142,9 @@
                       (_timer
                        (run-at-time 0.1 nil
                                     (lambda () (setq marker t))))
-                      (deadline (+ (float-time) 7)))
+                      (deadline
+                       (+ (float-time)
+                          ,anvil-eval-async-isolation-test--settle-timeout)))
                  (unless (and (anvil-future-p bad-future)
                               (processp bad-proc)
                               (= recorded-pid (process-id bad-proc)))
@@ -131,7 +161,9 @@
                  (unless (and (eq 'error (plist-get bad-job :status))
                               (eq 'timeout (plist-get bad-job :reason)))
                    (error "non-yielding job did not time out: %S" bad-job))
-                 (let ((death-deadline (+ (float-time) 2)))
+                 (let ((death-deadline
+                        (+ (float-time)
+                           ,anvil-eval-async-isolation-test--death-timeout)))
                    (while (and (process-live-p bad-proc)
                                (< (float-time) death-deadline))
                      (accept-process-output bad-proc 0.02 nil t)))
@@ -140,7 +172,9 @@
                (let* ((good-reply (anvil-eval--async "(+ 1 2)"))
                       (good-id (string-remove-prefix
                                 "Job started: " good-reply))
-                      (deadline (+ (float-time) 6)))
+                      (deadline
+                       (+ (float-time)
+                          ,anvil-eval-async-isolation-test--good-timeout)))
                  (while (and (< (float-time) deadline)
                              (eq 'running
                                  (plist-get
@@ -165,7 +199,9 @@
            :connection-type 'pipe
            :noquery t
            :sentinel #'ignore))
-         (deadline (+ (float-time) 15)))
+         (deadline
+          (+ (float-time)
+             anvil-eval-async-isolation-test--root-timeout)))
     (unwind-protect
         (progn
           (while (and (process-live-p proc) (< (float-time) deadline))
@@ -173,8 +209,11 @@
           (when (process-live-p proc)
             (delete-process proc)
             (ert-fail "disposable root froze on non-yielding async eval"))
-          (let ((output (with-current-buffer buffer (buffer-string))))
-            (should (= 0 (process-exit-status proc)))
+          (let ((output (with-current-buffer buffer (buffer-string)))
+                (status (process-exit-status proc)))
+            (unless (= 0 status)
+              (ert-fail
+               (format "disposable root exited %s:\n%s" status output)))
             (should (string-match-p "ANVIL-ASYNC-ISOLATION-OK" output))))
       (when (process-live-p proc) (delete-process proc))
       (when (buffer-live-p buffer) (kill-buffer buffer))

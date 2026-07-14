@@ -20,6 +20,8 @@ import time
 
 
 REPLY_TIMEOUT_SECONDS = 3.0
+BRIDGE_TERM_GRACE_SECONDS = 0.5
+BRIDGE_REAP_TIMEOUT_SECONDS = 10.0
 HELPER_NAMES = (
     "cat",
     "rm",
@@ -181,6 +183,24 @@ exit 125
 """
     source = source.replace("__BASH__", bash)
     source = source.replace("__NAME__", name)
+    make_executable(path, source)
+
+
+def write_delayed_python_wrapper(
+    path: Path,
+    bash: str,
+    real_python: str,
+    real_sleep: str,
+) -> None:
+    """Delay parser startup past the former default, then exec Python."""
+    source = r"""#!__BASH__
+set -u
+__SLEEP__ 3
+exec __PYTHON__ "$@"
+"""
+    source = source.replace("__BASH__", bash)
+    source = source.replace("__SLEEP__", shlex.quote(real_sleep))
+    source = source.replace("__PYTHON__", shlex.quote(real_python))
     make_executable(path, source)
 
 
@@ -411,7 +431,7 @@ def build_fixture(
             "ANVIL_EMACSCLIENT_STARTUP_DISPATCH_TIMEOUT": "5",
             "ANVIL_EMACSCLIENT_DISPATCH_TIMEOUT": "5",
             "ANVIL_EMACSCLIENT_KILL_AFTER_TIMEOUT": "1",
-            "ANVIL_MCP_REQUEST_PARSE_TIMEOUT": "2",
+            "ANVIL_MCP_REQUEST_PARSE_TIMEOUT": "10",
             "ANVIL_MCP_FRAME_READ_TIMEOUT": "2",
             "ANVIL_EMACSCLIENT_RETRY_MAX": "1",
             "ANVIL_EMACSCLIENT_RETRY_DELAY_MS": "0",
@@ -496,9 +516,10 @@ def read_reply(
     expected: dict[str, object],
     *,
     framed: bool,
+    timeout_seconds: float = REPLY_TIMEOUT_SECONDS,
 ) -> None:
     """Read and validate one line or framed response."""
-    deadline = time.monotonic() + REPLY_TIMEOUT_SECONDS
+    deadline = time.monotonic() + timeout_seconds
     first = reader.line(deadline)
     declared: int | None
     if framed:
@@ -593,32 +614,86 @@ def process_group_alive(pgid: int) -> bool:
     return True
 
 
+def wait_for_bridge_reap(
+    process: subprocess.Popen[bytes],
+    timeout: float = BRIDGE_REAP_TIMEOUT_SECONDS,
+) -> None:
+    """Wait boundedly for a signalled bridge leader to become observable."""
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        raise AssertionError(
+            f"bridge leader {process.pid} was not reaped within {timeout:.1f}s"
+        ) from error
+
+
+class DelayedReapFixture:
+    """Fake process whose exit is observable only with a sufficient budget."""
+
+    pid = 424_242
+
+    def __init__(self, minimum_timeout: float) -> None:
+        self.minimum_timeout = minimum_timeout
+        self.returncode: int | None = None
+        self.wait_timeouts: list[float | None] = []
+
+    def poll(self) -> int | None:
+        """Return the synthetic process status."""
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        """Fail short observation budgets without sleeping."""
+        self.wait_timeouts.append(timeout)
+        if timeout is None or timeout < self.minimum_timeout:
+            raise subprocess.TimeoutExpired(["delayed-reap-fixture"], timeout)
+        self.returncode = -signal.SIGKILL
+        return self.returncode
+
+
+def run_bridge_reap_budget_regression() -> None:
+    """Prove the loaded-suite reap budget exceeds the historical two seconds."""
+    too_short = DelayedReapFixture(minimum_timeout=5.0)
+    try:
+        wait_for_bridge_reap(too_short, timeout=2.0)  # type: ignore[arg-type]
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("historical two-second reap budget unexpectedly passed")
+
+    bounded = DelayedReapFixture(minimum_timeout=5.0)
+    wait_for_bridge_reap(bounded)  # type: ignore[arg-type]
+    if bounded.wait_timeouts != [BRIDGE_REAP_TIMEOUT_SECONDS]:
+        raise AssertionError(f"wrong bridge reap budget: {bounded.wait_timeouts}")
+
+
 def terminate_bridge(process: subprocess.Popen[bytes]) -> None:
     """Kill and reap PROCESS and every descendant in its process group."""
-    if os.name == "posix":
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except (PermissionError, ProcessLookupError):
-            pass
-        deadline = time.monotonic() + 0.5
-        while process_group_alive(process.pid) and time.monotonic() < deadline:
-            time.sleep(0.02)
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except (PermissionError, ProcessLookupError):
-            pass
-    elif process.poll() is None:
-        process.terminate()
+    try:
+        if os.name == "posix":
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except (PermissionError, ProcessLookupError):
+                pass
+            deadline = time.monotonic() + BRIDGE_TERM_GRACE_SECONDS
+            while process_group_alive(process.pid) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (PermissionError, ProcessLookupError):
+                pass
+        elif process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=BRIDGE_TERM_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                process.kill()
 
-    if process.poll() is None:
-        try:
-            process.wait(timeout=1)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=2)
-    for stream in (process.stdin, process.stdout):
-        if stream is not None and not stream.closed:
-            stream.close()
+        if process.poll() is None:
+            wait_for_bridge_reap(process)
+    finally:
+        for stream in (process.stdin, process.stdout):
+            if stream is not None and not stream.closed:
+                stream.close()
 
 
 def wait_for_bridge_ready(
@@ -629,7 +704,9 @@ def wait_for_bridge_ready(
     """Wait until startup logging proves the bridge entered its read loop."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if debug_log.is_file() and "MCP-READY: stdio request loop" in safe_text(debug_log):
+        if debug_log.is_file() and "MCP-READY: stdio request loop" in safe_text(
+            debug_log
+        ):
             return
         if process.poll() is not None:
             raise AssertionError(
@@ -827,7 +904,6 @@ def run_nonfinite_identifier(
             paths["dispatch_count"],
         )
         clean = False
-        lifecycle_log = None
         try:
             wait_for_bridge_ready(paths["debug_log"], process)
             original_pid = process.pid
@@ -892,7 +968,7 @@ def run_predispatch_freeze(
             [percent_wire(json_bytes(expected))],
             bash,
         )
-        environment["ANVIL_MCP_REQUEST_PARSE_TIMEOUT"] = "1"
+        environment["ANVIL_MCP_REQUEST_PARSE_TIMEOUT"] = "5"
         python_wrapper = paths["binary"] / "python3"
         write_blocking_predispatch_wrapper(python_wrapper, bash, "python3")
         process = start_bridge(
@@ -925,11 +1001,16 @@ def run_predispatch_freeze(
                 process,
                 {"jsonrpc": "2.0", "id": 31, "method": "test"},
             )
-            if not wait_until(paths["predispatch_marker"].is_file, 2):
+            if not wait_until(paths["predispatch_marker"].is_file, 5):
                 raise AssertionError("frozen pre-dispatch helper did not start")
             marker = json.loads(paths["predispatch_marker"].read_text(encoding="utf-8"))
             frozen_pid = int(marker["pid"])
-            read_reply(reader, synthetic_parse_runner_error(124), framed=False)
+            read_reply(
+                reader,
+                synthetic_parse_runner_error(124),
+                framed=False,
+                timeout_seconds=7,
+            )
             if read_count(paths["dispatch_count"]) != 0:
                 raise AssertionError("pre-dispatch failure reached stateful Emacs")
             if not wait_until(lambda: not process_alive(frozen_pid), 2):
@@ -969,6 +1050,72 @@ def run_predispatch_freeze(
                 process.stdout.close()
         if frozen_pid is None:
             raise AssertionError("pre-dispatch regression recorded no child pid")
+
+
+def run_default_parse_budget(
+    stdio: Path,
+    bash: str,
+    real_helpers: dict[str, str],
+) -> None:
+    """Prove the default parser budget survives three seconds of host load."""
+    with tempfile.TemporaryDirectory(prefix="anvil-stdio-parse-default-") as raw_root:
+        root = Path(raw_root)
+        expected = {
+            "jsonrpc": "2.0",
+            "id": 30,
+            "result": "default-parse-ok",
+        }
+        environment, paths = build_fixture(
+            root,
+            real_helpers,
+            [percent_wire(json_bytes(expected))],
+            bash,
+        )
+        environment.pop("ANVIL_MCP_REQUEST_PARSE_TIMEOUT")
+        write_delayed_python_wrapper(
+            paths["binary"] / "python3",
+            bash,
+            real_helpers["python3"],
+            real_helpers["sleep"],
+        )
+        process = start_bridge(
+            bash,
+            stdio,
+            environment,
+            paths["bridge_stderr"],
+            "--socket=/tmp/anvil-parse-default-test",
+            "--server-id=test",
+        )
+        reader = BinaryReader(
+            process,
+            paths["debug_log"],
+            paths["bridge_stderr"],
+            paths["helper_marker"],
+            paths["dispatch_count"],
+        )
+        clean = False
+        try:
+            wait_for_bridge_ready(paths["debug_log"], process)
+            send(process, {"jsonrpc": "2.0", "id": 30, "method": "test"})
+            wait_for_dispatch_complete(
+                paths["dispatch_complete"],
+                process,
+                paths["dispatch_ack_fifo"],
+                1,
+            )
+            read_reply(reader, expected, framed=False)
+            paths["dispatch_complete"].unlink()
+            process.stdin.close()
+            process.wait(timeout=5)
+            if process.returncode != 0:
+                raise AssertionError(reader.diagnostics())
+            clean = True
+        finally:
+            reader.close()
+            if not clean:
+                terminate_bridge(process)
+            elif process.stdout is not None and not process.stdout.closed:
+                process.stdout.close()
 
 
 def run_guard_loader_owner_death(
@@ -1420,12 +1567,12 @@ def run_cumulative_frame_budget(
                 ) from error
             if process.returncode == 0:
                 raise AssertionError("incomplete cumulative frame exited successfully")
-            if "MCP-FRAMING: body reader start" not in safe_text(
-                paths["debug_log"]
-            ):
+            if "MCP-FRAMING: body reader start" not in safe_text(paths["debug_log"]):
                 raise AssertionError("cumulative frame never entered the body reader")
             if read_count(paths["dispatch_count"]) != 0:
-                raise AssertionError("incomplete cumulative frame reached stateful Emacs")
+                raise AssertionError(
+                    "incomplete cumulative frame reached stateful Emacs"
+                )
             if not wait_until(lambda: not process_group_alive(process.pid), 2):
                 raise AssertionError("cumulative-frame bridge group survived exit")
         finally:
@@ -1615,13 +1762,16 @@ def run_negative_control(
             terminate_bridge(process)
         if helper_pid is None:
             raise AssertionError("negative control recorded no helper pid")
-        if not wait_until(lambda: not process_alive(helper_pid), 2):
+        if not wait_until(
+            lambda: not process_alive(helper_pid),
+            BRIDGE_REAP_TIMEOUT_SECONDS,
+        ):
             raise AssertionError(
                 f"negative-control helper survived cleanup: {helper_pid}"
             )
         if not wait_until(
             lambda: not process_group_alive(process.pid),
-            2,
+            BRIDGE_REAP_TIMEOUT_SECONDS,
         ):
             raise AssertionError("negative-control process group survived")
 
@@ -1835,6 +1985,8 @@ def main() -> int:
     if parent_guard_python is not None and not Path(parent_guard_python).is_file():
         raise SystemExit(f"not a file: {parent_guard_python}")
 
+    run_bridge_reap_budget_regression()
+
     real_helpers: dict[str, str] = {}
     for name in HELPER_NAMES:
         program = shutil.which(name)
@@ -1875,6 +2027,7 @@ def main() -> int:
         parent_guard,
         parent_guard_python,
     )
+    run_default_parse_budget(stdio, bash, real_helpers)
     run_idle_then_partial_first_line(stdio, bash, real_helpers)
     run_stalled_frame_header(stdio, bash, real_helpers)
     run_truncated_frame(stdio, bash, real_helpers)

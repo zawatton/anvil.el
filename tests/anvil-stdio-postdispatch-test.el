@@ -82,6 +82,15 @@
                     (point-min) (point-max))))
         (should
          (string-match-p
+          (regexp-quote
+           "ANVIL_MCP_REQUEST_PARSE_TIMEOUT=${ANVIL_MCP_REQUEST_PARSE_TIMEOUT:-10}")
+          source))
+        (should
+         (string-match-p
+          (regexp-quote "\"$ANVIL_MCP_REQUEST_PARSE_TIMEOUT\" 10")
+          source))
+        (should
+         (string-match-p
           (regexp-quote "mcp_debug_log \"INIT-RC\" \"$INIT_RC\"")
           source))
         (should

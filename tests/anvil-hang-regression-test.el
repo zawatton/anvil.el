@@ -162,17 +162,19 @@ re-entering synchronous Anvil waits."
 (ert-deftest anvil-hang-regression-dead-repl-settles-without-timer ()
   "Awaiting a dead REPL must not depend on a zero-delay sentinel timer.
 
-The real child exits while `run-at-time' is intercepted, making the old
-`sit-for 0' fallback deterministically leave the future pending."
+The real child waits until its future is registered, then exits with its
+automatic sentinel disabled.  The production sentinel is invoked while
+`run-at-time' is intercepted, making the old `sit-for 0' fallback leave the
+future pending without depending on Emacs callback scheduling."
   (anvil-hang-regression-test--reset-offload)
   (let* ((proc
           (make-process
            :name "anvil-hang-dead-repl"
            :command
-           (list shell-file-name shell-command-switch "sleep 0.1; exit 7")
+           (list shell-file-name shell-command-switch "read ignored; exit 7")
            :connection-type 'pipe
            :noquery t
-           :sentinel #'anvil-offload--sentinel))
+           :sentinel #'ignore))
          (id 9001)
          (future
           (make-anvil-future :id id :process proc :status 'pending))
@@ -183,8 +185,18 @@ The real child exits while `run-at-time' is intercepted, making the old
                    (lambda (&rest args)
                      (setq deferred args)
                      'withheld-timer)))
-          (should (anvil-future-await future 2))
+          ;; Release the child only after its future and the timer stub are
+          ;; live.  Invoke the real sentinel explicitly after death: whether
+          ;; Emacs happens to dispatch a process sentinel during await is an
+          ;; event-loop detail, not part of the behavior under test.
+          (process-send-string proc "\n")
+          (should
+           (anvil-hang-regression-test--wait-until
+            (lambda () (not (process-live-p proc))) 2))
+          (anvil-offload--sentinel proc "exited abnormally with code 7\n")
           (should deferred)
+          (should (eq 'pending (anvil-future-status future)))
+          (should (anvil-future-await future 2))
           (should (eq 'error (anvil-future-status future)))
           (should (string-match-p "offload REPL exited"
                                   (anvil-future-error future)))
