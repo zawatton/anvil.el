@@ -702,6 +702,31 @@
       (when (process-live-p proc)
         (delete-process proc)))))
 
+(ert-deftest
+    anvil-eval-async-isolation-stop-repl-preserves-live-tracking ()
+  "Stopping all REPLs cannot orphan children that resist termination."
+  (let* ((pooled
+          (anvil-eval-async-isolation-test--idle-process
+           "anvil-async-stop-pooled"))
+         (isolated
+          (anvil-eval-async-isolation-test--idle-process
+           "anvil-async-stop-isolated"))
+         (anvil-offload--pool (vector pooled))
+         (anvil-offload--isolated-processes (make-hash-table :test 'eq)))
+    (puthash isolated t anvil-offload--isolated-processes)
+    (unwind-protect
+        (progn
+          (cl-letf (((symbol-function 'kill-process) #'ignore)
+                    ((symbol-function 'delete-process) #'ignore))
+            (anvil-offload-stop-repl))
+          (should (process-live-p pooled))
+          (should (eq pooled (aref anvil-offload--pool 0)))
+          (should (process-live-p isolated))
+          (should (gethash isolated anvil-offload--isolated-processes)))
+      (dolist (proc (list pooled isolated))
+        (when (process-live-p proc)
+          (delete-process proc))))))
+
 (ert-deftest anvil-eval-async-isolation-rejects-cross-process-frames ()
   "Started, checkpoint, and terminal frames cannot settle a peer process."
   (let* ((proc-a

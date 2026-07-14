@@ -725,26 +725,26 @@ When ISOLATED is non-nil, record it as a one-shot owned process."
 
 ;;;###autoload
 (defun anvil-offload-stop-repl ()
-  "Terminate every pooled and isolated REPL and clear owned state.
+  "Terminate every pooled and isolated REPL without losing ownership.
 Pending futures bound to those processes settle as errored via
-`anvil-offload--sentinel'.  The next `anvil-offload' call will
-rebuild the pool using the current `anvil-offload-pool-size'."
+`anvil-offload--sentinel'.  Subsequent dispatch rebuilds every slot
+whose child terminated, using the current `anvil-offload-pool-size'.
+A child that remains live after failed termination stays tracked for
+a later sentinel or cleanup attempt."
   (interactive)
   (when anvil-offload--pool
     (dotimes (i (length anvil-offload--pool))
       (let ((p (aref anvil-offload--pool i)))
-        (when (and p (process-live-p p))
-          (kill-process p))
-        (aset anvil-offload--pool i nil))))
-  (setq anvil-offload--pool nil)
+        (when p
+          (anvil-offload--hard-delete-process p))))
+    (unless (cl-some #'identity (append anvil-offload--pool nil))
+      (setq anvil-offload--pool nil)))
   (when (hash-table-p anvil-offload--isolated-processes)
     (let (processes)
       (maphash (lambda (proc _value) (push proc processes))
                anvil-offload--isolated-processes)
       (dolist (proc processes)
-        (when (process-live-p proc)
-          (ignore-errors (kill-process proc)))))
-    (clrhash anvil-offload--isolated-processes)))
+        (anvil-offload--hard-delete-process proc)))))
 
 ;;;###autoload
 (defun anvil-offload-repl-alive-p ()
