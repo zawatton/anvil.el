@@ -4,8 +4,8 @@
 
 ;; Regression / correctness tests for `anvil-shell' and related
 ;; `anvil-host' helpers.  Focused on behaviours that are easy to get
-;; wrong at the `make-process' boundary — most notably that background
-;; / disowned descendants spawned from inside the shell must survive
+;; wrong at the `make-process' boundary — most notably that detached
+;; descendants spawned from inside the shell must survive
 ;; the wrapper shell exiting (issue #10).
 
 ;;; Code:
@@ -19,18 +19,13 @@
 (ert-deftest anvil-host-test-shell-preserves-disowned-children ()
   "Regression guard for issue #10.
 
-A background / disowned descendant spawned inside the shell command
-must survive `anvil-shell' returning.  On Linux, `setsid --fork' is
-the only reliable way to detach — `& disown' alone keeps the child
-in the shell's session and the kernel SIGHUPs it when the wrapper
-shell exits.  Detail: `anvil-host--run' uses `:connection-type
-'pipe', but `make-process' still calls `setsid()' for its direct
-child, and the child inherits the parent's controlling TTY via fd 0.
-So plain `& disown' descendants remain in bash's (now session-leader)
-session and get SIGHUP when bash returns.  `setsid --fork' forks a
-grandchild into a brand-new session with no controlling TTY, which
-survives.  This is what `wl-copy' / `pbcopy' / `xclip' do internally
-when they spawn their clipboard-holder daemons.
+A detached descendant spawned inside the shell command must survive
+`anvil-shell' returning.  `anvil-host--run' gives the shell pipe
+streams and closes its process-input pipe immediately because the
+API has no stdin channel.  On Linux, `setsid --fork' creates the new
+session needed for a descendant to outlive the wrapper shell.  This
+is the same mechanism clipboard helpers such as `wl-copy' and
+`xclip' use for their owner daemons.
 
 The test schedules a short-delayed background `touch' via
 `setsid --fork' and asserts the marker file appears after the shell
@@ -75,6 +70,56 @@ line on exit; the wrapper silences it with `:sentinel #'ignore'
       (should (string-match-p "world" err)))))
 
 ;;;; --- basic exit / output semantics --------------------------------------
+
+(ert-deftest anvil-host-test-shell-stdin-is-eof ()
+  "Shell commands that read stdin must observe immediate EOF."
+  (skip-unless (memq system-type '(gnu/linux darwin windows-nt)))
+  (let* ((command
+          (if (eq system-type 'windows-nt)
+              "more >NUL & echo stdin-eof"
+            "cat >/dev/null; printf 'stdin-eof\\n'"))
+         (res (anvil-shell command '(:timeout 3))))
+    (should (eql 0 (plist-get res :exit)))
+    (should (equal "stdin-eof\n" (plist-get res :stdout)))
+    (should (equal "" (plist-get res :stderr)))))
+
+(ert-deftest anvil-host-test-child-bindings-are-spawn-local ()
+  "Dedicated child bindings apply at spawn without leaking into the root."
+  (skip-unless (memq system-type '(gnu/linux darwin)))
+  (let* ((root-environment process-environment)
+         (root-exec-path exec-path)
+         (root-shell shell-file-name)
+         (root-switch shell-command-switch)
+         (child-environment
+          (cons "ANVIL_HOST_CHILD_SCOPE=child"
+                (copy-sequence process-environment)))
+         (child-exec-path (reverse (copy-sequence exec-path)))
+         (child-shell (or (executable-find "sh") shell-file-name))
+         (anvil-host-child-process-environment child-environment)
+         (anvil-host-child-exec-path child-exec-path)
+         (anvil-host-child-shell-file-name child-shell)
+         (anvil-host-child-shell-command-switch "-c")
+         (original-make-process (symbol-function 'make-process))
+         observed)
+    (cl-letf (((symbol-function 'make-process)
+               (lambda (&rest args)
+                 (setq observed
+                       (list process-environment exec-path
+                             shell-file-name shell-command-switch))
+                 (apply original-make-process args))))
+      (let ((result
+             (anvil-host--run
+              "printf %s \"$ANVIL_HOST_CHILD_SCOPE\""
+              'utf-8 temporary-file-directory 3)))
+        (should (equal '(0 "child" "") result))))
+    (should (equal child-environment (nth 0 observed)))
+    (should (equal child-exec-path (nth 1 observed)))
+    (should (equal child-shell (nth 2 observed)))
+    (should (equal "-c" (nth 3 observed)))
+    (should (eq root-environment process-environment))
+    (should (eq root-exec-path exec-path))
+    (should (eq root-shell shell-file-name))
+    (should (eq root-switch shell-command-switch))))
 
 (ert-deftest anvil-host-test-shell-nonzero-exit-reported ()
   "A non-zero shell exit is reported in :exit (not raised)."

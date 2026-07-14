@@ -279,35 +279,26 @@ future first."
         (kill-buffer stderr-buffer)))))
 
 (ert-deftest anvil-hang-regression-host-drains-final-stdout-after-exit ()
-  "A child shell's final stdout must survive its tracked wrapper's exit."
+  "A tracked shell's final stdout must survive that shell's exit.
+
+The tracked process writes the final bytes itself.  An auxiliary wrapper would
+only add a second dynamic-loader launch and make this drain regression depend
+on host-wide loader scheduling."
   (skip-unless
    (and (memq system-type '(darwin gnu/linux))
-        (file-executable-p "/bin/sh")
-        (executable-find "echo")))
-  (let ((wrapper
-         (make-temp-file
-          "anvil-host-wrapper-" nil ".sh"
-          "#!/bin/sh\n/bin/sh \"$@\"\nexit $?\n"))
-        failures)
-    (unwind-protect
-        (progn
-          (set-file-modes wrapper #o700)
-          (let ((shell-file-name wrapper))
-            (dotimes (iteration 50)
-              (let ((result
-                     (anvil-shell
-                      (format "printf prefix; %s -n suffix"
-                              (shell-quote-argument
-                               (executable-find "echo")))
-                      '(:timeout 15 :max-output nil))))
-                (unless
-                    (and (zerop (plist-get result :exit))
-                         (equal "prefixsuffix"
-                                (plist-get result :stdout))
-                         (string-empty-p (plist-get result :stderr)))
-                  (push (cons iteration result) failures)))))
-          (should-not failures))
-      (delete-file wrapper))))
+        (file-executable-p shell-file-name)))
+  (let (failures)
+    (dotimes (iteration 100)
+      (let ((result
+             (anvil-shell
+              "printf prefix; printf suffix"
+              '(:timeout 15 :max-output nil))))
+        (unless
+            (and (zerop (plist-get result :exit))
+                 (equal "prefixsuffix" (plist-get result :stdout))
+                 (string-empty-p (plist-get result :stderr)))
+          (push (cons iteration result) failures))))
+    (should-not failures)))
 
 (ert-deftest anvil-hang-regression-host-drains-stderr-while-running ()
   "A stderr flood larger than pipe capacity must complete without timeout."

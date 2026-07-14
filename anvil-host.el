@@ -57,6 +57,18 @@ the shell child died.  Capped so a disowned descendant which
 inherits fd 2 (e.g. `setsid --fork') cannot extend
 `anvil-shell' beyond this budget.")
 
+(defvar anvil-host-child-process-environment nil
+  "Optional process environment used only while creating a shell child.")
+
+(defvar anvil-host-child-exec-path nil
+  "Optional executable path used only while creating a shell child.")
+
+(defvar anvil-host-child-shell-file-name nil
+  "Optional shell executable used only while creating a shell child.")
+
+(defvar anvil-host-child-shell-command-switch nil
+  "Optional shell command switch used only while creating a shell child.")
+
 (defun anvil-host--default-coding ()
   "Return the default coding system for shell I/O on this OS.
 Windows defaults to cp932-dos because wmic / systeminfo emit Shift_JIS
@@ -83,23 +95,17 @@ children; helpers we invoke (wmic / wl-copy / xclip / pbcopy /
 PowerShell / ...) are all fine with non-tty I/O and this keeps the
 captured stdout / stderr byte-accurate.
 
-Detach semantics (issue #10):  pipe mode alone does NOT let an
-arbitrary `& disown' descendant outlive the wrapper shell.
-`make-process' always calls `setsid()' for its direct child so the
-spawned shell is a session leader; fd 0 is inherited from Emacs'
-stdin, which on a typical desktop or server session is a pts/
-device — that becomes the shell's controlling TTY.  `& disown'
-keeps the background job in the shell's session (just hides it
-from `jobs'), so the kernel SIGHUPs it when the shell exits and
-releases the TTY.
+Pipe and detach semantics (issue #10): all three standard streams
+are pipes owned by Emacs.  This API has no stdin channel, so the
+process-input pipe is closed immediately after spawn.  A background
+descendant can still inherit stdout or stderr; the bounded wait and
+post-exit drain prevent those inherited descriptors from retaining
+the call indefinitely.
 
-The only reliable detach on Linux is `setsid --fork' (or
-equivalent double-fork), which moves the grandchild into a brand-
-new session with no controlling TTY.  That's what `wl-copy' /
-`pbcopy' / `xclip' already do internally for their clipboard-owner
-daemons, which is why clipboard set-then-read works over
-`anvil-shell' in practice.  Callers that need a detached descendant
-for other reasons should invoke `setsid --fork' explicitly.
+On Linux, callers that require a descendant to outlive its wrapper
+shell should use `setsid --fork' (or an equivalent double-fork).
+That creates a new session, as clipboard helpers such as `wl-copy'
+and `xclip' already do for their owner daemons.
 
 Stdout and stderr are serviced independently while waiting.
 Nonlocal exits delete both process objects and both temporary
@@ -114,19 +120,41 @@ buffers."
          stderr-proc)
     (unwind-protect
         (progn
-          (setq proc
-                (make-process
-                 :name "anvil-host-shell"
-                 :buffer stdout-buf
-                 :stderr stderr-buf
-                 :noquery t
-                 :connection-type 'pipe
-                 ;; Emacs's default process sentinel writes a status line
-                 ;; into the process buffer.  Silence it so stdout contains
-                 ;; only bytes produced by COMMAND.
-                 :sentinel #'ignore
-                 :command
-                 (list shell-file-name shell-command-switch command)))
+          ;; Dedicated backends may supply immutable child bindings.
+          ;; Keep the dynamic scope as narrow as make-process itself: the
+          ;; accept loop below must run in the root daemon's baseline
+          ;; environment so timers and concurrent requests cannot inherit a
+          ;; project's direnv state.
+          (let ((process-environment
+                 (or anvil-host-child-process-environment
+                     process-environment))
+                (exec-path (or anvil-host-child-exec-path exec-path))
+                (shell-file-name
+                 (or anvil-host-child-shell-file-name shell-file-name))
+                (shell-command-switch
+                 (or anvil-host-child-shell-command-switch
+                     shell-command-switch)))
+            (setq proc
+                  (make-process
+                   :name "anvil-host-shell"
+                   :buffer stdout-buf
+                   :stderr stderr-buf
+                   :noquery t
+                   :connection-type 'pipe
+                   ;; Emacs's default process sentinel writes a status line
+                   ;; into the process buffer.  Silence it so stdout contains
+                   ;; only bytes produced by COMMAND.
+                   :sentinel #'ignore
+                   :command
+                   (list shell-file-name shell-command-switch command))))
+          ;; The shell API has no stdin channel.  Close the pipe immediately so
+          ;; commands that auto-read non-TTY stdin observe EOF instead of
+          ;; retaining the root event loop until the tool timeout.
+          (condition-case error
+              (process-send-eof proc)
+            (error
+             (when (process-live-p proc)
+               (signal (car error) (cdr error)))))
           ;; make-process represents stderr with an independent pipe process.
           ;; It needs its own sentinel and must be serviced separately.
           (setq stderr-proc (get-buffer-process stderr-buf))
