@@ -932,6 +932,39 @@ Pipeline order under test:
         (should-not (plist-get result :filter))
         (should (equal "one\ntwo\nthree" (plist-get result :compressed)))))))
 
+(ert-deftest anvil-shell-filter-test/sync-timeout-cap-precedes-spawn ()
+  "Oversize shell-run requests fail before starting a child."
+  (let ((anvil-shell-filter-max-sync-timeout 2)
+        shell-called
+        timeout-seen)
+    (cl-letf (((symbol-function 'anvil-shell)
+               (lambda (_cmd opts)
+                 (setq shell-called t
+                       timeout-seen (plist-get opts :timeout))
+                 '(:exit 0 :stdout "" :stderr "")))
+              ((symbol-function 'anvil-shell-filter--tee-put)
+               (lambda (_raw) "test-tee")))
+      (should-error (anvil-shell-filter-run "true" :timeout 3)
+                    :type 'user-error)
+      (should-not shell-called)
+      (let ((result (anvil-shell-filter-run "true" :timeout 2)))
+        (should shell-called)
+        (should (= 2 timeout-seen))
+        (should (zerop (plist-get result :exit)))))))
+
+(ert-deftest anvil-shell-filter-test/tee-grep-honors-sync-timeout-cap ()
+  "Oversize tee-grep requests fail before starting a child."
+  (let ((anvil-shell-filter-max-sync-timeout 2)
+        shell-called)
+    (cl-letf (((symbol-function 'anvil-shell)
+               (lambda (&rest _args)
+                 (setq shell-called t)
+                 '(:exit 0 :stdout "" :stderr ""))))
+      (should-error
+       (anvil-shell-filter-tee-grep "true" :grep "x" :timeout 3)
+       :type 'user-error)
+      (should-not shell-called))))
+
 
 (provide 'anvil-shell-filter-test)
 
