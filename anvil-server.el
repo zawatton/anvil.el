@@ -678,16 +678,28 @@ standalone nelisp)."
 ;; not the full JSON-RPC wrapper, because the wrapper's `id' varies per
 ;; call.  The wrapper concat is constant-time string assembly.
 (defvar anvil-server--tools-list-cache (make-hash-table :test 'equal)
-  "Hash table mapping server-id → JSON string of cached `result' object.
+  "Hash table mapping (VIRTUAL-ID . RESOLVED-ID) to cached JSON.
 The stored string is the JSON-encoded `((tools . [...]))' alist, with no
-outer JSON-RPC wrapper.  Cleared per server-id by
+outer JSON-RPC wrapper.  Cleared for every alias of a changed server-id by
 `anvil-server--tools-list-cache-invalidate' when tools register /
 unregister.")
 
 (defun anvil-server--tools-list-cache-invalidate (&optional server-id)
-  "Drop the tools/list cache entry for SERVER-ID (or every entry if nil)."
+  "Drop tools/list cache entries involving SERVER-ID, or every entry if nil.
+SERVER-ID may be either a virtual or resolved registry id.  Invalidating a
+resolved id also removes every cached virtual alias of that registry."
   (if server-id
-      (remhash server-id anvil-server--tools-list-cache)
+      (let (stale-keys)
+        (maphash
+         (lambda (key _value)
+           (when (or (equal key server-id)
+                     (and (consp key)
+                          (or (equal (car key) server-id)
+                              (equal (cdr key) server-id))))
+             (push key stale-keys)))
+         anvil-server--tools-list-cache)
+        (dolist (key stale-keys)
+          (remhash key anvil-server--tools-list-cache)))
     (clrhash anvil-server--tools-list-cache)))
 
 (defun anvil-server--jsonrpc-response-from-result-json (id result-json)
@@ -1533,16 +1545,11 @@ server-id in `anvil-server--tools-list-cache' and skips full
 json-encode on subsequent calls.  The cache is invalidated by
 register / unregister."
   (let* ((resolved-id (anvil-server--resolve-id server-id))
-         ;; Filter function may have stateful side effects keyed off
-         ;; the *virtual* server-id (= unresolved).  We still cache
-         ;; by resolved-id because the maphash domain (= tools table)
-         ;; is shared across virtual ids that alias the same real id;
-         ;; per-virtual filter selectivity does not change the tool
-         ;; metadata included for a given resolved-id.  If a filter
-         ;; that legitimately varies output by virtual id is wired,
-         ;; switch this key to (cons server-id resolved-id) and add
-         ;; matching `remhash' calls in the invalidate helper.
-         (cache-key (format "%s->%s" server-id resolved-id))
+         ;; Filters receive the unresolved virtual id and may intentionally
+         ;; expose a different profile per alias, so the cache key retains
+         ;; both virtual and resolved ids.  The invalidator removes every key
+         ;; whose resolved component changes.
+         (cache-key (cons server-id resolved-id))
          ;; Fragment transformers can depend on dynamic query / LRU /
          ;; state-filter context, so cached result JSON would be stale.
          (cached (and (null anvil-server-tool-fragment-function)
