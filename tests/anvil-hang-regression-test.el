@@ -225,7 +225,8 @@ future first."
             (anvil-offload--sentinel proc "finished\n"))
           (should deferred)
           (should (eq 'pending (anvil-future-status future)))
-          (anvil-offload--dispatch-reply (list :id id :ok 'late-reply))
+          (anvil-offload--dispatch-reply
+           proc (list :id id :ok 'late-reply))
           (apply (nth 2 deferred) (nthcdr 3 deferred))
           (should (eq 'done (anvil-future-status future)))
           (should (eq 'late-reply (anvil-future-value future))))

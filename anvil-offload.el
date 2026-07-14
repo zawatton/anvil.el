@@ -21,7 +21,9 @@
 ;; Public API:
 ;;   (anvil-offload FORM &rest KEYS)
 ;;       Returns an `anvil-future'.  FORM evaluates in the REPL.
-;;       KEYS :require, :load-path, :timeout, :env.
+;;       KEYS :require, :load-path, :isolated, :on-start, :on-settle,
+;;       :process-environment, :exec-path, :default-directory,
+;;       :shell-file-name, :shell-command-switch, :exact-load-path.
 ;;   (anvil-future-done-p FUTURE)
 ;;   (anvil-future-await FUTURE &optional TIMEOUT)
 ;;   (anvil-future-value FUTURE)
@@ -60,7 +62,16 @@
   :group 'anvil
   :prefix "anvil-offload-")
 
-(defcustom anvil-offload-emacs-bin (or (executable-find "emacs") "emacs")
+(defcustom anvil-offload-emacs-bin
+  (let ((invoked-emacs
+         (and (stringp invocation-name)
+              (stringp invocation-directory)
+              (expand-file-name invocation-name invocation-directory))))
+    (or (and invoked-emacs
+             (file-executable-p invoked-emacs)
+             invoked-emacs)
+        (executable-find "emacs")
+        "emacs"))
   "Emacs binary used to spawn the offload REPL."
   :type 'file
   :group 'anvil-offload)
@@ -84,6 +95,34 @@ is the Phase 1 behaviour.  Changes take effect after the next
   :type 'integer
   :group 'anvil-offload)
 
+(defcustom anvil-offload-max-frame-bytes (* 2 1024 1024)
+  "Maximum bytes accepted for one offload protocol frame.
+An over-limit frame fails every future owned by that subprocess and
+terminates it before base64 decoding or Lisp reading can monopolize
+the host Emacs."
+  :type 'integer
+  :group 'anvil-offload)
+
+(defcustom anvil-offload-init-files nil
+  "Files loaded in every offload subprocess before the REPL loop.
+Dedicated backends use this to install a controlled environment.  Isolated
+children start with `-Q' and do not clone live functions, features, buffers,
+or buffer-local state from the root Emacs; list explicit initializer files
+here when child expressions require that configuration.  Request-local
+environment, directory, executable, shell, and load-path bindings are
+transported separately around each submitted form."
+  :type '(repeat file)
+  :group 'anvil-offload)
+
+(defcustom anvil-offload-spawn-environment-function nil
+  "Optional function returning `process-environment' for child spawn.
+The function is called immediately before `make-process'.  A nil
+return means to copy the caller's current environment.  Request-local
+environment bindings are transported separately and never affect
+subprocess creation."
+  :type '(choice (const :tag "Inherit caller environment" nil) function)
+  :group 'anvil-offload)
+
 ;;; State
 
 (defvar anvil-offload--pool nil
@@ -102,10 +141,13 @@ was initialised.  Each slot is either a live `make-process' or nil
   "Hash table mapping request-id → `anvil-future'.
 Created lazily in `anvil-offload--ensure-pending'.")
 
+(defvar anvil-offload--isolated-processes nil
+  "Hash table of one-shot subprocesses owned by isolated futures.")
+
 (defvar anvil-offload--repl-init-file nil
   "Path to the generated REPL init file, or nil if not yet written.")
 
-(defconst anvil-offload--protocol-version 2
+(defconst anvil-offload--protocol-version 3
   "Wire-format version spoken by the offload REPL pool.")
 
 (defconst anvil-offload--frame-prefix "ANVIL-OFFLOAD "
@@ -153,6 +195,52 @@ Created lazily in `anvil-offload--ensure-pending'.")
   (or anvil-offload--pending
       (setq anvil-offload--pending (make-hash-table :test 'eql))))
 
+(defun anvil-offload--ensure-isolated-processes ()
+  "Return the isolated-process table, creating it if needed."
+  (or (and (hash-table-p anvil-offload--isolated-processes)
+           anvil-offload--isolated-processes)
+      (setq anvil-offload--isolated-processes
+            (make-hash-table :test 'eq))))
+
+(defun anvil-offload--hard-delete-process (proc)
+  "Hard-delete the exact owned subprocess PROC.
+Pool and isolated-process tracking are cleared only after PROC is
+observed dead.  If either termination operation signals or PROC stays
+live, retain its tracking so an owned live child cannot become orphaned."
+  (when (processp proc)
+    (let (termination-errors)
+      (when (process-live-p proc)
+        (let ((inhibit-quit t))
+          (condition-case err
+              (kill-process proc)
+            ((error quit)
+             (push (format "kill-process: %s" (error-message-string err))
+                   termination-errors)))
+          (when (process-live-p proc)
+            (condition-case err
+                (delete-process proc)
+              ((error quit)
+               (push (format "delete-process: %s"
+                             (error-message-string err))
+                     termination-errors))))))
+      (if (or termination-errors (process-live-p proc))
+          (progn
+            (message
+             "anvil-offload: child %s remains tracked after failed hard delete%s"
+             (process-name proc)
+             (if termination-errors
+                 (format ": %s"
+                         (string-join (nreverse termination-errors) "; "))
+               ""))
+            nil)
+        (when anvil-offload--pool
+          (dotimes (i (length anvil-offload--pool))
+            (when (eq proc (aref anvil-offload--pool i))
+              (aset anvil-offload--pool i nil))))
+        (when (hash-table-p anvil-offload--isolated-processes)
+          (remhash proc anvil-offload--isolated-processes))
+        t))))
+
 ;;; REPL init file
 
 (defconst anvil-offload--repl-body
@@ -184,6 +272,7 @@ has the latest partial state if the call is killed over budget.\"
       (let* ((msg (read t))
              (id (and (listp msg) (plist-get msg :id)))
              (payload (and (listp msg) (plist-get msg :payload)))
+             (quit-after (and (listp msg) (plist-get msg :quit-after)))
              (form (and payload
                         (car (read-from-string
                               (decode-coding-string
@@ -191,6 +280,8 @@ has the latest partial state if the call is killed over budget.\"
                                'utf-8-unix))))))
         (when id
           (let* ((anvil-offload--repl-current-id id)
+                 (_started
+                  (anvil-offload--emit-frame (list :id id :started t)))
                  (reply
                   (condition-case err
                       (list :id id
@@ -199,7 +290,9 @@ has the latest partial state if the call is killed over budget.\"
                               (let ((standard-output (current-buffer)))
                                 (eval form t))))
                     (error (list :id id :error (format \"%%S\" err))))))
-            (anvil-offload--emit-frame reply)))))
+            (anvil-offload--emit-frame reply)
+            (when quit-after
+              (kill-emacs 0))))))
   (end-of-file (kill-emacs 0)))
 " anvil-offload--frame-prefix)
   "Body of the REPL loop written into the subprocess init file.")
@@ -227,11 +320,60 @@ has the latest partial state if the call is killed over budget.\"
   result
   err
   checkpoint             ; latest (:value V :cursor C) from subprocess, or nil
+  started-at
+  terminal-reason
+  isolated-p
+  on-start
+  on-settle
   (created-at (float-time))
   done-at)
 
+(defun anvil-offload--invoke-callback (future callback event)
+  "Invoke CALLBACK for FUTURE, containing errors and quits from filters.
+EVENT is a diagnostic symbol used only in the error message."
+  (when callback
+    (condition-case err
+        (funcall callback future)
+      ((error quit)
+       (message "anvil-offload: %s callback failed for %s: %s"
+                event (anvil-future--id future)
+                (error-message-string err))))))
+
+(defun anvil-offload--mark-started (future)
+  "Mark pending FUTURE started and notify its start callback once."
+  (when (and (eq 'pending (anvil-future--status future))
+             (null (anvil-future--started-at future)))
+    (setf (anvil-future--started-at future) (float-time))
+    (let ((callback (anvil-future--on-start future))
+          completed)
+      (setf (anvil-future--on-start future) nil)
+      (unwind-protect
+          (progn
+            (anvil-offload--invoke-callback future callback 'start)
+            (setq completed t))
+        (unless completed
+          (anvil-future-kill future 'start-callback-aborted)))))
+  future)
+
+(defun anvil-offload--settle (future status &optional payload reason)
+  "Settle pending FUTURE once with STATUS, PAYLOAD, and REASON.
+STATUS is one of `done', `error', `cancelled', or `killed'."
+  (when (eq 'pending (anvil-future--status future))
+    (remhash (anvil-future--id future) (anvil-offload--ensure-pending))
+    (setf (anvil-future--status future) status
+          (anvil-future--terminal-reason future) reason
+          (anvil-future--done-at future) (float-time))
+    (pcase status
+      ('done (setf (anvil-future--result future) payload))
+      ((or 'error 'killed) (setf (anvil-future--err future) payload)))
+    (let ((callback (anvil-future--on-settle future)))
+      (setf (anvil-future--on-start future) nil
+            (anvil-future--on-settle future) nil)
+      (anvil-offload--invoke-callback future callback 'settle))
+    t))
+
 (defun anvil-future-status (future)
-  "Return the status symbol of FUTURE (pending/done/error/cancelled)."
+  "Return FUTURE's status (pending/done/error/cancelled/killed)."
   (anvil-future--status future))
 
 (defun anvil-future-checkpoint (future)
@@ -241,11 +383,11 @@ last handed to `anvil-preempt-checkpoint' inside the REPL."
   (anvil-future--checkpoint future))
 
 (defun anvil-future-done-p (future)
-  "Non-nil when FUTURE has settled (done/error/cancelled)."
+  "Non-nil when FUTURE has settled (done/error/cancelled/killed)."
   (not (eq (anvil-future--status future) 'pending)))
 
 (defun anvil-future-value (future)
-  "Return the value of FUTURE; signal if errored, cancelled, or pending."
+  "Return FUTURE's value; signal if errored, killed, cancelled, or pending."
   (pcase (anvil-future--status future)
     ('done      (anvil-future--result future))
     ('error     (error "anvil-offload: remote error: %s"
@@ -298,13 +440,10 @@ fallback timer."
 The subprocess keeps running; its eventual reply is silently
 discarded.  To hard-stop offload work, call `anvil-future-kill'
 \(per-future) or `anvil-offload-stop-repl' (whole pool)."
-  (when (eq 'pending (anvil-future--status future))
-    (remhash (anvil-future--id future) (anvil-offload--ensure-pending))
-    (setf (anvil-future--status future) 'cancelled
-          (anvil-future--done-at future) (float-time)))
+  (anvil-offload--settle future 'cancelled nil 'cancelled)
   future)
 
-(defun anvil-future-kill (future)
+(defun anvil-future-kill (future &optional reason)
   "Hard-kill the subprocess slot owning pending FUTURE.
 Unlike `anvil-future-cancel', this terminates the REPL process so a
 runaway call cannot keep tying up its pool slot.  The future is
@@ -316,23 +455,18 @@ The elapsed wall time (seconds since the future's `created-at') is
 stored in `anvil-future--err'.  Repeated calls are idempotent.  Return
 FUTURE."
   (when (eq 'pending (anvil-future--status future))
-    (let ((proc (anvil-future--process future))
-          (elapsed (- (float-time) (anvil-future--created-at future))))
+    (let* ((proc (anvil-future--process future))
+           (elapsed (- (float-time) (anvil-future--created-at future)))
+           (message (if reason
+                        (format "%s after %.2fs" reason elapsed)
+                      (format "killed after %.2fs" elapsed))))
       ;; Settle locally before signalling the child.  A synchronous
       ;; sentinel/filter callback can no longer race this future into a
       ;; different terminal state.
-      (remhash (anvil-future--id future)
-               (anvil-offload--ensure-pending))
-      (setf (anvil-future--status future) 'killed
-            (anvil-future--err future)
-            (format "killed after %.2fs" elapsed)
-            (anvil-future--done-at future) (float-time))
-      (when anvil-offload--pool
-        (dotimes (i (length anvil-offload--pool))
-          (when (eq proc (aref anvil-offload--pool i))
-            (aset anvil-offload--pool i nil))))
-      (when (and proc (process-live-p proc))
-        (ignore-errors (kill-process proc)))))
+      (unwind-protect
+          (anvil-offload--settle
+           future 'killed message (or reason 'killed))
+        (anvil-offload--hard-delete-process proc))))
   future)
 
 (defun anvil-future-elapsed (future)
@@ -366,68 +500,126 @@ unconditionally.  Returns VALUE."
              "\n")))
   value)
 
-(defun anvil-offload--dispatch-reply (msg)
-  "Route decoded reply MSG to its registered future, if any.
-Checkpoint messages update `checkpoint' on the pending future but
-do not settle it; `:ok'/`:error' replies settle and dehashref."
+(defun anvil-offload--settle-reply
+    (proc future status payload reason)
+  "Settle FUTURE from PROC and hard-delete a terminal isolated child."
+  (let (settled)
+    (unwind-protect
+        (setq settled
+              (anvil-offload--settle future status payload reason))
+      ;; The child has already flushed a complete terminal frame.  Delete the
+      ;; exact one-shot process here instead of trusting its subsequent
+      ;; `kill-emacs': evaluated code or initializer files may install a
+      ;; blocking exit hook, and a completed job no longer owns a deadline.
+      ;; This cleanup must also survive a tagged nonlocal exit from a public
+      ;; callback invoked during settlement.
+      (when (and (anvil-future--isolated-p future)
+                 (eq proc (anvil-future--process future)))
+        (anvil-offload--hard-delete-process proc)))
+    settled))
+
+(defun anvil-offload--dispatch-reply (proc msg)
+  "Route decoded reply MSG from PROC to its registered future, if any.
+Every started, checkpoint, and terminal frame is accepted only from the
+process that owns its request id.  Terminal replies hard-delete an isolated
+one-shot child after settlement."
   (when (listp msg)
     (let* ((id (plist-get msg :id))
            (table (anvil-offload--ensure-pending))
            (future (and id (gethash id table))))
       (when future
-        (cond
-         ((plist-member msg :checkpoint)
-          (setf (anvil-future--checkpoint future)
-                (plist-get msg :checkpoint)))
-         ((plist-member msg :ok)
-          (remhash id table)
-          (setf (anvil-future--status future) 'done
-                (anvil-future--result future) (plist-get msg :ok)
-                (anvil-future--done-at future) (float-time)))
-         ((plist-member msg :error)
-          (remhash id table)
-          (setf (anvil-future--status future) 'error
-                (anvil-future--err future) (plist-get msg :error)
-                (anvil-future--done-at future) (float-time))))))))
+        (if (not (eq proc (anvil-future--process future)))
+            (unless (process-get proc 'anvil-owner-mismatch-logged)
+              (process-put proc 'anvil-owner-mismatch-logged t)
+              (message "anvil-offload: ignored request %s frame from %s"
+                       id (process-name proc)))
+          (cond
+           ((plist-member msg :started)
+            (anvil-offload--mark-started future))
+           ((plist-member msg :checkpoint)
+            (setf (anvil-future--checkpoint future)
+                  (plist-get msg :checkpoint)))
+           ((plist-member msg :ok)
+            (anvil-offload--settle-reply
+             proc future 'done (plist-get msg :ok) 'done))
+           ((plist-member msg :error)
+            (anvil-offload--settle-reply
+             proc future 'error (plist-get msg :error) 'remote-error))))))))
 
 (defun anvil-offload--filter (proc string)
-  "Accumulate STRING bytes on PROC and dispatch complete framed replies."
+  "Accumulate STRING bytes on PROC and dispatch complete framed replies.
+The byte ceiling applies to each newline-terminated frame and to the one
+unterminated remainder, not to an arbitrary process-filter chunk that may
+coalesce several independently valid frames."
   (let ((buf (concat (or (process-get proc 'anvil-pending-bytes) "") string))
         (prefix-re (regexp-quote anvil-offload--frame-prefix))
-        line-end)
-    (while (setq line-end (string-match "\n" buf))
-      (let ((line (anvil-offload--strip-ignored-junk-prefixes
-                   (substring buf 0 line-end))))
+        line-end failure)
+    (while (and (null failure)
+                (setq line-end (string-match "\n" buf)))
+      (let ((raw-line (substring buf 0 line-end)))
         (setq buf (substring buf (1+ line-end)))
-        (unless (string-blank-p line)
-          (let ((idx (string-match prefix-re line)))
-            (cond
-             ((null idx)
-              (message "anvil-offload: dropped junk reply line: %S"
-                       (anvil-offload--line-preview line)))
-             (t
-              (condition-case err
-                  (anvil-offload--dispatch-reply
-                   (car
-                    (read-from-string
-                     (anvil-offload--frame-decode-payload
-                      (substring line (+ idx (length anvil-offload--frame-prefix)))))))
-                (error
-                 (message "anvil-offload: unreadable reply frame: %s" err)))))))))
-    (process-put proc 'anvil-pending-bytes buf)))
+        (if (> (1+ (string-bytes raw-line))
+               anvil-offload-max-frame-bytes)
+            (setq failure
+                  (format "offload frame exceeded %d-byte limit"
+                          anvil-offload-max-frame-bytes))
+          (let ((line (anvil-offload--strip-ignored-junk-prefixes raw-line)))
+            (unless (string-blank-p line)
+              (let ((idx (string-match prefix-re line)))
+                (cond
+                 ((null idx)
+                  (unless (process-get proc 'anvil-junk-reply-logged)
+                    (process-put proc 'anvil-junk-reply-logged t)
+                    (message "anvil-offload: dropped junk reply line: %S"
+                             (anvil-offload--line-preview line))))
+                 (t
+                  (condition-case err
+                      (anvil-offload--dispatch-reply
+                       proc
+                       (car
+                        (read-from-string
+                         (anvil-offload--frame-decode-payload
+                          (substring
+                           line
+                           (+ idx (length anvil-offload--frame-prefix)))))))
+                    (error
+                     (message "anvil-offload: unreadable reply frame: %s"
+                              err)))))))))))
+    (when (and (null failure)
+               (> (string-bytes buf) anvil-offload-max-frame-bytes))
+      (setq failure
+            (format "offload frame exceeded %d-byte limit"
+                    anvil-offload-max-frame-bytes)))
+    (if failure
+        (progn
+          (process-put proc 'anvil-pending-bytes "")
+          (unwind-protect
+              (anvil-offload--finalize-dead-process proc failure)
+            (anvil-offload--hard-delete-process proc)))
+      (process-put proc 'anvil-pending-bytes buf))))
 
 (defun anvil-offload--finalize-dead-process (proc reason)
   "Settle pending futures still owned by dead PROC with REASON."
-  (let ((table (anvil-offload--ensure-pending)))
+  (let ((table (anvil-offload--ensure-pending))
+        futures)
     (maphash
-     (lambda (id future)
+     (lambda (_id future)
        (when (and (eq proc (anvil-future--process future))
                   (eq 'pending (anvil-future--status future)))
-         (setf (anvil-future--status future) 'error
-               (anvil-future--err future) reason
-               (anvil-future--done-at future) (float-time))
-         (remhash id table)))
-     table)))
+         (push future futures)))
+     table)
+    (unwind-protect
+        (dolist (future futures)
+          (anvil-offload--settle future 'error reason 'child-exit))
+      ;; A tagged nonlocal exit from one public callback must not leave sibling
+      ;; futures pending forever on a process that is already dead.  Their
+      ;; callbacks cannot safely run while unwinding, but their terminal state
+      ;; and pending-table cleanup are mandatory.
+      (dolist (future futures)
+        (when (eq 'pending (anvil-future--status future))
+          (setf (anvil-future--on-start future) nil
+                (anvil-future--on-settle future) nil)
+          (anvil-offload--settle future 'error reason 'child-exit))))))
 
 (defun anvil-offload--sentinel (proc event)
   "Handle death of PROC; fail only the pending futures bound to PROC.
@@ -442,26 +634,38 @@ the new REPL's pending futures.  EVENT describes the process status."
       ;; performs this finalization synchronously after it has serviced
       ;; PROC, so this timer is an idempotent fallback for other callers.
       (run-at-time 0 nil #'anvil-offload--finalize-dead-process proc reason))
+    (remhash proc (anvil-offload--ensure-isolated-processes))
     ;; Clear the dying slot so the next dispatch respawns it.
     (when anvil-offload--pool
       (dotimes (i (length anvil-offload--pool))
         (when (eq proc (aref anvil-offload--pool i))
-          (aset anvil-offload--pool i nil))))))
+          (aset anvil-offload--pool i nil))))
+    (when (process-get proc 'anvil-offload-isolated)
+      (when-let ((buffer (process-buffer proc)))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
 
 ;;; Pool lifecycle
 
-(defun anvil-offload--spawn-process (slot-index)
-  "Spawn a fresh REPL subprocess tagged for SLOT-INDEX.
-The tag only influences the process name / buffer name — it is
-diagnostic, not load-bearing for dispatch."
-  (let* ((init-file (anvil-offload--repl-init-file))
-         (name (format "anvil-offload-repl-%d" slot-index))
+(defun anvil-offload--process-command ()
+  "Return the command used for an offload subprocess."
+  (append
+   (list anvil-offload-emacs-bin "-Q" "--batch")
+   (cl-mapcan (lambda (file) (list "-l" file)) anvil-offload-init-files)
+   (list "-l" (anvil-offload--repl-init-file))))
+
+(defun anvil-offload--spawn-named-process (name &optional isolated)
+  "Spawn a REPL subprocess named NAME.
+When ISOLATED is non-nil, record it as a one-shot owned process."
+  (let* ((candidate
+          (and anvil-offload-spawn-environment-function
+               (funcall anvil-offload-spawn-environment-function)))
+         (process-environment
+          (copy-sequence (or candidate process-environment)))
          (proc (make-process
                 :name name
                 :buffer (get-buffer-create (format " *%s*" name))
-                :command (list anvil-offload-emacs-bin
-                               "--batch"
-                               "-l" init-file)
+                :command (anvil-offload--process-command)
                 :connection-type 'pipe
                 :coding 'utf-8-unix
                 :noquery t
@@ -470,7 +674,20 @@ diagnostic, not load-bearing for dispatch."
     (process-put proc 'anvil-pending-bytes "")
     (process-put proc 'anvil-offload-protocol-version
                  anvil-offload--protocol-version)
+    (when isolated
+      (process-put proc 'anvil-offload-isolated t)
+      (puthash proc t (anvil-offload--ensure-isolated-processes)))
     proc))
+
+(defun anvil-offload--spawn-process (slot-index)
+  "Spawn a fresh pooled REPL subprocess tagged for SLOT-INDEX."
+  (anvil-offload--spawn-named-process
+   (format "anvil-offload-repl-%d" slot-index)))
+
+(defun anvil-offload--spawn-isolated-process (request-id)
+  "Spawn a one-shot REPL subprocess for REQUEST-ID."
+  (anvil-offload--spawn-named-process
+   (format "anvil-offload-job-%d" request-id) t))
 
 (defun anvil-offload--ensure-pool-vector ()
   "Ensure `anvil-offload--pool' is a vector sized to the current size."
@@ -507,7 +724,7 @@ diagnostic, not load-bearing for dispatch."
 
 ;;;###autoload
 (defun anvil-offload-stop-repl ()
-  "Terminate every REPL in the pool and clear the vector.
+  "Terminate every pooled and isolated REPL and clear owned state.
 Pending futures bound to those processes settle as errored via
 `anvil-offload--sentinel'.  The next `anvil-offload' call will
 rebuild the pool using the current `anvil-offload-pool-size'."
@@ -518,7 +735,15 @@ rebuild the pool using the current `anvil-offload-pool-size'."
         (when (and p (process-live-p p))
           (kill-process p))
         (aset anvil-offload--pool i nil))))
-  (setq anvil-offload--pool nil))
+  (setq anvil-offload--pool nil)
+  (when (hash-table-p anvil-offload--isolated-processes)
+    (let (processes)
+      (maphash (lambda (proc _value) (push proc processes))
+               anvil-offload--isolated-processes)
+      (dolist (proc processes)
+        (when (process-live-p proc)
+          (ignore-errors (kill-process proc)))))
+    (clrhash anvil-offload--isolated-processes)))
 
 ;;;###autoload
 (defun anvil-offload-repl-alive-p ()
@@ -554,9 +779,25 @@ in the subprocess.  Returns a list of forms (possibly empty)."
                              requires)))))
     (append
      (and extra-load-path
-          (list `(dolist (d ',extra-load-path)
+          ;; `add-to-list' prepends, so emit the additions in reverse to
+          ;; preserve the caller's left-to-right search precedence.
+          (list `(dolist (d ',(reverse extra-load-path))
                    (add-to-list 'load-path d))))
      (mapcar (lambda (f) `(require ',f)) features))))
+
+(defun anvil-offload--bind-context (form keys)
+  "Wrap FORM in request-local dynamic bindings selected from KEYS."
+  (let (bindings)
+    (dolist (entry '((:process-environment . process-environment)
+                     (:exec-path . exec-path)
+                     (:default-directory . default-directory)
+                     (:shell-file-name . shell-file-name)
+                     (:shell-command-switch . shell-command-switch)
+                     (:exact-load-path . load-path)))
+      (when (plist-member keys (car entry))
+        (push (list (cdr entry) (list 'quote (plist-get keys (car entry))))
+              bindings)))
+    (if bindings `(let ,(nreverse bindings) ,form) form)))
 
 ;;;###autoload
 (cl-defun anvil-offload (form &rest keys)
@@ -564,35 +805,73 @@ in the subprocess.  Returns a list of forms (possibly empty)."
 
 FORM is sent as a single S-expression.  The subprocess evaluates
 its printed form via a base64 payload inside the request sexp.  The
-subprocess evaluates it with lexical binding and sends back either `(:id N :ok VALUE)'
-or `(:id N :error MSG)'.  The main daemon never blocks.
+subprocess evaluates it with lexical binding and sends back either
+`(:id N :ok VALUE)' or `(:id N :error MSG)'.  The main daemon never
+blocks.
 
 Keyword arguments:
   :require FEATURES   Symbol or list of symbols to `require' in the
                       subprocess before FORM is evaluated.
   :load-path DIRS     List of directories prepended to `load-path'
                       in the subprocess (applied before :require).
-  :timeout SECONDS    Reserved for Phase 3 preemption.
-  :env PLIST          Reserved.
+  :isolated BOOL      Use a fresh one-shot subprocess owned only by
+                      this future.
+  :on-start FN        Called once with the future before evaluation.
+  :on-settle FN       Called once with the terminal future.
+  :process-environment, :exec-path, :default-directory,
+  :shell-file-name, :shell-command-switch
+                      Request-local bindings in the subprocess.
+  :exact-load-path DIRS
+                      Replace `load-path' exactly around FORM.  This is used
+                      by isolated async evaluation to preserve request search
+                      precedence; ordinary callers normally use :load-path.
 
 Dispatch uses round-robin across the pool (`anvil-offload-pool-size')."
   (let* ((requires (plist-get keys :require))
          (extra-load-path (plist-get keys :load-path))
          (preamble (anvil-offload--build-preamble requires extra-load-path))
-         (full-form (if preamble `(progn ,@preamble ,form) form))
-         (proc (anvil-offload--pick-worker))
          (id (cl-incf anvil-offload--next-id))
+         (isolated (plist-get keys :isolated))
+         (context-form (anvil-offload--bind-context form keys))
+         (full-form
+          (if preamble `(progn ,@preamble ,context-form) context-form))
+         (proc (if isolated
+                   (anvil-offload--spawn-isolated-process id)
+                 (anvil-offload--pick-worker)))
          (future (make-anvil-future
-                  :id id :process proc :status 'pending)))
+                  :id id
+                  :process proc
+                  :status 'pending
+                  :isolated-p isolated
+                  :on-start (plist-get keys :on-start)
+                  :on-settle (plist-get keys :on-settle))))
     (puthash id future (anvil-offload--ensure-pending))
-    (process-send-string proc
-                         (concat (prin1-to-string
-                                  (list :id id
-                                        :payload
-                                        (anvil-offload--frame-encode-payload
-                                         (prin1-to-string full-form))))
-                                 "\n"))
+    (condition-case err
+        (process-send-string
+         proc
+         (concat
+          (prin1-to-string
+           (list :id id
+                 :quit-after (and isolated t)
+                 :payload
+                 (anvil-offload--frame-encode-payload
+                  (let ((print-circle t)) (prin1-to-string full-form)))))
+          "\n"))
+      (error
+       (unwind-protect
+           (progn
+             (anvil-offload--settle
+              future 'error (format "offload send failed: %s"
+                                    (error-message-string err))
+              'send-error)
+             (signal (car err) (cdr err)))
+         (anvil-offload--hard-delete-process proc))))
     future))
+
+;;;###autoload
+(cl-defun anvil-offload-isolated (form &rest keys)
+  "Evaluate FORM in a fresh one-shot subprocess and return its future."
+  (apply #'anvil-offload form :isolated t keys))
 
 ;;; Module enable / disable (for `anvil-enable' integration)
 
