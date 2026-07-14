@@ -365,12 +365,12 @@ Disable health timer + spawning so no real subprocesses start."
           (should (member "/tmp/sf" call)))))))
 
 (ert-deftest anvil-worker-test-emacsclient-server-args-tcp-vs-socket ()
-  "`anvil-worker--emacsclient-server-args' picks `-s' for Unix sockets, `-f' for TCP."
+  "Worker clients fail closed and select the right endpoint option."
   (let ((server-use-tcp nil))
-    (should (equal '("-s" "/tmp/sf")
+    (should (equal '("-a" "false" "-s" "/tmp/sf")
                    (anvil-worker--emacsclient-server-args "/tmp/sf"))))
   (let ((server-use-tcp t))
-    (should (equal '("-f" "/tmp/sf")
+    (should (equal '("-a" "false" "-f" "/tmp/sf")
                    (anvil-worker--emacsclient-server-args "/tmp/sf")))))
 
 (ert-deftest anvil-worker-test-maybe-schedule-warmup-only-batch ()
