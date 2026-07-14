@@ -90,8 +90,8 @@
   "Number of REPL subprocesses in the offload pool.
 Round-robin dispatch spreads offload requests across live slots;
 futures bound to distinct slots execute in parallel.  Default 1
-is the Phase 1 behaviour.  Changes take effect after the next
-`anvil-offload-stop-repl'."
+is the Phase 1 behaviour.  A size change retires the old pool before
+the next dispatch; dispatch fails closed until every old child exits."
   :type 'integer
   :group 'anvil-offload)
 
@@ -130,6 +130,9 @@ subprocess creation."
 Length matches `anvil-offload-pool-size' at the moment the pool
 was initialised.  Each slot is either a live `make-process' or nil
 \(unspawned / died and not yet respawned).")
+
+(defvar anvil-offload--pool-retiring-p nil
+  "Non-nil while old pooled children must not receive new requests.")
 
 (defvar anvil-offload--round-robin 0
   "Rolling index for pool dispatch.")
@@ -691,21 +694,27 @@ When ISOLATED is non-nil, record it as a one-shot owned process."
    (format "anvil-offload-job-%d" request-id) t))
 
 (defun anvil-offload--ensure-pool-vector ()
-  "Ensure `anvil-offload--pool' is sized to the current pool size.
-When an old child resists termination, retain the old vector so its
-sole ownership reference is not lost; a later call retries the resize."
+  "Return a dispatchable pool sized to `anvil-offload-pool-size'.
+A size change retires every old child first.  If any child resists
+termination, retain its ownership reference and fail closed until a
+later call completes retirement; no old or partially rebuilt slot can
+receive a new request."
   (let ((n (max 1 anvil-offload-pool-size)))
-    (unless (and anvil-offload--pool
-                 (= (length anvil-offload--pool) n))
+    (when (or anvil-offload--pool-retiring-p
+              (not (and anvil-offload--pool
+                        (= (length anvil-offload--pool) n))))
       (when anvil-offload--pool
         (dotimes (i (length anvil-offload--pool))
           (let ((proc (aref anvil-offload--pool i)))
             (when proc
               (anvil-offload--hard-delete-process proc)))))
-      (unless (and anvil-offload--pool
-                   (cl-some #'identity
-                            (append anvil-offload--pool nil)))
-        (setq anvil-offload--pool (make-vector n nil))))
+      (if (and anvil-offload--pool
+               (cl-some #'identity (append anvil-offload--pool nil)))
+          (progn
+            (setq anvil-offload--pool-retiring-p t)
+            (error "anvil-offload: pool retirement still in progress"))
+        (setq anvil-offload--pool (make-vector n nil)
+              anvil-offload--pool-retiring-p nil)))
     anvil-offload--pool))
 
 (defun anvil-offload--ensure-slot (idx)
@@ -738,16 +747,19 @@ lose its sole ownership reference."
 Pending futures bound to those processes settle as errored via
 `anvil-offload--sentinel'.  Subsequent dispatch rebuilds every slot
 whose child terminated, using the current `anvil-offload-pool-size'.
-A child that remains live after failed termination stays tracked for
-a later sentinel or cleanup attempt."
+A child that remains live after failed termination stays tracked and
+retires the whole pool, so no retained child receives another request."
   (interactive)
   (when anvil-offload--pool
     (dotimes (i (length anvil-offload--pool))
-      (let ((p (aref anvil-offload--pool i)))
-        (when p
-          (anvil-offload--hard-delete-process p))))
-    (unless (cl-some #'identity (append anvil-offload--pool nil))
-      (setq anvil-offload--pool nil)))
+      (let ((proc (aref anvil-offload--pool i)))
+        (when proc
+          (anvil-offload--hard-delete-process proc)))))
+  (if (and anvil-offload--pool
+           (cl-some #'identity (append anvil-offload--pool nil)))
+      (setq anvil-offload--pool-retiring-p t)
+    (setq anvil-offload--pool nil
+          anvil-offload--pool-retiring-p nil))
   (when (hash-table-p anvil-offload--isolated-processes)
     (let (processes)
       (maphash (lambda (proc _value) (push proc processes))

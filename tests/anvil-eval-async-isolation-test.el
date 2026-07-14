@@ -72,6 +72,7 @@
         anvil-eval--async-counter 0
         anvil-offload--pending (make-hash-table :test 'eql)
         anvil-offload--isolated-processes (make-hash-table :test 'eq)
+        anvil-offload--pool-retiring-p nil
         anvil-offload--next-id 0)
   (accept-process-output nil 0.05))
 
@@ -704,23 +705,48 @@
 
 (ert-deftest
     anvil-eval-async-isolation-pool-resize-preserves-live-tracking ()
-  "A failed resize cannot orphan a pooled child that remains live."
-  (let* ((proc
+  "Partial retirement fails closed until every old pooled child exits."
+  (let* ((stubborn
           (anvil-eval-async-isolation-test--idle-process
-           "anvil-async-resize-tracking"))
-         (pool (vector proc))
+           "anvil-async-resize-stubborn"))
+         (disposable
+          (anvil-eval-async-isolation-test--idle-process
+           "anvil-async-resize-disposable"))
+         (pool (vector stubborn disposable))
          (anvil-offload--pool pool)
-         (anvil-offload-pool-size 2))
+         (anvil-offload--pool-retiring-p nil)
+         (anvil-offload-pool-size 1)
+         (real-delete (symbol-function 'delete-process))
+         spawned)
     (unwind-protect
         (progn
-          (cl-letf (((symbol-function 'kill-process) #'ignore)
-                    ((symbol-function 'delete-process) #'ignore))
-            (should (eq pool (anvil-offload--ensure-pool-vector))))
-          (should (= 1 (length anvil-offload--pool)))
-          (should (eq proc (aref anvil-offload--pool 0)))
-          (should (process-live-p proc)))
-      (when (process-live-p proc)
-        (delete-process proc)))))
+          (cl-letf
+              (((symbol-function 'kill-process) #'ignore)
+               ((symbol-function 'delete-process)
+                (lambda (proc)
+                  (unless (eq proc stubborn)
+                    (funcall real-delete proc))))
+               ((symbol-function 'anvil-offload--spawn-process)
+                (lambda (_idx)
+                  (setq spawned t)
+                  (error "replacement spawned"))))
+            (should-error
+             (anvil-offload--ensure-pool-vector)
+             :type 'error)
+            (should anvil-offload--pool-retiring-p)
+            (should (eq pool anvil-offload--pool))
+            (should (eq stubborn (aref anvil-offload--pool 0)))
+            (should-not (aref anvil-offload--pool 1))
+            (should-error (anvil-offload--pick-worker) :type 'error))
+          (should-not spawned)
+          (should (process-live-p stubborn))
+          (delete-process stubborn)
+          (should (= 1 (length (anvil-offload--ensure-pool-vector))))
+          (should-not anvil-offload--pool-retiring-p)
+          (should-not (aref anvil-offload--pool 0)))
+      (dolist (proc (list stubborn disposable))
+        (when (process-live-p proc)
+          (delete-process proc))))))
 
 (ert-deftest
     anvil-eval-async-isolation-protocol-replacement-preserves-live-tracking ()
@@ -729,6 +755,7 @@
           (anvil-eval-async-isolation-test--idle-process
            "anvil-async-protocol-tracking"))
          (anvil-offload--pool (vector proc))
+         (anvil-offload--pool-retiring-p nil)
          (anvil-offload-pool-size 1)
          spawned)
     (process-put proc 'anvil-offload-protocol-version
@@ -751,7 +778,7 @@
 
 (ert-deftest
     anvil-eval-async-isolation-stop-repl-preserves-live-tracking ()
-  "Stopping all REPLs cannot orphan children that resist termination."
+  "A failed stop retires retained children and prevents their reuse."
   (let* ((pooled
           (anvil-eval-async-isolation-test--idle-process
            "anvil-async-stop-pooled"))
@@ -759,17 +786,29 @@
           (anvil-eval-async-isolation-test--idle-process
            "anvil-async-stop-isolated"))
          (anvil-offload--pool (vector pooled))
-         (anvil-offload--isolated-processes (make-hash-table :test 'eq)))
+         (anvil-offload--pool-retiring-p nil)
+         (anvil-offload-pool-size 1)
+         (anvil-offload--isolated-processes (make-hash-table :test 'eq))
+         spawned)
     (puthash isolated t anvil-offload--isolated-processes)
     (unwind-protect
         (progn
-          (cl-letf (((symbol-function 'kill-process) #'ignore)
-                    ((symbol-function 'delete-process) #'ignore))
-            (anvil-offload-stop-repl))
-          (should (process-live-p pooled))
-          (should (eq pooled (aref anvil-offload--pool 0)))
-          (should (process-live-p isolated))
-          (should (gethash isolated anvil-offload--isolated-processes)))
+          (cl-letf
+              (((symbol-function 'kill-process) #'ignore)
+               ((symbol-function 'delete-process) #'ignore)
+               ((symbol-function 'anvil-offload--spawn-process)
+                (lambda (_idx)
+                  (setq spawned t)
+                  (error "replacement spawned"))))
+            (anvil-offload-stop-repl)
+            (should anvil-offload--pool-retiring-p)
+            (should (process-live-p pooled))
+            (should (eq pooled (aref anvil-offload--pool 0)))
+            (should (process-live-p isolated))
+            (should (gethash isolated anvil-offload--isolated-processes))
+            (should-error (anvil-offload--pick-worker) :type 'error))
+          (should-not spawned)
+          (should (eq pooled (aref anvil-offload--pool 0))))
       (dolist (proc (list pooled isolated))
         (when (process-live-p proc)
           (delete-process proc))))))
