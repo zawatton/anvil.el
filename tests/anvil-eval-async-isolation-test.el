@@ -966,7 +966,7 @@ replace a live protocol-incompatible slot."
          (anvil-offload--isolated-processes ownership)
          (peer-future
           (make-anvil-future :id 707 :process peer :status 'pending))
-         (real-remhash (symbol-function 'remhash))
+         (real-remhash anvil-offload--remhash-primitive)
          spawn-inhibit
          publication-observed)
     (process-put target 'anvil-offload-protocol-version
@@ -987,7 +987,7 @@ replace a live protocol-incompatible slot."
                 (lambda (_idx)
                   (setq spawn-inhibit inhibit-quit)
                   replacement))
-               ((symbol-function 'remhash)
+               (anvil-offload--remhash-primitive
                 (lambda (key table)
                   (when (and (eq key replacement)
                              (eq table ownership))

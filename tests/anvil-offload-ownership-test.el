@@ -276,7 +276,7 @@
                 (error "ownership table watcher"))))
       (add-variable-watcher 'anvil-offload--isolated-processes watcher)
       (unwind-protect
-          (cl-letf (((symbol-function 'make-process)
+          (cl-letf ((anvil-offload--make-process-primitive
                      (lambda (&rest _args)
                        (cl-incf make-count)
                        (error "make-process unexpectedly called"))))
@@ -287,7 +287,7 @@
 (ert-deftest anvil-offload-ownership-registered-table-is-not-republished ()
   "Post-spawn custody does not reassign an already registered watched table."
   (anvil-offload-ownership-test--with-state
-    (let ((real-make (symbol-function 'make-process))
+    (let ((real-make anvil-offload--make-process-primitive)
           created
           result
           (registry-sets 0)
@@ -306,7 +306,7 @@
               (((symbol-function 'anvil-offload--process-command)
                 (lambda ()
                   (list shell-file-name shell-command-switch "sleep 30")))
-               ((symbol-function 'make-process)
+               (anvil-offload--make-process-primitive
                 (lambda (&rest args)
                   (setq created (apply real-make args)))))
             (setq result
@@ -392,47 +392,47 @@
       (should-not anvil-offload--stop-retiring-p))))
 
 (ert-deftest anvil-offload-ownership-spawn-unwind-prefers-exact-local-proc ()
-  "A post-return staging error owns the local proc, not a buffer peer."
+  "Custody primitives preserve the original exit and exact new child."
   (anvil-offload-ownership-test--with-state
-    (let* ((name "anvil-ownership-exact-spawn")
-           (buffer (get-buffer-create (format " *%s*" name)))
-           (prior
-            (anvil-offload-ownership-test--idle-process
-             "anvil-ownership-exact-prior" buffer))
-           (other-buffer (get-buffer-create " *anvil-ownership-exact-new*"))
-           (real-process-put (symbol-function 'process-put))
-           new fired)
-      (cl-letf (((symbol-function 'anvil-offload--process-command)
-                 (lambda ()
-                   (list shell-file-name shell-command-switch "sleep 30")))
-                ((symbol-function 'process-put)
-                 (lambda (proc property value)
-                   (when (and (processp proc)
-                              (eq property 'anvil-offload-ownership-tables)
-                              (string= name (process-name proc))
-                              (not fired))
-                     (setq fired t new proc)
-                     (set-process-buffer proc other-buffer)
-                     (error "post-return staging failure"))
-                   (funcall real-process-put proc property value)))
-                ((symbol-function 'kill-process) #'ignore)
-                ((symbol-function 'delete-process) #'ignore))
-        (should-error (anvil-offload--spawn-named-process name t)))
-      (should fired)
-      (should (process-live-p new))
-      (should (process-live-p prior))
-      (should (anvil-offload-ownership-test--owned-p new))
-      (should-not (anvil-offload-ownership-test--owned-p prior)))))
+    (let ((real-make-process anvil-offload--make-process-primitive)
+          created advice-called outcome)
+      (cl-letf
+          (((symbol-function 'anvil-offload--process-command)
+            (lambda ()
+              (list shell-file-name shell-command-switch "sleep 30")))
+           ((symbol-function 'process-put)
+            (lambda (&rest _args)
+              (setq advice-called t
+                    anvil-offload--isolated-processes
+                    (make-hash-table :test 'eq)
+                    anvil-offload--ownership-table-registry nil)
+              (throw 'anvil-ownership-replacement-exit :replaced)))
+           (anvil-offload--make-process-primitive
+            (lambda (&rest args)
+              (setq created (apply real-make-process args))
+              (throw 'anvil-ownership-original-exit :original)))
+           ((symbol-function 'kill-process) #'ignore)
+           ((symbol-function 'delete-process) #'ignore))
+        (setq outcome
+              (catch 'anvil-ownership-original-exit
+                (catch 'anvil-ownership-replacement-exit
+                  (anvil-offload--spawn-named-process
+                   "anvil-ownership-exact-spawn" t)
+                  :returned))))
+      (should (eq outcome :original))
+      (should-not advice-called)
+      (should (process-live-p created))
+      (should (anvil-offload-ownership-test--owned-p created)))))
 
 (ert-deftest anvil-offload-ownership-spawn-quit-retains-exact-custody ()
   "Quit after child creation leaves the exact child globally retriable."
   (anvil-offload-ownership-test--with-state
-    (let ((real-make (symbol-function 'make-process))
+    (let ((real-make anvil-offload--make-process-primitive)
           created quit-seen)
       (cl-letf (((symbol-function 'anvil-offload--process-command)
                  (lambda ()
                    (list shell-file-name shell-command-switch "sleep 30")))
-                ((symbol-function 'make-process)
+                (anvil-offload--make-process-primitive
                  (lambda (&rest args)
                    (setq created (apply real-make args))
                    (signal 'quit nil)))
@@ -472,13 +472,13 @@
 (ert-deftest anvil-offload-ownership-spawn-recovers-moved-buffer-child ()
   "A child moved before make-process throws remains globally owned."
   (anvil-offload-ownership-test--with-state
-    (let ((real-make (symbol-function 'make-process))
+    (let ((real-make anvil-offload--make-process-primitive)
           (other-buffer (get-buffer-create " *anvil-ownership-moved-child*"))
           created outcome)
       (cl-letf (((symbol-function 'anvil-offload--process-command)
                  (lambda ()
                    (list shell-file-name shell-command-switch "sleep 30")))
-                ((symbol-function 'make-process)
+                (anvil-offload--make-process-primitive
                  (lambda (&rest args)
                    (setq created (apply real-make args))
                    (set-process-buffer created other-buffer)
@@ -1353,6 +1353,721 @@
       (should (memq old anvil-offload--retired-pools))
       (should anvil-offload--pool-retiring-p)
       (should (process-live-p stubborn)))))
+
+(ert-deftest anvil-offload-ownership-spawn-rejects-preexisting-return ()
+  "Pooled and isolated spawn never claim or mutate a preexisting peer."
+  (anvil-offload-ownership-test--with-state
+    (let* ((peer
+            (anvil-offload-ownership-test--idle-process
+             "anvil-ownership-preexisting-spawn-peer"))
+           (original-filter (process-filter peer)))
+      (dolist (isolated '(nil t))
+        (let (condition)
+          (cl-letf ((anvil-offload--make-process-primitive
+                     (lambda (&rest _args) peer)))
+            (setq condition
+                  (should-error
+                   (anvil-offload--spawn-named-process
+                    (format
+                     "anvil-ownership-preexisting-return-%s" isolated)
+                    isolated))))
+          (should
+           (string-match-p
+            "constructor returned a preexisting process"
+            (error-message-string condition)))
+          (should (process-live-p peer))
+          (should (eq (process-filter peer) original-filter))
+          (should-not
+           (process-get peer 'anvil-offload-protocol-version))
+          (should-not (process-get peer 'anvil-offload-isolated))
+          (should-not (process-get peer 'anvil-offload-retiring))
+          (should-not (anvil-offload-ownership-test--owned-p peer)))))))
+
+(ert-deftest anvil-offload-ownership-spawn-cleans-duplicate-success ()
+  "A valid returned child cannot orphan a matching constructor sibling."
+  (anvil-offload-ownership-test--with-state
+    (let ((real-make-process anvil-offload--make-process-primitive)
+          first second returned)
+      (cl-letf
+          (((symbol-function 'anvil-offload--process-command)
+            (lambda ()
+              (list shell-file-name shell-command-switch "exec sleep 30")))
+           (anvil-offload--make-process-primitive
+            (lambda (&rest args)
+              (setq first (apply real-make-process args)
+                    second (apply real-make-process args))
+              first)))
+        (setq returned
+              (anvil-offload--spawn-named-process
+               "anvil-ownership-duplicate-success")))
+      (should (eq returned first))
+      (should (process-live-p first))
+      (should-not (process-live-p second))
+      (should (anvil-offload-ownership-test--owned-p first))
+      (should-not (anvil-offload-ownership-test--owned-p second))
+      (should
+       (= anvil-offload--protocol-version
+          (process-get first 'anvil-offload-protocol-version)))
+      (anvil-offload--hard-delete-process first)
+      (should-not (process-live-p first))
+      (should-not (anvil-offload-ownership-test--owned-p first)))))
+
+(ert-deftest anvil-offload-ownership-spawn-cleans-duplicate-throw ()
+  "A constructor throw gives custody of every new child before deletion."
+  (anvil-offload-ownership-test--with-state
+    (let ((real-make-process anvil-offload--make-process-primitive)
+          created outcome)
+      (cl-letf
+          (((symbol-function 'anvil-offload--process-command)
+            (lambda ()
+              (list shell-file-name shell-command-switch "exec sleep 30")))
+           (anvil-offload--make-process-primitive
+            (lambda (&rest args)
+              (push (apply real-make-process args) created)
+              (push (apply real-make-process args) created)
+              (throw 'anvil-ownership-spawn-exit :original))))
+        (setq outcome
+              (catch 'anvil-ownership-spawn-exit
+                (anvil-offload--spawn-named-process
+                 "anvil-ownership-duplicate-throw")
+                :returned)))
+      (should (eq outcome :original))
+      (should (= 2 (length created)))
+      (dolist (proc created)
+        (should-not (process-live-p proc))
+        (should-not (anvil-offload-ownership-test--owned-p proc))))))
+
+(ert-deftest anvil-offload-ownership-spawn-invalid-return-cleans-delta ()
+  "A new unrelated return cannot hide the exact requested child."
+  (anvil-offload-ownership-test--with-state
+    (let ((real-make-process anvil-offload--make-process-primitive)
+          requested helper condition)
+      (cl-letf
+          (((symbol-function 'anvil-offload--process-command)
+            (lambda ()
+              (list shell-file-name shell-command-switch "exec sleep 30")))
+           (anvil-offload--make-process-primitive
+            (lambda (&rest args)
+              (setq requested (apply real-make-process args)
+                    helper
+                    (funcall
+                     real-make-process
+                     :name "anvil-ownership-unrelated-return"
+                     :buffer nil
+                     :command
+                     (list shell-file-name shell-command-switch
+                           "exec sleep 30")
+                     :connection-type 'pipe
+                     :noquery t
+                     :filter #'ignore
+                     :sentinel #'ignore))
+              helper)))
+        (setq condition
+              (should-error
+               (anvil-offload--spawn-named-process
+                "anvil-ownership-invalid-new-return"))))
+      (should
+       (string-match-p
+        "constructor returned an invalid process"
+        (error-message-string condition)))
+      (dolist (proc (list requested helper))
+        (should (processp proc))
+        (should-not (process-live-p proc))
+        (should-not (anvil-offload-ownership-test--owned-p proc))))))
+
+(ert-deftest anvil-offload-ownership-sentinel-exit-always-releases ()
+  "Scheduler errors and tagged exits cannot skip sentinel resource cleanup."
+  (anvil-offload-ownership-test--with-state
+    (dolist (exit-kind '(error throw))
+      (let* ((buffer
+              (generate-new-buffer
+               (format " *anvil-ownership-sentinel-%s*" exit-kind)))
+             (proc
+              (anvil-offload-ownership-test--idle-process
+               (format "anvil-ownership-sentinel-%s" exit-kind)
+               buffer))
+             outcome)
+        (anvil-offload--track-process-ownership
+         proc t anvil-offload--isolated-processes)
+        (funcall anvil-offload--process-put-primitive
+                 proc 'anvil-offload-isolated t)
+        (funcall anvil-offload--process-put-primitive
+                 proc 'anvil-offload-owned-buffer buffer)
+        (set-process-sentinel proc #'ignore)
+        (delete-process proc)
+        (let ((anvil-offload--run-at-time-function
+               (lambda (&rest _args)
+                 (pcase exit-kind
+                   ('error (error "sentinel timer error"))
+                   ('throw
+                    (throw
+                     'anvil-ownership-sentinel-exit :original))))))
+          (pcase exit-kind
+            ('error
+             (anvil-offload--sentinel proc "finished")
+             (setq outcome :returned))
+            ('throw
+             (setq outcome
+                   (catch 'anvil-ownership-sentinel-exit
+                     (anvil-offload--sentinel proc "finished")
+                     :returned)))))
+        (should
+         (eq outcome (if (eq exit-kind 'error) :returned :original)))
+        (should-not (anvil-offload-ownership-test--owned-p proc))
+        (should-not (buffer-live-p buffer))))))
+
+(ert-deftest anvil-offload-ownership-spawn-preserves-shared-peer-buffer ()
+  "Invalid-return cleanup cannot kill a preexisting peer's target buffer."
+  (anvil-offload-ownership-test--with-state
+    (let* ((name "anvil-ownership-shared-buffer")
+           (buffer (get-buffer-create (format " *%s*" name)))
+           (peer
+            (anvil-offload-ownership-test--idle-process
+             "anvil-ownership-shared-buffer-peer" buffer))
+           (real-make-process anvil-offload--make-process-primitive)
+           child condition)
+      (cl-letf
+          (((symbol-function 'anvil-offload--process-command)
+            (lambda ()
+              (list shell-file-name shell-command-switch "exec sleep 30")))
+           (anvil-offload--make-process-primitive
+            (lambda (&rest args)
+              (setq child (apply real-make-process args))
+              peer)))
+        (setq condition
+              (should-error
+               (anvil-offload--spawn-named-process name))))
+      (should
+       (string-match-p
+        "constructor returned a preexisting process"
+        (error-message-string condition)))
+      (should (process-live-p peer))
+      (should (buffer-live-p buffer))
+      (should (eq (process-buffer peer) buffer))
+      (should (processp child))
+      (should-not (process-live-p child))
+      (should-not (anvil-offload-ownership-test--owned-p child))
+      (should-not (anvil-offload-ownership-test--owned-p peer)))))
+
+(ert-deftest anvil-offload-ownership-sentinel-nil-scheduler-terminalizes-pending ()
+  "A nil scheduler result cannot leave a dead process's future pending."
+  (anvil-offload-ownership-test--with-state
+    (let* ((buffer
+            (generate-new-buffer " *anvil-ownership-sentinel-pending*"))
+           (proc
+            (anvil-offload-ownership-test--idle-process
+             "anvil-ownership-sentinel-pending" buffer))
+           (future
+            (anvil-offload-ownership-test--future
+             201 proc :isolated-p t)))
+      (anvil-offload--track-process-ownership
+       proc t anvil-offload--isolated-processes)
+      (funcall anvil-offload--process-put-primitive
+               proc 'anvil-offload-isolated t)
+      (funcall anvil-offload--process-put-primitive
+               proc 'anvil-offload-owned-buffer buffer)
+      (puthash 201 future anvil-offload--pending)
+      (set-process-sentinel proc #'ignore)
+      (delete-process proc)
+      (let ((anvil-offload--run-at-time-function
+             (lambda (&rest _args) nil)))
+        (anvil-offload--sentinel proc "finished"))
+      (let ((deadline (+ (float-time) 1.0)))
+        (while (and (eq 'pending (anvil-future-status future))
+                    (< (float-time) deadline))
+          (accept-process-output nil 0.01)))
+      (should (eq 'error (anvil-future-status future)))
+      (should-not (gethash 201 anvil-offload--pending))
+      (should-not (anvil-offload-ownership-test--owned-p proc))
+      (should-not (buffer-live-p buffer)))))
+
+(ert-deftest anvil-offload-ownership-sentinel-owned-skips-property-read ()
+  "Registered isolated ownership bypasses the legacy isolated property."
+  (anvil-offload-ownership-test--with-state
+    (let* ((buffer
+            (generate-new-buffer " *anvil-ownership-sentinel-property*"))
+           (proc
+            (anvil-offload-ownership-test--idle-process
+             "anvil-ownership-sentinel-property" buffer))
+           (real-process-get anvil-offload--process-get-primitive)
+           isolated-property-read outcome)
+      (anvil-offload--track-process-ownership
+       proc t anvil-offload--isolated-processes)
+      (funcall anvil-offload--process-put-primitive
+               proc 'anvil-offload-isolated t)
+      (funcall anvil-offload--process-put-primitive
+               proc 'anvil-offload-owned-buffer buffer)
+      (set-process-sentinel proc #'ignore)
+      (delete-process proc)
+      (let ((anvil-offload--process-get-primitive
+             (lambda (process property)
+               (if (eq property 'anvil-offload-isolated)
+                   (progn
+                     (setq isolated-property-read t)
+                     (throw 'anvil-ownership-property-exit :unexpected))
+                 (funcall real-process-get process property)))))
+        (setq outcome
+              (catch 'anvil-ownership-property-exit
+                (anvil-offload--sentinel proc "finished")
+                :returned)))
+      (should (eq outcome :returned))
+      (should-not isolated-property-read)
+      (should-not (anvil-offload-ownership-test--owned-p proc))
+      (should-not (buffer-live-p buffer)))))
+
+(ert-deftest anvil-offload-ownership-abort-scheduler-fallback-preserves-exit ()
+  "Abort cleanup bypasses a tagged scheduler and preserves transport exit."
+  (anvil-offload-ownership-test--with-state
+    (let* ((proc
+            (anvil-offload-ownership-test--compatible
+             (anvil-offload-ownership-test--idle-process
+              "anvil-ownership-abort-scheduler")))
+           (anvil-offload--pool (vector proc))
+           scheduler-called outcome)
+      (cl-letf
+          (((symbol-function 'anvil-offload--pick-worker)
+            (lambda () proc))
+           ((symbol-function 'process-send-string)
+            (lambda (&rest _args)
+              (throw 'anvil-ownership-send-exit :original))))
+        (let ((anvil-offload--run-at-time-function
+               (lambda (&rest _args)
+                 (setq scheduler-called t)
+                 (throw 'anvil-ownership-abort-scheduler :replaced))))
+          (setq outcome
+                (catch 'anvil-ownership-send-exit
+                  (anvil-offload '(+ 1 2))
+                  :returned))))
+      (should (eq outcome :original))
+      (should-not scheduler-called)
+      (should (= 0 (hash-table-count anvil-offload--pending)))
+      (let ((deadline (+ (float-time) 1.0)))
+        (while (and (process-live-p proc)
+                    (< (float-time) deadline))
+          (accept-process-output nil 0.01)))
+      (should-not (process-live-p proc))
+      (should-not (anvil-offload-ownership-test--owned-p proc)))))
+
+(ert-deftest anvil-offload-ownership-process-list-advice-cannot-orphan ()
+  "Persistent process-list advice cannot interrupt spawn unwind custody."
+  (anvil-offload-ownership-test--with-state
+    (let ((real-make-process anvil-offload--make-process-primitive)
+          created outcome)
+      (cl-letf
+          (((symbol-function 'anvil-offload--process-command)
+            (lambda ()
+              (list shell-file-name shell-command-switch "exec sleep 30")))
+           ((symbol-function 'process-list)
+            (lambda ()
+              (error "persistent process-list failure")))
+           (anvil-offload--make-process-primitive
+            (lambda (&rest args)
+              (setq created (apply real-make-process args))
+              (throw 'anvil-ownership-process-list-exit :original))))
+        (setq outcome
+              (catch 'anvil-ownership-process-list-exit
+                (anvil-offload--spawn-named-process
+                 "anvil-ownership-process-list" t)
+                :returned)))
+      (should (eq outcome :original))
+      (should (processp created))
+      (should-not (process-live-p created))
+      (should-not (anvil-offload-ownership-test--owned-p created)))))
+
+(ert-deftest anvil-offload-ownership-valid-shared-buffer-preserves-peer ()
+  "A valid isolated child never owns a preexisting peer buffer."
+  (anvil-offload-ownership-test--with-state
+    (let* ((name "anvil-ownership-valid-shared-buffer")
+           (buffer (get-buffer-create (format " *%s*" name)))
+           (peer
+            (anvil-offload-ownership-test--idle-process
+             "anvil-ownership-valid-shared-peer" buffer))
+           child)
+      (unwind-protect
+          (progn
+            (cl-letf
+                (((symbol-function 'anvil-offload--process-command)
+                  (lambda ()
+                    (list shell-file-name shell-command-switch
+                          "exec sleep 30"))))
+              (setq child
+                    (anvil-offload--spawn-named-process name t)))
+            (should (process-live-p child))
+            (should (process-live-p peer))
+            (should
+             (eq (funcall anvil-offload--process-buffer-primitive child)
+                 buffer))
+            (should-not
+             (funcall anvil-offload--process-get-primitive
+                      child 'anvil-offload-owned-buffer))
+            (anvil-offload--hard-delete-process child)
+            (should-not (process-live-p child))
+            (should (process-live-p peer))
+            (should (buffer-live-p buffer))
+            (should (eq (process-buffer peer) buffer)))
+        (when (and (processp child) (process-live-p child))
+          (anvil-offload--hard-delete-process child))
+        (when (and (processp peer) (process-live-p peer))
+          (set-process-sentinel peer #'ignore)
+          (delete-process peer))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest anvil-offload-ownership-constructor-advice-cannot-yield-output ()
+  "Runtime constructor advice cannot rewrite a child before custody exists."
+  (anvil-offload-ownership-test--with-state
+    (let* ((name "anvil-ownership-advised-constructor")
+           (real-symbol-make-process (symbol-function 'make-process))
+           (foreign-buffer
+            (generate-new-buffer " *anvil-ownership-advised-foreign*"))
+           (canary
+            (format "anvil-offload-yield-canary-%s"
+                    (random most-positive-fixnum)))
+           advice-called created seen child)
+      (unwind-protect
+          (cl-letf
+              (((symbol-function 'anvil-offload--process-command)
+                (lambda ()
+                  (list shell-file-name shell-command-switch
+                        "exec sleep 30")))
+               ((symbol-function 'make-process)
+                (lambda (&rest args)
+                  (setq advice-called t)
+                  (setq args (plist-put args :buffer foreign-buffer)
+                        args
+                        (plist-put
+                         args :filter
+                         (lambda (_process chunk)
+                           (setq seen (concat seen chunk))))
+                        args
+                        (plist-put
+                         args :command
+                         (list shell-file-name shell-command-switch
+                               (format "printf %s; sleep 30"
+                                       (shell-quote-argument canary)))))
+                  (setq created (apply real-symbol-make-process args))
+                  (accept-process-output created 0.2)
+                  created)))
+            (setq child
+                  (anvil-offload--spawn-named-process name t))
+            (should-not advice-called)
+            (should-not seen)
+            (should
+             (eq (funcall anvil-offload--process-filter-primitive child)
+                 #'anvil-offload--filter))
+            (should-not
+             (eq (funcall anvil-offload--process-buffer-primitive child)
+                 foreign-buffer))
+            (should (string-empty-p
+                     (with-current-buffer foreign-buffer
+                       (buffer-string))))
+            (anvil-offload--hard-delete-process child)
+            (should-not (process-live-p child)))
+        (when (and (processp created) (process-live-p created))
+          (delete-process created))
+        (when (and (processp child) (process-live-p child))
+          (anvil-offload--hard-delete-process child))
+        (when (buffer-live-p foreign-buffer)
+          (kill-buffer foreign-buffer))))))
+
+(ert-deftest anvil-offload-ownership-rejects-rewritten-transport ()
+  "A returned child with a foreign filter or buffer is invalid and retired."
+  (anvil-offload-ownership-test--with-state
+    (let* ((name "anvil-ownership-rewritten-transport")
+           (real-make-process anvil-offload--make-process-primitive)
+           (foreign-buffer
+            (generate-new-buffer " *anvil-ownership-rewritten-foreign*"))
+           created condition)
+      (unwind-protect
+          (cl-letf
+              (((symbol-function 'anvil-offload--process-command)
+                (lambda ()
+                  (list shell-file-name shell-command-switch
+                        "exec sleep 30")))
+               (anvil-offload--make-process-primitive
+                (lambda (&rest args)
+                  (setq created (apply real-make-process args))
+                  (set-process-buffer created foreign-buffer)
+                  (set-process-filter created #'ignore)
+                  created)))
+            (setq condition
+                  (should-error
+                   (anvil-offload--spawn-named-process name t)))
+            (should
+             (string-match-p
+              "constructor returned an invalid process"
+              (error-message-string condition)))
+            (should (processp created))
+            (should-not (process-live-p created))
+            (should-not
+             (anvil-offload-ownership-test--owned-p created))
+            (should (buffer-live-p foreign-buffer)))
+        (when (and (processp created) (process-live-p created))
+          (delete-process created))
+        (when (buffer-live-p foreign-buffer)
+          (kill-buffer foreign-buffer))))))
+
+(ert-deftest anvil-offload-ownership-custody-bypasses-get-and-remove-advice ()
+  "Property and hash advice cannot replace a constructor's original exit."
+  (anvil-offload-ownership-test--with-state
+    (let ((real-make-process anvil-offload--make-process-primitive)
+          created process-get-called remhash-called outcome)
+      (cl-letf
+          (((symbol-function 'anvil-offload--process-command)
+            (lambda ()
+              (list shell-file-name shell-command-switch
+                    "exec sleep 30")))
+           (anvil-offload--make-process-primitive
+            (lambda (&rest args)
+              (setq created (apply real-make-process args))
+              (throw 'anvil-ownership-constructor-exit :original)))
+           ((symbol-function 'process-get)
+            (lambda (&rest _args)
+              (setq process-get-called t)
+              (throw 'anvil-ownership-process-get-exit :replaced-get)))
+           ((symbol-function 'remhash)
+            (lambda (&rest _args)
+              (setq remhash-called t)
+              (throw 'anvil-ownership-remhash-exit :replaced-remove))))
+        (setq outcome
+              (catch 'anvil-ownership-constructor-exit
+                (catch 'anvil-ownership-process-get-exit
+                  (catch 'anvil-ownership-remhash-exit
+                    (anvil-offload--spawn-named-process
+                     "anvil-ownership-custody-advice" t)
+                    :returned)))))
+      (should (eq outcome :original))
+      (should-not process-get-called)
+      (should-not remhash-called)
+      (should (processp created))
+      (should-not (process-live-p created))
+      (should-not (anvil-offload-ownership-test--owned-p created)))))
+
+(ert-deftest anvil-offload-ownership-nil-scheduler-replays-later-frame ()
+  "A nil timer result cannot strand a later coalesced reply."
+  (anvil-offload-ownership-test--with-state
+    (let* ((proc
+            (anvil-offload-ownership-test--idle-process
+             "anvil-ownership-nil-scheduler"))
+           (first-count 0)
+           (second-count 0)
+           (scheduler-calls 0)
+           (first
+            (make-anvil-future
+             :id 211 :process proc :status 'pending
+             :on-settle
+             (lambda (_future)
+               (cl-incf first-count)
+               (throw 'anvil-ownership-nil-frame-exit :original))))
+           (second
+            (make-anvil-future
+             :id 212 :process proc :status 'pending
+             :on-settle
+             (lambda (_future) (cl-incf second-count))))
+           (second-frame
+            (anvil-offload-ownership-test--frame
+             '(:id 212 :ok second)))
+           (chunk
+            (concat
+             (anvil-offload-ownership-test--frame
+              '(:id 211 :ok first))
+             second-frame)))
+      (puthash 211 first anvil-offload--pending)
+      (puthash 212 second anvil-offload--pending)
+      (let ((anvil-offload--run-at-time-function
+             (lambda (&rest _args)
+               (cl-incf scheduler-calls)
+               nil)))
+        (should
+         (eq :original
+             (catch 'anvil-ownership-nil-frame-exit
+               (anvil-offload--filter proc chunk)
+               :returned))))
+      (should (= 1 scheduler-calls))
+      (should (eq 'done (anvil-future-status first)))
+      (should (eq 'pending (anvil-future-status second)))
+      (should
+       (equal
+        second-frame
+        (funcall anvil-offload--process-get-primitive
+                 proc 'anvil-pending-bytes)))
+      (let ((deadline (+ (float-time) 1.0)))
+        (while (and (eq 'pending (anvil-future-status second))
+                    (< (float-time) deadline))
+          (accept-process-output nil 0.01)))
+      (should (eq 'done (anvil-future-status second)))
+      (should (eq 'second (anvil-future-value second)))
+      (should (= 1 first-count))
+      (should (= 1 second-count))
+      (should (= 0 (hash-table-count anvil-offload--pending)))
+      (should
+       (string-empty-p
+        (or
+         (funcall anvil-offload--process-get-primitive
+                  proc 'anvil-pending-bytes)
+         ""))))))
+
+(ert-deftest anvil-offload-ownership-sentinel-preserves-foreign-timer ()
+  "A preexisting foreign timer cannot strand dead-child finalization."
+  (anvil-offload-ownership-test--with-state
+    (let* ((peer
+            (run-at-time 30 30 #'ignore 'peer-argument))
+           (peer-function (timer--function peer))
+           (peer-repeat (timer--repeat-delay peer))
+           (peer-args (copy-tree (timer--args peer)))
+           (buffer
+            (generate-new-buffer " *anvil-ownership-sentinel-peer-timer*"))
+           (proc
+            (anvil-offload-ownership-test--idle-process
+             "anvil-ownership-sentinel-peer-timer" buffer))
+           (future
+            (anvil-offload-ownership-test--future
+             221 proc :isolated-p t)))
+      (unwind-protect
+          (progn
+            (anvil-offload--track-process-ownership
+             proc t anvil-offload--isolated-processes)
+            (funcall anvil-offload--process-put-primitive
+                     proc 'anvil-offload-isolated t)
+            (funcall anvil-offload--process-put-primitive
+                     proc 'anvil-offload-owned-buffer buffer)
+            (puthash 221 future anvil-offload--pending)
+            (set-process-sentinel proc #'ignore)
+            (delete-process proc)
+            (let ((anvil-offload--run-at-time-function
+                   (lambda (&rest _args) peer)))
+              (anvil-offload--sentinel proc "finished"))
+            (let ((deadline (+ (float-time) 1.0)))
+              (while (and (eq 'pending (anvil-future-status future))
+                          (< (float-time) deadline))
+                (accept-process-output nil 0.01)))
+            (should (eq 'error (anvil-future-status future)))
+            (should-not (gethash 221 anvil-offload--pending))
+            (should (memq peer timer-list))
+            (should (eq (timer--function peer) peer-function))
+            (should (equal (timer--repeat-delay peer) peer-repeat))
+            (should (equal (timer--args peer) peer-args))
+            (should-not (buffer-live-p buffer)))
+        (when (and (timerp peer)
+                   (or (memq peer timer-list)
+                       (memq peer timer-idle-list)))
+          (cancel-timer peer))))))
+
+(ert-deftest anvil-offload-ownership-filter-preserves-foreign-timer ()
+  "A preexisting foreign timer cannot strand a coalesced reply."
+  (anvil-offload-ownership-test--with-state
+    (let* ((peer
+            (run-at-time 30 30 #'ignore 'peer-argument))
+           (peer-function (timer--function peer))
+           (peer-repeat (timer--repeat-delay peer))
+           (peer-args (copy-tree (timer--args peer)))
+           (proc
+            (anvil-offload-ownership-test--idle-process
+             "anvil-ownership-filter-peer-timer"))
+           (first
+            (make-anvil-future
+             :id 222 :process proc :status 'pending
+             :on-settle
+             (lambda (_future)
+               (throw 'anvil-ownership-peer-timer-exit :original))))
+           (second
+            (make-anvil-future
+             :id 223 :process proc :status 'pending))
+           (second-frame
+            (anvil-offload-ownership-test--frame
+             '(:id 223 :ok second)))
+           (chunk
+            (concat
+             (anvil-offload-ownership-test--frame
+              '(:id 222 :ok first))
+             second-frame)))
+      (unwind-protect
+          (progn
+            (puthash 222 first anvil-offload--pending)
+            (puthash 223 second anvil-offload--pending)
+            (let ((anvil-offload--run-at-time-function
+                   (lambda (&rest _args) peer)))
+              (should
+               (eq :original
+                   (catch 'anvil-ownership-peer-timer-exit
+                     (anvil-offload--filter proc chunk)
+                     :returned))))
+            (let ((deadline (+ (float-time) 1.0)))
+              (while (and (eq 'pending (anvil-future-status second))
+                          (< (float-time) deadline))
+                (accept-process-output nil 0.01)))
+            (should (eq 'done (anvil-future-status second)))
+            (should (eq 'second (anvil-future-value second)))
+            (should (= 0 (hash-table-count anvil-offload--pending)))
+            (should (memq peer timer-list))
+            (should (eq (timer--function peer) peer-function))
+            (should (equal (timer--repeat-delay peer) peer-repeat))
+            (should (equal (timer--args peer) peer-args)))
+        (when (and (timerp peer)
+                   (or (memq peer timer-list)
+                       (memq peer timer-idle-list)))
+          (cancel-timer peer))))))
+
+(ert-deftest anvil-offload-ownership-scheduler-collapses-exact-duplicates ()
+  "One exact callback timer survives while foreign helpers stay unchanged."
+  (let* ((real-run-at-time (symbol-function 'run-at-time))
+         (callback-count 0)
+         (callback (lambda (_argument) (cl-incf callback-count)))
+         first second helper selected
+         helper-function helper-repeat helper-args)
+    (unwind-protect
+        (let ((anvil-offload--run-at-time-function
+               (lambda (_time _repeat function &rest args)
+                 (setq first
+                       (apply real-run-at-time 30 30 function args)
+                       second
+                       (apply real-run-at-time 30 30 function args)
+                       helper
+                       (funcall real-run-at-time
+                                30 30 #'ignore 'foreign-helper)
+                       helper-function (timer--function helper)
+                       helper-repeat (timer--repeat-delay helper)
+                       helper-args (copy-tree (timer--args helper)))
+                 first)))
+          (setq selected
+                (anvil-offload--schedule-zero-delay
+                 callback 'exact-argument))
+          (should (eq selected first))
+          (should (anvil-offload--timer-scheduled-p first))
+          (should-not (timer--repeat-delay first))
+          (should-not (anvil-offload--timer-scheduled-p second))
+          (should (eq (timer--function first) callback))
+          (should (equal (timer--args first) '(exact-argument)))
+          (should (anvil-offload--timer-scheduled-p helper))
+          (should (eq (timer--function helper) helper-function))
+          (should (equal (timer--repeat-delay helper) helper-repeat))
+          (should (equal (timer--args helper) helper-args))
+          (let ((deadline (+ (float-time) 1.0)))
+            (while (and (zerop callback-count)
+                        (< (float-time) deadline))
+              (accept-process-output nil 0.01)))
+          (should (= 1 callback-count))
+          (accept-process-output nil 0.05)
+          (should (= 1 callback-count))
+          (should (anvil-offload--timer-scheduled-p helper))
+          (should (eq (timer--function helper) helper-function))
+          (should (equal (timer--repeat-delay helper) helper-repeat))
+          (should (equal (timer--args helper) helper-args)))
+      (dolist (timer (list selected first second helper))
+        (when (anvil-offload--timer-scheduled-p timer)
+          (cancel-timer timer))))))
+
+(ert-deftest anvil-offload-ownership-capture-strips-preexisting-advice ()
+  "Primitive capture unwraps advice already installed on the target symbol."
+  (let ((wrapper
+         (lambda (original &rest args)
+           (apply original args))))
+    (advice-add 'make-process :around wrapper)
+    (unwind-protect
+        (should
+         (eq (anvil-offload--capture-primitive 'make-process)
+             anvil-offload--make-process-primitive))
+      (advice-remove 'make-process wrapper))))
 
 (ert-deftest anvil-offload-ownership-zz-global-state-remains-clean ()
   "Focused and full runs must leave no hidden global ownership state."

@@ -99,9 +99,9 @@ line on exit; the wrapper silences it with `:sentinel #'ignore'
          (anvil-host-child-exec-path child-exec-path)
          (anvil-host-child-shell-file-name child-shell)
          (anvil-host-child-shell-command-switch "-c")
-         (original-make-process (symbol-function 'make-process))
+         (original-make-process anvil-host--make-process-primitive)
          observed)
-    (cl-letf (((symbol-function 'make-process)
+    (cl-letf ((anvil-host--make-process-primitive
                (lambda (&rest args)
                  (setq observed
                        (list process-environment exec-path
