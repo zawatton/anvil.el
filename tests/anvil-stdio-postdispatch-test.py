@@ -24,6 +24,7 @@ import time
 READY_OBSERVER_TIMEOUT_SECONDS = 30.0
 SUCCESS_REPLY_TIMEOUT_SECONDS = 30.0
 DISPATCH_OBSERVER_TIMEOUT_SECONDS = 45.0
+OWNER_DISPATCH_OBSERVER_TIMEOUT_SECONDS = 15.0
 BRIDGE_TERM_GRACE_SECONDS = 0.5
 BRIDGE_REAP_TIMEOUT_SECONDS = 10.0
 FRAME_EXIT_TIMEOUT_SECONDS = 5.0
@@ -107,7 +108,9 @@ def safe_text(path: Path, limit: int = 4000) -> str:
 def assert_no_stage_fd_inheritance(marker: dict[str, object], label: str) -> None:
     """Require one exact stage and prove the child did not inherit its FD."""
     if marker.get("stageCount") != 1 or marker.get("fd6MatchesStage") is not False:
-        raise AssertionError(f"{label} inherited authenticated response custody: {marker}")
+        raise AssertionError(
+            f"{label} inherited authenticated response custody: {marker}"
+        )
 
 
 def replace_with_fifo(path: Path) -> None:
@@ -818,16 +821,22 @@ def start_bridge(
     environment: dict[str, str],
     bridge_stderr: Path,
     *arguments: str,
+    initial_input: bytes | None = None,
 ) -> subprocess.Popen[bytes]:
     """Start one bridge in an isolated process group."""
     options: dict[str, object] = {}
     if os.name == "posix":
         options["start_new_session"] = True
     stderr_handle = bridge_stderr.open("wb")
+    input_handle = None
     try:
+        if initial_input is not None:
+            input_handle = tempfile.TemporaryFile()
+            input_handle.write(initial_input)
+            input_handle.seek(0)
         return subprocess.Popen(
             [bash, str(bridge), *arguments],
-            stdin=subprocess.PIPE,
+            stdin=input_handle if input_handle is not None else subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=stderr_handle,
             bufsize=0,
@@ -835,6 +844,8 @@ def start_bridge(
             **options,
         )
     finally:
+        if input_handle is not None:
+            input_handle.close()
         stderr_handle.close()
 
 
@@ -974,9 +985,7 @@ def run_cleanup_rescan_regression(stdio: Path) -> None:
         metadata_proof = metadata_directory / "proof.1.json"
         metadata_marker = root / "metadata-marker"
         metadata_release = root / "metadata-release"
-        request = json_bytes(
-            {"jsonrpc": "2.0", "id": 301, "method": "test"}
-        )
+        request = json_bytes({"jsonrpc": "2.0", "id": 301, "method": "test"})
 
         def publish_metadata() -> None:
             os.link(metadata_temp, metadata_final)
@@ -1283,8 +1292,7 @@ def synthetic_stage_error(request_id: object, rc: int) -> dict[str, object]:
         "error": {
             "code": -32603,
             "message": (
-                "Bridge synthetic error: "
-                "large request staging failed before dispatch"
+                "Bridge synthetic error: large request staging failed before dispatch"
             ),
             "data": {
                 "phase": "stage",
@@ -1720,18 +1728,23 @@ def run_owner_death_case(
             paths["bridge_stderr"],
             f"--socket=/tmp/anvil-owner-{label}-test",
             "--server-id=test",
+            initial_input=(
+                json_bytes({"jsonrpc": "2.0", "id": 61, "method": "test"}) + b"\n"
+            ),
         )
         child_pid: int | None = None
         child_group: int | None = None
         try:
             wait_for_bridge_ready(paths["debug_log"], process)
-            send(
-                process,
-                {"jsonrpc": "2.0", "id": 61, "method": "test"},
-            )
-            if not wait_until(child_marker.is_file, 5):
+            if not wait_until(
+                child_marker.is_file,
+                OWNER_DISPATCH_OBSERVER_TIMEOUT_SECONDS,
+            ):
                 raise AssertionError(
-                    f"{label} dispatch did not enter the blocking client"
+                    f"{label} dispatch did not enter the blocking client: "
+                    f"rc={process.poll()} "
+                    f"debug={safe_text(paths['debug_log'])} "
+                    f"stderr={safe_text(paths['bridge_stderr'])}"
                 )
             marker = json.loads(child_marker.read_text(encoding="utf-8"))
             assert_no_stage_fd_inheritance(marker, f"{label} client")
@@ -2446,8 +2459,7 @@ def run_negative_control(
                     "negative control unexpectedly returned a response"
                 )
             wait_until(
-                lambda: paths["helper_marker"].is_file()
-                or process.poll() is not None,
+                lambda: paths["helper_marker"].is_file() or process.poll() is not None,
                 SUCCESS_REPLY_TIMEOUT_SECONDS,
             )
             if not paths["helper_marker"].is_file():
@@ -2697,6 +2709,7 @@ def run_response_prepare_interruption(
         symlink_temp = root / "tmp-link"
         symlink_temp.symlink_to(paths["temp"], target_is_directory=True)
         environment["TMPDIR"] = str(symlink_temp)
+        request = json_bytes({"jsonrpc": "2.0", "id": 201, "method": "test"}) + b"\n"
         process = start_bridge(
             bash,
             stdio,
@@ -2704,6 +2717,7 @@ def run_response_prepare_interruption(
             paths["bridge_stderr"],
             "--socket=/tmp/anvil-response-prepare-timeout",
             "--server-id=test",
+            initial_input=request,
         )
         reader = BinaryReader(
             process,
@@ -2714,10 +2728,6 @@ def run_response_prepare_interruption(
         )
         try:
             wait_for_bridge_ready(paths["debug_log"], process)
-            send(
-                process,
-                {"jsonrpc": "2.0", "id": 201, "method": "test"},
-            )
             read_reply(
                 reader,
                 synthetic_stage_error(201, 70),
@@ -3176,7 +3186,9 @@ def run_large_request_metadata(
                     raise AssertionError("first staged request is not exact")
                 stages = list(directory.glob(".response-tmp.1.*"))
                 if len(stages) != 1:
-                    raise AssertionError(f"missing unique first response stage: {stages}")
+                    raise AssertionError(
+                        f"missing unique first response stage: {stages}"
+                    )
                 response_stage = stages[0]
                 response_stat = response_stage.lstat()
                 if (
@@ -3201,9 +3213,10 @@ def run_large_request_metadata(
                         f"expected one private staging directory: {directories}"
                     )
                 directory = directories[0]
-                if captured_request.resolve() != (
-                    directory / "request.1.json"
-                ).resolve():
+                if (
+                    captured_request.resolve()
+                    != (directory / "request.1.json").resolve()
+                ):
                     raise AssertionError("captured request path changed generation")
                 if (
                     captured_stage.parent.resolve() != directory.resolve()
@@ -3230,9 +3243,7 @@ def run_large_request_metadata(
                         f"missing unique second response stage: {response_stages}"
                     )
                 names = sorted(child.name for child in directory.iterdir())
-                expected_names = sorted(
-                    ["request.2.json", response_stages[0].name]
-                )
+                expected_names = sorted(["request.2.json", response_stages[0].name])
                 if names != expected_names:
                     raise AssertionError(
                         f"retired generation did not converge: {names}"
