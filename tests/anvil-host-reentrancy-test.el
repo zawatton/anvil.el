@@ -118,6 +118,78 @@
       (anvil-host-reentrancy-test--force-clean nil nil)
       (delete-directory project t))))
 
+(ert-deftest anvil-host-reentrancy-foreign-filter-releases-child ()
+  "Foreign process filters remain live while a host child is running."
+  (skip-unless (memq system-type '(gnu/linux darwin)))
+  (let* ((directory (make-temp-file "anvil-host-foreign-filter-" t))
+         (started (expand-file-name "started" directory))
+         (release (expand-file-name "release" directory))
+         (baseline-directory default-directory)
+         (child-environment
+          (cons "ANVIL_HOST_PRIVATE_MARKER=secret"
+                (copy-sequence process-environment)))
+         (anvil-host--cleanup-state
+          (cons nil (make-hash-table :test #'eq)))
+         (anvil-host--cleanup-timer nil)
+         (anvil-host--cleanup-active nil)
+         helper observed)
+    (unwind-protect
+        (progn
+          ;; Spawn before the host transaction so the helper is foreign to its
+          ;; identity snapshot.  Only servicing that foreign process can
+          ;; create the release gate awaited by the owned child.
+          (setq helper
+                (make-process
+                 :name "anvil-host-foreign-release-helper"
+                 :buffer nil
+                 :command
+                 (list
+                  shell-file-name shell-command-switch
+                  (format
+                   (concat "while [ ! -e %s ]; do sleep 0.01; done; "
+                           "printf x; exec sleep 30")
+                   (shell-quote-argument started)))
+                 :connection-type 'pipe
+                 :coding 'binary
+                 :noquery t
+                 :sentinel #'ignore
+                 :filter
+                 (lambda (_process _chunk)
+                   (setq observed
+                         (list
+                          default-directory
+                          anvil-host-child-process-environment
+                          anvil-host-child-exec-path
+                          anvil-host-child-shell-file-name
+                          anvil-host-child-shell-command-switch
+                          (getenv "ANVIL_HOST_PRIVATE_MARKER")))
+                   (write-region "" nil release nil 'silent))))
+          (let ((anvil-host-child-process-environment child-environment)
+                (anvil-host-child-exec-path (copy-sequence exec-path))
+                (anvil-host-child-shell-file-name shell-file-name)
+                (anvil-host-child-shell-command-switch shell-command-switch))
+            (should
+             (equal
+              '(0 "secret" "")
+              (anvil-host--run
+               (format
+                (concat ": > %s; "
+                        "while [ ! -e %s ]; do sleep 0.01; done; "
+                        "printf '%%s' \"$ANVIL_HOST_PRIVATE_MARKER\"")
+                (shell-quote-argument started)
+                (shell-quote-argument release))
+               'utf-8-unix directory 2))))
+          (should
+           (equal (list baseline-directory nil nil nil nil nil) observed))
+          (should (file-exists-p release))
+          ;; The owned transaction must not sweep its preexisting helper.
+          (should (process-live-p helper))
+          (anvil-host-reentrancy-test--assert-clean nil nil))
+      (when (and (processp helper) (process-live-p helper))
+        (delete-process helper))
+      (anvil-host-reentrancy-test--force-clean nil nil)
+      (delete-directory directory t))))
+
 (ert-deftest anvil-host-reentrancy-output-is-not-buffer-visible ()
   "Callbacks cannot read filtered stdout or stderr from Emacs buffers."
   (skip-unless (memq system-type '(gnu/linux darwin)))

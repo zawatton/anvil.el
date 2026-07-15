@@ -733,9 +733,10 @@ post-exit draining prevent inherited descriptors from retaining the call.
 
 Output is accumulated in lexical filter state rather than discoverable
 buffers.  Request-specific child bindings are present only during spawn.
-Targeted waits prioritize this shell and its stderr pipe while ordinary
-timers remain responsive.  Emacs may still dispatch a ready foreign filter;
-hard containment therefore belongs to the dedicated-daemon bridge watchdog.
+Waits target this shell for return semantics while servicing all process
+output, so Emacs server sockets and helper filters remain responsive.
+Secret-bearing child overrides are shadowed during every yield; hard
+containment therefore belongs to the dedicated-daemon bridge watchdog.
 Nonlocal exits recover every exact post-snapshot constructor child."
   (anvil-host--resource-state)
   ;; Public submission is fail-closed across cleanup snapshots.
@@ -888,6 +889,8 @@ Nonlocal exits recover every exact post-snapshot constructor child."
              (when (process-live-p proc)
                (signal (car error) (cdr error)))))
           ;; Shadow secret-bearing outer advice bindings during every yield.
+          ;; Accept foreign process output as well: Emacs server sockets and
+          ;; helper filters must remain responsive while the child is running.
           (let ((anvil-host-child-process-environment nil)
                 (anvil-host-child-exec-path nil)
                 (anvil-host-child-shell-file-name nil)
@@ -895,10 +898,10 @@ Nonlocal exits recover every exact post-snapshot constructor child."
             (let ((deadline (+ (float-time) timeout)))
               (while (and (process-live-p proc)
                           (< (float-time) deadline))
-                (funcall anvil-host--accept-process-output-primitive proc 0.05 nil t)
+                (funcall anvil-host--accept-process-output-primitive proc 0.05 nil nil)
                 (when (and (processp stderr-proc)
                            (process-live-p stderr-proc))
-                  (funcall anvil-host--accept-process-output-primitive stderr-proc 0 nil t)))
+                  (funcall anvil-host--accept-process-output-primitive stderr-proc 0 nil nil)))
               (when (process-live-p proc)
                 (error "anvil-host: shell timeout after %ss: %s"
                        timeout command)))
@@ -909,9 +912,9 @@ Nonlocal exits recover every exact post-snapshot constructor child."
                      (+ (float-time) anvil-host--stderr-drain-budget-sec)))
                 (while (and (process-live-p stderr-proc)
                             (< (float-time) drain-deadline))
-                  (funcall anvil-host--accept-process-output-primitive stderr-proc 0.02 nil t)
-                  (funcall anvil-host--accept-process-output-primitive proc 0 nil t))))
-            (funcall anvil-host--accept-process-output-primitive proc 0.01 nil t))
+                  (funcall anvil-host--accept-process-output-primitive stderr-proc 0.02 nil nil)
+                  (funcall anvil-host--accept-process-output-primitive proc 0 nil nil))))
+            (funcall anvil-host--accept-process-output-primitive proc 0.01 nil nil))
           (list
            (process-exit-status proc)
            (anvil-host--decode-output
