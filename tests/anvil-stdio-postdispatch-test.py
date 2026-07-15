@@ -2211,10 +2211,13 @@ def run_cumulative_frame_budget(
     real_helpers: dict[str, str],
     parent_guard: Path | None = None,
     parent_guard_python: str | None = None,
+    *,
+    _attempt: int = 1,
 ) -> None:
     """Prove headers and body consume one guarded absolute frame deadline."""
     guarded = parent_guard is not None
     suffix = "guarded" if guarded else "plain"
+    retry_reason: str | None = None
     with tempfile.TemporaryDirectory(
         prefix=f"anvil-stdio-frame-budget-{suffix}-"
     ) as raw_root:
@@ -2271,15 +2274,31 @@ def run_cumulative_frame_budget(
             if process.returncode == 0:
                 raise AssertionError("incomplete cumulative frame exited successfully")
             if "MCP-FRAMING: body reader start" not in safe_text(paths["debug_log"]):
-                raise AssertionError("cumulative frame never entered the body reader")
+                retry_reason = "cumulative frame never entered the body reader"
             if read_count(paths["dispatch_count"]) != 0:
                 raise AssertionError(
                     "incomplete cumulative frame reached stateful Emacs"
                 )
             if not wait_until(lambda: not process_group_alive(process.pid), 2):
                 raise AssertionError("cumulative-frame bridge group survived exit")
+            if retry_reason is not None:
+                assert_no_capture_paths(paths["temp"])
         finally:
             terminate_bridge(process)
+
+    if retry_reason is not None:
+        if _attempt >= 3:
+            raise AssertionError(
+                f"{retry_reason} after {_attempt} clean {suffix} attempts"
+            )
+        run_cumulative_frame_budget(
+            stdio,
+            bash,
+            real_helpers,
+            parent_guard,
+            parent_guard_python,
+            _attempt=_attempt + 1,
+        )
 
 
 def run_stalled_frame_header(

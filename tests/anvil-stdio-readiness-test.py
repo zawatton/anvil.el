@@ -122,9 +122,11 @@ def execute_file_expression(*, ready=True):
     response_payload = base64.b64encode(
         os.environ["FAKE_RESPONSE_JSON"].encode("utf-8")
     ).decode("ascii")
+    delay = float(os.environ.get("FAKE_REAL_EMACS_DELAY_SEC", "0"))
     program = (
         "(progn "
-        f"(fset 'anvil-headless--ready-p (lambda (_server) {'t' if ready else 'nil'})) "
+        + (f"(sleep-for {delay!r}) " if delay else "")
+        + f"(fset 'anvil-headless--ready-p (lambda (_server) {'t' if ready else 'nil'})) "
         "(fset 'anvil-server-process-jsonrpc "
         "(lambda (_request _server) "
         f"(decode-coding-string (base64-decode-string "
@@ -147,7 +149,6 @@ def execute_file_expression(*, ready=True):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        timeout=5,
         check=False,
     )
     if completed.returncode != 0:
@@ -533,6 +534,8 @@ def run_case(
     probe_timeout: int = 5,
     retry_delay_ms: int = 50,
     retry_max: int = 5,
+    dispatch_timeout: int = 10,
+    real_emacs_delay_sec: float = 0,
     large_request: bool = False,
     exit_descendant: bool = False,
 ) -> tuple[dict[str, object], int, int, float, str, str]:
@@ -574,6 +577,7 @@ def run_case(
                     expected, separators=(",", ":"), ensure_ascii=False
                 ),
                 "FAKE_REAL_EMACS": os.environ["ANVIL_TEST_REAL_EMACS"],
+                "FAKE_REAL_EMACS_DELAY_SEC": str(real_emacs_delay_sec),
                 "FAKE_ANVIL_ROOT": str(stdio.parent),
                 "FAKE_NIL_BEFORE": str(nil_before),
                 "FAKE_ALWAYS_NIL": "1" if always_nil else "0",
@@ -591,7 +595,7 @@ def run_case(
                 "ANVIL_EMACSCLIENT_PROBE_TIMEOUT": str(probe_timeout),
                 "ANVIL_EMACSCLIENT_READINESS_TIMEOUT": str(readiness_timeout),
                 "ANVIL_EMACSCLIENT_STARTUP_DISPATCH_TIMEOUT": "10",
-                "ANVIL_EMACSCLIENT_DISPATCH_TIMEOUT": "10",
+                "ANVIL_EMACSCLIENT_DISPATCH_TIMEOUT": str(dispatch_timeout),
                 "ANVIL_EMACSCLIENT_KILL_AFTER_TIMEOUT": "1",
                 "ANVIL_EMACSCLIENT_RETRY_MAX": str(retry_max),
                 "ANVIL_EMACSCLIENT_RETRY_DELAY_MS": str(retry_delay_ms),
@@ -1302,6 +1306,25 @@ def main() -> int:
         raise AssertionError(
             f"nil-to-ready case failed: response={success!r} "
             f"probes={probes} dispatches={dispatches} stderr={stderr!r}"
+        )
+
+    delayed_success, probes, dispatches, elapsed, stderr, _guard = run_case(
+        stdio,
+        bash,
+        real_emacs_delay_sec=5.1,
+        dispatch_timeout=20,
+    )
+    if (
+        not strict_equal(delayed_success, expected)
+        or probes != 1
+        or dispatches != 1
+        or not 5 < elapsed < 20
+    ):
+        raise AssertionError(
+            "real Emacs was preempted by a nested harness timeout: "
+            f"response={delayed_success!r} probes={probes} "
+            f"dispatches={dispatches} elapsed={elapsed:.3f} "
+            f"stderr={stderr!r}"
         )
 
     large_success, probes, dispatches, _elapsed, stderr, _guard = run_case(
