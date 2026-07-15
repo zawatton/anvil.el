@@ -8,6 +8,7 @@ import errno
 import json
 import os
 from pathlib import Path
+import re
 import selectors
 import shutil
 import shlex
@@ -16,10 +17,13 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 
-REPLY_TIMEOUT_SECONDS = 3.0
+READY_OBSERVER_TIMEOUT_SECONDS = 30.0
+SUCCESS_REPLY_TIMEOUT_SECONDS = 30.0
+DISPATCH_OBSERVER_TIMEOUT_SECONDS = 45.0
 BRIDGE_TERM_GRACE_SECONDS = 0.5
 BRIDGE_REAP_TIMEOUT_SECONDS = 10.0
 FRAME_EXIT_TIMEOUT_SECONDS = 5.0
@@ -47,9 +51,39 @@ def json_bytes(value: object) -> bytes:
     ).encode("utf-8")
 
 
-def percent_wire(payload: bytes) -> str:
-    """Encode PAYLOAD for anvil-stdio's process-free response wire."""
-    return "".join(f"%{byte:02x}" for byte in payload)
+def captured_generation_paths(
+    expression_path: Path,
+    sequence: int,
+) -> tuple[Path, Path]:
+    """Decode the exact request path and precommitted response stage."""
+    expression = expression_path.read_text(encoding="utf-8")
+    decoded: set[Path] = set()
+    for payload in re.findall(
+        r'base64-decode-string "([A-Za-z0-9+/=]+)"',
+        expression,
+    ):
+        try:
+            value = base64.b64decode(payload, validate=True).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if os.path.isabs(value):
+            decoded.add(Path(value))
+    request_name = f"request.{sequence}.json"
+    stage_prefix = f".response-tmp.{sequence}."
+    requests = [candidate for candidate in decoded if candidate.name == request_name]
+    stages = [
+        candidate for candidate in decoded if candidate.name.startswith(stage_prefix)
+    ]
+    if len(requests) != 1 or len(stages) != 1:
+        raise AssertionError(
+            f"captured expression lacks exact generation {sequence}: {decoded}"
+        )
+    return requests[0], stages[0]
+
+
+def printf_wire(payload: bytes) -> str:
+    """Encode PAYLOAD as process-free Bash printf escapes."""
+    return "".join(f"\\x{byte:02x}" for byte in payload)
 
 
 def read_count(path: Path) -> int:
@@ -70,6 +104,12 @@ def safe_text(path: Path, limit: int = 4000) -> str:
         return f"<unavailable: {error}>"
 
 
+def assert_no_stage_fd_inheritance(marker: dict[str, object], label: str) -> None:
+    """Require one exact stage and prove the child did not inherit its FD."""
+    if marker.get("stageCount") != 1 or marker.get("fd6MatchesStage") is not False:
+        raise AssertionError(f"{label} inherited authenticated response custody: {marker}")
+
+
 def replace_with_fifo(path: Path) -> None:
     """Replace PATH with a FIFO without launching another executable."""
     try:
@@ -85,72 +125,142 @@ def make_executable(path: Path, source: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
-def write_fake_emacsclient(path: Path, bash: str) -> None:
-    """Create a builtin-only Bash emacsclient with controlled responses."""
-    source = r"""#!__BASH__
-set -u
+def write_fake_emacsclient(path: Path, _bash: str) -> None:
+    """Create a child-free Python emacsclient with controlled responses."""
+    source = r"""#!__PYTHON__
+import base64
+import os
+from pathlib import Path
+import re
+import sys
 
-if [[ -n ${ALTERNATE_EDITOR+x} ]]; then
-    printf 'ALTERNATE_EDITOR leaked into emacsclient\n' >&2
-    exit 78
-fi
 
-bump() {
-    local path=$1
-    local value=0
-    if [[ -r "$path" ]]; then
-        IFS= read -r value < "$path" || :
-    fi
-    value=$((value + 1))
-    printf '%s' "$value" > "$path"
-    BUMP_VALUE=$value
-}
+def emit(descriptor, payload):
+    os.write(descriptor, payload)
 
-expression=${!#}
-if [[ ${#expression} -gt 100000 ]]; then
-    printf 'emacsclient expression exceeds portable argument ceiling\n' >&2
-    exit 75
-fi
-case "$expression" in
-    t)
-        bump "$FAKE_PROBE_COUNT"
-        printf 't\n'
-        ;;
-    '(test-init)')
-        bump "$FAKE_INIT_COUNT"
-        printf 't\n'
-        ;;
-    '(test-stop)')
-        bump "$FAKE_STOP_COUNT"
-        printf 't\n'
-        ;;
-    *)
-        bump "$FAKE_DISPATCH_COUNT"
-        index=$((BUMP_VALUE - 1))
-        case "$index" in
-            0) wire=$FAKE_RESPONSE_WIRE_0 ;;
-            1) wire=$FAKE_RESPONSE_WIRE_1 ;;
-            2) wire=$FAKE_RESPONSE_WIRE_2 ;;
-            *)
-                printf 'unexpected duplicate dispatch\n' >&2
-                exit 64
-                ;;
-        esac
-        printf '%s' "$BUMP_VALUE" > "$FAKE_DISPATCH_COMPLETE"
-        IFS= read -r _ < "$FAKE_DISPATCH_ACK_FIFO"
-        if [[ "$index" -eq 1 ]]; then
-            printf 'captured-stderr-%s' "$FAKE_CAPTURED_STDERR" >&2
-        fi
-        if [[ "$index" -eq 2 ]]; then
-            cut=$((${#wire} / 2))
-            printf '"%s\r\n*ERROR*: Unknown message: %s"\r\n' \
-                "${wire:0:cut}" "${wire:cut}"
-        else
-            printf '"%s"\n' "$wire"
-        fi
-        ;;
-esac
-""".replace("__BASH__", bash)
+
+def bump(path):
+    try:
+        value = int(Path(path).read_text(encoding="ascii"))
+    except FileNotFoundError:
+        value = 0
+    value += 1
+    Path(path).write_text(str(value), encoding="ascii")
+    return value
+
+
+def decode_wire(text):
+    if re.fullmatch(r"(?:\\x[0-9A-Fa-f]{2})*", text) is None:
+        raise ValueError("invalid fake response wire")
+    return bytes.fromhex(text.replace("\\x", ""))
+
+
+if "ALTERNATE_EDITOR" in os.environ:
+    emit(2, b"ALTERNATE_EDITOR leaked into emacsclient\n")
+    raise SystemExit(78)
+
+expression = sys.argv[-1]
+if len(expression) > 100000:
+    emit(2, b"emacsclient expression exceeds portable argument ceiling\n")
+    raise SystemExit(75)
+
+if expression == "t":
+    bump(os.environ["FAKE_PROBE_COUNT"])
+    emit(1, b"t\n")
+elif expression == (
+    '(if t (progn (test-init) "anvil-mcp-lifecycle-complete") '
+    '"anvil-mcp-headless-not-ready")'
+):
+    bump(os.environ["FAKE_INIT_COUNT"])
+    emit(1, b'"anvil-mcp-lifecycle-complete"\n')
+elif expression == (
+    '(if t (progn (test-stop) "anvil-mcp-lifecycle-complete") '
+    '"anvil-mcp-headless-not-ready")'
+):
+    bump(os.environ["FAKE_STOP_COUNT"])
+    emit(1, b'"anvil-mcp-lifecycle-complete"\n')
+else:
+    invocation = bump(os.environ["FAKE_DISPATCH_COUNT"])
+    index = invocation - 1
+    if index == 0 and os.environ.get("FAKE_CAPTURED_EXPRESSION"):
+        Path(os.environ["FAKE_CAPTURED_EXPRESSION"]).write_text(
+            expression,
+            encoding="utf-8",
+        )
+    try:
+        wire_text = os.environ[f"FAKE_RESPONSE_WIRE_{index}"]
+    except KeyError:
+        emit(2, b"unexpected duplicate dispatch\n")
+        raise SystemExit(64)
+    Path(os.environ["FAKE_DISPATCH_COMPLETE"]).write_text(
+        str(invocation),
+        encoding="ascii",
+    )
+    with open(os.environ["FAKE_DISPATCH_ACK_FIFO"], "rb") as stream:
+        stream.read(1)
+
+    decoded = []
+    for payload in re.findall(
+        r'base64-decode-string "([A-Za-z0-9+/=]+)"',
+        expression,
+    ):
+        try:
+            value = base64.b64decode(payload, validate=True).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if os.path.isabs(value):
+            decoded.append(Path(value))
+    stages = []
+    for candidate in decoded:
+        match = re.fullmatch(r"\.response-tmp\.([0-9]+)\..+", candidate.name)
+        if match is not None and int(match.group(1)) > 0:
+            stages.append((candidate, int(match.group(1))))
+    if len(stages) != 1:
+        emit(2, f"missing unique response stage: {decoded}\n".encode())
+        raise SystemExit(70)
+    stage, sequence = stages[0]
+    final = stage.parent / f"response.{sequence}.json"
+    proof = stage.parent / f"proof.{sequence}.json"
+    wire = decode_wire(wire_text)
+    publication_mode = os.environ.get("FAKE_RESPONSE_PUBLICATION_MODE", "normal")
+    if publication_mode == "competitor":
+        competitor = decode_wire(os.environ["FAKE_COMPETITOR_WIRE"])
+        with final.open("xb") as stream:
+            stream.write(competitor)
+        os.chmod(final, 0o600)
+        os.link(final, proof)
+        response_size = len(competitor)
+    elif publication_mode == "normal":
+        with stage.open("wb") as stream:
+            stream.write(wire)
+        os.link(stage, final)
+        os.link(stage, proof)
+        stage.unlink()
+        response_size = len(wire)
+    else:
+        emit(2, f"unknown fake publication mode: {publication_mode}\n".encode())
+        raise SystemExit(64)
+    if os.environ.get("FAKE_RESPONSE_MARKER_SIZE"):
+        response_size = int(os.environ["FAKE_RESPONSE_MARKER_SIZE"])
+
+    marker = f"anvil-mcp-response-staged:{sequence}:{response_size}"
+    if index == 1:
+        emit(
+            2,
+            ("captured-stderr-" + os.environ["FAKE_CAPTURED_STDERR"]).encode(),
+        )
+    if index == 2:
+        cut = len(marker) // 2
+        emit(
+            1,
+            (
+                '"' + marker[:cut] + "\r\n*ERROR*: Unknown message: "
+                + marker[cut:] + '"\r\n'
+            ).encode(),
+        )
+    else:
+        emit(1, ('"' + marker + '"\n').encode())
+""".replace("__PYTHON__", sys.executable)
     make_executable(path, source)
 
 
@@ -160,10 +270,23 @@ def write_helper_wrapper(
     name: str,
     real_helper: str,
 ) -> None:
-    """Forward before dispatch; otherwise record and block on a FIFO."""
+    """Allow known next-request work, but block response-path recovery."""
     source = r"""#!__BASH__
 set -u
 if [[ -e "$FAKE_DISPATCH_COMPLETE" ]]; then
+    # A pipelined request may begin only after the prior reply was emitted.
+    # Permit its known replay-safe framing, metadata, and staging helpers.
+    # Every helper started to recover the completed dispatch remains blocked.
+    case "$*" in
+    *"limit = int(sys.argv[1])"*|\
+    *"remaining = int(sys.argv[1])"*|\
+    *"document = json.loads"*|\
+    *"def generation_file(name, prefix):"*|\
+    *"pieces[0] == \"response\""*|\
+    *"pieces[0] == \"request\""*)
+        exec __REAL_HELPER__ "$@"
+        ;;
+    esac
     printf '{"pid":%s,"program":"__NAME__"}\n' "$$" \
         > "$FAKE_POSTDISPATCH_HELPER"
     IFS= read -r _ < "$FAKE_HELPER_BLOCK_FIFO"
@@ -177,10 +300,20 @@ exec __REAL_HELPER__ "$@"
     make_executable(path, source)
 
 
-def write_blocking_predispatch_wrapper(path: Path, bash: str, name: str) -> None:
-    """Create a builtin-only helper that simulates a loader-frozen child."""
+def write_blocking_predispatch_wrapper(
+    path: Path,
+    bash: str,
+    name: str,
+    real_helper: str,
+) -> None:
+    """Freeze the metadata loader while allowing binary-safe wire readers."""
     source = r"""#!__BASH__
 set -u
+case "$*" in
+*"limit = int(sys.argv[1])"*|*"remaining = int(sys.argv[1])"*)
+    exec __REAL_HELPER__ "$@"
+    ;;
+esac
 printf '{"pid":%s,"program":"__NAME__"}\n' "$$" \
     > "$FAKE_PREDISPATCH_MARKER"
 IFS= read -r _ < "$FAKE_PREDISPATCH_BLOCK_FIFO"
@@ -188,6 +321,7 @@ exit 125
 """
     source = source.replace("__BASH__", bash)
     source = source.replace("__NAME__", name)
+    source = source.replace("__REAL_HELPER__", shlex.quote(real_helper))
     make_executable(path, source)
 
 
@@ -200,6 +334,11 @@ def write_delayed_python_wrapper(
     """Delay parser startup past the former default, then exec Python."""
     source = r"""#!__BASH__
 set -u
+case "$*" in
+*"limit = int(sys.argv[1])"*|*"remaining = int(sys.argv[1])"*)
+    exec __PYTHON__ "$@"
+    ;;
+esac
 __SLEEP__ 3
 exec __PYTHON__ "$@"
 """
@@ -209,28 +348,129 @@ exec __PYTHON__ "$@"
     make_executable(path, source)
 
 
-def write_owner_blocking_emacsclient(path: Path, bash: str) -> None:
-    """Create an emacsclient that publishes its PID, then blocks."""
-    source = r"""#!__BASH__
-set -u
+def write_response_prepare_pause_wrapper(
+    path: Path,
+    real_python: str,
+) -> None:
+    """Pause response preparation only after its stage inode is owned."""
+    source = f"""#!{real_python}
+import os
+import sys
 
-expression=${!#}
-if [[ "$expression" == t ]]; then
-    printf 't\n'
-    exit 0
-fi
+real_python = {real_python!r}
+arguments = sys.argv[1:]
+try:
+    script_index = arguments.index("-c") + 1
+except ValueError:
+    script_index = -1
+if script_index > 0 and script_index < len(arguments):
+    script = arguments[script_index]
+    if (
+        'pieces[0] == "response"' in script
+        and "response staging interrupted" in script
+    ):
+        mode = os.environ.get("FAKE_RESPONSE_PREPARE_MODE")
+        if mode == "pause":
+            needle = "    without_term(create_stage)\\n"
+            replacement = (
+                needle
+                + "    marker = os.environ['FAKE_RESPONSE_PREPARE_MARKER']\\n"
+                + "    with open(marker, 'w', encoding='ascii') as stream:\\n"
+                + "        stream.write(str(os.getpid()))\\n"
+                + "    import time\\n"
+                + "    time.sleep(60)\\n"
+            )
+        elif mode == "link-fail":
+            needle = "        os.link(path, probe_path)\\n"
+            replacement = (
+                "        marker = os.environ['FAKE_RESPONSE_LINK_MARKER']\\n"
+                + "        with open(marker, 'w', encoding='ascii') as stream:\\n"
+                + "            stream.write(str(os.getpid()))\\n"
+                + "        raise OSError(95, 'hard links unavailable')\\n"
+            )
+        else:
+            needle = ""
+            replacement = ""
+        if needle:
+            if script.count(needle) != 1:
+                raise SystemExit("response-preparation injection point drifted")
+            arguments[script_index] = script.replace(needle, replacement, 1)
+os.execv(real_python, [real_python, *arguments])
+"""
+    make_executable(path, source)
 
-value=0
-if [[ -r "$FAKE_OWNER_DISPATCH_COUNT" ]]; then
-    IFS= read -r value < "$FAKE_OWNER_DISPATCH_COUNT" || :
-fi
-value=$((value + 1))
-printf '%s' "$value" > "$FAKE_OWNER_DISPATCH_COUNT"
-printf '{"pid":%s,"parent":%s}\n' "$$" "$PPID" \
-    > "$FAKE_OWNER_CHILD_MARKER"
-IFS= read -r _ < "$FAKE_OWNER_BLOCK_FIFO"
-exit 125
-""".replace("__BASH__", bash)
+
+def write_owner_blocking_emacsclient(path: Path, _bash: str) -> None:
+    """Create a child-free client that records FD custody, then blocks."""
+    source = r"""#!__PYTHON__
+import base64
+import json
+import os
+from pathlib import Path
+import re
+import sys
+
+
+expression = sys.argv[-1]
+if expression == "t":
+    os.write(1, b"t\n")
+    raise SystemExit(0)
+
+count_path = Path(os.environ["FAKE_OWNER_DISPATCH_COUNT"])
+try:
+    count = int(count_path.read_text(encoding="ascii"))
+except FileNotFoundError:
+    count = 0
+count += 1
+count_path.write_text(str(count), encoding="ascii")
+
+stages = []
+for payload in re.findall(
+    r'base64-decode-string "([A-Za-z0-9+/=]+)"',
+    expression,
+):
+    try:
+        value = base64.b64decode(payload, validate=True).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        continue
+    candidate = Path(value)
+    if (
+        os.path.isabs(value)
+        and re.fullmatch(r"\.response-tmp\.[0-9]+\..+", candidate.name)
+    ):
+        stages.append(candidate)
+
+try:
+    held = os.fstat(6)
+except OSError:
+    fd6_open = False
+    fd6_matches_stage = False
+else:
+    fd6_open = True
+    fd6_matches_stage = False
+    for stage in stages:
+        try:
+            info = stage.stat()
+        except FileNotFoundError:
+            continue
+        if held.st_dev == info.st_dev and held.st_ino == info.st_ino:
+            fd6_matches_stage = True
+
+marker = {
+    "pid": os.getpid(),
+    "parent": os.getppid(),
+    "fd6Open": fd6_open,
+    "fd6MatchesStage": fd6_matches_stage,
+    "stageCount": len(stages),
+}
+Path(os.environ["FAKE_OWNER_CHILD_MARKER"]).write_text(
+    json.dumps(marker, separators=(",", ":")),
+    encoding="ascii",
+)
+with open(os.environ["FAKE_OWNER_BLOCK_FIFO"], "rb") as stream:
+    stream.read(1)
+raise SystemExit(125)
+""".replace("__PYTHON__", sys.executable)
     make_executable(path, source)
 
 
@@ -398,6 +638,7 @@ def build_fixture(
         "predispatch_marker": root / "predispatch-helper",
         "helper_marker": root / "postdispatch-helper",
         "dispatch_count": root / "dispatch-count",
+        "captured_expression": root / "captured-expression.el",
         "probe_count": root / "probe-count",
         "init_count": root / "init-count",
         "stop_count": root / "stop-count",
@@ -423,6 +664,7 @@ def build_fixture(
             "FAKE_PREDISPATCH_MARKER": str(paths["predispatch_marker"]),
             "FAKE_POSTDISPATCH_HELPER": str(paths["helper_marker"]),
             "FAKE_DISPATCH_COUNT": str(paths["dispatch_count"]),
+            "FAKE_CAPTURED_EXPRESSION": str(paths["captured_expression"]),
             "FAKE_PROBE_COUNT": str(paths["probe_count"]),
             "FAKE_INIT_COUNT": str(paths["init_count"]),
             "FAKE_STOP_COUNT": str(paths["stop_count"]),
@@ -431,13 +673,14 @@ def build_fixture(
             "FAKE_RESPONSE_WIRE_2": wires[2] if len(wires) > 2 else "",
             "FAKE_CAPTURED_STDERR": "x" * 8192,
             "EMACS_MCP_DEBUG_LOG": str(paths["debug_log"]),
+            "ANVIL_MCP_READINESS_MODE": "emacs",
             "ANVIL_EMACSCLIENT_PROBE_TIMEOUT": "5",
             "ANVIL_EMACSCLIENT_READINESS_TIMEOUT": "10",
-            "ANVIL_EMACSCLIENT_STARTUP_DISPATCH_TIMEOUT": "5",
-            "ANVIL_EMACSCLIENT_DISPATCH_TIMEOUT": "5",
+            "ANVIL_EMACSCLIENT_STARTUP_DISPATCH_TIMEOUT": "10",
+            "ANVIL_EMACSCLIENT_DISPATCH_TIMEOUT": "10",
             "ANVIL_EMACSCLIENT_KILL_AFTER_TIMEOUT": "1",
             "ANVIL_MCP_REQUEST_PARSE_TIMEOUT": "10",
-            "ANVIL_MCP_FRAME_READ_TIMEOUT": "2",
+            "ANVIL_MCP_FRAME_READ_TIMEOUT": "10",
             "ANVIL_EMACSCLIENT_RETRY_MAX": "1",
             "ANVIL_EMACSCLIENT_RETRY_DELAY_MS": "0",
             "ALTERNATE_EDITOR": str(root / "must-not-run"),
@@ -521,7 +764,7 @@ def read_reply(
     expected: dict[str, object],
     *,
     framed: bool,
-    timeout_seconds: float = REPLY_TIMEOUT_SECONDS,
+    timeout_seconds: float = SUCCESS_REPLY_TIMEOUT_SECONDS,
 ) -> None:
     """Read and validate one line or framed response."""
     deadline = time.monotonic() + timeout_seconds
@@ -632,6 +875,184 @@ def wait_for_bridge_reap(
         ) from error
 
 
+def extract_inline_python(stdio: Path, function_name: str) -> str:
+    """Extract one exact Python -c body from a bridge shell function."""
+    source = stdio.read_text(encoding="utf-8")
+    function_start = source.index(f"{function_name}() {{")
+    function_end = source.index(
+        '\n\treturn "$ANVIL_MCP_RUN_STATUS"\n}\n',
+        function_start,
+    )
+    block = source[function_start:function_end]
+    command_marker = "-I -S -c '\n"
+    script_start = block.index(command_marker) + len(command_marker)
+    script_end = block.rindex("\n' ")
+    return block[script_start:script_end]
+
+
+def inject_cleanup_barrier(script: str) -> str:
+    """Pause the first cleanup snapshot so the test can publish concurrently."""
+    needle = "        names = os.listdir(directory)\n"
+    replacement = (
+        needle
+        + "        race_marker = os.environ.get("
+        + "'ANVIL_CLEANUP_RACE_MARKER')\n"
+        + "        if race_marker and not os.path.exists(race_marker):\n"
+        + "            with open(race_marker, 'w', encoding='ascii') as stream:\n"
+        + "                stream.write(str(os.getpid()))\n"
+        + "            race_release = os.environ['ANVIL_CLEANUP_RACE_RELEASE']\n"
+        + "            while not os.path.exists(race_release):\n"
+        + "                __import__('time').sleep(0.001)\n"
+    )
+    if script.count(needle) != 1:
+        raise AssertionError("cleanup snapshot injection point drifted")
+    return script.replace(needle, replacement, 1)
+
+
+def run_cleanup_race_program(
+    script: str,
+    arguments: list[str],
+    input_bytes: bytes,
+    marker: Path,
+    release: Path,
+    publish: object,
+) -> bytes:
+    """Run SCRIPT through one deterministic snapshot/publication race."""
+    environment = os.environ.copy()
+    environment["ANVIL_CLEANUP_RACE_MARKER"] = str(marker)
+    environment["ANVIL_CLEANUP_RACE_RELEASE"] = str(release)
+    process = subprocess.Popen(
+        [sys.executable, "-I", "-S", "-c", script, *arguments],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=environment,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not marker.is_file():
+            if process.poll() is not None:
+                stdout, stderr = process.communicate()
+                raise AssertionError(
+                    f"cleanup race exited before barrier rc={process.returncode}: "
+                    f"{stdout!r} {stderr!r}"
+                )
+            if time.monotonic() >= deadline:
+                raise AssertionError("cleanup race did not reach snapshot barrier")
+            time.sleep(0.01)
+        publish()  # type: ignore[operator]
+        release.touch()
+        stdout, stderr = process.communicate(input=input_bytes, timeout=10)
+        if process.returncode != 0:
+            raise AssertionError(
+                f"cleanup race failed rc={process.returncode}: {stderr!r}"
+            )
+        return stdout
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=2)
+
+
+def run_cleanup_rescan_regression(stdio: Path) -> None:
+    """Concurrent publication cannot survive metadata or EXIT cleanup."""
+    metadata_script = inject_cleanup_barrier(
+        extract_inline_python(stdio, "anvil_mcp_request_metadata")
+    )
+    exit_script = inject_cleanup_barrier(
+        extract_inline_python(stdio, "anvil_mcp_cleanup_all_staged")
+    )
+    with tempfile.TemporaryDirectory(prefix="anvil-cleanup-race-") as raw:
+        root = Path(raw).resolve()
+
+        metadata_directory = root / "metadata"
+        metadata_directory.mkdir(mode=0o700)
+        metadata_temp = metadata_directory / ".response-tmp.1.race"
+        metadata_temp.write_bytes(b"sensitive")
+        metadata_temp.chmod(0o600)
+        metadata_final = metadata_directory / "response.1.json"
+        metadata_proof = metadata_directory / "proof.1.json"
+        metadata_marker = root / "metadata-marker"
+        metadata_release = root / "metadata-release"
+        request = json_bytes(
+            {"jsonrpc": "2.0", "id": 301, "method": "test"}
+        )
+
+        def publish_metadata() -> None:
+            os.link(metadata_temp, metadata_final)
+            os.link(metadata_temp, metadata_proof)
+            metadata_temp.unlink()
+
+        metadata_output = run_cleanup_race_program(
+            metadata_script,
+            ["16777216", "16384", str(metadata_directory)],
+            request,
+            metadata_marker,
+            metadata_release,
+            publish_metadata,
+        )
+        fields = metadata_output.decode("utf-8").strip().split("|", 5)
+        if (
+            len(fields) != 6
+            or fields[0] != "request"
+            or fields[1] != "0"
+            or fields[2] != "inline"
+            or fields[4] != str(len(request))
+            or fields[5] != "301"
+            or base64.b64decode(fields[3], validate=True) != request
+        ):
+            raise AssertionError(f"metadata cleanup corrupted parsing: {fields}")
+        if list(metadata_directory.iterdir()):
+            raise AssertionError("metadata cleanup left raced publication")
+
+        exit_directory = root / "exit-published"
+        exit_directory.mkdir(mode=0o700)
+        exit_temp = exit_directory / ".response-tmp.1.race"
+        exit_temp.write_bytes(b"sensitive")
+        exit_temp.chmod(0o600)
+        exit_final = exit_directory / "response.1.json"
+        exit_proof = exit_directory / "proof.1.json"
+        exit_marker = root / "exit-marker"
+        exit_release = root / "exit-release"
+
+        def publish_exit() -> None:
+            os.link(exit_temp, exit_final)
+            os.link(exit_temp, exit_proof)
+            exit_temp.unlink()
+
+        run_cleanup_race_program(
+            exit_script,
+            [str(exit_directory)],
+            b"",
+            exit_marker,
+            exit_release,
+            publish_exit,
+        )
+        if exit_directory.exists():
+            raise AssertionError("EXIT cleanup left raced publication directory")
+
+        empty_directory = root / "exit-empty"
+        empty_directory.mkdir(mode=0o700)
+        empty_marker = root / "empty-marker"
+        empty_release = root / "empty-release"
+
+        def publish_after_empty_snapshot() -> None:
+            path = empty_directory / ".response-tmp.2.race"
+            path.write_bytes(b"late")
+            path.chmod(0o600)
+
+        run_cleanup_race_program(
+            exit_script,
+            [str(empty_directory)],
+            b"",
+            empty_marker,
+            empty_release,
+            publish_after_empty_snapshot,
+        )
+        if empty_directory.exists():
+            raise AssertionError("EXIT cleanup did not retry ENOTEMPTY")
+
+
 class DelayedReapFixture:
     """Fake process whose exit is observable only with a sufficient budget."""
 
@@ -720,7 +1141,7 @@ def terminate_bridge(process: subprocess.Popen[bytes]) -> None:
 def wait_for_bridge_ready(
     debug_log: Path,
     process: subprocess.Popen[bytes],
-    timeout: float = 15.0,
+    timeout: float = READY_OBSERVER_TIMEOUT_SECONDS,
 ) -> None:
     """Wait until startup logging proves the bridge entered its read loop."""
     deadline = time.monotonic() + timeout
@@ -745,7 +1166,7 @@ def wait_for_dispatch_complete(
     ack_fifo: Path,
     expected: int,
     before_release: object | None = None,
-    timeout: float = 15.0,
+    timeout: float = DISPATCH_OBSERVER_TIMEOUT_SECONDS,
 ) -> None:
     """Wait for dispatch, inject races, then release the fake client."""
     deadline = time.monotonic() + timeout
@@ -854,6 +1275,27 @@ def synthetic_dispatch_error(request_id: object, rc: int) -> dict[str, object]:
     }
 
 
+def synthetic_stage_error(request_id: object, rc: int) -> dict[str, object]:
+    """Return the expected correlated pre-dispatch staging error."""
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "error": {
+            "code": -32603,
+            "message": (
+                "Bridge synthetic error: "
+                "large request staging failed before dispatch"
+            ),
+            "data": {
+                "phase": "stage",
+                "dispatched": False,
+                "replayed": False,
+                "emacsclientRc": rc,
+            },
+        },
+    }
+
+
 def synthetic_parse_runner_error(rc: int) -> dict[str, object]:
     """Return the expected bounded pre-dispatch runner error."""
     return {
@@ -906,7 +1348,7 @@ def run_nonfinite_identifier(
         environment, paths = build_fixture(
             root,
             real_helpers,
-            [percent_wire(json_bytes(expected))],
+            [printf_wire(json_bytes(expected))],
             bash,
         )
         process = start_bridge(
@@ -986,12 +1428,17 @@ def run_predispatch_freeze(
         environment, paths = build_fixture(
             root,
             real_helpers,
-            [percent_wire(json_bytes(expected))],
+            [printf_wire(json_bytes(expected))],
             bash,
         )
         environment["ANVIL_MCP_REQUEST_PARSE_TIMEOUT"] = "5"
         python_wrapper = paths["binary"] / "python3"
-        write_blocking_predispatch_wrapper(python_wrapper, bash, "python3")
+        write_blocking_predispatch_wrapper(
+            python_wrapper,
+            bash,
+            "python3",
+            real_helpers["python3"],
+        )
         process = start_bridge(
             bash,
             stdio,
@@ -1089,7 +1536,7 @@ def run_default_parse_budget(
         environment, paths = build_fixture(
             root,
             real_helpers,
-            [percent_wire(json_bytes(expected))],
+            [printf_wire(json_bytes(expected))],
             bash,
         )
         environment.pop("ANVIL_MCP_REQUEST_PARSE_TIMEOUT")
@@ -1154,7 +1601,7 @@ def run_guard_loader_owner_death(
         environment, paths = build_fixture(
             root,
             real_helpers,
-            [percent_wire(json_bytes({"unused": True}))],
+            [printf_wire(json_bytes({"unused": True}))],
             bash,
         )
         guard, _guard_python = prepare_parent_guard(
@@ -1190,10 +1637,12 @@ def run_guard_loader_owner_death(
                 process,
                 {"jsonrpc": "2.0", "id": 55, "method": "test"},
             )
-            if not wait_until(loader_marker.is_file, 5):
+            if not wait_until(loader_marker.is_file, 15):
                 raise AssertionError(
                     "guard interpreter did not freeze before readiness: "
-                    f"{safe_text(paths['bridge_stderr'])}"
+                    f"rc={process.poll()} "
+                    f"debug={safe_text(paths['debug_log'])} "
+                    f"stderr={safe_text(paths['bridge_stderr'])}"
                 )
             loader_pid = int(loader_marker.read_text(encoding="utf-8"))
             if os.getpgid(loader_pid) != process.pid:
@@ -1237,7 +1686,7 @@ def run_owner_death_case(
         environment, paths = build_fixture(
             root,
             real_helpers,
-            [percent_wire(json_bytes({"unused": True}))],
+            [printf_wire(json_bytes({"unused": True}))],
             bash,
         )
         child_marker = root / "owner-child"
@@ -1285,6 +1734,7 @@ def run_owner_death_case(
                     f"{label} dispatch did not enter the blocking client"
                 )
             marker = json.loads(child_marker.read_text(encoding="utf-8"))
+            assert_no_stage_fd_inheritance(marker, f"{label} client")
             child_pid = int(marker["pid"])
             child_group = os.getpgid(child_pid)
             if child_group != child_pid:
@@ -1345,7 +1795,7 @@ def run_runner_death_recovery(
         environment, paths = build_fixture(
             root,
             real_helpers,
-            [percent_wire(json_bytes(expected))],
+            [printf_wire(json_bytes(expected))],
             bash,
         )
         guard, guard_python = prepare_parent_guard(
@@ -1405,6 +1855,7 @@ def run_runner_death_recovery(
             if not wait_until(child_marker.is_file, 5):
                 raise AssertionError("runner-death client did not start")
             marker = json.loads(child_marker.read_text(encoding="utf-8"))
+            assert_no_stage_fd_inheritance(marker, "runner-death client")
             child_pid = int(marker["pid"])
             runner_pid = int(marker["parent"])
             child_group = os.getpgid(child_pid)
@@ -1484,7 +1935,7 @@ def run_idle_then_partial_first_line(
             environment, paths = build_fixture(
                 root,
                 real_helpers,
-                [percent_wire(json_bytes({"unused": True}))],
+                [printf_wire(json_bytes({"unused": True}))],
                 bash,
             )
             environment["ANVIL_MCP_FRAME_READ_TIMEOUT"] = "1"
@@ -1526,6 +1977,138 @@ def run_idle_then_partial_first_line(
                 terminate_bridge(process)
 
 
+def run_nul_wire_rejection(
+    stdio: Path,
+    bash: str,
+    real_helpers: dict[str, str],
+) -> None:
+    """Reject raw NUL without dispatching or orphaning the bounded reader."""
+    cases = (
+        (
+            "legacy-embedded",
+            b'{"jsonrpc":"2.0","id":7,\x00"method":"tools/call"}\n',
+            "line",
+        ),
+        (
+            "header-embedded",
+            b"Content-Length: 2\r\nX-Test:\x00bad\r\n\r\n{}",
+            "line",
+        ),
+        (
+            "body-partial",
+            b"Content-Length: 100\r\n\r\n\x00",
+            "body",
+        ),
+        (
+            "body-forged-status",
+            b"Content-Length: 100\r\n\r\n\x000\n",
+            "body",
+        ),
+    )
+    for label, payload, expected_tag in cases:
+        with tempfile.TemporaryDirectory(
+            prefix=f"anvil-stdio-nul-{label}-"
+        ) as raw_root:
+            root = Path(raw_root)
+            environment, paths = build_fixture(
+                root,
+                real_helpers,
+                [printf_wire(json_bytes({"unused": True}))],
+                bash,
+            )
+            marker = root / "python-reader-pids"
+            wrapper = paths["binary"] / "python3"
+            real_python = real_helpers["python3"]
+            make_executable(
+                wrapper,
+                f"""#!{real_python}
+import os
+import sys
+
+code = " ".join(sys.argv[1:])
+tag = (
+    "body"
+    if "remaining = int(sys.argv[1])" in code
+    else "line"
+    if "limit = int(sys.argv[1])" in code
+    else ""
+)
+if tag:
+    descriptor = os.open(
+        os.environ["ANVIL_TEST_PYTHON_MARKER"],
+        os.O_APPEND | os.O_CREAT | os.O_WRONLY,
+        0o600,
+    )
+    try:
+        os.write(
+            descriptor,
+            f"{{tag}}|{{os.getpid()}}|{{os.getppid()}}\\n".encode("ascii"),
+        )
+    finally:
+        os.close(descriptor)
+os.execv({real_python!r}, [{real_python!r}, *sys.argv[1:]])
+""",
+            )
+            environment.update(
+                {
+                    "ANVIL_TEST_PYTHON_MARKER": str(marker),
+                    "ANVIL_MCP_FRAME_READ_TIMEOUT": "10",
+                }
+            )
+            process = start_bridge(
+                bash,
+                stdio,
+                environment,
+                paths["bridge_stderr"],
+                f"--socket=/tmp/anvil-nul-{label}-test",
+                "--server-id=test",
+            )
+            try:
+                wait_for_bridge_ready(paths["debug_log"], process)
+                if process.stdin is None:
+                    raise AssertionError("bridge stdin is unavailable")
+                process.stdin.write(payload)
+                process.stdin.flush()
+                wait_for_bridge_reap(
+                    process,
+                    timeout=15.0,
+                )
+                if process.returncode == 0:
+                    raise AssertionError(f"{label} NUL input exited successfully")
+                if read_count(paths["dispatch_count"]) != 0:
+                    raise AssertionError(f"{label} NUL input reached stateful Emacs")
+                records = [
+                    line.split("|")
+                    for line in safe_text(marker).splitlines()
+                    if line.count("|") == 2
+                ]
+                if not any(record[0] == expected_tag for record in records):
+                    raise AssertionError(
+                        f"{label} did not enter the expected reader: {records!r}"
+                    )
+                identities = {
+                    int(identity)
+                    for _tag, child, parent in records
+                    for identity in (child, parent)
+                }
+                if not wait_until(
+                    lambda: all(not process_alive(pid) for pid in identities),
+                    3,
+                ):
+                    survivors = [pid for pid in identities if process_alive(pid)]
+                    raise AssertionError(
+                        f"{label} left reader/runner identities alive: {survivors}"
+                    )
+                if not wait_until(
+                    lambda: not process_group_alive(process.pid),
+                    3,
+                ):
+                    raise AssertionError(f"{label} bridge group survived exit")
+                assert_no_capture_paths(paths["temp"])
+            finally:
+                terminate_bridge(process)
+
+
 def run_cumulative_frame_budget(
     stdio: Path,
     bash: str,
@@ -1543,7 +2126,7 @@ def run_cumulative_frame_budget(
         environment, paths = build_fixture(
             root,
             real_helpers,
-            [percent_wire(json_bytes({"unused": True}))],
+            [printf_wire(json_bytes({"unused": True}))],
             bash,
         )
         environment["ANVIL_MCP_FRAME_READ_TIMEOUT"] = "10"
@@ -1614,7 +2197,7 @@ def run_stalled_frame_header(
         environment, paths = build_fixture(
             root,
             real_helpers,
-            [percent_wire(json_bytes({"unused": True}))],
+            [printf_wire(json_bytes({"unused": True}))],
             bash,
         )
         environment["ANVIL_MCP_FRAME_READ_TIMEOUT"] = "1"
@@ -1654,7 +2237,7 @@ def run_truncated_frame(
         environment, paths = build_fixture(
             root,
             real_helpers,
-            [percent_wire(json_bytes({"unused": True}))],
+            [printf_wire(json_bytes({"unused": True}))],
             bash,
         )
         environment["ANVIL_MCP_FRAME_READ_TIMEOUT"] = "1"
@@ -1704,11 +2287,10 @@ def run_negative_control(
 
         vulnerable = root / "anvil-stdio-vulnerable.sh"
         source = stdio.read_text(encoding="utf-8")
-        needle = '\tanvil_mcp_capture_finish\n\tif [ "$_anvil_client_rc" -ne 0 ]; then'
+        needle = "\t# The marker is intentionally tiny"
         injected = (
-            "\tanvil_mcp_capture_finish\n"
-            "\tgrep -c '\\*ERROR\\*' /dev/null >/dev/null\n"
-            '\tif [ "$_anvil_client_rc" -ne 0 ]; then'
+            "\tgrep -c '\\*ERROR\\*' /dev/null >/dev/null\n\n"
+            "\t# The marker is intentionally tiny"
         )
         if source.count(needle) != 1:
             raise AssertionError("negative-control injection point drifted")
@@ -1717,7 +2299,9 @@ def run_negative_control(
             raise AssertionError("metadata override injection point drifted")
         metadata_override = (
             "anvil_mcp_request_metadata() {\n"
-            f"\tprintf '%s' {shlex.quote(metadata)}\n"
+            f"\tANVIL_MCP_RUN_OUTPUT={shlex.quote(metadata)}\n"
+            "\tANVIL_MCP_RUN_STATUS=0\n"
+            "\treturn 0\n"
             "}\n\n"
         )
         source = source.replace(needle, injected, 1)
@@ -1736,7 +2320,7 @@ def run_negative_control(
         environment, paths = build_fixture(
             root,
             real_helpers,
-            [percent_wire(json_bytes(expected))],
+            [printf_wire(json_bytes(expected))],
             bash,
         )
         process = start_bridge(
@@ -1766,13 +2350,23 @@ def run_negative_control(
                 1,
             )
             try:
-                read_reply(reader, expected, framed=False)
+                read_reply(
+                    reader,
+                    expected,
+                    framed=False,
+                    timeout_seconds=3.0,
+                )
             except AssertionError:
                 pass
             else:
                 raise AssertionError(
                     "negative control unexpectedly returned a response"
                 )
+            wait_until(
+                lambda: paths["helper_marker"].is_file()
+                or process.poll() is not None,
+                SUCCESS_REPLY_TIMEOUT_SECONDS,
+            )
             if not paths["helper_marker"].is_file():
                 raise AssertionError(
                     "negative control did not reach post-dispatch grep: "
@@ -1824,16 +2418,16 @@ def run_positive(
         third_bytes = json_bytes(third)
         if len(third_bytes) == len(third_bytes.decode("utf-8")):
             raise AssertionError("framed fixture is not multibyte")
-        if len(percent_wire(third_bytes)) <= 49_152:
+        if len(printf_wire(third_bytes)) <= 49_152:
             raise AssertionError("framed fixture does not cross a decoder chunk")
 
         environment, paths = build_fixture(
             root,
             real_helpers,
             [
-                percent_wire(json_bytes(first)),
-                "%7b%00%7d",
-                percent_wire(third_bytes),
+                printf_wire(json_bytes(first)),
+                r"\x7b\x00\x7d",
+                printf_wire(third_bytes),
             ],
             bash,
         )
@@ -1990,6 +2584,405 @@ def run_positive(
                         stream.close()
 
 
+def run_response_prepare_interruption(
+    stdio: Path,
+    bash: str,
+    real_helpers: dict[str, str],
+) -> None:
+    """A timed-out stage helper must retain no canonical artifacts."""
+    with tempfile.TemporaryDirectory(prefix="anvil-response-prepare-timeout-") as raw:
+        root = Path(raw)
+        unused = {
+            "jsonrpc": "2.0",
+            "id": 201,
+            "result": "must-not-dispatch",
+        }
+        environment, paths = build_fixture(
+            root,
+            real_helpers,
+            [printf_wire(json_bytes(unused))],
+            bash,
+        )
+        pause_marker = root / "response-prepare-paused"
+        write_response_prepare_pause_wrapper(
+            paths["binary"] / "python3",
+            real_helpers["python3"],
+        )
+        environment["FAKE_RESPONSE_PREPARE_MODE"] = "pause"
+        environment["FAKE_RESPONSE_PREPARE_MARKER"] = str(pause_marker)
+        environment["ANVIL_MCP_REQUEST_PARSE_TIMEOUT"] = "1"
+        symlink_temp = root / "tmp-link"
+        symlink_temp.symlink_to(paths["temp"], target_is_directory=True)
+        environment["TMPDIR"] = str(symlink_temp)
+        process = start_bridge(
+            bash,
+            stdio,
+            environment,
+            paths["bridge_stderr"],
+            "--socket=/tmp/anvil-response-prepare-timeout",
+            "--server-id=test",
+        )
+        reader = BinaryReader(
+            process,
+            paths["debug_log"],
+            paths["bridge_stderr"],
+            paths["helper_marker"],
+            paths["dispatch_count"],
+        )
+        try:
+            wait_for_bridge_ready(paths["debug_log"], process)
+            send(
+                process,
+                {"jsonrpc": "2.0", "id": 201, "method": "test"},
+            )
+            read_reply(
+                reader,
+                synthetic_stage_error(201, 70),
+                framed=False,
+                timeout_seconds=5,
+            )
+            process.wait(timeout=5)
+            if process.returncode != 74:
+                raise AssertionError(
+                    f"response-preparation timeout returned {process.returncode}: "
+                    f"{reader.diagnostics()}"
+                )
+            if not pause_marker.is_file():
+                raise AssertionError("response preparer never created its stage")
+            if read_count(paths["dispatch_count"]) != 0:
+                raise AssertionError("response-preparation failure reached dispatch")
+            if list(paths["temp"].glob("anvil-mcp.*")):
+                raise AssertionError("interrupted response stage was orphaned")
+            if not wait_until(lambda: not process_group_alive(process.pid), 2):
+                raise AssertionError("response-preparation helper survived timeout")
+        finally:
+            reader.close()
+            terminate_bridge(process)
+
+
+def run_response_link_capability_failure(
+    stdio: Path,
+    bash: str,
+    real_helpers: dict[str, str],
+) -> None:
+    """An unsupported hard link fails before dispatch without artifacts."""
+    with tempfile.TemporaryDirectory(prefix="anvil-response-link-failure-") as raw:
+        root = Path(raw)
+        unused = {
+            "jsonrpc": "2.0",
+            "id": 203,
+            "result": "must-not-dispatch",
+        }
+        environment, paths = build_fixture(
+            root,
+            real_helpers,
+            [printf_wire(json_bytes(unused))],
+            bash,
+        )
+        link_marker = root / "response-link-probed"
+        write_response_prepare_pause_wrapper(
+            paths["binary"] / "python3",
+            real_helpers["python3"],
+        )
+        environment["FAKE_RESPONSE_PREPARE_MODE"] = "link-fail"
+        environment["FAKE_RESPONSE_LINK_MARKER"] = str(link_marker)
+        process = start_bridge(
+            bash,
+            stdio,
+            environment,
+            paths["bridge_stderr"],
+            "--socket=/tmp/anvil-response-link-failure",
+            "--server-id=test",
+        )
+        reader = BinaryReader(
+            process,
+            paths["debug_log"],
+            paths["bridge_stderr"],
+            paths["helper_marker"],
+            paths["dispatch_count"],
+        )
+        try:
+            wait_for_bridge_ready(paths["debug_log"], process)
+            send(
+                process,
+                {"jsonrpc": "2.0", "id": 203, "method": "test"},
+            )
+            read_reply(
+                reader,
+                synthetic_stage_error(203, 70),
+                framed=False,
+                timeout_seconds=5,
+            )
+            process.wait(timeout=5)
+            if process.returncode != 74:
+                raise AssertionError(
+                    f"link preflight failure returned {process.returncode}: "
+                    f"{reader.diagnostics()}"
+                )
+            if not link_marker.is_file():
+                raise AssertionError("hard-link preflight was not exercised")
+            if read_count(paths["dispatch_count"]) != 0:
+                raise AssertionError("unsupported hard link reached dispatch")
+            if list(paths["temp"].glob("anvil-mcp.*")):
+                raise AssertionError("failed hard-link preflight left artifacts")
+        finally:
+            reader.close()
+            terminate_bridge(process)
+
+
+def run_competitor_inode_rejection(
+    stdio: Path,
+    bash: str,
+    real_helpers: dict[str, str],
+) -> None:
+    """A different final/proof inode can never supply MCP response bytes."""
+    with tempfile.TemporaryDirectory(prefix="anvil-response-competitor-") as raw:
+        root = Path(raw)
+        legitimate = {
+            "jsonrpc": "2.0",
+            "id": 204,
+            "result": "legitimate-but-unwritten",
+        }
+        competitor = {
+            "jsonrpc": "2.0",
+            "id": 204,
+            "result": "COMPETITOR-INODE-MUST-NEVER-REACH-STDOUT",
+        }
+        competitor_bytes = json_bytes(competitor)
+        environment, paths = build_fixture(
+            root,
+            real_helpers,
+            [printf_wire(json_bytes(legitimate))],
+            bash,
+        )
+        environment["FAKE_RESPONSE_PUBLICATION_MODE"] = "competitor"
+        environment["FAKE_COMPETITOR_WIRE"] = printf_wire(competitor_bytes)
+        process = start_bridge(
+            bash,
+            stdio,
+            environment,
+            paths["bridge_stderr"],
+            "--socket=/tmp/anvil-response-competitor",
+            "--server-id=test",
+        )
+        reader = BinaryReader(
+            process,
+            paths["debug_log"],
+            paths["bridge_stderr"],
+            paths["helper_marker"],
+            paths["dispatch_count"],
+        )
+        clean = False
+        try:
+            wait_for_bridge_ready(paths["debug_log"], process)
+            send(
+                process,
+                {"jsonrpc": "2.0", "id": 204, "method": "test"},
+            )
+            wait_for_dispatch_complete(
+                paths["dispatch_complete"],
+                process,
+                paths["dispatch_ack_fifo"],
+                1,
+            )
+            read_reply(
+                reader,
+                synthetic_dispatch_error(204, 70),
+                framed=False,
+            )
+            if competitor_bytes in bytes(reader.buffer):
+                raise AssertionError("competitor inode bytes remained on MCP stdout")
+            if "COMPETITOR-INODE" in safe_text(paths["bridge_stderr"]):
+                raise AssertionError("competitor inode leaked through bridge stderr")
+            if read_count(paths["dispatch_count"]) != 1:
+                raise AssertionError("competitor rejection replayed the request")
+            paths["dispatch_complete"].unlink()
+            process.stdin.close()
+            process.wait(timeout=5)
+            if process.returncode != 0:
+                raise AssertionError(reader.diagnostics())
+            if list(paths["temp"].glob("anvil-mcp.*")):
+                raise AssertionError("competitor transaction survived bridge EOF")
+            if process_group_alive(process.pid):
+                raise AssertionError("competitor bridge group survived EOF")
+            clean = True
+        finally:
+            reader.close()
+            if not clean:
+                terminate_bridge(process)
+            elif process.stdout is not None and not process.stdout.closed:
+                process.stdout.close()
+
+
+def run_request_symlink_retirement(
+    stdio: Path,
+    bash: str,
+    real_helpers: dict[str, str],
+) -> None:
+    """A swapped large-request symlink fails closed without touching its target."""
+    with tempfile.TemporaryDirectory(prefix="anvil-request-symlink-") as raw:
+        root = Path(raw)
+        document = {
+            "jsonrpc": "2.0",
+            "id": 205,
+            "method": "test",
+            "params": {"payload": "x" * (32 * 1024)},
+        }
+        document_bytes = json_bytes(document)
+        response = {"jsonrpc": "2.0", "id": 205, "result": "must-not-emit"}
+        environment, paths = build_fixture(
+            root,
+            real_helpers,
+            [printf_wire(json_bytes(response))],
+            bash,
+        )
+        sentinel = root / "outside-sentinel"
+        sentinel_bytes = b"external-target-must-remain-unchanged\n"
+        sentinel.write_bytes(sentinel_bytes)
+        sentinel.chmod(0o600)
+        process = start_bridge(
+            bash,
+            stdio,
+            environment,
+            paths["bridge_stderr"],
+            "--socket=/tmp/anvil-request-symlink",
+            "--server-id=test",
+        )
+        clean = False
+        try:
+            wait_for_bridge_ready(paths["debug_log"], process)
+            send(process, document)
+
+            def replace_request_with_symlink() -> None:
+                directories = list(paths["temp"].glob("anvil-mcp.*"))
+                if len(directories) != 1:
+                    raise AssertionError(
+                        f"missing symlink-test transaction: {directories}"
+                    )
+                request = directories[0] / "request.1.json"
+                if (
+                    request.is_symlink()
+                    or not request.is_file()
+                    or request.read_bytes() != document_bytes
+                ):
+                    raise AssertionError("large request was not staged exactly")
+                request.unlink()
+                request.symlink_to(sentinel)
+
+            wait_for_dispatch_complete(
+                paths["dispatch_complete"],
+                process,
+                paths["dispatch_ack_fifo"],
+                1,
+                replace_request_with_symlink,
+            )
+            process.wait(timeout=5)
+            stdout = process.stdout.read() if process.stdout is not None else b""
+            if process.returncode != 74:
+                raise AssertionError(
+                    f"request symlink returned {process.returncode}: "
+                    f"stdout={stdout!r} stderr={safe_text(paths['bridge_stderr'])}"
+                )
+            if stdout:
+                raise AssertionError(f"request symlink emitted MCP bytes: {stdout!r}")
+            if sentinel.read_bytes() != sentinel_bytes:
+                raise AssertionError("request retirement modified the symlink target")
+            if read_count(paths["dispatch_count"]) != 1:
+                raise AssertionError("request symlink replayed the dispatch")
+            if list(paths["temp"].glob("anvil-mcp.*")):
+                raise AssertionError("request-symlink transaction survived exit")
+            if process_group_alive(process.pid):
+                raise AssertionError("request-symlink bridge group survived exit")
+            clean = True
+        finally:
+            if process.stdin is not None and not process.stdin.closed:
+                try:
+                    process.stdin.close()
+                except BrokenPipeError:
+                    pass
+            if not clean:
+                terminate_bridge(process)
+            elif process.stdout is not None and not process.stdout.closed:
+                process.stdout.close()
+
+
+def run_oversized_marker(
+    stdio: Path,
+    bash: str,
+    real_helpers: dict[str, str],
+) -> None:
+    """An absurd advisory marker cannot reach Bash integer comparison."""
+    with tempfile.TemporaryDirectory(prefix="anvil-response-marker-overflow-") as raw:
+        root = Path(raw)
+        expected = {
+            "jsonrpc": "2.0",
+            "id": 202,
+            "result": "marker-overflow-ok",
+        }
+        environment, paths = build_fixture(
+            root,
+            real_helpers,
+            [printf_wire(json_bytes(expected))],
+            bash,
+        )
+        environment["FAKE_RESPONSE_MARKER_SIZE"] = "9" * 1024
+        process = start_bridge(
+            bash,
+            stdio,
+            environment,
+            paths["bridge_stderr"],
+            "--socket=/tmp/anvil-marker-overflow",
+            "--server-id=test",
+        )
+        reader = BinaryReader(
+            process,
+            paths["debug_log"],
+            paths["bridge_stderr"],
+            paths["helper_marker"],
+            paths["dispatch_count"],
+        )
+        clean = False
+        try:
+            wait_for_bridge_ready(paths["debug_log"], process)
+            original_pid = process.pid
+            if process.stdin is None or process.stdout is None:
+                raise AssertionError("bridge pipes are unavailable")
+            pipe_ids = (
+                os.fstat(process.stdin.fileno()).st_ino,
+                os.fstat(process.stdout.fileno()).st_ino,
+            )
+            send(
+                process,
+                {"jsonrpc": "2.0", "id": 202, "method": "test"},
+                framed=True,
+            )
+            wait_for_dispatch_complete(
+                paths["dispatch_complete"],
+                process,
+                paths["dispatch_ack_fifo"],
+                1,
+            )
+            read_reply(reader, expected, framed=True)
+            assert_same_bridge(process, original_pid, pipe_ids)
+            assert_no_helper(paths["helper_marker"])
+            if "integer expression expected" in safe_text(paths["bridge_stderr"]):
+                raise AssertionError("oversized marker reached Bash arithmetic")
+            paths["dispatch_complete"].unlink()
+            process.stdin.close()
+            process.wait(timeout=5)
+            if process.returncode != 0:
+                raise AssertionError(reader.diagnostics())
+            if list(paths["temp"].glob("anvil-mcp.*")):
+                raise AssertionError("marker-overflow transaction survived EOF")
+            clean = True
+        finally:
+            reader.close()
+            if not clean:
+                terminate_bridge(process)
+            elif process.stdout is not None and not process.stdout.closed:
+                process.stdout.close()
+
+
 def run_large_request_metadata(
     stdio: Path,
     bash: str,
@@ -2001,7 +2994,7 @@ def run_large_request_metadata(
         first = synthetic_dispatch_error("large|pipe", 70)
         second = {
             "jsonrpc": "2.0",
-            "id": 2,
+            "id": "second|pip",
             "result": "recovery-ok",
         }
         large_document = {
@@ -2010,13 +3003,22 @@ def run_large_request_metadata(
             "method": "test",
             "params": {"raw": "雪" + ("x" * (512 * 1024))},
         }
+        second_large_document = {
+            "jsonrpc": "2.0",
+            "id": "second|pip",
+            "method": "test",
+            "params": {"raw": "火" + ("y" * (512 * 1024))},
+        }
         large_bytes = json_bytes(large_document)
+        second_large_bytes = json_bytes(second_large_document)
+        if len(second_large_bytes) != len(large_bytes):
+            raise AssertionError("large ABA fixtures must have equal byte size")
         environment, paths = build_fixture(
             root,
             real_helpers,
             [
-                "%7b%00%7d",
-                percent_wire(json_bytes(second)),
+                r"\x7b\x00\x7d",
+                printf_wire(json_bytes(second)),
             ],
             bash,
         )
@@ -2040,6 +3042,11 @@ def run_large_request_metadata(
             paths["dispatch_count"],
         )
         clean = False
+        second_sender: threading.Thread | None = None
+        second_send_errors: list[BaseException] = []
+        captured_request: Path | None = None
+        captured_stage: Path | None = None
+        delayed_release_observed = False
         try:
             wait_for_bridge_ready(paths["debug_log"], process)
             original_pid = process.pid
@@ -2051,11 +3058,19 @@ def run_large_request_metadata(
             )
             try:
                 send(process, large_document, framed=True)
-                send(
-                    process,
-                    {"jsonrpc": "2.0", "id": 2, "method": "test"},
-                    framed=True,
+
+                def send_second() -> None:
+                    try:
+                        send(process, second_large_document, framed=True)
+                    except BaseException as error:
+                        second_send_errors.append(error)
+
+                second_sender = threading.Thread(
+                    target=send_second,
+                    name="anvil-second-large-request",
+                    daemon=True,
                 )
+                second_sender.start()
             except BrokenPipeError as error:
                 raise AssertionError(reader.diagnostics()) from error
 
@@ -2068,16 +3083,93 @@ def run_large_request_metadata(
                 directory = directories[0]
                 if stat.S_IMODE(directory.stat().st_mode) != 0o700:
                     raise AssertionError("request staging directory is not mode 0700")
-                requests = list(directory.glob("request.*.json"))
-                if len(requests) != 1:
+                staged = directory / "request.1.json"
+                if (
+                    not staged.is_file()
+                    or staged.is_symlink()
+                    or stat.S_IMODE(staged.stat().st_mode) != 0o600
+                    or staged.read_bytes() != large_bytes
+                ):
+                    raise AssertionError("first staged request is not exact")
+                stages = list(directory.glob(".response-tmp.1.*"))
+                if len(stages) != 1:
+                    raise AssertionError(f"missing unique first response stage: {stages}")
+                response_stage = stages[0]
+                response_stat = response_stage.lstat()
+                if (
+                    not stat.S_ISREG(response_stat.st_mode)
+                    or response_stage.is_symlink()
+                    or response_stat.st_size != 0
+                    or response_stat.st_nlink != 1
+                    or stat.S_IMODE(response_stat.st_mode) != 0o600
+                ):
+                    raise AssertionError("first response stage is not safe")
+                for name in ("response.1.json", "proof.1.json"):
+                    if (directory / name).exists():
+                        raise AssertionError(f"premature response publication: {name}")
+                # Simulate emacsclient returning before Emacs evaluates: leave
+                # the full request path in place for Bash retirement.
+
+            def assert_second_staged_request() -> None:
+                nonlocal delayed_release_observed
+                directories = list(paths["temp"].glob("anvil-mcp.*"))
+                if len(directories) != 1:
                     raise AssertionError(
-                        f"expected one staged request file: {requests}"
+                        f"expected one private staging directory: {directories}"
                     )
-                staged = requests[0]
-                if stat.S_IMODE(staged.stat().st_mode) != 0o600:
-                    raise AssertionError("staged request is not mode 0600")
-                if staged.read_bytes() != large_bytes:
-                    raise AssertionError("staged request bytes differ")
+                directory = directories[0]
+                if captured_request.resolve() != (
+                    directory / "request.1.json"
+                ).resolve():
+                    raise AssertionError("captured request path changed generation")
+                if (
+                    captured_stage.parent.resolve() != directory.resolve()
+                    or not captured_stage.name.startswith(".response-tmp.1.")
+                ):
+                    raise AssertionError("captured response stage changed generation")
+                # Releasing the actual generation-1 expression now begins with
+                # this exact read.  Retirement makes it fail before deletion,
+                # handler dispatch, or response publication can occur.
+                try:
+                    captured_request.read_bytes()
+                except FileNotFoundError:
+                    delayed_release_observed = True
+                else:
+                    raise AssertionError("retired generation remained readable")
+                if captured_stage.exists():
+                    raise AssertionError("retired response stage reappeared")
+                for name in ("response.1.json", "proof.1.json"):
+                    if (directory / name).exists():
+                        raise AssertionError(f"retired publication survived: {name}")
+                response_stages = list(directory.glob(".response-tmp.2.*"))
+                if len(response_stages) != 1:
+                    raise AssertionError(
+                        f"missing unique second response stage: {response_stages}"
+                    )
+                names = sorted(child.name for child in directory.iterdir())
+                expected_names = sorted(
+                    ["request.2.json", response_stages[0].name]
+                )
+                if names != expected_names:
+                    raise AssertionError(
+                        f"retired generation did not converge: {names}"
+                    )
+                staged = directory / "request.2.json"
+                if (
+                    staged.is_symlink()
+                    or stat.S_IMODE(staged.stat().st_mode) != 0o600
+                    or staged.read_bytes() != second_large_bytes
+                ):
+                    raise AssertionError("second staged request is not exact")
+                response_stage = response_stages[0]
+                response_stat = response_stage.lstat()
+                if (
+                    response_stage.is_symlink()
+                    or response_stat.st_size != 0
+                    or response_stat.st_nlink != 1
+                    or stat.S_IMODE(response_stat.st_mode) != 0o600
+                ):
+                    raise AssertionError("second response stage is not safe")
 
             wait_for_dispatch_complete(
                 paths["dispatch_complete"],
@@ -2087,25 +3179,44 @@ def run_large_request_metadata(
                 assert_staged_request,
             )
             read_reply(reader, first, framed=True)
+            assert_no_helper(paths["helper_marker"])
+            captured_request, captured_stage = captured_generation_paths(
+                paths["captured_expression"],
+                1,
+            )
             paths["dispatch_complete"].unlink()
             assert_same_bridge(process, original_pid, pipe_ids)
+            if second_sender is None:
+                raise AssertionError("second large-request sender did not start")
+            second_sender.join(timeout=10)
+            if second_sender.is_alive():
+                raise AssertionError("second large-request write stayed blocked")
+            if second_send_errors:
+                raise AssertionError(reader.diagnostics()) from second_send_errors[0]
+            second_sender = None
 
             wait_for_dispatch_complete(
                 paths["dispatch_complete"],
                 process,
                 paths["dispatch_ack_fifo"],
                 2,
+                assert_second_staged_request,
             )
             read_reply(reader, second, framed=True)
+            assert_no_helper(paths["helper_marker"])
             paths["dispatch_complete"].unlink()
             assert_same_bridge(process, original_pid, pipe_ids)
             if read_count(paths["dispatch_count"]) != 2:
                 raise AssertionError("large request was replayed")
+            if not delayed_release_observed:
+                raise AssertionError("captured generation was never released")
 
             process.stdin.close()
             process.wait(timeout=5)
             if process.returncode != 0:
                 raise AssertionError(reader.diagnostics())
+            if list(paths["temp"].glob("anvil-mcp.*")):
+                raise AssertionError("large-request transaction survived EOF")
             if not wait_until(lambda: not process_group_alive(process.pid), 2):
                 raise AssertionError("large-request process group survived exit")
             clean = True
@@ -2113,7 +3224,9 @@ def run_large_request_metadata(
             reader.close()
             if not clean:
                 terminate_bridge(process)
-            else:
+            if second_sender is not None:
+                second_sender.join(timeout=2)
+            if clean:
                 for stream in (process.stdout,):
                     if stream is not None and not stream.closed:
                         stream.close()
@@ -2142,6 +3255,7 @@ def main() -> int:
         raise SystemExit(f"not a file: {parent_guard_python}")
 
     run_bridge_reap_budget_regression()
+    run_cleanup_rescan_regression(stdio)
 
     real_helpers: dict[str, str] = {}
     for name in HELPER_NAMES:
@@ -2185,6 +3299,7 @@ def main() -> int:
     )
     run_default_parse_budget(stdio, bash, real_helpers)
     run_idle_then_partial_first_line(stdio, bash, real_helpers)
+    run_nul_wire_rejection(stdio, bash, real_helpers)
     run_stalled_frame_header(stdio, bash, real_helpers)
     run_truncated_frame(stdio, bash, real_helpers)
     run_cumulative_frame_budget(stdio, bash, real_helpers)
@@ -2196,6 +3311,11 @@ def main() -> int:
             parent_guard,
             parent_guard_python,
         )
+    run_response_prepare_interruption(stdio, bash, real_helpers)
+    run_response_link_capability_failure(stdio, bash, real_helpers)
+    run_competitor_inode_rejection(stdio, bash, real_helpers)
+    run_request_symlink_retirement(stdio, bash, real_helpers)
+    run_oversized_marker(stdio, bash, real_helpers)
     run_large_request_metadata(stdio, bash, real_helpers)
     run_positive(stdio, bash, real_helpers)
     print(f"stdio-postdispatch-ok bash={bash}")

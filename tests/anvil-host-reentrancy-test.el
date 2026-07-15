@@ -12,6 +12,13 @@
 (require 'seq)
 (require 'anvil-host)
 
+(defun anvil-host-reentrancy-test--result (exit stdout stderr)
+  "Return the seven-field host transaction result for expected output."
+  (list exit stdout stderr
+        (string-bytes stdout) (string-bytes stderr)
+        (encode-coding-string stdout 'utf-8)
+        (encode-coding-string stderr 'utf-8)))
+
 (defun anvil-host-reentrancy-test--force-clean (processes buffers)
   "Converge PROCESSES, BUFFERS, and dynamically bound host state."
   (dolist (process processes)
@@ -94,7 +101,7 @@
                 (anvil-host-child-shell-command-switch shell-command-switch))
             (should
              (equal
-              (list 0
+              (anvil-host-reentrancy-test--result 0
                     (format "%s\nsecret\ncafé"
                             (directory-file-name (file-truename project)))
                     "")
@@ -170,7 +177,7 @@
                 (anvil-host-child-shell-command-switch shell-command-switch))
             (should
              (equal
-              '(0 "secret" "")
+              (anvil-host-reentrancy-test--result 0 "secret" "")
               (anvil-host--run
                (format
                 (concat ": > %s; "
@@ -261,7 +268,7 @@
                    (result
                     (anvil-host--run command 'utf-8-unix directory 6)))
               (should
-               (equal (list 0 stdout-canary stderr-canary) result))))
+               (equal (anvil-host-reentrancy-test--result 0 stdout-canary stderr-canary) result))))
           (setq post-exposed (visible-canary-buffer))
           (should scanned)
           (should-not exposed)
@@ -994,7 +1001,7 @@
                           "printf nested" 'utf-8-unix nil 1)))
                   (apply real-make-pipe-process args)))))
           (should
-           (equal '(0 "outer" "")
+           (equal (anvil-host-reentrancy-test--result 0 "outer" "")
                   (anvil-host--run
                    "printf outer" 'utf-8-unix nil 1)))
           (should
@@ -1254,7 +1261,7 @@
                           target)
                       (apply real-make-process args)))))
               (should
-               (equal '(0 "tracked" "")
+               (equal (anvil-host-reentrancy-test--result 0 "tracked" "")
                       (anvil-host--run
                        "printf tracked" 'utf-8-unix nil 2))))
             (should (processp target))
@@ -1780,7 +1787,7 @@
                   (shell-quote-argument finished))
                  'utf-8-unix directory 2)
                 elapsed (- (float-time) started))
-          (should (equal '(0 "" "") result))
+          (should (equal (anvil-host-reentrancy-test--result 0 "" "") result))
           (should-not (file-exists-p finished))
           ;; The configured child cleanup timeout is 1.5s.  Pipe closure must
           ;; remain near the documented 0.2s drain instead of waiting for it.
@@ -1894,7 +1901,7 @@
                  (anvil-host--run
                   (format "printf %s" (shell-quote-argument canary))
                   'utf-8-unix nil 2)))
-            (should (equal result (list 0 canary "")))
+            (should (equal result (anvil-host-reentrancy-test--result 0 canary "")))
             (should-not advice-called)
             (should-not leaked)
             (should (string-empty-p
@@ -1978,7 +1985,7 @@
                    (format "cat >/dev/null; printf %s"
                            (shell-quote-argument canary))
                    'utf-8-unix nil 2)))
-          (should (equal result (list 0 canary "")))
+          (should (equal result (anvil-host-reentrancy-test--result 0 canary "")))
           (should-not called)
           (should-not seen)
           (should (string-empty-p
@@ -2022,7 +2029,7 @@
                    (format "sleep 0.05; printf %s"
                            (shell-quote-argument canary))
                    'utf-8-unix nil 2)))
-          (should (equal result (list 0 canary "")))
+          (should (equal result (anvil-host-reentrancy-test--result 0 canary "")))
           (should-not called)
           (should-not seen)
           (should (string-empty-p

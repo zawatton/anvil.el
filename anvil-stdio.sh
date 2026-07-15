@@ -30,6 +30,7 @@ SERVER_ID=""
 EMACS_MCP_DEBUG_LOG=${EMACS_MCP_DEBUG_LOG:-""}
 ANVIL_MCP_PARENT_GUARD=${ANVIL_MCP_PARENT_GUARD:-""}
 ANVIL_MCP_PARENT_GUARD_PYTHON=${ANVIL_MCP_PARENT_GUARD_PYTHON:-""}
+ANVIL_MCP_READINESS_MODE=${ANVIL_MCP_READINESS_MODE:-emacs}
 
 # Keep a restrictive mask for a caller-selected debug log.  Stateful stderr is
 # discarded through a sink opened once at startup; creating and later cleaning
@@ -133,7 +134,7 @@ anvil_mcp_exec_program() {
 anvil_mcp_exec_child() {
 	local stderr_mode="$1" input_mode="$2" input="$3"
 	shift 3
-	exec 7<&- 9>&-
+	exec 6<&- 7<&- 9>&-
 	case "$input_mode:$stderr_mode" in
 	input:merge)
 		anvil_mcp_exec_program "$@" < <(printf '%s' "$input") 2>&1 8>&-
@@ -169,21 +170,31 @@ anvil_mcp_exec_child() {
 
 anvil_mcp_run_child() {
 	local guard_deadline="$1" stderr_mode="$2" input_mode="$3" input="$4"
-	local child="" rc=70 runner_pid="" timed_out=0
+	local child="" rc=70 runner_pid="" timed_out=0 term_sent=0 kill_sent=0
 	shift 4
 
 	# A guarded launch keeps its Python loader in the bridge group until the
 	# loaded guard validates the exact runner and moves the target.  Timeout
 	# signals cover the pre-group PID and post-group PGID.
 	trap '
-		timed_out=1
-		[ -z "$child" ] || kill -TERM "$child" 2>/dev/null || :
-		[ -z "$child" ] || kill -TERM -- "-$child" 2>/dev/null || :
+		if [ "$term_sent" -eq 0 ]; then
+			term_sent=1
+			timed_out=1
+			if [ -n "$child" ]; then
+				kill -TERM -- "-$child" 2>/dev/null \
+					|| kill -TERM "$child" 2>/dev/null || :
+			fi
+		fi
 	' TERM
 	trap '
-		timed_out=1
-		[ -z "$child" ] || kill -KILL "$child" 2>/dev/null || :
-		[ -z "$child" ] || kill -KILL -- "-$child" 2>/dev/null || :
+		if [ "$kill_sent" -eq 0 ]; then
+			kill_sent=1
+			timed_out=1
+			if [ -n "$child" ]; then
+				kill -KILL -- "-$child" 2>/dev/null \
+					|| kill -KILL "$child" 2>/dev/null || :
+			fi
+		fi
 	' USR1
 
 	if [ -n "$ANVIL_MCP_PARENT_GUARD" ]; then
@@ -227,40 +238,102 @@ anvil_mcp_run_child() {
 	printf '\0%s\n' "$rc"
 }
 
-# Results are returned in ANVIL_MCP_RUN_OUTPUT / STATUS.  A missing sentinel is
-# always a timeout/failure; partial output is deliberately ignored.
+# Converge the exact bounded runner while descriptor 7 remains open.
+# The runner's TERM/USR1 handlers retire both the direct child and its group.
+anvil_mcp_converge_runner() {
+	local runner="$1"
+	local grace="${ANVIL_EMACSCLIENT_KILL_AFTER_TIMEOUT:-1}"
+	case "$runner" in
+	""|*[!0-9]*) return 0 ;;
+	esac
+	if kill -0 "$runner" 2>/dev/null; then
+		kill -TERM "$runner" 2>/dev/null || :
+		if ! IFS= read -r -d '' -t "$grace" _ <&7; then
+			kill -USR1 "$runner" 2>/dev/null || :
+			IFS= read -r -d '' -t "$grace" _ <&7 || :
+		fi
+		kill -KILL "$runner" 2>/dev/null || :
+	fi
+}
+
+# Results are returned in ANVIL_MCP_RUN_OUTPUT / STATUS.  A missing sentinel
+# or malformed private status is always failure; partial output is ignored and
+# the still-published runner is converged before the function returns.
 anvil_mcp_run_bounded() {
 	local deadline="$1" stderr_mode="$2" input_mode="$3" input="$4"
-	local runner status=""
+	local runner status="" completed=0
 	shift 4
 	ANVIL_MCP_RUN_OUTPUT=""
 	ANVIL_MCP_RUN_STATUS=70
 
+	ANVIL_MCP_RUNNER_STARTING=1
 	exec 7< <(anvil_mcp_run_child \
 		"$deadline" "$stderr_mode" "$input_mode" "$input" "$@")
 	runner=$!
+	ANVIL_MCP_ACTIVE_RUNNER=$runner
+	ANVIL_MCP_RUNNER_STARTING=0
+	if [ -n "$ANVIL_MCP_PENDING_TERMINATION_STATUS" ]; then
+		status=$ANVIL_MCP_PENDING_TERMINATION_STATUS
+		ANVIL_MCP_PENDING_TERMINATION_STATUS=
+		anvil_mcp_terminate "$status"
+	fi
 	if IFS= read -r -d '' -t "$deadline" ANVIL_MCP_RUN_OUTPUT <&7; then
 		if IFS= read -r -t "$ANVIL_EMACSCLIENT_KILL_AFTER_TIMEOUT" status <&7 \
 			&& [[ "$status" =~ ^[0-9]+$ ]] \
 			&& [ "$status" -le 255 ]; then
 			ANVIL_MCP_RUN_STATUS=$status
+			completed=1
+		else
+			ANVIL_MCP_RUN_OUTPUT=""
+			ANVIL_MCP_RUN_STATUS=70
 		fi
 	else
 		ANVIL_MCP_RUN_OUTPUT=""
 		ANVIL_MCP_RUN_STATUS=124
-		if kill -0 "$runner" 2>/dev/null; then
-			kill -TERM "$runner" 2>/dev/null || :
-			if ! IFS= read -r -d '' \
-				-t "$ANVIL_EMACSCLIENT_KILL_AFTER_TIMEOUT" _ <&7; then
-				kill -USR1 "$runner" 2>/dev/null || :
-				IFS= read -r -d '' \
-					-t "$ANVIL_EMACSCLIENT_KILL_AFTER_TIMEOUT" _ <&7 || :
-			fi
-			kill -KILL "$runner" 2>/dev/null || :
-		fi
+	fi
+	if [ "$completed" -eq 0 ]; then
+		anvil_mcp_converge_runner "$runner"
 	fi
 	exec 7<&-
+	ANVIL_MCP_ACTIVE_RUNNER=
 }
+
+# A supervisor normally signals only the advertised bridge PID.  Forward that
+# termination to the currently bounded runner; its own TERM trap retires the
+# exact helper and process group.  Exiting then runs staged-request custody
+# cleanup before the bridge disappears.
+ANVIL_MCP_ACTIVE_RUNNER=
+ANVIL_MCP_RUNNER_STARTING=0
+ANVIL_MCP_PENDING_TERMINATION_STATUS=
+anvil_mcp_terminate() {
+	local requested_status="$1" runner="${ANVIL_MCP_ACTIVE_RUNNER:-}"
+	local status="${ANVIL_MCP_PENDING_TERMINATION_STATUS:-$requested_status}"
+	case "$runner" in
+	""|*[!0-9]*)
+		if [ "$ANVIL_MCP_RUNNER_STARTING" -eq 1 ]; then
+			[ -n "$ANVIL_MCP_PENDING_TERMINATION_STATUS" ] \
+				|| ANVIL_MCP_PENDING_TERMINATION_STATUS=$requested_status
+			return 0
+		fi
+		;;
+	*)
+		ANVIL_MCP_ACTIVE_RUNNER=
+		ANVIL_MCP_RUNNER_STARTING=0
+		ANVIL_MCP_PENDING_TERMINATION_STATUS=
+		# Repeated signals must not interrupt child/staging convergence.  Caught
+		# no-op dispositions reset to defaults in external cleanup children.
+		trap ':' HUP INT TERM
+		anvil_mcp_converge_runner "$runner"
+		exit "$status"
+		;;
+	esac
+	ANVIL_MCP_PENDING_TERMINATION_STATUS=
+	trap ':' HUP INT TERM
+	exit "$status"
+}
+trap 'anvil_mcp_terminate 129' HUP
+trap 'anvil_mcp_terminate 130' INT
+trap 'anvil_mcp_terminate 143' TERM
 
 # --- Retry wrapper for emacsclient ------------------------------------
 # Absorbs the ~few-second window where `emacs --daemon' is being
@@ -288,6 +361,10 @@ ANVIL_EMACSCLIENT_KILL_AFTER_TIMEOUT=${ANVIL_EMACSCLIENT_KILL_AFTER_TIMEOUT:-1}
 ANVIL_MCP_REQUEST_PARSE_TIMEOUT=${ANVIL_MCP_REQUEST_PARSE_TIMEOUT:-10}
 ANVIL_MCP_FRAME_READ_TIMEOUT=${ANVIL_MCP_FRAME_READ_TIMEOUT:-10}
 readonly ANVIL_MCP_MAX_REQUEST_BYTES=16777216
+# Tool results are staged on disk before they cross emacsclient.  This limit is
+# large enough for the worst-case JSON escaping of the 4 MiB shell tee while
+# bounding both bridge memory and private staging storage.
+readonly ANVIL_MCP_MAX_RESPONSE_BYTES=33554432
 # Linux limits each exec argument to 128 KiB even when ARG_MAX is much larger.
 # Keep inline request expressions comfortably below that boundary; larger
 # requests travel through one private bridge-owned staging directory instead.
@@ -300,21 +377,49 @@ esac
 readonly ANVIL_MCP_REQUEST_DIRECTORY
 unset _anvil_request_tmp
 ANVIL_MCP_REQUEST_SEQUENCE=0
+ANVIL_MCP_TRANSACTION_DIRECTORY=
+_anvil_response_payload=
+_anvil_response_stage_path=
+_anvil_response_path=
+_anvil_response_proof_path=
+_anvil_response_device=
+_anvil_response_inode=
+_anvil_request_path=
 
 anvil_mcp_validate_timeout() {
 	local name="$1" value="$2" maximum="$3"
 	case "$value" in
-	""|*[!0-9]*)
+	""|*[!0-9]*|0[0-9]*)
 		echo "anvil-mcp: $name must be an integer between 1 and $maximum" >&2
 		return 64
 		;;
 	esac
-	if [ "$value" -lt 1 ] || [ "$value" -gt "$maximum" ]; then
+	if [ "${#value}" -gt "${#maximum}" ] \
+		|| [ "$value" -lt 1 ] || [ "$value" -gt "$maximum" ]; then
 		echo "anvil-mcp: $name must be between 1 and $maximum seconds" >&2
 		return 64
 	fi
 }
 
+anvil_mcp_validate_range() {
+	local name="$1" value="$2" minimum="$3" maximum="$4" unit="$5"
+	case "$value" in
+	""|*[!0-9]*|0[0-9]*)
+		echo "anvil-mcp: $name must be an integer" >&2
+		return 64
+		;;
+	esac
+	if [ "${#value}" -gt "${#maximum}" ] \
+		|| [ "$value" -lt "$minimum" ] || [ "$value" -gt "$maximum" ]; then
+		echo "anvil-mcp: $name must be between $minimum and $maximum $unit" >&2
+		return 64
+	fi
+}
+
+anvil_mcp_validate_range ANVIL_EMACSCLIENT_RETRY_MAX \
+	"$ANVIL_EMACSCLIENT_RETRY_MAX" 1 1000 attempts
+anvil_mcp_validate_range ANVIL_EMACSCLIENT_RETRY_DELAY_MS \
+	"$ANVIL_EMACSCLIENT_RETRY_DELAY_MS" 0 60000 milliseconds
 anvil_mcp_validate_timeout ANVIL_EMACSCLIENT_PROBE_TIMEOUT \
 	"$ANVIL_EMACSCLIENT_PROBE_TIMEOUT" 5
 anvil_mcp_validate_timeout ANVIL_EMACSCLIENT_READINESS_TIMEOUT \
@@ -370,24 +475,46 @@ anvil_emacsclient_once() {
 	shift
 	if [ "${1-}" = "--" ]; then shift; fi
 
-	local out="" rc=0
 	anvil_mcp_run_bounded "$timeout_seconds" merge null "" \
 		"$ANVIL_MCP_EMACSCLIENT" -a false "$@"
-	out=$ANVIL_MCP_RUN_OUTPUT
-	rc=$ANVIL_MCP_RUN_STATUS
-	printf '%s' "$out"
-	return "$rc"
+	return "$ANVIL_MCP_RUN_STATUS"
+}
+
+anvil_emacsclient_probe_delay() {
+	local started_seconds="$1"
+	local delay_ms=$ANVIL_EMACSCLIENT_RETRY_DELAY_MS
+	if [ "$ANVIL_EMACSCLIENT_READINESS_TIMEOUT" -ne 0 ]; then
+		local elapsed=$((SECONDS - started_seconds))
+		local remaining=$((ANVIL_EMACSCLIENT_READINESS_TIMEOUT - elapsed))
+		if [ "$remaining" -le 0 ]; then
+			return 0
+		fi
+		local remaining_ms=$((remaining * 1000))
+		if [ "$delay_ms" -gt "$remaining_ms" ]; then
+			delay_ms=$remaining_ms
+		fi
+	fi
+	if [ "$delay_ms" -gt 0 ]; then
+		local delay_sec
+		printf -v delay_sec '%d.%03d' \
+			"$((delay_ms / 1000))" "$((delay_ms % 1000))"
+		local delay_cap=$((delay_ms / 1000 + 1))
+		anvil_mcp_run_bounded "$delay_cap" merge null "" \
+			"$ANVIL_MCP_SLEEP" "$delay_sec"
+	fi
 }
 
 # Retry only the side-effect-free readiness expression.  A sibling bridge may
 # occupy the single Emacs server event loop longer than one probe timeout, so
-# timeout exits are replayed until ANVIL_EMACSCLIENT_READINESS_TIMEOUT expires.
+# timeout exits and exact nil results are replayed until the readiness budget
+# expires.  Any other successful output fails closed.
 # Missing/refused socket races retain their independent attempt limit.
 anvil_emacsclient_probe_retry() {
 	if [ "${1-}" = "--" ]; then shift; fi
 
 	local socket_attempt=0 timeout_attempt=0 out="" rc=0
 	local started_seconds=$SECONDS this_timeout elapsed remaining
+	ANVIL_EMACSCLIENT_PROBE_OUTPUT=
 	while :; do
 		this_timeout=$ANVIL_EMACSCLIENT_PROBE_TIMEOUT
 		if [ "$ANVIL_EMACSCLIENT_READINESS_TIMEOUT" = "0" ]; then
@@ -399,7 +526,7 @@ anvil_emacsclient_probe_retry() {
 			if [ "$remaining" -le 0 ]; then
 				mcp_debug_log "PROBE-WAIT-EXHAUSTED" \
 					"timeouts=$timeout_attempt budget=${ANVIL_EMACSCLIENT_READINESS_TIMEOUT}s rc=$rc"
-				printf '%s' "$out"
+				ANVIL_EMACSCLIENT_PROBE_OUTPUT=$out
 				return "$rc"
 			fi
 			if [ "$this_timeout" -eq 0 ] \
@@ -407,14 +534,43 @@ anvil_emacsclient_probe_retry() {
 				this_timeout=$remaining
 			fi
 		fi
-		if out=$(anvil_emacsclient_once "$this_timeout" -- "$@"); then
+		if anvil_emacsclient_once "$this_timeout" -- "$@"; then
 			rc=0
 		else
 			rc=$?
 		fi
+		out=$ANVIL_MCP_RUN_OUTPUT
+		# Bounded capture retains emacsclient's terminal LF; normalize the
+		# same trailing line endings that command substitution historically
+		# removed before applying the exact readiness contract.
+		while [[ "$out" == *$'\n' ]]; do
+			out=${out%$'\n'}
+		done
+		case "$out" in
+		*$'\r') out=${out%$'\r'} ;;
+		esac
 		if [ "$rc" -eq 0 ]; then
-			printf '%s' "$out"
-			return 0
+			case "$out" in
+			t)
+				ANVIL_EMACSCLIENT_PROBE_OUTPUT=$out
+				return 0
+				;;
+			nil)
+				# Preserve a nonzero status if the overall deadline expires
+				# after a sequence of successful-but-not-ready probes.
+				rc=75
+				mcp_debug_log "PROBE-NOT-READY" \
+					"budget=${ANVIL_EMACSCLIENT_READINESS_TIMEOUT}s"
+				anvil_emacsclient_probe_delay "$started_seconds"
+				continue
+				;;
+			*)
+				mcp_debug_log "PROBE-INVALID-OUTPUT" \
+					"rc=0 bytes=${#out}"
+				ANVIL_EMACSCLIENT_PROBE_OUTPUT=$out
+				return 75
+				;;
+			esac
 		fi
 		case "$rc" in
 		124|137|142)
@@ -431,7 +587,7 @@ anvil_emacsclient_probe_retry() {
 			socket_attempt=$((socket_attempt + 1))
 			if [ "$socket_attempt" -ge "$ANVIL_EMACSCLIENT_RETRY_MAX" ]; then
 				mcp_debug_log "PROBE-RETRY-EXHAUSTED" "attempts=$socket_attempt max=$ANVIL_EMACSCLIENT_RETRY_MAX rc=$rc"
-				printf '%s' "$out"
+				ANVIL_EMACSCLIENT_PROBE_OUTPUT=$out
 				return "$rc"
 			fi
 			if [ "$socket_attempt" -eq 1 ] || [ $((socket_attempt % 10)) -eq 0 ]; then
@@ -439,18 +595,10 @@ anvil_emacsclient_probe_retry() {
 				mcp_debug_log "PROBE-RETRY" \
 					"attempt=$socket_attempt rc=$rc stderr=${probe_summary:0:120}"
 			fi
-			if [ "$ANVIL_EMACSCLIENT_RETRY_DELAY_MS" -gt 0 ]; then
-				local delay_sec
-				printf -v delay_sec '%d.%03d' \
-					"$((ANVIL_EMACSCLIENT_RETRY_DELAY_MS / 1000))" \
-					"$((ANVIL_EMACSCLIENT_RETRY_DELAY_MS % 1000))"
-				local delay_cap=$((ANVIL_EMACSCLIENT_RETRY_DELAY_MS / 1000 + 1))
-				anvil_mcp_run_bounded "$delay_cap" merge null "" \
-					"$ANVIL_MCP_SLEEP" "$delay_sec"
-			fi
+			anvil_emacsclient_probe_delay "$started_seconds"
 			continue
 		fi
-		printf '%s' "$out"
+		ANVIL_EMACSCLIENT_PROBE_OUTPUT=$out
 		return "$rc"
 	done
 }
@@ -460,13 +608,9 @@ anvil_emacsclient_dispatch_once() {
 	shift
 	if [ "${1-}" = "--" ]; then shift; fi
 
-	local out="" rc=0
 	anvil_mcp_run_bounded "$timeout_seconds" separate null "" \
 		"$ANVIL_MCP_EMACSCLIENT" -a false "$@"
-	out=$ANVIL_MCP_RUN_OUTPUT
-	rc=$ANVIL_MCP_RUN_STATUS
-	printf '%s' "$out"
-	return "$rc"
+	return "$ANVIL_MCP_RUN_STATUS"
 }
 
 # Parse command line arguments
@@ -528,6 +672,31 @@ else
 	mcp_debug_log "INFO" "Using default server-id: $SERVER_ID"
 fi
 
+case "$ANVIL_MCP_READINESS_MODE" in
+emacs)
+	ANVIL_EMACSCLIENT_READY_EXPR=t
+	;;
+headless)
+	case "$SERVER_ID" in
+	""|*[!A-Za-z0-9._-]*)
+		echo "anvil-mcp: unsafe server id for headless readiness" >&2
+		exit 64
+		;;
+	esac
+	ANVIL_EMACSCLIENT_READY_EXPR="(and (fboundp 'anvil-headless--ready-p) (anvil-headless--ready-p \"$SERVER_ID\"))"
+	;;
+*)
+	echo "anvil-mcp: unsupported readiness mode: $ANVIL_MCP_READINESS_MODE" >&2
+	exit 64
+	;;
+esac
+ANVIL_MCP_NOT_READY_SENTINEL=anvil-mcp-headless-not-ready
+ANVIL_MCP_LIFECYCLE_COMPLETE=anvil-mcp-lifecycle-complete
+ANVIL_MCP_RESPONSE_STAGED_PREFIX=anvil-mcp-response-staged:
+readonly ANVIL_MCP_READINESS_MODE ANVIL_EMACSCLIENT_READY_EXPR
+readonly ANVIL_MCP_NOT_READY_SENTINEL ANVIL_MCP_LIFECYCLE_COMPLETE
+readonly ANVIL_MCP_RESPONSE_STAGED_PREFIX
+
 # Initialize MCP if init function is provided.  Probe readiness with the
 # only replayable expression, then invoke the potentially stateful init once.
 if [ -n "$INIT_FUNCTION" ]; then
@@ -535,9 +704,11 @@ if [ -n "$INIT_FUNCTION" ]; then
 
 	init_probe_output=""
 	set +e
-	init_probe_output=$(anvil_emacsclient_probe_retry -- \
-		${SOCKET_OPTIONS[@]+"${SOCKET_OPTIONS[@]}"} -e t)
+	anvil_emacsclient_probe_retry -- \
+		${SOCKET_OPTIONS[@]+"${SOCKET_OPTIONS[@]}"} \
+		-e "$ANVIL_EMACSCLIENT_READY_EXPR"
 	INIT_READY_RC=$?
+	init_probe_output=$ANVIL_EMACSCLIENT_PROBE_OUTPUT
 	INIT_RC=$INIT_READY_RC
 	set -e
 	if [ "$INIT_READY_RC" -ne 0 ]; then
@@ -552,11 +723,30 @@ if [ -n "$INIT_FUNCTION" ]; then
 			anvil_emacsclient_dispatch_once \
 				"$ANVIL_EMACSCLIENT_STARTUP_DISPATCH_TIMEOUT" -- \
 				${SOCKET_OPTIONS[@]+"${SOCKET_OPTIONS[@]}"} \
-				-e "($INIT_FUNCTION)" >/dev/null
+				-e "(if $ANVIL_EMACSCLIENT_READY_EXPR (progn ($INIT_FUNCTION) \"$ANVIL_MCP_LIFECYCLE_COMPLETE\") \"$ANVIL_MCP_NOT_READY_SENTINEL\")"
 			INIT_RC=$?
+			init_dispatch_output=$ANVIL_MCP_RUN_OUTPUT
 			set -e
 			anvil_mcp_capture_finish
 			ANVIL_MCP_RESPONSE_PENDING=0
+			while :; do
+				case "$init_dispatch_output" in
+				*$'\n') init_dispatch_output=${init_dispatch_output%$'\n'} ;;
+				*$'\r') init_dispatch_output=${init_dispatch_output%$'\r'} ;;
+				*) break ;;
+				esac
+			done
+			if [ "${#init_dispatch_output}" -ge 2 ] \
+				&& [[ "$init_dispatch_output" == \"* && "$init_dispatch_output" == *\" ]]; then
+				init_dispatch_output="${init_dispatch_output:1:${#init_dispatch_output}-2}"
+			fi
+			if [ "$INIT_RC" -eq 0 ] \
+				&& [ "$init_dispatch_output" = "$ANVIL_MCP_NOT_READY_SENTINEL" ]; then
+				INIT_RC=75
+			elif [ "$INIT_RC" -eq 0 ] \
+				&& [ "$init_dispatch_output" != "$ANVIL_MCP_LIFECYCLE_COMPLETE" ]; then
+				INIT_RC=70
+			fi
 		else
 			INIT_RC=74
 			mcp_debug_log "INIT-CAPTURE" "failed before dispatch rc=$INIT_RC"
@@ -583,6 +773,46 @@ fi
 # Output: when input was framed, emit a framed response; otherwise emit
 # legacy single-line JSON.
 
+# Read one post-first-byte line without letting Bash normalize wire bytes.
+# The helper reads exactly through LF, never reads ahead into the next request,
+# rejects NUL before emitting anything, and publishes output only on success.
+ANVIL_MCP_BINARY_LINE=""
+anvil_mcp_read_binary_line() {
+	local frame_deadline="$1" max_bytes="$2" frame_remaining
+	ANVIL_MCP_BINARY_LINE=""
+	frame_remaining=$((frame_deadline - SECONDS))
+	[ "$frame_remaining" -gt 0 ] || return 1
+	exec 5<&0
+	anvil_mcp_run_bounded "$frame_remaining" merge descriptor "" \
+		"$ANVIL_MCP_PYTHON" -I -S -c '
+import os
+import sys
+
+limit = int(sys.argv[1])
+line = bytearray()
+while len(line) <= limit:
+    byte = os.read(0, 1)
+    if not byte:
+        raise SystemExit(1)
+    if byte == b"\0":
+        raise SystemExit(65)
+    if byte == b"\n":
+        view = memoryview(line)
+        while view:
+            written = os.write(1, view)
+            if written <= 0:
+                raise SystemExit(1)
+            view = view[written:]
+        raise SystemExit(0)
+    line.extend(byte)
+raise SystemExit(3)
+' "$max_bytes"
+	exec 5<&-
+	[ "$ANVIL_MCP_RUN_STATUS" -eq 0 ] || return "$ANVIL_MCP_RUN_STATUS"
+	ANVIL_MCP_BINARY_LINE=$ANVIL_MCP_RUN_OUTPUT
+	return 0
+}
+
 # anvil_mcp_read_framed_message
 #
 # Reads one MCP framed message from STDIN.  Headers are read line by
@@ -606,12 +836,10 @@ anvil_mcp_read_framed_message() {
 	# the body.  A client that stalls with stdin open after Content-Length must
 	# not retain this bridge indefinitely before dispatch.
 	while :; do
-		frame_remaining=$((frame_deadline - SECONDS))
-		[ "$frame_remaining" -gt 0 ] || return 1
-		if ! LC_ALL=C IFS= read -r -t "$frame_remaining" header_line; then
+		if ! anvil_mcp_read_binary_line "$frame_deadline" 65536; then
 			return 1
 		fi
-		header_line="${header_line%$'\r'}"
+		header_line="${ANVIL_MCP_BINARY_LINE%$'\r'}"
 		if [ -z "$header_line" ]; then
 			break
 		fi
@@ -647,6 +875,8 @@ while remaining:
     chunk = os.read(0, min(65536, remaining))
     if not chunk:
         raise SystemExit(1)
+    if b"\0" in chunk:
+        raise SystemExit(65)
     view = memoryview(chunk)
     while view:
         written = os.write(1, view)
@@ -689,32 +919,168 @@ anvil_mcp_emit_response() {
 	ANVIL_MCP_RESPONSE_PENDING=0
 }
 
-# Decode and emit a validated percent-byte wire without materializing another
-# full response string.  Global substitution is quadratic in macOS Bash 3.2;
-# splitting once and printing each byte remains linear for large responses.
-anvil_mcp_emit_wire_response() {
-	local framed="$1" wire="$2" wire_length byte_count
-	local offset=0 chunk_chars=49152 chunk
-	local LC_ALL=C
-	local -a bytes
-	wire_length=${#wire}
-	byte_count=$((wire_length / 3))
+# Authenticate FD 6 before dispatch without relying on /dev/fd stat identity.
+# macOS Bash 3.2 reports /dev/fd/N on devfs, so -ef rejects a correct descriptor.
+# Duplicate the held descriptor to bounded-run stdin; the child closes FD 6
+# itself and fstats only descriptor 0.
+anvil_mcp_validate_response_fd() {
+	local expected_device="$1" expected_inode="$2" status
+	if ! exec 5<&6; then
+		return 74
+	fi
+	anvil_mcp_run_bounded "$ANVIL_MCP_REQUEST_PARSE_TIMEOUT" merge descriptor "" \
+		"$ANVIL_MCP_PYTHON" -I -S -c '
+import os
+import stat
+import sys
 
-	if [ "$framed" = "1" ]; then
-		printf 'Content-Length: %s\r\n\r\n' "$byte_count"
+device = sys.argv[1]
+inode = sys.argv[2]
+if (
+    not device.isascii()
+    or not device.isdecimal()
+    or not inode.isascii()
+    or not inode.isdecimal()
+):
+    raise SystemExit(64)
+info = os.fstat(0)
+if (
+    not stat.S_ISREG(info.st_mode)
+    or info.st_uid != os.geteuid()
+    or stat.S_IMODE(info.st_mode) != 0o600
+    or info.st_nlink != 1
+    or info.st_size != 0
+    or info.st_dev != int(device)
+    or info.st_ino != int(inode)
+):
+    raise SystemExit(74)
+print("anvil-response-fd-authenticated")
+' "$expected_device" "$expected_inode"
+	status=$ANVIL_MCP_RUN_STATUS
+	exec 5<&-
+	[ "$status" -eq 0 ] \
+		&& [ "$ANVIL_MCP_RUN_OUTPUT" = "anvil-response-fd-authenticated"$'\n' ]
+}
+
+# Validate the two published names without ever opening either for response
+# bytes.  Linux exposes the target device through /dev/fd and gets an exact
+# descriptor comparison.  Darwin's devfs does not; its FD was authenticated
+# above, while the server validates the expected device/inode around both links.
+anvil_mcp_response_names_valid() {
+	local path="$1" proof="$2"
+	[ -e /dev/fd/6 ] \
+		&& [ -f "$path" ] && [ ! -L "$path" ] && [ -O "$path" ] \
+		&& [ -f "$proof" ] && [ ! -L "$proof" ] && [ -O "$proof" ] \
+		&& [[ "$path" -ef "$proof" ]] \
+		|| return 1
+	if [ "$ANVIL_MCP_FD_PATH_IDENTITY" -eq 1 ]; then
+		[[ "$path" -ef /dev/fd/6 ]] || return 1
 	fi
-	while [ "$offset" -lt "$wire_length" ]; do
-		chunk="${wire:offset:chunk_chars}"
-		bytes=()
-		IFS='%' read -r -a bytes <<<"$chunk"
-		unset 'bytes[0]'
-		printf '%b' "${bytes[@]/#/\\x}"
-		offset=$((offset + chunk_chars))
-	done
-	if [ "$framed" != "1" ]; then
-		printf '\n'
+}
+
+# Load one descriptor-authenticated response using Bash 3-compatible builtins.
+# FD 6 is opened and authenticated before stateful dispatch.  The published
+# names must remain one hard-link pair before and after the bounded read, but
+# response bytes always come exclusively from FD 6, never a callback-reachable
+# pathname.
+ANVIL_MCP_STAGED_RESPONSE=
+ANVIL_MCP_STAGED_RESPONSE_BYTES=0
+ANVIL_MCP_FD_PATH_IDENTITY=0
+anvil_mcp_read_staged_response() {
+	local path="$1" proof="$2" expected_size="$3"
+	local body="" read_status=0 size
+	local LC_ALL=C
+	ANVIL_MCP_STAGED_RESPONSE=
+	ANVIL_MCP_STAGED_RESPONSE_BYTES=0
+	case "$expected_size" in
+	"") ;;
+	*[!0-9]*|0[0-9]*)
+		exec 6<&-
+		return 65
+		;;
+	*)
+		if [ "${#expected_size}" -gt "${#ANVIL_MCP_MAX_RESPONSE_BYTES}" ] \
+			|| { [ "${#expected_size}" -eq "${#ANVIL_MCP_MAX_RESPONSE_BYTES}" ] \
+				&& [[ "$expected_size" > "$ANVIL_MCP_MAX_RESPONSE_BYTES" ]]; }; then
+			exec 6<&-
+			return 65
+		fi
+		;;
+	esac
+	if ! anvil_mcp_response_names_valid "$path" "$proof"; then
+		exec 6<&-
+		return 66
 	fi
+	if IFS= read -r -d '' -n "$((ANVIL_MCP_MAX_RESPONSE_BYTES + 1))" body <&6; then
+		read_status=0
+	else
+		read_status=$?
+	fi
+	if ! anvil_mcp_response_names_valid "$path" "$proof"; then
+		exec 6<&-
+		return 66
+	fi
+	exec 6<&-
+	if [ "$read_status" -eq 0 ]; then
+		return 65
+	fi
+	size=${#body}
+	if [ "$size" -gt "$ANVIL_MCP_MAX_RESPONSE_BYTES" ]; then
+		return 65
+	fi
+	if [ -n "$expected_size" ] && [ "$size" -ne "$expected_size" ]; then
+		return 65
+	fi
+	ANVIL_MCP_STAGED_RESPONSE=$body
+	ANVIL_MCP_STAGED_RESPONSE_BYTES=$size
+	return 0
+}
+
+# Emit only after the entire generation-bound response has been validated.
+# The file remains in private custody until the next pre-dispatch cleanup or
+# bridge EXIT; never mutate a callback-reachable pathname after dispatch.
+anvil_mcp_emit_staged_response() {
+	local framed="$1" request_kind="$2"
+	case "$request_kind" in
+	notification)
+		[ "$ANVIL_MCP_STAGED_RESPONSE_BYTES" -eq 0 ] || return 65
+		;;
+	request)
+		[ "$ANVIL_MCP_STAGED_RESPONSE_BYTES" -gt 0 ] || return 65
+		if [ "$framed" = "1" ]; then
+			printf 'Content-Length: %s\r\n\r\n' \
+				"$ANVIL_MCP_STAGED_RESPONSE_BYTES" || return 74
+			printf '%s' "$ANVIL_MCP_STAGED_RESPONSE" || return 74
+		else
+			printf '%s\n' "$ANVIL_MCP_STAGED_RESPONSE" || return 74
+		fi
+		;;
+	*) return 65 ;;
+	esac
+	ANVIL_MCP_STAGED_RESPONSE=
+	ANVIL_MCP_STAGED_RESPONSE_BYTES=0
 	ANVIL_MCP_RESPONSE_PENDING=0
+	return 0
+}
+
+# Erase the exact generation's staged request bytes without starting a helper.
+# A delayed Emacs event can only delete or consume this unique generation, never
+# a later request.  Bash 3 cannot revalidate mode or link count; Python
+# established those inside the private 0700 directory before dispatch.
+anvil_mcp_retire_staged_request() {
+	local path="$1"
+	local expected="$ANVIL_MCP_TRANSACTION_DIRECTORY/request.${ANVIL_MCP_REQUEST_SEQUENCE}.json"
+	[ "$path" = "$expected" ] || return 74
+	if [ -L "$path" ]; then
+		return 74
+	fi
+	if [ ! -e "$path" ]; then
+		return 0
+	fi
+	# Do not mutate a callback-reachable pathname after validation.  This
+	# generation is unique and remains inside the private 0700 directory until
+	# the next metadata cleanup or EXIT unlinks the directory entry.
+	[ -f "$path" ] && [ -O "$path" ]
 }
 
 # Parse only bounded request metadata outside Emacs.  The root may be dead on
@@ -724,20 +1090,64 @@ anvil_mcp_emit_wire_response() {
 # after the readiness probe succeeds, avoiding both exec argument limits and
 # unused files when Emacs is unavailable.
 anvil_mcp_request_metadata() {
-	local request="$1"
-	if [ "${#request}" -gt "$ANVIL_MCP_MAX_REQUEST_BYTES" ]; then
-		printf 'parse-error|0|none||0|null'
-		return 0
-	fi
+	local request="$1" transaction_directory="${2:-}"
 	anvil_mcp_run_bounded "$ANVIL_MCP_REQUEST_PARSE_TIMEOUT" \
 		merge input "$request" "$ANVIL_MCP_PYTHON" -I -S -c '
 import base64
 import json
 import math
+import os
+import stat
 import sys
 
 maximum = int(sys.argv[1])
 inline_maximum = int(sys.argv[2])
+transaction_directory = sys.argv[3]
+
+def generation_file(name, prefix):
+    pieces = name.split(".")
+    return (
+        len(pieces) == 3
+        and pieces[0] == prefix
+        and pieces[1].isdigit()
+        and pieces[2] == "json"
+    )
+
+if transaction_directory:
+    directory = os.path.abspath(transaction_directory)
+    info = os.lstat(directory)
+    if (
+        os.path.realpath(directory) != directory
+        or not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        raise SystemExit(74)
+    while True:
+        names = os.listdir(directory)
+        if not names:
+            break
+        for name in names:
+            allowed = (
+                generation_file(name, "request")
+                or generation_file(name, "response")
+                or generation_file(name, "proof")
+                or name.startswith(".response-tmp.")
+            )
+            if not allowed:
+                raise SystemExit(74)
+            path = os.path.join(directory, name)
+            try:
+                entry = os.lstat(path)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISDIR(entry.st_mode):
+                raise SystemExit(74)
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
 raw = sys.stdin.buffer.read(maximum + 1)
 
 def emit(kind, startup, request_id):
@@ -797,38 +1207,40 @@ else:
                     emit("request", startup, request_id)
                 else:
                     emit("invalid-request", startup, None)
-' "$ANVIL_MCP_MAX_REQUEST_BYTES" "$ANVIL_MCP_INLINE_REQUEST_BYTES"
-	printf '%s' "$ANVIL_MCP_RUN_OUTPUT"
+' "$ANVIL_MCP_MAX_REQUEST_BYTES" "$ANVIL_MCP_INLINE_REQUEST_BYTES" \
+		"$transaction_directory"
 	return "$ANVIL_MCP_RUN_STATUS"
 }
 
-# Stage one already-validated large request in a bridge-private directory.
-# The helper is bounded and runs before stateful dispatch.  It creates both the
-# directory and file without following links, verifies ownership/modes, writes
-# the exact request bytes, and returns only the base64-encoded absolute path.
-anvil_mcp_stage_request() {
-	local request="$1" basename="$2"
+# Prepare one generation-bound response inode before stateful dispatch.
+# The helper canonicalizes the parent, validates ownership and modes, creates a
+# random .response-tmp.SEQUENCE.* inode without following links, and preflights
+# same-directory hard links.  It returns
+# BASE64-PATH<TAB>CANONICAL-PATH<TAB>DEVICE<TAB>INODE.
+anvil_mcp_prepare_response() {
+	local requested_directory="$1" basename="$2"
 	anvil_mcp_run_bounded "$ANVIL_MCP_REQUEST_PARSE_TIMEOUT" \
-		merge input "$request" "$ANVIL_MCP_PYTHON" -I -S -c '
+		merge null "" "$ANVIL_MCP_PYTHON" -I -S -c '
 import base64
 import os
 import signal
 import stat
 import sys
+import tempfile
 
 requested_directory = os.path.abspath(sys.argv[1])
-root = os.path.realpath(os.path.dirname(requested_directory))
-directory = os.path.join(root, os.path.basename(requested_directory))
 basename = sys.argv[2]
-maximum = int(sys.argv[3])
-raw = sys.stdin.buffer.read(maximum + 1)
-if len(raw) > maximum:
-    raise SystemExit(65)
-if not basename.isascii() or not basename.startswith("request."):
-    raise SystemExit(64)
-if "/" in basename or (os.altsep and os.altsep in basename):
+pieces = basename.split(".")
+if not (
+    len(pieces) == 3
+    and pieces[0] == "response"
+    and pieces[1].isdigit()
+    and pieces[2] == "json"
+):
     raise SystemExit(64)
 
+root = os.path.realpath(os.path.dirname(requested_directory))
+directory = os.path.join(root, os.path.basename(requested_directory))
 root_stat = os.lstat(root)
 root_mode = stat.S_IMODE(root_stat.st_mode)
 private_root = root_stat.st_uid == os.geteuid() and not (root_mode & 0o022)
@@ -839,13 +1251,178 @@ sticky_root = bool(root_mode & stat.S_ISVTX) and root_stat.st_uid in {
 if not stat.S_ISDIR(root_stat.st_mode) or not (private_root or sticky_root):
     raise SystemExit(73)
 
+directory_created = False
+descriptor = -1
+path = ""
+probe_path = ""
+created = False
+
+
+def cleanup():
+    global descriptor, created, directory_created
+    open_descriptor = descriptor
+    descriptor = -1
+    if open_descriptor >= 0:
+        try:
+            os.close(open_descriptor)
+        except OSError:
+            pass
+    if probe_path:
+        try:
+            os.unlink(probe_path)
+        except OSError:
+            pass
+    remove_path = created
+    created = False
+    if remove_path and path:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    remove_directory = directory_created
+    directory_created = False
+    if remove_directory:
+        try:
+            os.rmdir(directory)
+        except OSError:
+            pass
+
+
+def without_term(function):
+    if not hasattr(signal, "pthread_sigmask"):
+        return function()
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    try:
+        return function()
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+def create_directory():
+    global directory_created
+    try:
+        os.mkdir(directory, 0o700)
+        directory_created = True
+    except FileExistsError:
+        pass
+
+
+def create_stage():
+    global descriptor, path, probe_path, created
+    descriptor, path = tempfile.mkstemp(
+        prefix=f".response-tmp.{pieces[1]}.",
+        dir=directory,
+    )
+    created = True
+    os.fchmod(descriptor, 0o600)
+    probe_path = path + ".link-probe"
+
+
+def interrupted(_signum, _frame):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    cleanup()
+    raise TimeoutError("response staging interrupted")
+
+
+signal.signal(signal.SIGTERM, interrupted)
 try:
-    os.mkdir(directory, 0o700)
-except FileExistsError:
-    pass
+    without_term(create_directory)
+    directory_stat = os.lstat(directory)
+    if (
+        os.path.realpath(directory) != directory
+        or not stat.S_ISDIR(directory_stat.st_mode)
+        or directory_stat.st_uid != os.geteuid()
+        or stat.S_IMODE(directory_stat.st_mode) != 0o700
+    ):
+        raise SystemExit(73)
+
+    without_term(create_stage)
+    info = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or info.st_size != 0
+    ):
+        raise PermissionError("unsafe response stage")
+
+    def probe_hardlink():
+        os.link(path, probe_path)
+        held = os.fstat(descriptor)
+        linked = os.lstat(probe_path)
+        if (
+            not stat.S_ISREG(linked.st_mode)
+            or linked.st_uid != os.geteuid()
+            or stat.S_IMODE(linked.st_mode) != 0o600
+            or linked.st_size != 0
+            or held.st_dev != linked.st_dev
+            or held.st_ino != linked.st_ino
+            or held.st_nlink != 2
+            or linked.st_nlink != 2
+        ):
+            raise PermissionError("unsafe response hard-link probe")
+        os.unlink(probe_path)
+        held = os.fstat(descriptor)
+        original = os.lstat(path)
+        if (
+            held.st_dev != original.st_dev
+            or held.st_ino != original.st_ino
+            or held.st_nlink != 1
+            or original.st_nlink != 1
+        ):
+            raise PermissionError("response hard-link probe did not converge")
+
+    without_term(probe_hardlink)
+    info = os.fstat(descriptor)
+    open_descriptor = descriptor
+    descriptor = -1
+    os.close(open_descriptor)
+    text_path = os.fsdecode(path)
+    if any(character in text_path for character in "\t\r\n"):
+        raise SystemExit(64)
+    encoded = base64.b64encode(os.fsencode(path)).decode("ascii")
+    print(f"{encoded}\t{text_path}\t{info.st_dev}\t{info.st_ino}")
+except BaseException:
+    cleanup()
+    raise
+' "$requested_directory" "$basename"
+	return "$ANVIL_MCP_RUN_STATUS"
+}
+
+# Stage one already-validated large request in the canonical transaction
+# directory.  The helper is bounded and runs before stateful dispatch.  It
+# writes one sequence-unique 0600 file and returns
+# BASE64-PATH<TAB>CANONICAL-PATH only after exact-size validation.
+anvil_mcp_stage_request() {
+	local request="$1" basename="$2" directory="$3"
+	anvil_mcp_run_bounded "$ANVIL_MCP_REQUEST_PARSE_TIMEOUT" \
+		merge input "$request" "$ANVIL_MCP_PYTHON" -I -S -c '
+import base64
+import os
+import signal
+import stat
+import sys
+
+directory = os.path.abspath(sys.argv[1])
+basename = sys.argv[2]
+maximum = int(sys.argv[3])
+raw = sys.stdin.buffer.read(maximum + 1)
+if len(raw) > maximum:
+    raise SystemExit(65)
+pieces = basename.split(".")
+if not (
+    len(pieces) == 3
+    and pieces[0] == "request"
+    and pieces[1].isdigit()
+    and pieces[2] == "json"
+):
+    raise SystemExit(64)
+
 directory_stat = os.lstat(directory)
 if (
-    not stat.S_ISDIR(directory_stat.st_mode)
+    os.path.realpath(directory) != directory
+    or not stat.S_ISDIR(directory_stat.st_mode)
     or directory_stat.st_uid != os.geteuid()
     or stat.S_IMODE(directory_stat.st_mode) != 0o700
 ):
@@ -871,12 +1448,27 @@ try:
         or file_stat.st_uid != os.geteuid()
         or file_stat.st_nlink != 1
         or stat.S_IMODE(file_stat.st_mode) != 0o600
+        or file_stat.st_size != 0
     ):
         raise PermissionError("unsafe request staging file")
     with os.fdopen(descriptor, "wb") as stream:
         descriptor = -1
         stream.write(raw)
-    print(base64.b64encode(os.fsencode(path)).decode("ascii"))
+        stream.flush()
+        final_stat = os.fstat(stream.fileno())
+        if (
+            not stat.S_ISREG(final_stat.st_mode)
+            or final_stat.st_uid != os.geteuid()
+            or final_stat.st_nlink != 1
+            or stat.S_IMODE(final_stat.st_mode) != 0o600
+            or final_stat.st_size != len(raw)
+        ):
+            raise PermissionError("request staging size or identity changed")
+    text_path = os.fsdecode(path)
+    if any(character in text_path for character in "\t\r\n"):
+        raise SystemExit(64)
+    encoded = base64.b64encode(os.fsencode(path)).decode("ascii")
+    print(f"{encoded}\t{text_path}")
 except BaseException:
     if descriptor >= 0:
         os.close(descriptor)
@@ -886,11 +1478,81 @@ except BaseException:
         except OSError:
             pass
     raise
-' "$ANVIL_MCP_REQUEST_DIRECTORY" "$basename" \
-		"$ANVIL_MCP_MAX_REQUEST_BYTES"
-	printf '%s' "$ANVIL_MCP_RUN_OUTPUT"
+' "$directory" "$basename" "$ANVIL_MCP_MAX_REQUEST_BYTES"
 	return "$ANVIL_MCP_RUN_STATUS"
 }
+
+anvil_mcp_cleanup_all_staged() {
+	local directory="${ANVIL_MCP_TRANSACTION_DIRECTORY:-$ANVIL_MCP_REQUEST_DIRECTORY}"
+	anvil_mcp_run_bounded "$ANVIL_EMACSCLIENT_KILL_AFTER_TIMEOUT" \
+		merge null "" "$ANVIL_MCP_PYTHON" -I -S -c '
+import errno
+import os
+import stat
+import sys
+
+directory = os.path.abspath(sys.argv[1])
+try:
+    info = os.lstat(directory)
+except FileNotFoundError:
+    raise SystemExit(0)
+if (
+    os.path.realpath(directory) != directory
+    or not stat.S_ISDIR(info.st_mode)
+    or info.st_uid != os.geteuid()
+    or stat.S_IMODE(info.st_mode) != 0o700
+):
+    raise SystemExit(74)
+
+def generation_file(name, prefix):
+    pieces = name.split(".")
+    return (
+        len(pieces) == 3
+        and pieces[0] == prefix
+        and pieces[1].isdigit()
+        and pieces[2] == "json"
+    )
+
+while True:
+    try:
+        names = os.listdir(directory)
+    except FileNotFoundError:
+        raise SystemExit(0)
+    for name in names:
+        allowed = (
+            generation_file(name, "request")
+            or generation_file(name, "response")
+            or generation_file(name, "proof")
+            or name.startswith(".response-tmp.")
+        )
+        if not allowed:
+            raise SystemExit(74)
+        path = os.path.join(directory, name)
+        try:
+            entry = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISDIR(entry.st_mode):
+            raise SystemExit(74)
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+    if names:
+        continue
+    try:
+        os.rmdir(directory)
+        break
+    except FileNotFoundError:
+        break
+    except OSError as error:
+        if error.errno not in (errno.EEXIST, errno.ENOTEMPTY):
+            raise
+' "$directory"
+	return "$ANVIL_MCP_RUN_STATUS"
+}
+
+trap '[ -z "$ANVIL_MCP_TRANSACTION_DIRECTORY" ] && [ ! -e "$ANVIL_MCP_REQUEST_DIRECTORY" ] || anvil_mcp_cleanup_all_staged || :' EXIT
 
 # Emit a correlated at-most-once error.  Notifications remain silent;
 # malformed input receives a protocol error with id null.
@@ -962,14 +1624,12 @@ while :; do
 	elif [ "$_anvil_first_byte" = $'\n' ]; then
 		line=""
 	else
-		_anvil_frame_remaining=$((_anvil_frame_deadline - SECONDS))
-		[ "$_anvil_frame_remaining" -gt 0 ] || exit 65
-		_anvil_line_tail=""
-		if ! LC_ALL=C IFS= read -r -t "$_anvil_frame_remaining" _anvil_line_tail; then
+		if ! anvil_mcp_read_binary_line \
+			"$_anvil_frame_deadline" "$ANVIL_MCP_MAX_REQUEST_BYTES"; then
 			mcp_debug_log "FRAMING-ERROR" "phase=first-line"
 			exit 65
 		fi
-		line="${_anvil_first_byte}${_anvil_line_tail}"
+		line="${_anvil_first_byte}${ANVIL_MCP_BINARY_LINE}"
 	fi
 
 	# T71: detect framing.  An MCP framed request begins with
@@ -1001,9 +1661,19 @@ while :; do
 	# Parse top-level metadata before touching Emacs.  This gives error paths a
 	# correct correlation id and lets initialize use its shorter startup cap.
 	set +e
-	_anvil_metadata=$(anvil_mcp_request_metadata "$line")
+	anvil_mcp_request_metadata \
+		"$line" "$ANVIL_MCP_TRANSACTION_DIRECTORY"
 	_anvil_metadata_rc=$?
+	_anvil_metadata=$ANVIL_MCP_RUN_OUTPUT
+	_anvil_metadata=${_anvil_metadata%$'\n'}
+	_anvil_metadata=${_anvil_metadata%$'\r'}
 	set -e
+	if [ "$_anvil_metadata_rc" -ne 0 ] \
+		&& [ -n "$ANVIL_MCP_TRANSACTION_DIRECTORY" ]; then
+		# The current frame is consumed, but retired-generation cleanup did
+		# not converge.  Closing is the only fail-closed continuation.
+		exit 74
+	fi
 	if [ "$_anvil_metadata_rc" -ne 0 ]; then
 		anvil_mcp_synthetic_error unknown null "$_anvil_framed" \
 			parse false "$_anvil_metadata_rc"
@@ -1076,9 +1746,11 @@ while :; do
 	# Once it succeeds, the JSON-RPC expression below is dispatched exactly once.
 	probe_output=""
 	set +e
-	probe_output=$(anvil_emacsclient_probe_retry -- \
-		${SOCKET_OPTIONS[@]+"${SOCKET_OPTIONS[@]}"} -e t)
+	anvil_emacsclient_probe_retry -- \
+		${SOCKET_OPTIONS[@]+"${SOCKET_OPTIONS[@]}"} \
+		-e "$ANVIL_EMACSCLIENT_READY_EXPR"
 	_anvil_probe_rc=$?
+	probe_output=$ANVIL_EMACSCLIENT_PROBE_OUTPUT
 	set -e
 	if [ "$_anvil_probe_rc" -ne 0 ]; then
 		anvil_mcp_log_probe_stderr "PROBE-STDERR" "$probe_output"
@@ -1104,99 +1776,248 @@ while :; do
 		continue
 	fi
 
-	# Process JSON-RPC and return an ASCII percent-byte wire value.  Inline
-	# requests remain below the per-argument exec ceiling.  Large requests are
-	# staged only now, after readiness and capture setup, and Emacs removes both
-	# the file and its directory even when request processing signals an error.
+	# Each request gets one precommitted response inode.  The parent bridge opens
+	# FD 6 before dispatch; bounded children close it, so descendants cannot
+	# prolong response custody.
+	ANVIL_MCP_REQUEST_SEQUENCE=$((ANVIL_MCP_REQUEST_SEQUENCE + 1))
+	_anvil_response_basename="response.$ANVIL_MCP_REQUEST_SEQUENCE.json"
+	_anvil_prepare_directory="${ANVIL_MCP_TRANSACTION_DIRECTORY:-$ANVIL_MCP_REQUEST_DIRECTORY}"
+	set +e
+	anvil_mcp_prepare_response \
+		"$_anvil_prepare_directory" "$_anvil_response_basename"
+	_anvil_response_prepare_rc=$?
+	_anvil_response_record=$ANVIL_MCP_RUN_OUTPUT
+	_anvil_response_record=${_anvil_response_record%$'\n'}
+	_anvil_response_record=${_anvil_response_record%$'\r'}
+	set -e
+	_anvil_response_payload=${_anvil_response_record%%$'\t'*}
+	_anvil_response_rest=${_anvil_response_record#*$'\t'}
+	_anvil_response_stage_path=${_anvil_response_rest%%$'\t'*}
+	_anvil_response_rest=${_anvil_response_rest#*$'\t'}
+	_anvil_response_device=${_anvil_response_rest%%$'\t'*}
+	_anvil_response_inode=${_anvil_response_rest#*$'\t'}
+	if [ "$_anvil_response_payload" = "$_anvil_response_record" ] \
+		|| [ "$_anvil_response_stage_path" = "$_anvil_response_rest" ] \
+		|| [ "$_anvil_response_device" = "$_anvil_response_rest" ] \
+		|| [[ "$_anvil_response_inode" == *$'\t'* ]]; then
+		_anvil_response_prepare_rc=70
+	fi
+	case "$_anvil_response_payload" in
+	""|*[!A-Za-z0-9+/=]*) _anvil_response_prepare_rc=70 ;;
+	esac
+	case "$_anvil_response_device" in
+	""|*[!0-9]*|0[0-9]*) _anvil_response_prepare_rc=70 ;;
+	esac
+	case "$_anvil_response_inode" in
+	""|*[!0-9]*|0|0[0-9]*) _anvil_response_prepare_rc=70 ;;
+	esac
+	_anvil_response_directory=${_anvil_response_stage_path%/*}
+	_anvil_response_stage_basename=${_anvil_response_stage_path##*/}
+	case "$_anvil_response_stage_basename" in
+	".response-tmp.$ANVIL_MCP_REQUEST_SEQUENCE."*) ;;
+	*) _anvil_response_prepare_rc=70 ;;
+	esac
+	if [ -z "$_anvil_response_directory" ] \
+		|| [ "$_anvil_response_directory" = "$_anvil_response_stage_path" ]; then
+		_anvil_response_prepare_rc=70
+	elif [ -z "$ANVIL_MCP_TRANSACTION_DIRECTORY" ]; then
+		ANVIL_MCP_TRANSACTION_DIRECTORY=$_anvil_response_directory
+	elif [ "$_anvil_response_directory" != "$ANVIL_MCP_TRANSACTION_DIRECTORY" ]; then
+		_anvil_response_prepare_rc=74
+	fi
+	_anvil_response_path="$ANVIL_MCP_TRANSACTION_DIRECTORY/$_anvil_response_basename"
+	_anvil_response_proof_path="$ANVIL_MCP_TRANSACTION_DIRECTORY/proof.$ANVIL_MCP_REQUEST_SEQUENCE.json"
+	if [ "$_anvil_response_prepare_rc" -eq 0 ] \
+		&& { [ "$_anvil_response_directory" != "$ANVIL_MCP_TRANSACTION_DIRECTORY" ] \
+			|| [ ! -f "$_anvil_response_stage_path" ] \
+			|| [ -L "$_anvil_response_stage_path" ] \
+			|| [ ! -O "$_anvil_response_stage_path" ] \
+			|| [ -s "$_anvil_response_stage_path" ] \
+			|| [ -e "$_anvil_response_path" ] \
+			|| [ -L "$_anvil_response_path" ] \
+			|| [ -e "$_anvil_response_proof_path" ] \
+			|| [ -L "$_anvil_response_proof_path" ]; }; then
+		_anvil_response_prepare_rc=74
+	fi
+	if [ "$_anvil_response_prepare_rc" -eq 0 ]; then
+		if ! exec 6<"$_anvil_response_stage_path"; then
+			_anvil_response_prepare_rc=74
+		elif ! anvil_mcp_validate_response_fd \
+			"$_anvil_response_device" "$_anvil_response_inode"; then
+			exec 6<&-
+			_anvil_response_prepare_rc=74
+		else
+			case "${OSTYPE-}" in
+			linux*) ANVIL_MCP_FD_PATH_IDENTITY=1 ;;
+			*) ANVIL_MCP_FD_PATH_IDENTITY=0 ;;
+			esac
+			if [ "$ANVIL_MCP_FD_PATH_IDENTITY" -eq 1 ] \
+				&& ! [[ "$_anvil_response_stage_path" -ef /dev/fd/6 ]]; then
+				exec 6<&-
+				_anvil_response_prepare_rc=74
+			fi
+		fi
+	fi
+	if [ "$_anvil_response_prepare_rc" -ne 0 ]; then
+		exec 6<&- 2>/dev/null || :
+		anvil_mcp_capture_finish
+		anvil_mcp_synthetic_error \
+			"$_anvil_request_kind" "$_anvil_request_id" \
+			"$_anvil_framed" stage false "$_anvil_response_prepare_rc"
+		exit 74
+	fi
+
+	# Process JSON-RPC exactly once and publish its authenticated UTF-8 response.
+	# Inline requests stay below exec argument limits; larger requests use the
+	# same private transaction directory and are deleted before tool dispatch.
+	not_ready_expr="\"$ANVIL_MCP_NOT_READY_SENTINEL\""
+	_anvil_request_path=
 	case "$_anvil_request_mode" in
 	inline)
 		base64_input=$_anvil_request_payload
 		mcp_debug_log "BASE64-INPUT" "bytes=${#base64_input}"
-		elisp_expr="(mapconcat (lambda (byte) (format \"%%%02x\" byte)) (encode-coding-string (or (anvil-server-process-jsonrpc (base64-decode-string \"$base64_input\") \"$SERVER_ID\") \"\") 'utf-8 t) \"\")"
+		elisp_expr="(anvil-server-process-jsonrpc-to-file (base64-decode-string \"$base64_input\") \"$SERVER_ID\" (decode-coding-string (base64-decode-string \"$_anvil_response_payload\") 'utf-8 t) $ANVIL_MCP_REQUEST_SEQUENCE $ANVIL_MCP_MAX_RESPONSE_BYTES $_anvil_response_device $_anvil_response_inode)"
 		;;
 	file)
-		ANVIL_MCP_REQUEST_SEQUENCE=$((ANVIL_MCP_REQUEST_SEQUENCE + 1))
 		_anvil_request_basename="request.${ANVIL_MCP_REQUEST_SEQUENCE}.json"
+		_anvil_expected_request_path="$ANVIL_MCP_TRANSACTION_DIRECTORY/$_anvil_request_basename"
 		set +e
-		_anvil_request_payload=$(anvil_mcp_stage_request \
-			"$line" "$_anvil_request_basename")
+		anvil_mcp_stage_request \
+			"$line" "$_anvil_request_basename" \
+			"$ANVIL_MCP_TRANSACTION_DIRECTORY"
 		_anvil_stage_rc=$?
+		_anvil_request_record=$ANVIL_MCP_RUN_OUTPUT
+		_anvil_request_record=${_anvil_request_record%$'\n'}
+		_anvil_request_record=${_anvil_request_record%$'\r'}
 		set -e
+		_anvil_request_payload=${_anvil_request_record%%$'\t'*}
+		_anvil_request_path=${_anvil_request_record#*$'\t'}
+		if [ "$_anvil_request_payload" = "$_anvil_request_record" ]; then
+			_anvil_stage_rc=70
+		fi
 		case "$_anvil_request_payload" in
 		""|*[!A-Za-z0-9+/=]*) _anvil_stage_rc=70 ;;
 		esac
+		if [ "$_anvil_request_path" != "$_anvil_expected_request_path" ]; then
+			_anvil_stage_rc=70
+		fi
 		if [ "$_anvil_stage_rc" -ne 0 ]; then
 			anvil_mcp_capture_finish
+			if ! anvil_mcp_retire_staged_request \
+				"$_anvil_expected_request_path"; then
+				exit 74
+			fi
 			anvil_mcp_synthetic_error \
 				"$_anvil_request_kind" "$_anvil_request_id" \
 				"$_anvil_framed" stage false "$_anvil_stage_rc"
+			exec 6<&-
 			continue
 		fi
 		mcp_debug_log "STAGED-INPUT" "bytes=$_anvil_request_size"
-		elisp_expr="(let* ((anvil-request-file (decode-coding-string (base64-decode-string \"$_anvil_request_payload\") 'utf-8 t)) (anvil-request-directory (file-name-directory anvil-request-file)) anvil-request) (unwind-protect (progn (setq anvil-request (with-temp-buffer (set-buffer-multibyte nil) (insert-file-contents-literally anvil-request-file) (unless (= (buffer-size) $_anvil_request_size) (error \"Staged Anvil request size changed\")) (buffer-string))) (delete-file anvil-request-file) (setq anvil-request-file nil) (ignore-errors (delete-directory anvil-request-directory)) (mapconcat (lambda (byte) (format \"%%%02x\" byte)) (encode-coding-string (or (anvil-server-process-jsonrpc anvil-request \"$SERVER_ID\") \"\") 'utf-8 t) \"\")) (when anvil-request-file (ignore-errors (delete-file anvil-request-file))) (ignore-errors (delete-directory anvil-request-directory))))"
+		line=
+		# A same-event readiness failure must prove exact retirement; deletion
+		# failure becomes an ambiguous dispatch rather than a retryable sentinel.
+		not_ready_expr="(progn (let ((delete-by-moving-to-trash nil)) (delete-file (decode-coding-string (base64-decode-string \"$_anvil_request_payload\") 'utf-8 t))) $not_ready_expr)"
+		elisp_expr="(let* ((anvil-request-file (decode-coding-string (base64-decode-string \"$_anvil_request_payload\") 'utf-8 t)) (anvil-response-file (decode-coding-string (base64-decode-string \"$_anvil_response_payload\") 'utf-8 t)) (delete-by-moving-to-trash nil) anvil-request) (unwind-protect (progn (setq anvil-request (with-temp-buffer (set-buffer-multibyte nil) (insert-file-contents-literally anvil-request-file) (unless (= (buffer-size) $_anvil_request_size) (error \"Staged Anvil request size changed\")) (buffer-string))) (delete-file anvil-request-file) (setq anvil-request-file nil) (anvil-server-process-jsonrpc-to-file anvil-request \"$SERVER_ID\" anvil-response-file $ANVIL_MCP_REQUEST_SEQUENCE $ANVIL_MCP_MAX_RESPONSE_BYTES $_anvil_response_device $_anvil_response_inode)) (when anvil-request-file (ignore-errors (delete-file anvil-request-file)))))"
 		;;
 	esac
+	# Close the probe/dispatch race inside the same Emacs server event.  The
+	# sentinel proves the stateful handler was not entered.
+	elisp_expr="(if $ANVIL_EMACSCLIENT_READY_EXPR $elisp_expr $not_ready_expr)"
 
-	# No helper process starts beyond this point: response normalization and
-	# decoding use Bash builtins so a delivered stateful response cannot wedge.
 	ANVIL_MCP_RESPONSE_PENDING=1
 	set +e
-	wire_response=$(anvil_emacsclient_dispatch_once \
+	anvil_emacsclient_dispatch_once \
 		"$_anvil_dispatch_timeout" -- \
 		${SOCKET_OPTIONS[@]+"${SOCKET_OPTIONS[@]}"} \
-		-e "$elisp_expr")
+		-e "$elisp_expr"
 	_anvil_client_rc=$?
+	dispatch_output=$ANVIL_MCP_RUN_OUTPUT
 	set -e
 	anvil_mcp_capture_finish
-	if [ "$_anvil_client_rc" -ne 0 ]; then
+
+	# Retire sensitive staged request bytes before marker parsing or stdout.
+	# Missing is success because Emacs deletes the unique path before callbacks.
+	if [ "$_anvil_request_mode" = "file" ]; then
+		set +e
+		anvil_mcp_retire_staged_request "$_anvil_request_path"
+		_anvil_request_retire_rc=$?
+		set -e
+		if [ "$_anvil_request_retire_rc" -ne 0 ]; then
+			exit 74
+		fi
+	fi
+
+	# The marker is intentionally tiny, but normalize the same line endings and
+	# Lisp string quotes accepted by lifecycle calls.
+	dispatch_output="${dispatch_output//$'\r'/}"
+	dispatch_output="${dispatch_output//$'\n'/}"
+	if [ "${#dispatch_output}" -ge 2 ] \
+		&& [[ "$dispatch_output" == \"* && "$dispatch_output" == *\" ]]; then
+		dispatch_output="${dispatch_output:1:${#dispatch_output}-2}"
+	fi
+
+	if [ "$dispatch_output" = "$ANVIL_MCP_NOT_READY_SENTINEL" ]; then
+		exec 6<&-
 		anvil_mcp_synthetic_error \
 			"$_anvil_request_kind" "$_anvil_request_id" \
-			"$_anvil_framed" dispatch true "$_anvil_client_rc"
+			"$_anvil_framed" readiness false 75
 		continue
 	fi
 
-	# Repair Windows MSYS frame-boundary corruption.
-	# emacsclient.c uses a read buffer of BUFSIZ+1 bytes; on MSYS / mingw
-	# stdio.h, BUFSIZ is 512.  The Emacs server's `server-reply-print'
-	# splits its output into frames of up to `server-msg-size' (1024 by
-	# default), so on Windows every frame larger than ~512 bytes overruns
-	# the client's read buffer.  When that happens, the tail of the frame
-	# loses its `-print-nonl ' prefix and emacsclient prints it as
-	#   *ERROR*: Unknown message: <tail>
-	# interleaved with the legitimate payload.  Bash parameter expansion
-	# removes those markers and CR/LF frame boundaries without launching a
-	# post-dispatch helper process.
-	# (No-op on Linux/macOS where one frame fits in one read.)
-	wire_response="${wire_response//\*ERROR\*: Unknown message: /}"
-	wire_response="${wire_response//$'\r'/}"
-	wire_response="${wire_response//$'\n'/}"
-
-	# Strip the Lisp string quotes after normalizing frame corruption: MSYS
-	# may leave a trailing CR after command substitution removes the newline.
-	# The wire alphabet contains only `%` and hexadecimal digits, so it needs
-	# no quote or backslash unescaping.
-	if [[ "$wire_response" == \"* && "$wire_response" == *\" ]]; then
-		wire_response="${wire_response:1:${#wire_response}-2}"
+	# The generation-bound response file is authoritative.  A valid marker adds
+	# an exact size check; lost marker transport cannot alias another request.
+	_anvil_expected_response_size=
+	case "$dispatch_output" in
+	"$ANVIL_MCP_RESPONSE_STAGED_PREFIX$ANVIL_MCP_REQUEST_SEQUENCE:"*)
+		_anvil_expected_response_size=${dispatch_output#"$ANVIL_MCP_RESPONSE_STAGED_PREFIX$ANVIL_MCP_REQUEST_SEQUENCE:"}
+		case "$_anvil_expected_response_size" in
+		""|*[!0-9]*|0[0-9]*) _anvil_expected_response_size= ;;
+		*)
+			if [ "${#_anvil_expected_response_size}" -gt \
+				"${#ANVIL_MCP_MAX_RESPONSE_BYTES}" ] \
+				|| { [ "${#_anvil_expected_response_size}" -eq \
+					"${#ANVIL_MCP_MAX_RESPONSE_BYTES}" ] \
+					&& [[ "$_anvil_expected_response_size" > \
+						"$ANVIL_MCP_MAX_RESPONSE_BYTES" ]]; }; then
+				_anvil_expected_response_size=
+			fi
+			;;
+		esac
+		;;
+	esac
+	set +e
+	anvil_mcp_read_staged_response \
+		"$_anvil_response_path" "$_anvil_response_proof_path" \
+		"$_anvil_expected_response_size"
+	_anvil_response_read_rc=$?
+	set -e
+	if [ "$_anvil_response_read_rc" -eq 0 ]; then
+		set +e
+		anvil_mcp_emit_staged_response \
+			"$_anvil_framed" "$_anvil_request_kind"
+		_anvil_response_emit_rc=$?
+		set -e
+		if [ "$_anvil_response_emit_rc" -eq 0 ]; then
+			continue
+		fi
+		# Status 65 is detected before stdout; all other failures may follow a
+		# partial frame, so close without appending another protocol object.
+		if [ "$_anvil_response_emit_rc" -ne 65 ]; then
+			exit 74
+		fi
 	fi
 
-	# Validate the wire before streaming it.  NUL cannot exist in a Bash
-	# variable and is never present in valid serialized JSON, so reject %00
-	# explicitly instead of silently truncating the response.
-	if [[ ! "$wire_response" =~ ^(%[0-9A-Fa-f]{2})*$ ]] \
-		|| [[ "$wire_response" == *%00* ]]; then
-		anvil_mcp_synthetic_error \
-			"$_anvil_request_kind" "$_anvil_request_id" \
-			"$_anvil_framed" dispatch true 70
-		continue
+	_anvil_failure_rc=$_anvil_client_rc
+	if [ "$_anvil_failure_rc" -eq 0 ]; then
+		_anvil_failure_rc=70
 	fi
-
-	if [ -n "$wire_response" ]; then
-		anvil_mcp_emit_wire_response "$_anvil_framed" "$wire_response"
-	else
-		anvil_mcp_synthetic_error \
-			"$_anvil_request_kind" "$_anvil_request_id" \
-			"$_anvil_framed" dispatch true "$_anvil_client_rc"
-	fi
+	anvil_mcp_synthetic_error \
+		"$_anvil_request_kind" "$_anvil_request_id" \
+		"$_anvil_framed" dispatch true "$_anvil_failure_rc"
+	# Stateful dispatch is never replayed.  Unique request bytes are already
+	# retired; this generation's response remains private until cleanup.
+	continue
 done
 
 # Stop MCP if stop function is provided.  As with init, readiness may
@@ -1207,9 +2028,11 @@ if [ -n "$STOP_FUNCTION" ]; then
 
 	stop_probe_output=""
 	set +e
-	stop_probe_output=$(anvil_emacsclient_probe_retry -- \
-		${SOCKET_OPTIONS[@]+"${SOCKET_OPTIONS[@]}"} -e t)
+	anvil_emacsclient_probe_retry -- \
+		${SOCKET_OPTIONS[@]+"${SOCKET_OPTIONS[@]}"} \
+		-e "$ANVIL_EMACSCLIENT_READY_EXPR"
 	STOP_READY_RC=$?
+	stop_probe_output=$ANVIL_EMACSCLIENT_PROBE_OUTPUT
 	STOP_RC=$STOP_READY_RC
 	set -e
 	if [ "$STOP_READY_RC" -ne 0 ]; then
@@ -1224,11 +2047,30 @@ if [ -n "$STOP_FUNCTION" ]; then
 			anvil_emacsclient_dispatch_once \
 				"$ANVIL_EMACSCLIENT_DISPATCH_TIMEOUT" -- \
 				${SOCKET_OPTIONS[@]+"${SOCKET_OPTIONS[@]}"} \
-				-e "($STOP_FUNCTION)" >/dev/null
+				-e "(if $ANVIL_EMACSCLIENT_READY_EXPR (progn ($STOP_FUNCTION) \"$ANVIL_MCP_LIFECYCLE_COMPLETE\") \"$ANVIL_MCP_NOT_READY_SENTINEL\")"
 			STOP_RC=$?
+			stop_dispatch_output=$ANVIL_MCP_RUN_OUTPUT
 			set -e
 			anvil_mcp_capture_finish
 			ANVIL_MCP_RESPONSE_PENDING=0
+			while :; do
+				case "$stop_dispatch_output" in
+				*$'\n') stop_dispatch_output=${stop_dispatch_output%$'\n'} ;;
+				*$'\r') stop_dispatch_output=${stop_dispatch_output%$'\r'} ;;
+				*) break ;;
+				esac
+			done
+			if [ "${#stop_dispatch_output}" -ge 2 ] \
+				&& [[ "$stop_dispatch_output" == \"* && "$stop_dispatch_output" == *\" ]]; then
+				stop_dispatch_output="${stop_dispatch_output:1:${#stop_dispatch_output}-2}"
+			fi
+			if [ "$STOP_RC" -eq 0 ] \
+				&& [ "$stop_dispatch_output" = "$ANVIL_MCP_NOT_READY_SENTINEL" ]; then
+				STOP_RC=75
+			elif [ "$STOP_RC" -eq 0 ] \
+				&& [ "$stop_dispatch_output" != "$ANVIL_MCP_LIFECYCLE_COMPLETE" ]; then
+				STOP_RC=70
+			fi
 		else
 			STOP_RC=74
 			mcp_debug_log "STOP-CAPTURE" "failed before dispatch rc=$STOP_RC"

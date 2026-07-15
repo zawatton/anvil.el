@@ -32,7 +32,9 @@
     (when (hash-table-p anvil-offload--pending)
       (maphash (lambda (id _future) (push id pending))
                anvil-offload--pending))
-    (when (or anvil-offload--pool
+    (when (or (anvil-offload--cleanup-active-p)
+              (anvil-offload--submission-active-p)
+              anvil-offload--pool
               anvil-offload--pool-retiring-p
               anvil-offload--pool-cleanup-active-p
               anvil-offload--submission-active-p
@@ -66,9 +68,11 @@
         anvil-offload--pool-retiring-p nil
         anvil-offload--pool-cleanup-active-p nil
         anvil-offload--submission-active-p nil
+        anvil-offload--transaction-state (vector nil nil)
         anvil-offload--stop-retiring-p nil
         anvil-offload--retired-pools nil
-        anvil-offload--ownership-table-registry nil)
+        anvil-offload--ownership-table-registry nil
+        anvil-offload--fallback-processes (make-hash-table :test 'eq))
   (sit-for 0.05))
 
 (defmacro anvil-offload-test--with-clean-repl (&rest body)
@@ -76,7 +80,7 @@
 Gated on `ANVIL_SLOW_TESTS=1' — the REPL spawn + sentinel wait
 flakes on slow CI hosts (see file commentary)."
   (declare (indent 0))
-  `(progn
+  `(let ((anvil-offload--transaction-state (vector nil nil)))
      (skip-unless (getenv "ANVIL_SLOW_TESTS"))
      (unwind-protect
          (progn (anvil-offload-test--reset) ,@body)

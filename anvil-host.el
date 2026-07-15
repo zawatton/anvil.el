@@ -136,13 +136,16 @@ on Japanese Windows. Other OSes default to utf-8."
 
 ;;;; --- internal: shell run ------------------------------------------------
 
-(defun anvil-host--truncate (str max)
-  "Truncate STR to MAX bytes, append a marker if cut."
-  (if (and (numberp max) (> (length str) max))
-      (concat (substring str 0 max)
-              (format "\n...[anvil-host: truncated, %d more bytes]"
-                      (- (length str) max)))
-    str))
+(defun anvil-host--truncate (str max &optional total-bytes)
+  "Append a truncation marker to bounded STR when TOTAL-BYTES exceeds MAX.
+Callers must already have limited the captured unibyte stream to MAX bytes.
+When TOTAL-BYTES is nil, derive it from STR for compatibility."
+  (let ((total (or total-bytes (string-bytes str))))
+    (if (and (numberp max) (> total max))
+        (concat str
+                (format "\n...[anvil-host: truncated, %d more bytes]"
+                        (- total max)))
+      str)))
 
 (defun anvil-host--scheduled-timers ()
   "Return a snapshot of every normal and idle timer identity."
@@ -255,25 +258,27 @@ on Japanese Windows. Other OSes default to utf-8."
         ;; suppresses ordinary timers.  Emacs may still dispatch an already-
         ;; ready foreign process filter.
         (funcall anvil-host--accept-process-output-primitive process 0.02 nil 1))
-      (when (process-live-p process)
-        (condition-case nil
-            (delete-process process)
-          ((error quit) nil)))
+      (condition-case nil
+          (delete-process process)
+        ((error quit) nil))
       (while (and (process-live-p process)
                   (< (float-time) deadline))
         (funcall anvil-host--accept-process-output-primitive process 0.02 nil 1))
-      (not (process-live-p process)))))
+      (and (not (process-live-p process))
+           (not (memq process
+                      (funcall anvil-host--process-list-primitive)))))))
 
 (defun anvil-host--close-exact-pipe (process)
   "Close exact pipe PROCESS without waiting for an inherited descriptor."
   (if (not (processp process))
       t
     (let ((inhibit-quit t))
-      (when (process-live-p process)
-        (condition-case nil
-            (delete-process process)
-          ((error quit) nil)))
-      (not (process-live-p process)))))
+      (condition-case nil
+          (delete-process process)
+        ((error quit) nil))
+      (and (not (process-live-p process))
+           (not (memq process
+                      (funcall anvil-host--process-list-primitive)))))))
 
 (defun anvil-host--release-process-resources (owner metadata)
   "Release OWNER only after every exact METADATA resource has converged.
@@ -281,34 +286,35 @@ The staged entry is removed last, so hash callbacks and tagged exits retain
 global custody for the retry timer."
   (let* ((resources (anvil-host--resource-state))
          (table (aref resources 0))
-         (process (plist-get metadata :process)))
+         (process (plist-get metadata :process))
+         (primary-released-p
+          (or (not (processp process))
+              (and (not (process-live-p process))
+                   (not (memq
+                         process
+                         (funcall anvil-host--process-list-primitive)))))))
     (when (and (anvil-host--owned-metadata-p owner metadata)
-               (or (not (processp process))
-                   (not (process-live-p process))))
-      (let ((stderr-process (plist-get metadata :stderr-process))
-            (custody-buffer (plist-get metadata :custody-buffer))
-            (stderr-custody-buffer
-             (plist-get metadata :stderr-custody-buffer))
-            (inhibit-quit t))
-        (when (and (processp stderr-process)
-                   (process-live-p stderr-process))
-          (anvil-host--close-exact-pipe stderr-process))
-        (when (and (or (not (processp stderr-process))
-                       (not (process-live-p stderr-process)))
+               primary-released-p)
+      (let* ((stderr-process (plist-get metadata :stderr-process))
+             (custody-buffer (plist-get metadata :custody-buffer))
+             (stderr-custody-buffer
+              (plist-get metadata :stderr-custody-buffer))
+             (inhibit-quit t)
+             (stderr-released-p
+              (or (not (processp stderr-process))
+                  (anvil-host--close-exact-pipe stderr-process))))
+        (when (and stderr-released-p
                    (buffer-live-p custody-buffer))
           (condition-case nil
               (kill-buffer custody-buffer)
             ((error quit) nil)))
-        (when (and (or (not (processp stderr-process))
-                       (not (process-live-p stderr-process)))
+        (when (and stderr-released-p
                    (buffer-live-p stderr-custody-buffer))
           (condition-case nil
               (kill-buffer stderr-custody-buffer)
             ((error quit) nil)))
-        (when (and (or (not (processp process))
-                       (not (process-live-p process)))
-                   (or (not (processp stderr-process))
-                       (not (process-live-p stderr-process)))
+        (when (and primary-released-p
+                   stderr-released-p
                    (not (buffer-live-p custody-buffer))
                    (not (buffer-live-p stderr-custody-buffer))
                    (anvil-host--owned-metadata-p owner metadata))
@@ -708,8 +714,9 @@ a successful valid constructor may create unrelated helper processes."
     (when (processp process)
       (funcall anvil-host--set-process-buffer-primitive process nil))))
 
-(defun anvil-host--run (command coding cwd timeout)
-  "Run one non-reentrant host-shell submission transaction."
+(defun anvil-host--run (command coding cwd timeout &optional max-output)
+  "Run one non-reentrant host-shell submission transaction.
+MAX-OUTPUT bounds captured bytes per output stream; nil means unbounded."
   (let* ((resources (anvil-host--resource-state))
          (outer-inhibit-quit inhibit-quit))
     (when (aref resources 3)
@@ -719,12 +726,15 @@ a successful valid constructor may create unrelated helper processes."
       (aset resources 3 t)
       (unwind-protect
           (let ((inhibit-quit outer-inhibit-quit))
-            (anvil-host--run-transaction command coding cwd timeout))
+            (anvil-host--run-transaction
+             command coding cwd timeout max-output))
         (aset resources 3 nil)))))
 
-(defun anvil-host--run-transaction (command coding cwd timeout)
+(defun anvil-host--run-transaction (command coding cwd timeout max-output)
   "Run shell COMMAND using CODING in CWD, waiting up to TIMEOUT seconds.
-Return (EXIT STDOUT STDERR).  Signal an error on timeout.
+Return (EXIT STDOUT STDERR STDOUT-TOTAL STDERR-TOTAL
+        STDOUT-SOURCE STDERR-SOURCE), where the final values are exact
+captured unibyte source strings.  Signal an error on timeout.
 
 The shell and both output streams use pipes.  This API has no stdin
 channel, so the process-input pipe is closed immediately after spawn.
@@ -765,15 +775,49 @@ Nonlocal exits recover every exact post-snapshot constructor child."
           (or anvil-host-child-shell-command-switch shell-command-switch))
          stdout-chunks
          stderr-chunks
+         (stdout-captured-bytes 0)
+         (stderr-captured-bytes 0)
+         (stdout-total-bytes 0)
+         (stderr-total-bytes 0)
          (stdout-filter
           (lambda (_process chunk)
             (unwind-protect
-                (push chunk stdout-chunks)
+                (let* ((size (string-bytes chunk))
+                       (remaining
+                        (and max-output
+                             (max 0 (- max-output
+                                       stdout-captured-bytes))))
+                       (take (if remaining (min size remaining) size)))
+                  (setq stdout-total-bytes
+                        (+ stdout-total-bytes size))
+                  (when (> take 0)
+                    ;; Binary process coding makes CHUNK unibyte, so string
+                    ;; indices and byte counts are identical here.
+                    (push (if (= take size)
+                              chunk
+                            (substring chunk 0 take))
+                          stdout-chunks)
+                    (setq stdout-captured-bytes
+                          (+ stdout-captured-bytes take))))
               (anvil-host--scrub-code-conversion-work-buffer))))
          (stderr-filter
           (lambda (_process chunk)
             (unwind-protect
-                (push chunk stderr-chunks)
+                (let* ((size (string-bytes chunk))
+                       (remaining
+                        (and max-output
+                             (max 0 (- max-output
+                                       stderr-captured-bytes))))
+                       (take (if remaining (min size remaining) size)))
+                  (setq stderr-total-bytes
+                        (+ stderr-total-bytes size))
+                  (when (> take 0)
+                    (push (if (= take size)
+                              chunk
+                            (substring chunk 0 take))
+                          stderr-chunks)
+                    (setq stderr-captured-bytes
+                          (+ stderr-captured-bytes take))))
               (anvil-host--scrub-code-conversion-work-buffer))))
          stderr-constructor-started-p
          stderr-constructor-before
@@ -915,12 +959,18 @@ Nonlocal exits recover every exact post-snapshot constructor child."
                   (funcall anvil-host--accept-process-output-primitive stderr-proc 0.02 nil nil)
                   (funcall anvil-host--accept-process-output-primitive proc 0 nil nil))))
             (funcall anvil-host--accept-process-output-primitive proc 0.01 nil nil))
-          (list
-           (process-exit-status proc)
-           (anvil-host--decode-output
-            (apply #'concat (nreverse stdout-chunks)) coding)
-           (anvil-host--decode-output
-            (apply #'concat (nreverse stderr-chunks)) coding)))
+          (let ((stdout-source
+                 (apply #'concat (nreverse stdout-chunks)))
+                (stderr-source
+                 (apply #'concat (nreverse stderr-chunks))))
+            (list
+             (process-exit-status proc)
+             (anvil-host--decode-output stdout-source coding)
+             (anvil-host--decode-output stderr-source coding)
+             stdout-total-bytes
+             stderr-total-bytes
+             stdout-source
+             stderr-source)))
       ;; Always derive custody from the pre-call identity snapshot.  A
       ;; constructor may rewrite names, detach buffers, create suffix
       ;; collisions, or return a preexisting peer instead of its new child.
@@ -956,10 +1006,21 @@ OPTS is a plist:
   :max-output bytes per stream (default 16384, nil = no limit)
   :coding     coding-system for I/O (default: cp932-dos on Windows, utf-8 elsewhere)
   :cwd        working directory
+  :include-source-bytes
+              include private captured unibyte source strings for callers
+              that must preserve source-stream byte accounting
 
 Returns:
-  (:exit N :stdout STR :stderr STR :command STR :coding SYM
-   :truncated BOOL)
+  (:exit N :stdout STR :stderr STR :stdout-captured STR
+   :stderr-captured STR :stdout-total-bytes N
+   :stderr-total-bytes N :command STR :coding SYM :truncated BOOL
+   [:stdout-captured-source-bytes UNIBYTE-STR
+    :stderr-captured-source-bytes UNIBYTE-STR])
+
+The public stdout/stderr fields carry presentation truncation sentinels.
+The captured fields are undecorated, bounded decoded text.  When requested,
+the source fields are exact bounded source-stream bytes and are the only
+fields suitable for source-encoding byte accounting.
 
 Note: this is synchronous and fail-closed against overlapping or reentrant
 host submissions.  Its process waits keep ordinary timers responsive, but
@@ -971,18 +1032,37 @@ bridge watchdog for hard containment from arbitrary callback hangs."
                        anvil-host--default-max-output))
          (coding     (or (plist-get opts :coding) (anvil-host--default-coding)))
          (cwd        (plist-get opts :cwd))
-         (result     (anvil-host--run command coding cwd timeout))
-         (exit       (nth 0 result))
-         (stdout     (nth 1 result))
-         (stderr     (nth 2 result))
-         (truncated  (or (and max-output (> (length stdout) max-output))
-                         (and max-output (> (length stderr) max-output)))))
-    (list :exit exit
-          :stdout (if max-output (anvil-host--truncate stdout max-output) stdout)
-          :stderr (if max-output (anvil-host--truncate stderr max-output) stderr)
-          :command command
-          :coding coding
-          :truncated (and truncated t))))
+         (include-source-bytes
+          (plist-get opts :include-source-bytes)))
+    (unless (or (null max-output)
+                (and (integerp max-output) (>= max-output 0)))
+      (error "anvil-host: :max-output must be a nonnegative integer or nil"))
+    (let* ((result
+            (anvil-host--run command coding cwd timeout max-output))
+           (exit (nth 0 result))
+           (stdout (nth 1 result))
+           (stderr (nth 2 result))
+           (stdout-total (or (nth 3 result) (string-bytes stdout)))
+           (stderr-total (or (nth 4 result) (string-bytes stderr)))
+           (truncated
+            (or (and max-output (> stdout-total max-output))
+                (and max-output (> stderr-total max-output)))))
+      (append
+       (list :exit exit
+             :stdout (anvil-host--truncate
+                      stdout max-output stdout-total)
+             :stderr (anvil-host--truncate
+                      stderr max-output stderr-total)
+             :stdout-captured stdout
+             :stderr-captured stderr
+             :stdout-total-bytes stdout-total
+             :stderr-total-bytes stderr-total
+             :command command
+             :coding coding
+             :truncated (and truncated t))
+       (when include-source-bytes
+         (list :stdout-captured-source-bytes (nth 5 result)
+               :stderr-captured-source-bytes (nth 6 result)))))))
 
 (defun anvil-shell-by-os (spec &optional opts)
   "Run an OS-dispatched shell command. SPEC is a plist:

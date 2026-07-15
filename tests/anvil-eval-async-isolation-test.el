@@ -76,7 +76,9 @@
     (when (hash-table-p anvil-offload--pending)
       (maphash (lambda (id _future) (push id pending))
                anvil-offload--pending))
-    (when (or anvil-offload--pool
+    (when (or (anvil-offload--cleanup-active-p)
+              (anvil-offload--submission-active-p)
+              anvil-offload--pool
               anvil-offload--pool-retiring-p
               anvil-offload--pool-cleanup-active-p
               anvil-offload--submission-active-p
@@ -116,16 +118,19 @@
         anvil-offload--pool-retiring-p nil
         anvil-offload--pool-cleanup-active-p nil
         anvil-offload--submission-active-p nil
+        anvil-offload--transaction-state (vector nil nil)
         anvil-offload--stop-retiring-p nil
         anvil-offload--retired-pools nil
         anvil-offload--ownership-table-registry nil
+        anvil-offload--fallback-processes (make-hash-table :test 'eq)
         anvil-offload--next-id 0)
   (accept-process-output nil 0.05))
 
 (defmacro anvil-eval-async-isolation-test--with-clean-state (&rest body)
   "Run BODY with bounded isolated-eval defaults and unconditional cleanup."
   (declare (indent 0))
-  `(let ((anvil-offload-emacs-bin
+  `(let ((anvil-offload--transaction-state (vector nil nil))
+         (anvil-offload-emacs-bin
           anvil-eval-async-isolation-test--emacs)
          (anvil-eval-async-max-active 2)
          (anvil-eval-async-max-queued 4)
@@ -730,12 +735,14 @@
            "anvil-async-hard-delete-tracking"))
          (anvil-offload--pool (vector proc))
          (anvil-offload--pool-retiring-p nil)
+         (anvil-offload--transaction-state (vector nil nil))
          (anvil-offload--pool-cleanup-active-p nil)
          (anvil-offload--isolated-processes (make-hash-table :test 'eq))
          (anvil-offload--submission-active-p nil)
          (anvil-offload--stop-retiring-p nil)
          (anvil-offload--retired-pools nil)
          (anvil-offload--ownership-table-registry nil)
+         (anvil-offload--fallback-processes (make-hash-table :test 'eq))
          (anvil-offload--pending (make-hash-table :test 'eql)))
     (puthash proc t anvil-offload--isolated-processes)
     (unwind-protect
@@ -773,11 +780,13 @@
          (pool (vector disposable stubborn))
          (anvil-offload--pool pool)
          (anvil-offload--pool-retiring-p nil)
+         (anvil-offload--transaction-state (vector nil nil))
          (anvil-offload--pool-cleanup-active-p nil)
          (anvil-offload--submission-active-p nil)
          (anvil-offload--stop-retiring-p nil)
          (anvil-offload--retired-pools nil)
          (anvil-offload--ownership-table-registry nil)
+         (anvil-offload--fallback-processes (make-hash-table :test 'eq))
          (anvil-offload-pool-size 1)
          (real-delete (symbol-function 'delete-process))
          spawned)
@@ -823,11 +832,13 @@
          (pool (vector first second))
          (anvil-offload--pool pool)
          (anvil-offload--pool-retiring-p nil)
+         (anvil-offload--transaction-state (vector nil nil))
          (anvil-offload--pool-cleanup-active-p nil)
          (anvil-offload--submission-active-p nil)
          (anvil-offload--stop-retiring-p nil)
          (anvil-offload--retired-pools nil)
          (anvil-offload--ownership-table-registry nil)
+         (anvil-offload--fallback-processes (make-hash-table :test 'eq))
          (anvil-offload-pool-size 1)
          observed
          reentrant-error
@@ -878,11 +889,13 @@
          (pool (vector old peer))
          (anvil-offload--pool pool)
          (anvil-offload--pool-retiring-p nil)
+         (anvil-offload--transaction-state (vector nil nil))
          (anvil-offload--pool-cleanup-active-p nil)
          (anvil-offload--submission-active-p nil)
          (anvil-offload--stop-retiring-p nil)
          (anvil-offload--retired-pools nil)
          (anvil-offload--ownership-table-registry nil)
+         (anvil-offload--fallback-processes (make-hash-table :test 'eq))
          (anvil-offload-pool-size 2)
          (anvil-offload--next-id 41)
          (peer-future
@@ -957,11 +970,13 @@ replace a live protocol-incompatible slot."
          (ownership (make-hash-table :test 'eq))
          (anvil-offload--pool pool)
          (anvil-offload--pool-retiring-p nil)
+         (anvil-offload--transaction-state (vector nil nil))
          (anvil-offload--pool-cleanup-active-p nil)
          (anvil-offload--submission-active-p nil)
          (anvil-offload--stop-retiring-p nil)
          (anvil-offload--retired-pools nil)
          (anvil-offload--ownership-table-registry nil)
+         (anvil-offload--fallback-processes (make-hash-table :test 'eq))
          (anvil-offload-pool-size 2)
          (anvil-offload--isolated-processes ownership)
          (peer-future
@@ -1038,11 +1053,13 @@ replace a live protocol-incompatible slot."
          (replacement-table (make-hash-table :test 'eq))
          (anvil-offload--pool pool)
          (anvil-offload--pool-retiring-p nil)
+         (anvil-offload--transaction-state (vector nil nil))
          (anvil-offload--pool-cleanup-active-p nil)
          (anvil-offload--submission-active-p nil)
          (anvil-offload--stop-retiring-p nil)
          (anvil-offload--retired-pools nil)
          (anvil-offload--ownership-table-registry nil)
+         (anvil-offload--fallback-processes (make-hash-table :test 'eq))
          (anvil-offload-pool-size 1)
          (anvil-offload--isolated-processes initial-table)
          spawn-inhibit)
@@ -1066,10 +1083,13 @@ replace a live protocol-incompatible slot."
           (dolist (table (list initial-table replacement-table))
             (should (eq :slot-staging (gethash staged table))))
           (let ((tables
-                 (process-get staged 'anvil-offload-ownership-tables)))
-            (should (= 2 (length tables)))
-            (should (memq initial-table tables))
-            (should (memq replacement-table tables)))
+                 (process-get staged 'anvil-offload-ownership-tables))
+                (expected
+                 (list initial-table replacement-table
+                       anvil-offload--fallback-processes)))
+            (should-not
+             (cl-set-exclusive-or
+              (copy-sequence tables) expected :test #'eq)))
           (should (eql 0 (process-get staged 'anvil-offload-staged-slot)))
           (should-not anvil-offload--pool-cleanup-active-p)
           ;; Exercise the sentinel path, not hard-delete's synchronous release.
@@ -1103,11 +1123,13 @@ replace a live protocol-incompatible slot."
          (ownership (make-hash-table :test 'eq))
          (anvil-offload--pool pool)
          (anvil-offload--pool-retiring-p nil)
+         (anvil-offload--transaction-state (vector nil nil))
          (anvil-offload--pool-cleanup-active-p nil)
          (anvil-offload--submission-active-p nil)
          (anvil-offload--stop-retiring-p nil)
          (anvil-offload--retired-pools nil)
          (anvil-offload--ownership-table-registry nil)
+         (anvil-offload--fallback-processes (make-hash-table :test 'eq))
          (anvil-offload-pool-size 1)
          (anvil-offload--isolated-processes ownership)
          spawn-inhibit)
@@ -1148,11 +1170,13 @@ replace a live protocol-incompatible slot."
            "anvil-async-stop-isolated"))
          (anvil-offload--pool (vector pooled))
          (anvil-offload--pool-retiring-p nil)
+         (anvil-offload--transaction-state (vector nil nil))
          (anvil-offload--pool-cleanup-active-p nil)
          (anvil-offload--submission-active-p nil)
          (anvil-offload--stop-retiring-p nil)
          (anvil-offload--retired-pools nil)
          (anvil-offload--ownership-table-registry nil)
+         (anvil-offload--fallback-processes (make-hash-table :test 'eq))
          (anvil-offload-pool-size 1)
          (anvil-offload--next-id 41)
          (anvil-offload--isolated-processes (make-hash-table :test 'eq))
@@ -1253,11 +1277,13 @@ replace a live protocol-incompatible slot."
          (anvil-offload-max-frame-bytes 1)
          (anvil-offload--pool nil)
          (anvil-offload--pool-retiring-p nil)
+         (anvil-offload--transaction-state (vector nil nil))
          (anvil-offload--pool-cleanup-active-p nil)
          (anvil-offload--submission-active-p nil)
          (anvil-offload--stop-retiring-p nil)
          (anvil-offload--retired-pools nil)
          (anvil-offload--ownership-table-registry nil)
+         (anvil-offload--fallback-processes (make-hash-table :test 'eq))
          (anvil-offload--isolated-processes (make-hash-table :test 'eq))
          (anvil-offload--pending (make-hash-table :test 'eql)))
     (unwind-protect

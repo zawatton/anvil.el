@@ -97,7 +97,9 @@
     (when (hash-table-p anvil-offload--pending)
       (maphash (lambda (id _future) (push id pending))
                anvil-offload--pending))
-    (when (or anvil-offload--pool
+    (when (or (anvil-offload--cleanup-active-p)
+              (anvil-offload--submission-active-p)
+              anvil-offload--pool
               anvil-offload--pool-retiring-p
               anvil-offload--pool-cleanup-active-p
               anvil-offload--submission-active-p
@@ -133,7 +135,8 @@
         anvil-offload--submission-active-p nil
         anvil-offload--stop-retiring-p nil
         anvil-offload--retired-pools nil
-        anvil-offload--ownership-table-registry nil)
+        anvil-offload--ownership-table-registry nil
+        anvil-offload--fallback-processes (make-hash-table :test 'eq))
   (accept-process-output nil 0.05))
 
 (defun anvil-hang-regression-test--stub-tool (&optional timeout)
@@ -150,55 +153,56 @@ Before the issue #53 fix, the nonlocal exit escaped
 `anvil-server--offload-apply' while its future and slow REPL remained live.
 With a one-slot pool, every later request was queued behind that abandoned
 form and appeared to hang."
-  (anvil-hang-regression-test--reset-offload)
-  (let ((anvil-offload-pool-size 1)
-        (anvil-offload-emacs-bin
-         (expand-file-name invocation-name invocation-directory))
-        (tool (anvil-hang-regression-test--stub-tool 5))
-        timer victim victim-proc victim-pid quit-seen)
-    (unwind-protect
-        (progn
-          (setq timer
-                (run-at-time
-                 0.25 nil
-                 (lambda ()
-                   (setq victim (anvil-hang-regression-test--first-pending)
-                         victim-proc
-                         (and victim (anvil-future--process victim))
-                         victim-pid
-                         (and victim-proc (process-id victim-proc)))
-                   (keyboard-quit))))
-          (condition-case nil
-              (anvil-server--offload-apply
-               tool 'anvil-offload-stub-sleep (list "slow"))
-            (quit (setq quit-seen t)))
-          (should quit-seen)
-          (should (anvil-future-p victim))
-          (should (processp victim-proc))
-          (should (integerp victim-pid))
-          (should (= 0 (hash-table-count
-                        (anvil-offload--ensure-pending))))
-          (should (eq 'killed (anvil-future-status victim)))
-          (should (string-match-p "killed after"
-                                  (anvil-future-error victim)))
-          (should
-           (anvil-hang-regression-test--wait-until
-            (lambda () (not (process-live-p victim-proc))) 2))
-          (let* ((started (float-time))
-                 (result
-                  (anvil-server--offload-apply
-                   tool 'anvil-offload-stub-pid-tool (list "fresh")))
-                 (elapsed (- (float-time) started)))
-            (should (string-match
-                     "\\`pid:\\([0-9]+\\) tag:fresh\\'" result))
-            (should-not (= victim-pid
-                           (string-to-number (match-string 1 result))))
-            (should (< elapsed 5.0))))
-      (when (timerp timer)
-        (cancel-timer timer))
-      (when (and victim-proc (process-live-p victim-proc))
-        (delete-process victim-proc))
-      (anvil-hang-regression-test--reset-offload))))
+  (let ((anvil-offload--transaction-state (vector nil nil)))
+    (anvil-hang-regression-test--reset-offload)
+    (let ((anvil-offload-pool-size 1)
+          (anvil-offload-emacs-bin
+           (expand-file-name invocation-name invocation-directory))
+          (tool (anvil-hang-regression-test--stub-tool 5))
+          timer victim victim-proc victim-pid quit-seen)
+      (unwind-protect
+          (progn
+            (setq timer
+                  (run-at-time
+                   0.25 nil
+                   (lambda ()
+                     (setq victim (anvil-hang-regression-test--first-pending)
+                           victim-proc
+                           (and victim (anvil-future--process victim))
+                           victim-pid
+                           (and victim-proc (process-id victim-proc)))
+                     (keyboard-quit))))
+            (condition-case nil
+		(anvil-server--offload-apply
+		 tool 'anvil-offload-stub-sleep (list "slow"))
+              (quit (setq quit-seen t)))
+            (should quit-seen)
+            (should (anvil-future-p victim))
+            (should (processp victim-proc))
+            (should (integerp victim-pid))
+            (should (= 0 (hash-table-count
+                          (anvil-offload--ensure-pending))))
+            (should (eq 'killed (anvil-future-status victim)))
+            (should (string-match-p "killed after"
+                                    (anvil-future-error victim)))
+            (should
+             (anvil-hang-regression-test--wait-until
+              (lambda () (not (process-live-p victim-proc))) 2))
+            (let* ((started (float-time))
+                   (result
+                    (anvil-server--offload-apply
+                     tool 'anvil-offload-stub-pid-tool (list "fresh")))
+                   (elapsed (- (float-time) started)))
+              (should (string-match
+                       "\\`pid:\\([0-9]+\\) tag:fresh\\'" result))
+              (should-not (= victim-pid
+                             (string-to-number (match-string 1 result))))
+              (should (< elapsed 5.0))))
+	(when (timerp timer)
+          (cancel-timer timer))
+	(when (and victim-proc (process-live-p victim-proc))
+          (delete-process victim-proc))
+	(anvil-hang-regression-test--reset-offload)))))
 
 (ert-deftest anvil-hang-regression-dead-repl-settles-without-timer ()
   "Awaiting a dead REPL must not depend on a zero-delay sentinel timer.
@@ -207,45 +211,46 @@ The real child waits until its future is registered, then exits with its
 automatic sentinel disabled.  The production sentinel is invoked while
 the captured timer scheduler is intercepted, making the old `sit-for 0'
 fallback leave the future pending without depending on Emacs scheduling."
-  (anvil-hang-regression-test--reset-offload)
-  (let* ((proc
-          (make-process
-           :name "anvil-hang-dead-repl"
-           :command
-           (list shell-file-name shell-command-switch "read ignored; exit 7")
-           :connection-type 'pipe
-           :noquery t
-           :sentinel #'ignore))
-         (id 9001)
-         (future
-          (make-anvil-future :id id :process proc :status 'pending))
-         deferred)
-    (puthash id future (anvil-offload--ensure-pending))
-    (unwind-protect
-        (let ((anvil-offload--run-at-time-function
-               (lambda (&rest args)
-                 (setq deferred args)
-                 'withheld-timer)))
-          ;; Release the child only after its future and the timer stub are
-          ;; live.  Invoke the real sentinel explicitly after death: whether
-          ;; Emacs happens to dispatch a process sentinel during await is an
-          ;; event-loop detail, not part of the behavior under test.
-          (process-send-string proc "\n")
-          (should
-           (anvil-hang-regression-test--wait-until
-            (lambda () (not (process-live-p proc))) 2))
-          (anvil-offload--sentinel proc "exited abnormally with code 7\n")
-          (should deferred)
-          (should (eq 'pending (anvil-future-status future)))
-          (should (anvil-future-await future 2))
-          (should (eq 'error (anvil-future-status future)))
-          (should (string-match-p "offload REPL exited"
-                                  (anvil-future-error future)))
-          (should-not (gethash id (anvil-offload--ensure-pending))))
-      (when (process-live-p proc)
-        (delete-process proc))
-      (remhash id (anvil-offload--ensure-pending))
-      (anvil-hang-regression-test--reset-offload))))
+  (let ((anvil-offload--transaction-state (vector nil nil)))
+    (anvil-hang-regression-test--reset-offload)
+    (let* ((proc
+            (make-process
+             :name "anvil-hang-dead-repl"
+             :command
+             (list shell-file-name shell-command-switch "read ignored; exit 7")
+             :connection-type 'pipe
+             :noquery t
+             :sentinel #'ignore))
+           (id 9001)
+           (future
+            (make-anvil-future :id id :process proc :status 'pending))
+           deferred)
+      (puthash id future (anvil-offload--ensure-pending))
+      (unwind-protect
+          (let ((anvil-offload--run-at-time-function
+		 (lambda (&rest args)
+                   (setq deferred args)
+                   'withheld-timer)))
+            ;; Release the child only after its future and the timer stub are
+            ;; live.  Invoke the real sentinel explicitly after death: whether
+            ;; Emacs happens to dispatch a process sentinel during await is an
+            ;; event-loop detail, not part of the behavior under test.
+            (process-send-string proc "\n")
+            (should
+             (anvil-hang-regression-test--wait-until
+              (lambda () (not (process-live-p proc))) 2))
+            (anvil-offload--sentinel proc "exited abnormally with code 7\n")
+            (should deferred)
+            (should (eq 'pending (anvil-future-status future)))
+            (should (anvil-future-await future 2))
+            (should (eq 'error (anvil-future-status future)))
+            (should (string-match-p "offload REPL exited"
+                                    (anvil-future-error future)))
+            (should-not (gethash id (anvil-offload--ensure-pending))))
+	(when (process-live-p proc)
+          (delete-process proc))
+	(remhash id (anvil-offload--ensure-pending))
+	(anvil-hang-regression-test--reset-offload)))))
 
 (ert-deftest anvil-hang-regression-final-filter-beats-deferred-death ()
   "A final reply delivered after the sentinel must beat deferred cleanup.
@@ -253,40 +258,41 @@ fallback leave the future pending without depending on Emacs scheduling."
 This exercises the sentinel-before-filter ordering explicitly.  The fallback
 death callback is idempotent and must not overwrite a reply that settles the
 future first."
-  (anvil-hang-regression-test--reset-offload)
-  (let* ((proc
-          (make-process
-           :name "anvil-hang-filter-order"
-           :command (list shell-file-name shell-command-switch "exit 0")
-           :connection-type 'pipe
-           :noquery t
-           :sentinel #'ignore))
-         (id 9002)
-         (future
-          (make-anvil-future :id id :process proc :status 'pending))
-         deferred)
-    (unwind-protect
-        (progn
-          (should
-           (anvil-hang-regression-test--wait-until
-            (lambda () (not (process-live-p proc))) 2))
-          (puthash id future (anvil-offload--ensure-pending))
-          (let ((anvil-offload--run-at-time-function
-                 (lambda (&rest args)
-                   (setq deferred args)
-                   'withheld-timer)))
-            (anvil-offload--sentinel proc "finished\n"))
-          (should deferred)
-          (should (eq 'pending (anvil-future-status future)))
-          (anvil-offload--dispatch-reply
-           proc (list :id id :ok 'late-reply))
-          (apply (nth 2 deferred) (nthcdr 3 deferred))
-          (should (eq 'done (anvil-future-status future)))
-          (should (eq 'late-reply (anvil-future-value future))))
-      (when (process-live-p proc)
-        (delete-process proc))
-      (remhash id (anvil-offload--ensure-pending))
-      (anvil-hang-regression-test--reset-offload))))
+  (let ((anvil-offload--transaction-state (vector nil nil)))
+    (anvil-hang-regression-test--reset-offload)
+    (let* ((proc
+            (make-process
+             :name "anvil-hang-filter-order"
+             :command (list shell-file-name shell-command-switch "exit 0")
+             :connection-type 'pipe
+             :noquery t
+             :sentinel #'ignore))
+           (id 9002)
+           (future
+            (make-anvil-future :id id :process proc :status 'pending))
+           deferred)
+      (unwind-protect
+          (progn
+            (should
+             (anvil-hang-regression-test--wait-until
+              (lambda () (not (process-live-p proc))) 2))
+            (puthash id future (anvil-offload--ensure-pending))
+            (let ((anvil-offload--run-at-time-function
+                   (lambda (&rest args)
+                     (setq deferred args)
+                     'withheld-timer)))
+              (anvil-offload--sentinel proc "finished\n"))
+            (should deferred)
+            (should (eq 'pending (anvil-future-status future)))
+            (anvil-offload--dispatch-reply
+             proc (list :id id :ok 'late-reply))
+            (apply (nth 2 deferred) (nthcdr 3 deferred))
+            (should (eq 'done (anvil-future-status future)))
+            (should (eq 'late-reply (anvil-future-value future))))
+	(when (process-live-p proc)
+          (delete-process proc))
+	(remhash id (anvil-offload--ensure-pending))
+	(anvil-hang-regression-test--reset-offload)))))
 
 (ert-deftest anvil-hang-regression-host-quit-cleans-exact-processes ()
   "A `keyboard-quit' during a host shell must release exact custody."
@@ -340,6 +346,63 @@ future first."
       (when (and (processp stderr-process)
                  (process-live-p stderr-process))
         (delete-process stderr-process))
+      (anvil-hang-regression-test--reset-host))))
+
+(ert-deftest anvil-hang-regression-dead-host-processes-are-forgotten ()
+  "Cleanup must remove exact process objects that have already exited."
+  (skip-unless
+   (and (memq system-type '(darwin gnu/linux))
+        (file-executable-p shell-file-name)))
+  (let ((delete-exited-processes nil)
+        (anvil-host--cleanup-state
+         (cons nil (make-hash-table :test #'eq)))
+        (anvil-host--cleanup-timer nil)
+        (anvil-host--cleanup-active nil)
+        process stderr-process)
+    (unwind-protect
+        (with-temp-buffer
+          (setq stderr-process
+                (make-pipe-process
+                 :name "anvil-hang-dead-stderr"
+                 :buffer (current-buffer)
+                 :coding 'binary
+                 :noquery t
+                 :sentinel #'ignore
+                 :filter #'ignore)
+                process
+                (make-process
+                 :name "anvil-hang-dead-shell"
+                 :buffer nil
+                 :stderr stderr-process
+                 :coding '(binary . binary)
+                 :noquery t
+                 :connection-type 'pipe
+                 :sentinel #'ignore
+                 :command
+                 (list shell-file-name shell-command-switch "exit 0")))
+          (ignore-errors (process-send-eof process))
+          (should
+           (anvil-hang-regression-test--wait-until
+            (lambda ()
+              (and (not (process-live-p process))
+                   (not (process-live-p stderr-process))))
+            2))
+          (should (eq (process-status process) 'exit))
+          (should (eq (process-status stderr-process) 'closed))
+          (should (memq process (process-list)))
+          (should (memq stderr-process (process-list)))
+          (anvil-host--retire-resources
+           (list (list :process process
+                       :stderr-process stderr-process
+                       :custody-buffer nil
+                       :stderr-custody-buffer nil)))
+          (should-not (memq process (process-list)))
+          (should-not (memq stderr-process (process-list)))
+          (anvil-hang-regression-test--assert-host-clean))
+      (when (processp process)
+        (ignore-errors (delete-process process)))
+      (when (processp stderr-process)
+        (ignore-errors (delete-process stderr-process)))
       (anvil-hang-regression-test--reset-host))))
 
 (ert-deftest anvil-hang-regression-host-drains-final-stdout-after-exit ()

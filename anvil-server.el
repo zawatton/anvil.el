@@ -2155,6 +2155,240 @@ See also: `anvil-server-process-jsonrpc-parsed'"
        (format "[PJ] out t=%.4f" (float-time))))
     response))
 
+(defun anvil-server-process-jsonrpc-to-file
+    (json-string server-id response-stage sequence max-bytes
+                 expected-device expected-inode)
+  "Process JSON-STRING once and publish its response from RESPONSE-STAGE.
+RESPONSE-STAGE is a precommitted zero-length 0600 inode in a canonical
+0700 directory owned by the current user.  EXPECTED-DEVICE and
+EXPECTED-INODE bind that inode before stateful dispatch.  SEQUENCE is a
+positive bridge-local request number and MAX-BYTES is a positive hard
+limit.
+
+After dispatch, write the exact stage inode and publish two no-clobber hard
+links, response.SEQUENCE.json and proof.SEQUENCE.json.  Both names must share
+the precommitted identity.  Return a small sequence and byte-count marker.
+The bridge retains an open descriptor to the stage inode and treats the
+authenticated link pair as authoritative even if marker transport is lost."
+  (unless (and (stringp response-stage)
+               (file-name-absolute-p response-stage))
+    (error "Anvil response stage must be an absolute path"))
+  (unless (and (integerp sequence) (> sequence 0))
+    (error "Anvil response sequence must be a positive integer"))
+  (unless (and (integerp max-bytes) (> max-bytes 0))
+    (error "Anvil response maximum must be a positive integer"))
+  (unless (and (integerp expected-device) (>= expected-device 0)
+               (integerp expected-inode) (> expected-inode 0))
+    (error "Anvil response identity must contain device and inode integers"))
+  (let* ((expanded-stage (expand-file-name response-stage))
+         (stage-basename (file-name-nondirectory expanded-stage))
+         (directory
+          (file-name-as-directory
+           (file-name-directory expanded-stage)))
+         (canonical-directory
+          (file-name-as-directory (file-truename directory)))
+         (canonical-stage
+          (expand-file-name stage-basename canonical-directory))
+         (final-file
+          (expand-file-name
+           (format "response.%d.json" sequence)
+           canonical-directory))
+         (proof-file
+          (expand-file-name
+           (format "proof.%d.json" sequence)
+           canonical-directory))
+         (directory-attributes
+          (file-attributes canonical-directory 'integer))
+         (stage-attributes
+          (file-attributes canonical-stage 'integer)))
+    (cl-labels
+        ((same-identity-p
+          (attributes)
+          (and attributes
+               (equal
+                (file-attribute-device-number attributes)
+                expected-device)
+               (equal
+                (file-attribute-inode-number attributes)
+                expected-inode)))
+         (parent-safe-p
+          ()
+          (let ((attributes
+                 (file-attributes canonical-directory 'integer)))
+            (and attributes
+                 (eq t (file-attribute-type attributes))
+                 (equal
+                  (file-attribute-user-id attributes)
+                  (user-uid))
+                 (= #o700 (file-modes canonical-directory))
+                 (equal
+                  (file-attribute-device-number attributes)
+                  (file-attribute-device-number directory-attributes))
+                 (equal
+                  (file-attribute-inode-number attributes)
+                  (file-attribute-inode-number directory-attributes)))))
+         (response-file-safe-p
+          (path link-numbers size)
+          (let ((attributes (file-attributes path 'integer)))
+            (and (same-identity-p attributes)
+                 (null (file-attribute-type attributes))
+                 (not (file-symlink-p path))
+                 (equal
+                  (file-attribute-user-id attributes)
+                  (user-uid))
+                 (memq
+                  (file-attribute-link-number attributes)
+                  link-numbers)
+                 (= #o600 (file-modes path))
+                 (= size (file-attribute-size attributes)))))
+         (name-absent-p
+          (path)
+          (and (not (file-exists-p path))
+               (not (file-symlink-p path))))
+         (delete-owned-name
+          (path)
+          (let ((attributes (file-attributes path 'integer)))
+            (when (same-identity-p attributes)
+              (ignore-errors (delete-file path)))))
+         (published-pair-p
+          (size)
+          (and (parent-safe-p)
+               (response-file-safe-p final-file '(2 3) size)
+               (response-file-safe-p proof-file '(2 3) size))))
+      (unless
+          (and (equal directory canonical-directory)
+               (equal expanded-stage canonical-stage)
+               (string-match-p
+                (format "^\\.response-tmp\\.%d\\.[^/]+$" sequence)
+                stage-basename)
+               directory-attributes
+               (eq t (file-attribute-type directory-attributes))
+               (equal
+                (file-attribute-user-id directory-attributes)
+                (user-uid))
+               (= #o700 (file-modes canonical-directory))
+               (same-identity-p stage-attributes)
+               (null (file-attribute-type stage-attributes))
+               (not (file-symlink-p canonical-stage))
+               (equal
+                (file-attribute-user-id stage-attributes)
+                (user-uid))
+               (= 1 (file-attribute-link-number stage-attributes))
+               (= #o600 (file-modes canonical-stage))
+               (= 0 (file-attribute-size stage-attributes))
+               (name-absent-p final-file)
+               (name-absent-p proof-file))
+        (error "Unsafe Anvil response stage: %s" response-stage))
+      (let ((response
+             (or (anvil-server-process-jsonrpc json-string server-id) "")))
+        (let ((inhibit-quit t)
+              (file-name-handler-alist nil)
+              bytes
+              byte-count
+              committed)
+          (unwind-protect
+              (progn
+                (setq bytes (encode-coding-string response 'utf-8 t))
+                (when (> (string-bytes bytes) max-bytes)
+                  (setq response
+                        (condition-case nil
+                            (let* ((json-object-type 'alist)
+                                   (json-key-type 'symbol)
+                                   (request
+                                    (json-read-from-string json-string))
+                                   (id-cell
+                                    (and (listp request)
+                                         (assq 'id request))))
+                              (if id-cell
+                                  (anvil-server--jsonrpc-error
+                                   (cdr id-cell)
+                                   anvil-server-jsonrpc-error-internal
+                                   (format
+                                    (concat
+                                     "Response exceeded bridge maximum "
+                                     "of %d bytes")
+                                    max-bytes))
+                                ""))
+                          (error "")))
+                  (setq bytes
+                        (encode-coding-string response 'utf-8 t))
+                  (when (> (string-bytes bytes) max-bytes)
+                    (setq response ""
+                          bytes "")))
+                (setq byte-count (string-bytes bytes))
+                (unless
+                    (and (parent-safe-p)
+                         (response-file-safe-p
+                          canonical-stage '(1) 0)
+                         (name-absent-p final-file)
+                         (name-absent-p proof-file))
+                  (error
+                   "Anvil response transaction changed during dispatch"))
+                (with-temp-buffer
+                  (set-buffer-multibyte nil)
+                  (insert bytes)
+                  (let ((backup-inhibited t)
+                        (create-lockfiles nil)
+                        (coding-system-for-write 'no-conversion)
+                        (write-region-annotate-functions nil)
+                        (write-region-post-annotation-function nil)
+                        (write-region-inhibit-fsync nil))
+                    (write-region
+                     (point-min) (point-max)
+                     canonical-stage nil 'silent)))
+                (set-file-modes canonical-stage #o600)
+                (unless
+                    (and (parent-safe-p)
+                         (response-file-safe-p
+                          canonical-stage '(1) byte-count)
+                         (name-absent-p final-file)
+                         (name-absent-p proof-file))
+                  (error "Anvil response stage changed while writing"))
+                (add-name-to-file canonical-stage final-file)
+                (unless
+                    (and (parent-safe-p)
+                         (response-file-safe-p
+                          canonical-stage '(2) byte-count)
+                         (response-file-safe-p
+                          final-file '(2) byte-count)
+                         (name-absent-p proof-file))
+                  (error "Anvil response final link changed identity"))
+                (add-name-to-file canonical-stage proof-file)
+                (unless
+                    (and (parent-safe-p)
+                         (response-file-safe-p
+                          canonical-stage '(3) byte-count)
+                         (response-file-safe-p
+                          final-file '(3) byte-count)
+                         (response-file-safe-p
+                          proof-file '(3) byte-count))
+                  (error "Anvil response proof link changed identity"))
+                (delete-file canonical-stage)
+                (unless
+                    (and (parent-safe-p)
+                         (response-file-safe-p
+                          final-file '(2) byte-count)
+                         (response-file-safe-p
+                          proof-file '(2) byte-count))
+                  (error "Anvil response publication did not converge"))
+                (setq committed t)
+                (format "anvil-mcp-response-staged:%d:%d"
+                        sequence byte-count))
+            (unless committed
+              (when (and byte-count
+                         (published-pair-p byte-count))
+                (delete-owned-name canonical-stage)
+                (setq committed
+                      (and
+                       (response-file-safe-p
+                        final-file '(2) byte-count)
+                       (response-file-safe-p
+                        proof-file '(2) byte-count))))
+              (unless committed
+                (delete-owned-name proof-file)
+                (delete-owned-name final-file)
+                (delete-owned-name canonical-stage)))))))))
+
 (defun anvil-server-process-jsonrpc-parsed (request server-id)
   "Send REQUEST to the MCP server and return parsed response for SERVER-ID.
 REQUEST should be a JSON string containing a valid JSON-RPC 2.0 request.

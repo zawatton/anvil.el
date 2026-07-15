@@ -135,10 +135,60 @@ was initialised.  Each slot is either a live `make-process' or nil
   "Non-nil while old pooled children must not receive new requests.")
 
 (defvar anvil-offload--pool-cleanup-active-p nil
-  "Non-nil during a synchronous pool or slot retirement transaction.")
+  "Observable mirror of a synchronous pool or slot retirement transaction.
+The stable cell read by `anvil-offload--cleanup-active-p' is authoritative.")
 
 (defvar anvil-offload--submission-active-p nil
-  "Non-nil while one public submission is being published transactionally.")
+  "Observable non-nil mirror while a public submission is transactional.")
+
+(defvar anvil-offload--transaction-state (vector nil nil)
+  "Stable cleanup and submission transaction state.
+Index 0 is the authoritative cleanup-active bit and index 1 is the
+authoritative submission-active bit.  Mutating this vector invokes no
+variable watcher, so reentrant callbacks observe the guard before the
+corresponding observable dynamic binding is established.")
+
+(defun anvil-offload--cleanup-active-p ()
+  "Return non-nil while an authoritative cleanup transaction is active."
+  (aref anvil-offload--transaction-state 0))
+
+(defun anvil-offload--submission-active-p ()
+  "Return non-nil while an authoritative submission transaction is active."
+  (aref anvil-offload--transaction-state 1))
+
+(defmacro anvil-offload--with-cleanup-guard (&rest body)
+  "Run BODY under the stable cleanup guard and its observable mirror."
+  (declare (indent 0) (debug t))
+  (let ((state-symbol (make-symbol "anvil-offload-cleanup-state"))
+        (inhibit-symbol (make-symbol "anvil-offload-outer-inhibit-quit")))
+    `(let ((,state-symbol anvil-offload--transaction-state)
+           (,inhibit-symbol inhibit-quit)
+           (inhibit-quit t))
+       (when (aref ,state-symbol 0)
+         (error "anvil-offload: pool cleanup already active"))
+       (aset ,state-symbol 0 t)
+       (unwind-protect
+           (let ((inhibit-quit ,inhibit-symbol)
+                 (anvil-offload--pool-cleanup-active-p t))
+             ,@body)
+         (aset ,state-symbol 0 nil)))))
+
+(defmacro anvil-offload--with-submission-guard (&rest body)
+  "Run BODY under the stable submission guard and its observable mirror."
+  (declare (indent 0) (debug t))
+  (let ((state-symbol (make-symbol "anvil-offload-submission-state"))
+        (inhibit-symbol (make-symbol "anvil-offload-outer-inhibit-quit")))
+    `(let ((,state-symbol anvil-offload--transaction-state)
+           (,inhibit-symbol inhibit-quit)
+           (inhibit-quit t))
+       (when (aref ,state-symbol 1)
+         (error "anvil-offload: submission already active"))
+       (aset ,state-symbol 1 t)
+       (unwind-protect
+           (let ((inhibit-quit ,inhibit-symbol)
+                 (anvil-offload--submission-active-p t))
+             ,@body)
+         (aset ,state-symbol 1 nil)))))
 
 (defvar anvil-offload--stop-retiring-p nil
   "Non-nil while a whole-subsystem stop has not fully converged.")
@@ -148,6 +198,9 @@ was initialised.  Each slot is either a live `make-process' or nil
 
 (defvar anvil-offload--ownership-table-registry nil
   "Auxiliary ownership tables retained across callback-driven table swaps.")
+
+(defvar anvil-offload--fallback-processes (make-hash-table :test 'eq)
+  "Stable fallback custody established before any watched table assignment.")
 
 (defvar anvil-offload--round-robin 0
   "Rolling index for pool dispatch.")
@@ -193,6 +246,10 @@ Created lazily in `anvil-offload--ensure-pending'.")
 
 (defconst anvil-offload--remhash-primitive (anvil-offload--capture-primitive 'remhash)
   "Unadvised hash removal primitive for nonlocal-exit cleanup.")
+
+(defconst anvil-offload--substring-primitive
+  (anvil-offload--capture-primitive 'substring)
+  "Captured substring primitive for observable linear-space slicing.")
 
 (defconst anvil-offload--run-at-time-function (anvil-offload--capture-primitive 'run-at-time)
   "Captured timer scheduler for preserving an in-flight nonlocal exit.")
@@ -249,6 +306,16 @@ Created lazily in `anvil-offload--ensure-pending'.")
   (and (timerp timer)
        (or (memq timer timer-list)
            (memq timer timer-idle-list))))
+
+(defun anvil-offload--exact-zero-delay-timer-scheduled-p (function args)
+  "Return non-nil when an exact FUNCTION/ARGS timer is still scheduled."
+  (cl-some
+   (lambda (timer)
+     (and (timerp timer)
+          (eq (timer--function timer) function)
+          (equal (timer--args timer) args)
+          (anvil-offload--timer-scheduled-p timer)))
+   (anvil-offload--scheduled-timers)))
 
 (defun anvil-offload--normalize-zero-delay-timer (timer function args)
   "Make exact TIMER run FUNCTION with ARGS promptly and only once."
@@ -383,18 +450,27 @@ deferred work active."
       flat)))
 
 (defun anvil-offload--strip-ignored-junk-prefixes (string)
-  "Drop known benign stdout prefixes from STRING."
-  (let ((out string)
+  "Drop known benign stdout prefixes from STRING in linear space."
+  (let ((offset 0)
+        (limit (length string))
         changed)
     (while
         (progn
           (setq changed nil)
           (dolist (prefix anvil-offload--ignored-junk-prefixes)
-            (when (string-prefix-p prefix out)
-              (setq out (substring out (length prefix))
-                    changed t)))
+            (let* ((prefix-length (length prefix))
+                   (end (+ offset prefix-length)))
+              (when (and (> prefix-length 0)
+                         (<= end limit)
+                         (eq t
+                             (compare-strings
+                              prefix nil nil string offset end)))
+                (setq offset end
+                      changed t))))
           changed))
-    out))
+    (if (zerop offset)
+        string
+      (funcall anvil-offload--substring-primitive string offset))))
 
 (defun anvil-offload--ensure-pending ()
   "Return the pending-futures hash, creating it if needed."
@@ -421,6 +497,8 @@ deferred work active."
 (defun anvil-offload--registered-ownership-tables ()
   "Return every globally retained auxiliary ownership table."
   (let ((tables (copy-sequence anvil-offload--ownership-table-registry)))
+    (when (hash-table-p anvil-offload--fallback-processes)
+      (push anvil-offload--fallback-processes tables))
     (when (hash-table-p anvil-offload--isolated-processes)
       (push anvil-offload--isolated-processes tables))
     (cl-delete-duplicates
@@ -453,17 +531,48 @@ table replacement."
       (push owner anvil-offload--ownership-table-registry))
     owner))
 
-(defun anvil-offload--retain-submission-process (proc table)
-  "Retain exact PROC in already registered TABLE without advice callbacks."
+(defun anvil-offload--retain-submission-process (proc table &optional reason)
+  "Retain exact PROC in already registered TABLE without advice callbacks.
+When REASON is non-nil, publish it as the current custody reason."
   (unless (and (processp proc) (hash-table-p table))
     (error "anvil-offload: invalid submission custody %S %S" proc table))
   (funcall anvil-offload--puthash-primitive
-           proc (or (funcall anvil-offload--gethash-primitive proc table) :submission-active) table)
+           proc
+           (or reason
+               (funcall anvil-offload--gethash-primitive proc table)
+               :submission-active)
+           table)
   (funcall anvil-offload--process-put-primitive
    proc 'anvil-offload-ownership-tables
    (cl-adjoin
     table (funcall anvil-offload--process-get-primitive proc 'anvil-offload-ownership-tables) :test #'eq))
   proc)
+
+(defun anvil-offload--stage-retirement-pools (pools)
+  "Retain every exact child in POOLS before any observable transition."
+  (unless (hash-table-p anvil-offload--fallback-processes)
+    (error "anvil-offload: stable fallback ownership is unavailable"))
+  (dolist (pool pools)
+    (when (vectorp pool)
+      (dotimes (i (length pool))
+        (let ((proc (aref pool i)))
+          (when (processp proc)
+            (anvil-offload--mark-retiring proc)
+            (anvil-offload--retain-submission-process
+             proc anvil-offload--fallback-processes :pool-retiring))))))
+  anvil-offload--fallback-processes)
+
+(defun anvil-offload--fallback-pool-retirement-p ()
+  "Return non-nil when stable fallback custody holds a retired pool child."
+  (and
+   (hash-table-p anvil-offload--fallback-processes)
+   (let (found)
+     (maphash
+      (lambda (_proc reason)
+        (when (eq reason :pool-retiring)
+          (setq found t)))
+      anvil-offload--fallback-processes)
+     found)))
 
 (defun anvil-offload--owned-auxiliary-processes ()
   "Return every process in any registered auxiliary ownership table."
@@ -471,6 +580,44 @@ table replacement."
     (dolist (table (anvil-offload--registered-ownership-tables))
       (maphash (lambda (proc _value) (push proc processes)) table))
     (cl-delete-duplicates processes :test #'eq)))
+
+(defun anvil-offload--stage-stop-auxiliary-processes ()
+  "Snapshot and stably retain every auxiliary child for whole-stop cleanup."
+  (unless (hash-table-p anvil-offload--fallback-processes)
+    (error "anvil-offload: stable fallback ownership is unavailable"))
+  (let ((processes (anvil-offload--owned-auxiliary-processes)))
+    (dolist (proc processes)
+      (when (processp proc)
+        (anvil-offload--mark-retiring proc)
+        (funcall anvil-offload--process-put-primitive
+                 proc 'anvil-offload-stop-retiring t)
+        (anvil-offload--retain-submission-process
+         proc anvil-offload--fallback-processes
+         (or (funcall anvil-offload--gethash-primitive
+                      proc anvil-offload--fallback-processes)
+             :stop-retiring))))
+    processes))
+
+(defun anvil-offload--fallback-stop-retirement-p ()
+  "Return non-nil while stable fallback holds a whole-stop child."
+  (and
+   (hash-table-p anvil-offload--fallback-processes)
+   (let (found)
+     (maphash
+      (lambda (proc _reason)
+        (when
+            (and
+             (processp proc)
+             (funcall anvil-offload--process-get-primitive
+                      proc 'anvil-offload-stop-retiring))
+          (setq found t)))
+      anvil-offload--fallback-processes)
+     found)))
+
+(defun anvil-offload--stop-incomplete-p ()
+  "Return non-nil while a whole-subsystem stop remains fail closed."
+  (or anvil-offload--stop-retiring-p
+      (anvil-offload--fallback-stop-retirement-p)))
 
 (defun anvil-offload--clear-process-from-pools (proc)
   "Clear exact PROC from the current and every retired pool vector."
@@ -497,49 +644,86 @@ table replacement."
         (when (hash-table-p table)
           (funcall anvil-offload--remhash-primitive proc table))))
     (funcall anvil-offload--process-put-primitive proc 'anvil-offload-ownership-tables nil)
-    (funcall anvil-offload--process-put-primitive proc 'anvil-offload-staged-slot nil)))
+    (funcall anvil-offload--process-put-primitive proc 'anvil-offload-staged-slot nil)
+    (funcall anvil-offload--process-put-primitive
+             proc 'anvil-offload-stop-retiring nil)))
+
+(defun anvil-offload--terminate-retained-process (proc)
+  "Terminate already marked and stably retained PROC without table publication."
+  (let (termination-errors)
+    (let ((inhibit-quit t))
+      (when (process-live-p proc)
+        (condition-case err
+            (kill-process proc)
+          ((error quit)
+           (push (format "kill-process: %s" (error-message-string err))
+                 termination-errors))))
+      (condition-case err
+          (delete-process proc)
+        ((error quit)
+         (push (format "delete-process: %s"
+                       (error-message-string err))
+               termination-errors))))
+    (if (or (process-live-p proc)
+            (memq proc (funcall anvil-offload--process-list-primitive)))
+        (progn
+          (message
+           "anvil-offload: child %s remains tracked after failed hard delete%s"
+           (funcall anvil-offload--process-name-primitive proc)
+           (if termination-errors
+               (format ": %s"
+                       (string-join (nreverse termination-errors) "; "))
+             ""))
+          nil)
+      (anvil-offload--release-process-ownership proc)
+      t)))
+
+(defun anvil-offload--delete-retained-process (proc)
+  "Best-effort deferred deletion of exact fallback-owned PROC."
+  (condition-case cleanup-error
+      (anvil-offload--terminate-retained-process proc)
+    ((error quit)
+     (message
+      "anvil-offload: deferred exact cleanup failed: %s"
+      (error-message-string cleanup-error)))))
+
+(defun anvil-offload--defer-hard-delete-preserving-exit (proc)
+  "Retain PROC and schedule callback-free deletion after a nonlocal exit."
+  (when (processp proc)
+    (anvil-offload--mark-retiring proc)
+    (if (hash-table-p anvil-offload--fallback-processes)
+        (anvil-offload--retain-submission-process
+         proc anvil-offload--fallback-processes)
+      (message "anvil-offload: stable fallback ownership is unavailable"))
+    (condition-case cleanup-error
+        (anvil-offload--make-direct-zero-delay-timer
+         #'anvil-offload--delete-retained-process proc)
+      ((error quit)
+       (message
+        "anvil-offload: exact cleanup remains globally owned: %s"
+        (error-message-string cleanup-error))))))
 
 (defun anvil-offload--hard-delete-process (proc)
   "Hard-delete the exact owned subprocess PROC.
 PROC is marked retiring before table creation can invoke variable
 watchers, then placed in a globally registered auxiliary table before
 the first destructive callback.  Ownership is cleared only after PROC
-is observed dead; failure leaves durable custody for a later retry."
+is absent from the process registry; failure leaves durable custody for
+a later retry."
   (when (processp proc)
-    ;; Table creation can run variable watchers.  Mark first so watcher
-    ;; reentry cannot reacquire this exact compatible pooled child.
+    ;; Table creation can run variable watchers.  Mark and establish custody
+    ;; in the stable fallback first, so a watcher can replace every pool/table
+    ;; global and exit nonlocally without orphaning this exact child.
     (anvil-offload--mark-retiring proc)
+    (unless (hash-table-p anvil-offload--fallback-processes)
+      (error "anvil-offload: stable fallback ownership is unavailable"))
+    (anvil-offload--retain-submission-process
+     proc anvil-offload--fallback-processes)
     (let* ((ownership (anvil-offload--ensure-isolated-processes))
            (existing (funcall anvil-offload--gethash-primitive proc ownership)))
       (anvil-offload--track-process-ownership
        proc (or existing :retiring) ownership)
-      (let (termination-errors)
-        (when (process-live-p proc)
-          (let ((inhibit-quit t))
-            (condition-case err
-                (kill-process proc)
-              ((error quit)
-               (push (format "kill-process: %s" (error-message-string err))
-                     termination-errors)))
-            (when (process-live-p proc)
-              (condition-case err
-                  (delete-process proc)
-                ((error quit)
-                 (push (format "delete-process: %s"
-                               (error-message-string err))
-                       termination-errors))))))
-        (if (or termination-errors (process-live-p proc))
-            (progn
-              (message
-               "anvil-offload: child %s remains tracked after failed hard delete%s"
-               (funcall anvil-offload--process-name-primitive proc)
-               (if termination-errors
-                   (format ": %s"
-                           (string-join (nreverse termination-errors) "; "))
-                 ""))
-              nil)
-          (anvil-offload--release-process-ownership proc)
-          t)))))
+      (anvil-offload--terminate-retained-process proc))))
 
 ;;; REPL init file
 
@@ -810,7 +994,7 @@ EVENT is a diagnostic symbol used only in the error message."
   "Mark pending FUTURE started and notify its start callback once.
 The request id and exact owner are captured before arbitrary callback
 code.  If the callback exits nonlocally, cleanup never rereads mutable
-future ownership fields."
+future ownership fields or performs watched table publication."
   (anvil-offload--ensure-registration future)
   (anvil-offload--sync-future-registration future)
   (when (and (anvil-offload--registered-pending-p future)
@@ -835,12 +1019,7 @@ future ownership fields."
              future id 'killed "start callback aborted"
              'start-callback-aborted)
             (when (processp owner)
-              (condition-case cleanup-error
-                  (anvil-offload--hard-delete-process owner)
-                ((error quit)
-                 (message
-                  "anvil-offload: start callback cleanup deferred: %s"
-                  (error-message-string cleanup-error))))))))))
+              (anvil-offload--defer-hard-delete-preserving-exit owner)))))))
   future)
 
 (defun anvil-offload--settle (future status &optional payload reason)
@@ -907,8 +1086,7 @@ sentinel's zero-delay fallback timer."
     ;; remainder before invoking the callback, so service it synchronously
     ;; rather than waiting for process output that has already arrived.
     (when (and (not (anvil-future-done-p future))
-               (string-match-p
-                "\n" (or (funcall anvil-offload--process-get-primitive proc 'anvil-pending-bytes) "")))
+               (anvil-offload--filter-queue-has-complete-line-p proc))
       (anvil-offload--filter proc ""))
     (while (and (not (anvil-future-done-p future))
                 (or (null deadline) (< (float-time) deadline))
@@ -952,7 +1130,8 @@ in anvil-future--err.  Repeated calls are idempotent.  Return FUTURE."
            (elapsed (- (float-time) (anvil-future--created-at future)))
            (message (if reason
                         (format "%s after %.2fs" reason elapsed)
-                      (format "killed after %.2fs" elapsed))))
+                      (format "killed after %.2fs" elapsed)))
+           settled)
       ;; Mark before settlement: anvil-offload--settle invokes arbitrary user
       ;; callbacks, and no callback may reacquire this exact child.
       (anvil-offload--mark-retiring proc)
@@ -960,9 +1139,13 @@ in anvil-future--err.  Repeated calls are idempotent.  Return FUTURE."
       ;; sentinel/filter callback can no longer race this future into a
       ;; different terminal state.
       (unwind-protect
-          (anvil-offload--settle
-           future 'killed message (or reason 'killed))
-        (anvil-offload--hard-delete-process proc))))
+          (progn
+            (anvil-offload--settle
+             future 'killed message (or reason 'killed))
+            (setq settled t))
+        (if settled
+            (anvil-offload--hard-delete-process proc)
+          (anvil-offload--defer-hard-delete-preserving-exit proc)))))
   future)
 
 (defun anvil-future-elapsed (future)
@@ -999,18 +1182,24 @@ unconditionally.  Returns VALUE."
 (defun anvil-offload--settle-reply
     (proc future status payload reason)
   "Settle FUTURE from PROC and hard-delete its captured isolated child.
-The exact isolated ownership predicate is snapshotted before settlement,
-because the user callback may mutate FUTURE or exit nonlocally."
+The exact isolated ownership predicate is snapshotted before settlement.
+A nonlocal callback exit defers callback-free exact deletion so cleanup
+cannot replace the original exit."
   (anvil-offload--ensure-registration future)
   (let ((delete-isolated
          (and (anvil-future--registered-isolated-p future)
               (eq proc (anvil-future--registered-process future))))
-        settled)
+        settled
+        completed)
     (unwind-protect
-        (setq settled
-              (anvil-offload--settle future status payload reason))
+        (progn
+          (setq settled
+                (anvil-offload--settle future status payload reason))
+          (setq completed t))
       (when delete-isolated
-        (anvil-offload--hard-delete-process proc)))
+        (if completed
+            (anvil-offload--hard-delete-process proc)
+          (anvil-offload--defer-hard-delete-preserving-exit proc))))
     settled))
 
 (defun anvil-offload--dispatch-reply (proc msg)
@@ -1048,10 +1237,10 @@ one-shot child after settlement."
 
 (defun anvil-offload--drain-filter-remainder (proc)
   "Drain PROC's transactionally retained filter bytes once."
-  (funcall anvil-offload--process-put-primitive proc 'anvil-offload-drain-timer nil)
+  (funcall anvil-offload--process-put-primitive
+           proc 'anvil-offload-drain-timer nil)
   (when (and (processp proc)
-             (not (string-empty-p
-                   (or (funcall anvil-offload--process-get-primitive proc 'anvil-pending-bytes) ""))))
+             (> (anvil-offload--filter-queue-total-bytes proc) 0))
     (anvil-offload--filter proc "")))
 
 (defun anvil-offload--schedule-filter-drain (proc)
@@ -1122,26 +1311,117 @@ ALLOWED-KEYS defaults to the top-level reply protocol keys."
       (error "invalid reply shape"))
     message))
 
-(defun anvil-offload--consume-filter-prefix (proc snapshot)
-  "Remove exact SNAPSHOT prefix from PROC's shared filter queue."
-  (let ((current (or (funcall anvil-offload--process-get-primitive proc 'anvil-pending-bytes) "")))
-    (unless (string-prefix-p snapshot current)
-      (error "offload filter queue changed outside serialized append"))
-    (funcall anvil-offload--process-put-primitive proc 'anvil-pending-bytes
-                 (substring current (length snapshot)))))
+(defconst anvil-offload--filter-queue-tag 'anvil-offload-filter-queue
+  "Tag stored in process-local incremental filter queue vectors.")
+
+(defun anvil-offload--filter-queue-p (value)
+  "Return non-nil when VALUE is an incremental filter queue."
+  (and (vectorp value)
+       (= (length value) 6)
+       (eq (aref value 0) anvil-offload--filter-queue-tag)))
+
+(defun anvil-offload--filter-queue (proc)
+  "Return PROC's incremental queue, upgrading a legacy string losslessly."
+  (let ((value
+         (funcall anvil-offload--process-get-primitive
+                  proc 'anvil-pending-bytes)))
+    (if (anvil-offload--filter-queue-p value)
+        value
+      (unless (or (null value) (stringp value))
+        (error "anvil-offload: invalid filter queue state"))
+      (let* ((base (or value ""))
+             (state
+              (vector anvil-offload--filter-queue-tag
+                      base 0 nil nil (string-bytes base))))
+        (funcall anvil-offload--process-put-primitive
+                 proc 'anvil-pending-bytes state)
+        state))))
+
+(defun anvil-offload--filter-queue-append (state string)
+  "Append STRING to STATE without copying previously queued bytes."
+  (unless (string-empty-p string)
+    (aset state 3 (cons string (aref state 3)))
+    (aset state 4
+          (or (aref state 4) (string-match-p "\n" string)))
+    (aset state 5 (+ (aref state 5) (string-bytes string))))
+  state)
+
+(defun anvil-offload--filter-queue-materialize (state)
+  "Materialize STATE's unconsumed base and chunks exactly once."
+  (let ((base (aref state 1))
+        (offset (aref state 2))
+        (chunks (aref state 3)))
+    (when (or chunks (> offset 0))
+      (setq base
+            (mapconcat
+             #'identity
+             (cons (if (zerop offset) base (substring base offset))
+                   (nreverse (copy-sequence chunks)))
+             ""))
+      (aset state 1 base)
+      (aset state 2 0)
+      (aset state 3 nil)
+      (aset state 4 nil)))
+  state)
+
+(defun anvil-offload--filter-queue-line-end (state)
+  "Return the next newline position in STATE's materialized base, or nil."
+  (string-match "\n" (aref state 1) (aref state 2)))
+
+(defun anvil-offload--filter-queue-has-complete-line-p (proc)
+  "Return non-nil when PROC's logical queue contains a complete line."
+  (let ((state (anvil-offload--filter-queue proc)))
+    (or (anvil-offload--filter-queue-line-end state)
+        (aref state 4))))
+
+(defun anvil-offload--filter-queue-total-bytes (proc)
+  "Return the logical byte count retained for PROC."
+  (aref (anvil-offload--filter-queue proc) 5))
+
+(defun anvil-offload--pending-bytes-string (proc)
+  "Return PROC's logical pending bytes as a compatibility snapshot."
+  (let ((state (anvil-offload--filter-queue proc)))
+    (anvil-offload--filter-queue-materialize state)
+    (aref state 1)))
+
+(defun anvil-offload--filter-queue-pop-line (proc)
+  "Pop and return (LINE . BYTE-COUNT) from PROC, or nil if incomplete."
+  (let* ((state (anvil-offload--filter-queue proc))
+         (line-end (anvil-offload--filter-queue-line-end state)))
+    (when (and (null line-end) (aref state 4))
+      (anvil-offload--filter-queue-materialize state)
+      (setq line-end (anvil-offload--filter-queue-line-end state)))
+    (when line-end
+      (let* ((base (aref state 1))
+             (offset (aref state 2))
+             (line (substring base offset line-end))
+             (consumed-bytes (1+ (string-bytes line)))
+             (next (1+ line-end)))
+        ;; Commit the exact remainder before dispatch can invoke callbacks.
+        (aset state 2 next)
+        (aset state 5 (- (aref state 5) consumed-bytes))
+        (when (= next (length base))
+          (aset state 1 "")
+          (aset state 2 0))
+        (cons line consumed-bytes)))))
+
+(defun anvil-offload--filter-queue-clear (proc)
+  "Replace PROC's logical queue with one empty incremental state."
+  (funcall anvil-offload--process-put-primitive
+           proc 'anvil-pending-bytes
+           (vector anvil-offload--filter-queue-tag "" 0 nil nil 0)))
 
 (defun anvil-offload--drain-filter (proc)
-  "Drain complete frames from PROC's shared serialized byte queue."
+  "Drain complete frames from PROC's shared incremental byte queue."
   (let ((prefix-re (regexp-quote anvil-offload--frame-prefix))
-        failure)
+        failure
+        record)
     (while (and (null failure)
-                (string-match
-                 "\n" (or (funcall anvil-offload--process-get-primitive proc 'anvil-pending-bytes) "")))
-      (let* ((queue (or (funcall anvil-offload--process-get-primitive proc 'anvil-pending-bytes) ""))
-             (line-end (string-match "\n" queue))
-             (raw-line (substring queue 0 line-end))
-             (consumed (substring queue 0 (1+ line-end))))
-        (if (> (string-bytes consumed) anvil-offload-max-frame-bytes)
+                (setq record
+                      (anvil-offload--filter-queue-pop-line proc)))
+      (let ((raw-line (car record))
+            (frame-bytes (cdr record)))
+        (if (> frame-bytes anvil-offload-max-frame-bytes)
             (setq failure
                   (format "offload frame exceeded %d-byte limit"
                           anvil-offload-max-frame-bytes))
@@ -1149,38 +1429,35 @@ ALLOWED-KEYS defaults to the top-level reply protocol keys."
                  (idx (and (not (string-blank-p line))
                            (string-match prefix-re line))))
             (cond
-             ((string-blank-p line)
-              (anvil-offload--consume-filter-prefix proc consumed))
+             ((string-blank-p line))
              ((null idx)
-              (unless (funcall anvil-offload--process-get-primitive proc 'anvil-junk-reply-logged)
-                (funcall anvil-offload--process-put-primitive proc 'anvil-junk-reply-logged t)
+              (unless
+                  (funcall anvil-offload--process-get-primitive
+                           proc 'anvil-junk-reply-logged)
+                (funcall anvil-offload--process-put-primitive
+                         proc 'anvil-junk-reply-logged t)
                 (message "anvil-offload: dropped junk reply line: %S"
-                         (anvil-offload--line-preview line)))
-              (anvil-offload--consume-filter-prefix proc consumed))
+                         (anvil-offload--line-preview line))))
              (t
-              ;; Publish the remainder before dispatch.  Terminal lifecycle
-              ;; paths remove their pending registration before invoking a
-              ;; callback, so a tagged exit cannot make this frame replayable.
-              ;; A callback may now service a later future recursively without
-              ;; losing or reordering the shared queue.
+              ;; The queue offset was committed before decoding and dispatch.
+              ;; A callback may service or append later frames recursively
+              ;; without replaying this one or copying the queued tail.
               (condition-case err
-                  (progn
-                    (anvil-offload--consume-filter-prefix proc consumed)
-                    (anvil-offload--dispatch-reply
-                     proc (anvil-offload--decode-reply-line line idx)))
+                  (anvil-offload--dispatch-reply
+                   proc (anvil-offload--decode-reply-line line idx))
                 (error
                  (setq failure
                        (format "unreadable offload reply frame: %s"
                                (error-message-string err)))))))))))
     (when (and (null failure)
-               (> (string-bytes
-                   (or (funcall anvil-offload--process-get-primitive proc 'anvil-pending-bytes) ""))
+               (not (anvil-offload--filter-queue-has-complete-line-p proc))
+               (> (anvil-offload--filter-queue-total-bytes proc)
                   anvil-offload-max-frame-bytes))
       (setq failure
             (format "offload frame exceeded %d-byte limit"
                     anvil-offload-max-frame-bytes)))
     (when failure
-      (funcall anvil-offload--process-put-primitive proc 'anvil-pending-bytes "")
+      (anvil-offload--filter-queue-clear proc)
       (anvil-offload--mark-retiring proc)
       (unwind-protect
           (anvil-offload--finalize-dead-process proc failure)
@@ -1188,26 +1465,29 @@ ALLOWED-KEYS defaults to the top-level reply protocol keys."
     (null failure)))
 
 (defun anvil-offload--filter (proc string)
-  "Accumulate STRING bytes on PROC and dispatch complete framed replies.
-The byte ceiling applies to each newline-terminated frame and to the one
-unterminated remainder, not to an arbitrary process-filter chunk that may
-coalesce several independently valid frames."
-  (funcall anvil-offload--process-put-primitive
-   proc 'anvil-pending-bytes
-   (concat (or (funcall anvil-offload--process-get-primitive proc 'anvil-pending-bytes) "") string))
+  "Queue STRING on PROC and dispatch complete framed replies.
+Incoming chunks are retained without copying prior bytes.  The byte ceiling
+applies to each newline-terminated frame and to the one unterminated
+remainder, not to a process-filter chunk that coalesces valid frames."
+  (anvil-offload--filter-queue-append
+   (anvil-offload--filter-queue proc) string)
   (let ((outermost
-         (not (funcall anvil-offload--process-get-primitive proc 'anvil-offload-filter-active))))
+         (not
+          (funcall anvil-offload--process-get-primitive
+                   proc 'anvil-offload-filter-active))))
     (when outermost
-      (funcall anvil-offload--process-put-primitive proc 'anvil-offload-filter-active t))
+      (funcall anvil-offload--process-put-primitive
+               proc 'anvil-offload-filter-active t))
     (let (completed)
       (unwind-protect
           (progn
             (anvil-offload--drain-filter proc)
             (setq completed t))
         (when outermost
-          (funcall anvil-offload--process-put-primitive proc 'anvil-offload-filter-active nil))
+          (funcall anvil-offload--process-put-primitive
+                   proc 'anvil-offload-filter-active nil))
         (unless completed
-          ;; The current frame was consumed before dispatch; any later queued
+          ;; The current frame was committed before dispatch; later logical
           ;; frames remain available for one idempotently scheduled drain.
           (anvil-offload--schedule-filter-drain proc))))))
 
@@ -1243,6 +1523,32 @@ Return callback records after registration state has been synchronized."
       (dolist (record records)
         (anvil-offload--sync-future-registration (nth 1 record))))))
 
+(defun anvil-offload--release-dead-process-resources
+    (proc isolated buffer owned-buffer)
+  "Release exact dead PROC and its exclusively owned BUFFER.
+Hard deletion runs after final-frame settlement.  Failed deletion retains
+global ownership for a later retry."
+  (unwind-protect
+      (anvil-offload--hard-delete-process proc)
+    (when (and isolated
+               (eq buffer owned-buffer)
+               (buffer-live-p buffer)
+               (not (anvil-offload--buffer-has-live-peer-p proc buffer)))
+      (kill-buffer buffer))))
+
+(defun anvil-offload--finalize-dead-process-and-resources
+    (proc reason isolated buffer owned-buffer)
+  "Settle PROC futures, then release its exact process and buffer resources."
+  (funcall anvil-offload--process-put-primitive
+           proc 'anvil-offload-death-finalizer-active t)
+  (unwind-protect
+      (unwind-protect
+          (anvil-offload--finalize-dead-process proc reason)
+        (anvil-offload--release-dead-process-resources
+         proc isolated buffer owned-buffer))
+    (funcall anvil-offload--process-put-primitive
+             proc 'anvil-offload-death-finalizer-active nil)))
+
 (defun anvil-offload--buffer-has-live-peer-p (proc buffer)
   "Return non-nil when BUFFER is still owned by a live process other than PROC."
   (and
@@ -1261,8 +1567,13 @@ Return callback records after registration state has been synchronized."
 Filtering by process identity is load-bearing: if the REPL is stopped and a
 fresh one spawned before this sentinel runs, the new REPL's futures must not
 be settled.  EVENT describes the process status."
-  (when (and (processp proc) (not (process-live-p proc)))
-    (let (reason isolated owned-buffer buffer scheduled-p)
+  (when (and
+         (processp proc)
+         (not (process-live-p proc))
+         (not
+          (funcall anvil-offload--process-get-primitive
+                   proc 'anvil-offload-death-finalizer-active)))
+    (let (reason isolated owned-buffer buffer scheduled-p finalizer-args)
       ;; The unwind boundary begins before every property, buffer, and timer
       ;; operation.  Scheduler failure terminalizes pending futures silently
       ;; so no request can remain pending without a future callback source.
@@ -1289,28 +1600,41 @@ be settled.  EVENT describes the process status."
                             proc 'anvil-offload-isolated)))
             (funcall anvil-offload--process-put-primitive
                      proc 'anvil-offload-death-reason reason)
-            ;; Let any final filter callback drain queued bytes before we mark
-            ;; still-pending futures as errored.  The synchronous await path
-            ;; also finalizes after servicing PROC, so this validated scheduler
-            ;; is only an idempotent fallback for other callers.
-            (anvil-offload--schedule-zero-delay
-             #'anvil-offload--finalize-dead-process proc reason)
+            ;; Let any final filter callback drain queued bytes before
+            ;; settlement and exact process deletion.  Ownership remains
+            ;; durable until this callback completes or unwinds.
+            (setq finalizer-args
+                  (list proc reason isolated buffer owned-buffer))
+            (apply
+             #'anvil-offload--schedule-zero-delay
+             #'anvil-offload--finalize-dead-process-and-resources
+             finalizer-args)
             (setq scheduled-p t))
-        (unwind-protect
-            (unless scheduled-p
-              (when reason
-                (condition-case nil
-                    (anvil-offload--terminalize-dead-process-silently
-                     proc reason)
-                  ((error quit) nil))))
+        ;; A tagged scheduler exit propagates after schedule-zero-delay has
+        ;; installed its exact fallback timer.  Observe that publication here
+        ;; so unwind cleanup does not recursively delete a process that Emacs
+        ;; is still removing inside its sentinel.
+        (unless scheduled-p
+          (setq scheduled-p
+                (and
+                 finalizer-args
+                 (anvil-offload--exact-zero-delay-timer-scheduled-p
+                  #'anvil-offload--finalize-dead-process-and-resources
+                  finalizer-args))))
+        (unless scheduled-p
+          (funcall anvil-offload--process-put-primitive
+                   proc 'anvil-offload-death-finalizer-active t)
           (unwind-protect
-              (anvil-offload--release-process-ownership proc)
-            (when (and isolated
-                       (eq buffer owned-buffer)
-                       (buffer-live-p buffer)
-                       (not (anvil-offload--buffer-has-live-peer-p
-                             proc buffer)))
-              (kill-buffer buffer))))))))
+              (unwind-protect
+                  (when reason
+                    (condition-case nil
+                        (anvil-offload--terminalize-dead-process-silently
+                         proc reason)
+                      ((error quit) nil)))
+                (anvil-offload--release-dead-process-resources
+                 proc isolated buffer owned-buffer))
+            (funcall anvil-offload--process-put-primitive
+                     proc 'anvil-offload-death-finalizer-active nil)))))))
 
 ;;; Pool lifecycle
 
@@ -1510,8 +1834,10 @@ vector is snapshotted and retained before any destructive callback, and
 all of their children are marked before the first delete.  Return
 non-nil only when POOL is still the primary pool and every retired
 generation has converged to empty."
-  (unless anvil-offload--pool-cleanup-active-p
+  (unless (anvil-offload--cleanup-active-p)
     (error "anvil-offload: pool cleanup lacks its active guard"))
+  (anvil-offload--stage-retirement-pools
+   (cons pool (copy-sequence anvil-offload--retired-pools)))
   (when (vectorp pool)
     (cl-pushnew pool anvil-offload--retired-pools :test #'eq))
   (let ((pools
@@ -1520,6 +1846,12 @@ generation has converged to empty."
            #'vectorp (copy-sequence anvil-offload--retired-pools))
           :test #'eq))
         processes)
+    (when (hash-table-p anvil-offload--fallback-processes)
+      (maphash
+       (lambda (proc reason)
+         (when (and (processp proc) (eq reason :pool-retiring))
+           (cl-pushnew proc processes :test #'eq)))
+       anvil-offload--fallback-processes))
     ;; Capture and mark the entire retirement set before the first callback.
     (dolist (retired pools)
       (dotimes (i (length retired))
@@ -1536,7 +1868,12 @@ generation has converged to empty."
     (dolist (retired pools)
       (dotimes (i (length retired))
         (let ((proc (aref retired i)))
-          (when (and (processp proc) (not (process-live-p proc)))
+          (when (and (processp proc)
+                     (not (process-live-p proc))
+                     (not
+                      (memq
+                       proc
+                       (funcall anvil-offload--process-list-primitive))))
             (aset retired i nil)))))
     (let ((survivors
            (cl-remove-if-not
@@ -1557,7 +1894,8 @@ generation has converged to empty."
                (lambda (retired)
                  (cl-some #'identity (append retired nil)))
                pools))
-         (null anvil-offload--retired-pools))))
+         (null anvil-offload--retired-pools)
+         (not (anvil-offload--fallback-pool-retirement-p)))))
 
 (defun anvil-offload--ensure-pool-vector ()
   "Return a dispatchable pool sized to `anvil-offload-pool-size'.
@@ -1566,18 +1904,21 @@ Reentrant dispatch fails while cleanup is active, and dispatch stays
 closed after an incomplete whole-subsystem stop.  A signaling watcher
 leaves the old primary and fail-closed flags intact; reentrant public
 calls observe the active guard."
-  (when anvil-offload--pool-cleanup-active-p
+  (when (anvil-offload--cleanup-active-p)
     (error "anvil-offload: pool cleanup already active"))
-  (when anvil-offload--stop-retiring-p
+  (when (anvil-offload--stop-incomplete-p)
     (error "anvil-offload: stop cleanup still in progress"))
   (let ((requested-size (max 1 anvil-offload-pool-size)))
     (if (and (not anvil-offload--pool-retiring-p)
              (null anvil-offload--retired-pools)
+             (not (anvil-offload--fallback-pool-retirement-p))
              anvil-offload--pool
              (= (length anvil-offload--pool) requested-size))
         anvil-offload--pool
-      (let ((anvil-offload--pool-cleanup-active-p t))
+      (anvil-offload--with-cleanup-guard
         (let ((pool anvil-offload--pool))
+          (anvil-offload--stage-retirement-pools
+           (cons pool (copy-sequence anvil-offload--retired-pools)))
           (setq anvil-offload--pool-retiring-p t)
           (unless (anvil-offload--retire-captured-pool pool)
             (error "anvil-offload: pool retirement still in progress"))
@@ -1598,7 +1939,7 @@ not sweep healthy peer slots or their pending futures.  A new process is
 staged in globally registered ownership tables until every publication
 step succeeds."
   (anvil-offload--ensure-pool-vector)
-  (when anvil-offload--pool-cleanup-active-p
+  (when (anvil-offload--cleanup-active-p)
     (error "anvil-offload: pool cleanup already active"))
   (let* ((pool anvil-offload--pool)
          (cur (aref pool idx)))
@@ -1608,7 +1949,7 @@ step succeeds."
              (eq (funcall anvil-offload--process-get-primitive cur 'anvil-offload-protocol-version)
                  anvil-offload--protocol-version))
         cur
-      (let ((anvil-offload--pool-cleanup-active-p t))
+      (anvil-offload--with-cleanup-guard
         (when cur
           (unless (processp cur)
             (error "anvil-offload: invalid child in slot %d" idx))
@@ -1659,29 +2000,39 @@ step succeeds."
 ;;;###autoload
 (defun anvil-offload-stop-repl ()
   "Transactionally stop every pooled, isolated, and staged subprocess.
-The cleanup-active and stop-retiring guards are published before taking
-snapshots.  Every retired pool generation and every registered auxiliary
-table retains global custody until all children are gone.  Any survivor
+Stable fallback custody snapshots and marks every child before the first
+watched stop publication.  Every retired pool generation and every registered
+auxiliary table remains reachable until all children are gone.  Any survivor
 or signaling watcher leaves dispatch fail closed for an explicit retry."
   (interactive)
-  (when anvil-offload--submission-active-p
+  (when (anvil-offload--submission-active-p)
     (error "anvil-offload: submission already active"))
-  (when anvil-offload--pool-cleanup-active-p
+  (when (anvil-offload--cleanup-active-p)
     (error "anvil-offload: pool cleanup already active"))
-  (let ((anvil-offload--pool-cleanup-active-p t))
-    (setq anvil-offload--stop-retiring-p t
-          anvil-offload--pool-retiring-p t)
-    (let ((pool anvil-offload--pool))
-      (let ((pool-converged
-             (anvil-offload--retire-captured-pool pool)))
-        ;; Take this snapshot after pool callbacks; every table in the registry
-        ;; participates, including tables installed by those callbacks.
-        (dolist (proc (anvil-offload--owned-auxiliary-processes))
+  (anvil-offload--with-cleanup-guard
+    (let* ((pool anvil-offload--pool)
+           (_pool-custody
+            (anvil-offload--stage-retirement-pools
+             (cons pool (copy-sequence anvil-offload--retired-pools))))
+           (captured-auxiliary
+            (anvil-offload--stage-stop-auxiliary-processes)))
+      (setq anvil-offload--stop-retiring-p t
+            anvil-offload--pool-retiring-p t)
+      (let* ((pool-converged
+              (anvil-offload--retire-captured-pool pool))
+             (auxiliary
+              (cl-delete-duplicates
+               (append
+                captured-auxiliary
+                (anvil-offload--stage-stop-auxiliary-processes))
+               :test #'eq)))
+        (dolist (proc auxiliary)
           (anvil-offload--hard-delete-process proc))
         (when (and pool-converged
                    (eq pool anvil-offload--pool)
                    (null anvil-offload--retired-pools)
-                   (null (anvil-offload--owned-auxiliary-processes)))
+                   (null (anvil-offload--owned-auxiliary-processes))
+                   (not (anvil-offload--fallback-stop-retirement-p)))
           ;; Publish the absent primary exactly once.  On Emacs 30 a watcher
           ;; signal prevents assignment, leaving both retiring flags intact.
           (setq anvil-offload--pool nil)
@@ -1742,19 +2093,13 @@ in the subprocess.  Returns a list of forms (possibly empty)."
               bindings)))
     (if bindings `(let ,(nreverse bindings) ,form) form)))
 
-(defun anvil-offload--delete-aborted-submission (proc ownership)
-  "Hard-delete captured PROC after the original submission unwind returns."
-  (condition-case cleanup-error
-      (let ((anvil-offload--isolated-processes ownership))
-        (anvil-offload--hard-delete-process proc))
-    ((error quit)
-     (message
-      "anvil-offload: deferred submission cleanup failed: %s"
-      (error-message-string cleanup-error)))))
+(defun anvil-offload--delete-aborted-submission (proc _ownership)
+  "Best-effort compatibility wrapper for deferred exact PROC cleanup."
+  (anvil-offload--delete-retained-process proc))
 
-(defun anvil-offload--abort-submission (proc future id ownership)
+(defun anvil-offload--abort-submission (proc future id _ownership)
   "Best-effort cleanup for a nonlocally aborted public submission.
-ID and OWNERSHIP were captured before arbitrary callbacks.  Retire exact
+ID was captured before arbitrary callbacks.  Retire exact
 PROC and silently remove pending FUTURE immediately.  Destructive cleanup
 uses captured timer primitives on a later event-loop turn, so an arbitrary
 scheduler cannot replace the original error, quit, or throw."
@@ -1766,13 +2111,7 @@ scheduler cannot replace the original error, quit, or throw."
      future id 'error
      "offload submission aborted" 'submission-aborted))
   (when (processp proc)
-    (condition-case cleanup-error
-        (anvil-offload--make-direct-zero-delay-timer
-         #'anvil-offload--delete-aborted-submission proc ownership)
-      ((error quit)
-       (message
-        "anvil-offload: abort cleanup remains globally owned: %s"
-        (error-message-string cleanup-error))))))
+    (anvil-offload--defer-hard-delete-preserving-exit proc)))
 
 ;;;###autoload
 (cl-defun anvil-offload (form &rest keys)
@@ -1800,16 +2139,16 @@ Keyword arguments:
                       precedence; ordinary callers normally use :load-path.
 
 Dispatch uses round-robin across the pool (`anvil-offload-pool-size')."
-  (when (or anvil-offload--pool-cleanup-active-p
-            anvil-offload--stop-retiring-p
-            anvil-offload--submission-active-p)
+  (when (or (anvil-offload--cleanup-active-p)
+            (anvil-offload--stop-incomplete-p)
+            (anvil-offload--submission-active-p))
     (error
      "anvil-offload: cleanup already active or submission already active"))
-  ;; This special binding is the submission linearization point.  It begins
-  ;; before spawn-environment callbacks and remains visible through pending
+  ;; The stable submission bit is the linearization point.  It is published
+  ;; before the observable special binding and remains set through pending
   ;; registration and the successful transport send.
-  (let* ((anvil-offload--submission-active-p t)
-         (requires (plist-get keys :require))
+  (anvil-offload--with-submission-guard
+    (let* ((requires (plist-get keys :require))
          (extra-load-path (plist-get keys :load-path))
          (preamble (anvil-offload--build-preamble requires extra-load-path))
          ;; Capture a registered table before allocation or arbitrary spawn
@@ -1866,7 +2205,7 @@ Dispatch uses round-robin across the pool (`anvil-offload-pool-size')."
       ;; exits from spawn callbacks, pending publication, or transport advice.
       (unless submitted
         (anvil-offload--abort-submission
-         proc future id submission-ownership)))))
+         proc future id submission-ownership))))))
 
 ;;;###autoload
 (cl-defun anvil-offload-isolated (form &rest keys)

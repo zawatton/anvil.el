@@ -83,6 +83,72 @@ line on exit; the wrapper silences it with `:sentinel #'ignore'
     (should (equal "stdin-eof\n" (plist-get res :stdout)))
     (should (equal "" (plist-get res :stderr)))))
 
+(ert-deftest anvil-host-test-shell-bounds-output-before-decoding ()
+  "A finite :max-output must cap lexical capture, not only returned text."
+  (skip-unless (memq system-type '(gnu/linux darwin)))
+  (skip-unless (executable-find "dd"))
+  (let ((decoded-byte-counts nil)
+        (decode-output (symbol-function 'anvil-host--decode-output)))
+    (cl-letf (((symbol-function 'anvil-host--decode-output)
+               (lambda (bytes coding)
+                 (push (string-bytes bytes) decoded-byte-counts)
+                 (funcall decode-output bytes coding))))
+      (let* ((limit 1024)
+             (res
+              (anvil-shell
+               "dd if=/dev/zero bs=1048576 count=1 2>/dev/null"
+               (list :timeout 5 :max-output limit))))
+        (should (eql 0 (plist-get res :exit)))
+        (should (eq t (plist-get res :truncated)))
+        (should (= 1048576 (plist-get res :stdout-total-bytes)))
+        (should (= 0 (plist-get res :stderr-total-bytes)))
+        (should decoded-byte-counts)
+        (should
+         (cl-every (lambda (size) (<= size limit))
+                   decoded-byte-counts))
+        (should
+         (string-match-p
+          "anvil-host: truncated, 1047552 more bytes"
+          (plist-get res :stdout)))))))
+
+(ert-deftest anvil-host-test-source-byte-fields-are-opt-in ()
+  "Exact source-byte fields are absent unless explicitly requested."
+  (skip-unless (memq system-type '(gnu/linux darwin)))
+  (dolist (opts
+           '((:timeout 3)
+             (:timeout 3 :include-source-bytes nil)))
+    (let ((res (anvil-shell "printf output" opts)))
+      (should-not
+       (plist-member res :stdout-captured-source-bytes))
+      (should-not
+       (plist-member res :stderr-captured-source-bytes)))))
+
+(ert-deftest anvil-host-test-source-byte-fields-are-exact-unibyte ()
+  "The opt-in fields preserve exact bounded bytes in the source encoding."
+  (skip-unless (memq system-type '(gnu/linux darwin)))
+  (skip-unless (coding-system-p 'cp932-dos))
+  (let* ((res
+          (anvil-shell
+           "printf '\\202\\240X'; printf '\\202\\242Y' >&2"
+           '(:timeout 3 :max-output 2 :coding cp932-dos
+             :include-source-bytes t)))
+         (stdout-source
+          (plist-get res :stdout-captured-source-bytes))
+         (stderr-source
+          (plist-get res :stderr-captured-source-bytes)))
+    (should (plist-member res :stdout-captured-source-bytes))
+    (should (plist-member res :stderr-captured-source-bytes))
+    (should (equal "あ" (plist-get res :stdout-captured)))
+    (should (equal "い" (plist-get res :stderr-captured)))
+    (should (= 3 (plist-get res :stdout-total-bytes)))
+    (should (= 3 (plist-get res :stderr-total-bytes)))
+    (should (equal (unibyte-string #x82 #xa0) stdout-source))
+    (should (equal (unibyte-string #x82 #xa2) stderr-source))
+    (should-not (multibyte-string-p stdout-source))
+    (should-not (multibyte-string-p stderr-source))
+    (should (= 2 (string-bytes stdout-source)))
+    (should (= 2 (string-bytes stderr-source)))))
+
 (ert-deftest anvil-host-test-child-bindings-are-spawn-local ()
   "Dedicated child bindings apply at spawn without leaking into the root."
   (skip-unless (memq system-type '(gnu/linux darwin)))
@@ -111,7 +177,12 @@ line on exit; the wrapper silences it with `:sentinel #'ignore'
              (anvil-host--run
               "printf %s \"$ANVIL_HOST_CHILD_SCOPE\""
               'utf-8 temporary-file-directory 3)))
-        (should (equal '(0 "child" "") result))))
+        (should
+         (equal
+          (list 0 "child" "" 5 0
+                (encode-coding-string "child" 'utf-8)
+                (encode-coding-string "" 'utf-8))
+          result))))
     (should (equal child-environment (nth 0 observed)))
     (should (equal child-exec-path (nth 1 observed)))
     (should (equal child-shell (nth 2 observed)))
