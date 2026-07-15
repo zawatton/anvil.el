@@ -1520,14 +1520,16 @@
           (cons nil (make-hash-table :test #'eq)))
          (anvil-host--cleanup-timer nil)
          (anvil-host--cleanup-active nil)
-         (anvil-host-cleanup-timeout 0.01)
          actual observed-during-constructor)
     (unwind-protect
         (progn
           (cl-letf ((anvil-host--run-at-time-function
                      (lambda (&rest args)
                        (setq actual (apply real-run-at-time args))
-                       (sleep-for 1.1)
+                       ;; Deliver the exact one-shot before its constructor
+                       ;; returns, independent of host scheduler latency.
+                       (let ((timer-event-last actual))
+                         (funcall (nth 2 args)))
                        (setq observed-during-constructor
                              (eq
                               (aref (anvil-host--resource-state) 2)
