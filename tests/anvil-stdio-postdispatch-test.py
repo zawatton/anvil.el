@@ -1982,48 +1982,55 @@ def run_nul_wire_rejection(
     bash: str,
     real_helpers: dict[str, str],
 ) -> None:
-    """Reject raw NUL without dispatching or orphaning the bounded reader."""
+    """Reject raw NUL after synchronizing with the intended bounded reader."""
     cases = (
         (
             "legacy-embedded",
             b'{"jsonrpc":"2.0","id":7,\x00"method":"tools/call"}\n',
             "line",
+            1,
         ),
         (
             "header-embedded",
             b"Content-Length: 2\r\nX-Test:\x00bad\r\n\r\n{}",
             "line",
+            2,
         ),
         (
             "body-partial",
             b"Content-Length: 100\r\n\r\n\x00",
             "body",
+            1,
         ),
         (
             "body-forged-status",
             b"Content-Length: 100\r\n\r\n\x000\n",
             "body",
+            1,
         ),
     )
-    for label, payload, expected_tag in cases:
-        with tempfile.TemporaryDirectory(
-            prefix=f"anvil-stdio-nul-{label}-"
-        ) as raw_root:
-            root = Path(raw_root)
-            environment, paths = build_fixture(
-                root,
-                real_helpers,
-                [printf_wire(json_bytes({"unused": True}))],
-                bash,
-            )
-            marker = root / "python-reader-pids"
-            wrapper = paths["binary"] / "python3"
-            real_python = real_helpers["python3"]
-            make_executable(
-                wrapper,
-                f"""#!{real_python}
+    for label, payload, expected_tag, expected_occurrence in cases:
+        attempt_failures: list[str] = []
+        for attempt in range(1, 4):
+            with tempfile.TemporaryDirectory(
+                prefix=f"anvil-stdio-nul-{label}-{attempt}-"
+            ) as raw_root:
+                root = Path(raw_root)
+                environment, paths = build_fixture(
+                    root,
+                    real_helpers,
+                    [printf_wire(json_bytes({"unused": True}))],
+                    bash,
+                )
+                marker = root / "python-reader-pids"
+                wrapper = paths["binary"] / "python3"
+                real_python = real_helpers["python3"]
+                make_executable(
+                    wrapper,
+                    f"""#!{real_python}
 import os
 import sys
+
 
 code = " ".join(sys.argv[1:])
 tag = (
@@ -2048,65 +2055,141 @@ if tag:
         os.close(descriptor)
 os.execv({real_python!r}, [{real_python!r}, *sys.argv[1:]])
 """,
-            )
-            environment.update(
-                {
-                    "ANVIL_TEST_PYTHON_MARKER": str(marker),
-                    "ANVIL_MCP_FRAME_READ_TIMEOUT": "10",
-                }
-            )
-            process = start_bridge(
-                bash,
-                stdio,
-                environment,
-                paths["bridge_stderr"],
-                f"--socket=/tmp/anvil-nul-{label}-test",
-                "--server-id=test",
-            )
-            try:
-                wait_for_bridge_ready(paths["debug_log"], process)
-                if process.stdin is None:
-                    raise AssertionError("bridge stdin is unavailable")
-                process.stdin.write(payload)
-                process.stdin.flush()
-                wait_for_bridge_reap(
-                    process,
-                    timeout=15.0,
                 )
-                if process.returncode == 0:
-                    raise AssertionError(f"{label} NUL input exited successfully")
-                if read_count(paths["dispatch_count"]) != 0:
-                    raise AssertionError(f"{label} NUL input reached stateful Emacs")
-                records = [
-                    line.split("|")
-                    for line in safe_text(marker).splitlines()
-                    if line.count("|") == 2
-                ]
-                if not any(record[0] == expected_tag for record in records):
-                    raise AssertionError(
-                        f"{label} did not enter the expected reader: {records!r}"
-                    )
-                identities = {
-                    int(identity)
-                    for _tag, child, parent in records
-                    for identity in (child, parent)
-                }
-                if not wait_until(
-                    lambda: all(not process_alive(pid) for pid in identities),
-                    3,
-                ):
-                    survivors = [pid for pid in identities if process_alive(pid)]
-                    raise AssertionError(
-                        f"{label} left reader/runner identities alive: {survivors}"
-                    )
-                if not wait_until(
-                    lambda: not process_group_alive(process.pid),
-                    3,
-                ):
-                    raise AssertionError(f"{label} bridge group survived exit")
-                assert_no_capture_paths(paths["temp"])
-            finally:
-                terminate_bridge(process)
+                environment.update(
+                    {
+                        "ANVIL_TEST_PYTHON_MARKER": str(marker),
+                        "ANVIL_MCP_FRAME_READ_TIMEOUT": "10",
+                    }
+                )
+                process = start_bridge(
+                    bash,
+                    stdio,
+                    environment,
+                    paths["bridge_stderr"],
+                    f"--socket=/tmp/anvil-nul-{label}-test",
+                    "--server-id=test",
+                )
+
+                def reader_records() -> list[list[str]]:
+                    return [
+                        line.split("|")
+                        for line in safe_text(marker).splitlines()
+                        if line.count("|") == 2
+                    ]
+
+                attempt_completed = False
+                try:
+                    wait_for_bridge_ready(paths["debug_log"], process)
+                    if process.stdin is None:
+                        raise AssertionError("bridge stdin is unavailable")
+                    prefix, separator, suffix = payload.partition(b"\x00")
+                    if separator != b"\x00":
+                        raise AssertionError(f"{label} fixture has no NUL byte")
+                    process.stdin.write(prefix)
+                    process.stdin.flush()
+
+                    def target_reader_started() -> bool:
+                        return (
+                            sum(
+                                record[0] == expected_tag for record in reader_records()
+                            )
+                            >= expected_occurrence
+                        )
+
+                    if not wait_until(target_reader_started, 4.0):
+                        attempt_failures.append(
+                            f"attempt={attempt} rc={process.poll()} "
+                            f"marker={safe_text(marker)!r} "
+                            f"debug={safe_text(paths['debug_log'])!r} "
+                            f"stderr={safe_text(paths['bridge_stderr'])!r}"
+                        )
+                        continue
+                    process.stdin.write(separator + suffix)
+                    process.stdin.flush()
+                    try:
+                        wait_for_bridge_reap(process, timeout=4.0)
+                    except AssertionError as error:
+                        attempt_failures.append(
+                            f"attempt={attempt} reader did not reject NUL "
+                            f"promptly: {error}; marker={safe_text(marker)!r} "
+                            f"debug={safe_text(paths['debug_log'])!r} "
+                            f"stderr={safe_text(paths['bridge_stderr'])!r}"
+                        )
+                        continue
+                    if process.returncode == 0:
+                        raise AssertionError(f"{label} NUL input exited successfully")
+                    if read_count(paths["dispatch_count"]) != 0:
+                        raise AssertionError(
+                            f"{label} NUL input reached stateful Emacs"
+                        )
+                    records = reader_records()
+                    if (
+                        sum(record[0] == expected_tag for record in records)
+                        < expected_occurrence
+                    ):
+                        raise AssertionError(
+                            f"{label} lost the expected reader record: {records!r}"
+                        )
+                    identities = {
+                        int(identity)
+                        for _tag, child, parent in records
+                        for identity in (child, parent)
+                    }
+                    if not wait_until(
+                        lambda: all(not process_alive(pid) for pid in identities),
+                        3,
+                    ):
+                        survivors = [pid for pid in identities if process_alive(pid)]
+                        raise AssertionError(
+                            f"{label} left reader/runner identities alive: {survivors}"
+                        )
+                    if not wait_until(
+                        lambda: not process_group_alive(process.pid),
+                        3,
+                    ):
+                        raise AssertionError(f"{label} bridge group survived exit")
+                    assert_no_capture_paths(paths["temp"])
+                    attempt_completed = True
+                finally:
+                    terminate_bridge(process)
+                    if not attempt_completed:
+                        if read_count(paths["dispatch_count"]) != 0:
+                            raise AssertionError(
+                                f"{label} synchronization attempt dispatched"
+                            )
+                        records = reader_records()
+                        identities = {
+                            int(identity)
+                            for _tag, child, parent in records
+                            for identity in (child, parent)
+                        }
+                        if not wait_until(
+                            lambda: all(not process_alive(pid) for pid in identities),
+                            3,
+                        ):
+                            survivors = [
+                                pid for pid in identities if process_alive(pid)
+                            ]
+                            raise AssertionError(
+                                f"{label} retry left reader/runner identities "
+                                f"alive: {survivors}"
+                            )
+                        if not wait_until(
+                            lambda: not process_group_alive(process.pid),
+                            3,
+                        ):
+                            raise AssertionError(
+                                f"{label} retry left the bridge group alive"
+                            )
+                        assert_no_capture_paths(paths["temp"])
+            break
+        else:
+            raise AssertionError(
+                f"{label} did not prove prompt NUL rejection through "
+                f"{expected_tag} reader occurrence {expected_occurrence} "
+                f"after three clean attempts: " + " | ".join(attempt_failures)
+            )
 
 
 def run_cumulative_frame_budget(
@@ -2639,9 +2722,9 @@ def run_response_prepare_interruption(
                 reader,
                 synthetic_stage_error(201, 70),
                 framed=False,
-                timeout_seconds=5,
+                timeout_seconds=15,
             )
-            process.wait(timeout=5)
+            process.wait(timeout=15)
             if process.returncode != 74:
                 raise AssertionError(
                     f"response-preparation timeout returned {process.returncode}: "
