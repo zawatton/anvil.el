@@ -726,6 +726,123 @@
       (should (< (length (anvil-future-error future)) 256))
       (should-not (gethash id anvil-offload--pending)))))
 
+(ert-deftest anvil-offload-ownership-sentinel-preserves-actionable-junk-prefix ()
+  "Later backtrace junk must not overwrite the actionable startup failure."
+  (anvil-offload-ownership-test--with-state
+    (let* ((id 302)
+           (proc
+            (make-process
+             :name "anvil-ownership-dead-diagnostic-prefix"
+             :buffer nil
+             :command
+             (list shell-file-name shell-command-switch "cat >/dev/null")
+             :connection-type 'pipe
+             :noquery t
+             :filter #'anvil-offload--filter
+             :sentinel #'ignore))
+           (future
+            (anvil-offload-ownership-test--future
+             id proc :isolated-p t))
+           (deadline (+ (float-time) 3))
+           (first
+            (concat "Actionable startup failure: " (make-string 180 ?x)))
+           (last
+            (concat (make-string 180 ?y) " normal-top-level()"))
+           (first-preview (anvil-offload--line-preview first))
+           (last-preview (anvil-offload--line-preview last))
+           diagnostic)
+      (process-put proc 'anvil-offload-isolated t)
+      (anvil-offload--track-process-ownership
+       proc t anvil-offload--isolated-processes)
+      (puthash id future anvil-offload--pending)
+      (anvil-offload--filter proc (format "%s\n%s\n" first last))
+      (should
+       (equal first-preview
+              (process-get proc 'anvil-offload-first-junk-reply)))
+      (should
+       (equal last-preview
+              (process-get proc 'anvil-offload-last-junk-reply)))
+      (setq diagnostic (anvil-offload--junk-diagnostic proc))
+      (should (string-prefix-p "Actionable startup failure:" diagnostic))
+      (should (string-suffix-p "normal-top-level()" diagnostic))
+      (should (<= (length diagnostic)
+                  anvil-offload--junk-diagnostic-max-chars))
+      (should
+       (equal
+        (mapcar
+         (lambda (limit)
+           (anvil-offload--bounded-ends "abcdef" limit))
+         '(0 1 2 3))
+        '("" "." ".." "...")))
+      (should
+       (equal
+        (mapcar
+         (lambda (length)
+           (length
+            (anvil-offload--exit-reason
+             proc (make-string length ?b))))
+         '(249 250 251 252))
+        '(255 255 255 252)))
+      (set-process-sentinel proc #'anvil-offload--sentinel)
+      (process-send-eof proc)
+      (while (and (< (float-time) deadline)
+                  (eq 'pending (anvil-future-status future)))
+        (accept-process-output nil 0.02))
+      (should (eq 'error (anvil-future-status future)))
+      (should
+       (string-match-p
+        (regexp-quote "Actionable startup failure:")
+        (anvil-future-error future)))
+      (should
+       (string-match-p
+        (regexp-quote "normal-top-level()")
+        (anvil-future-error future)))
+      (should (<= (length (anvil-future-error future))
+                  anvil-offload--exit-reason-max-chars))
+      (should-not (gethash id anvil-offload--pending)))))
+
+(ert-deftest anvil-offload-ownership-sentinel-includes-late-final-filter-junk ()
+  "The deferred death finalizer samples junk after the last filter callback."
+  (anvil-offload-ownership-test--with-state
+    (let* ((delete-exited-processes nil)
+           (id 303)
+           (settle-count 0)
+           (proc
+            (make-process
+             :name "anvil-ownership-late-death-diagnostic"
+             :buffer nil
+             :command
+             (list shell-file-name shell-command-switch "exit 1")
+             :connection-type 'pipe
+             :noquery t
+             :filter #'anvil-offload--filter
+             :sentinel #'ignore))
+           (future
+            (anvil-offload-ownership-test--future
+             id proc :isolated-p t
+             :on-settle (lambda (_future) (cl-incf settle-count))))
+           (deadline (+ (float-time) 3))
+           (late "late actionable diagnostic"))
+      (process-put proc 'anvil-offload-isolated t)
+      (anvil-offload--track-process-ownership
+       proc t anvil-offload--isolated-processes)
+      (puthash id future anvil-offload--pending)
+      (while (and (process-live-p proc) (< (float-time) deadline))
+        (accept-process-output proc 0.02))
+      (should-not (process-live-p proc))
+      (anvil-offload--sentinel proc "exited abnormally with code 1\n")
+      (should (eq 'pending (anvil-future-status future)))
+      (anvil-offload--filter proc (concat late "\n"))
+      (while (and (< (float-time) deadline)
+                  (eq 'pending (anvil-future-status future)))
+        (accept-process-output nil 0.02))
+      (should (eq 'error (anvil-future-status future)))
+      (should (string-match-p
+               (regexp-quote late)
+               (anvil-future-error future)))
+      (should (= settle-count 1))
+      (should-not (gethash id anvil-offload--pending)))))
+
 (ert-deftest anvil-offload-ownership-hard-delete-forgets-dead-child ()
   "Hard delete must remove an already-exited exact child from Emacs."
   (anvil-offload-ownership-test--with-state

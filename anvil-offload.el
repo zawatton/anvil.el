@@ -445,9 +445,81 @@ deferred work active."
 (defun anvil-offload--line-preview (string)
   "Return a short, single-line preview of STRING for diagnostics."
   (let ((flat (replace-regexp-in-string "[\r\n]+" "\\n" string)))
-    (if (> (length flat) 120)
-        (concat (substring flat 0 117) "...")
-      flat)))
+    (anvil-offload--bounded-ends flat 120)))
+
+(defconst anvil-offload--junk-diagnostic-max-chars 192
+  "Maximum combined non-frame diagnostic characters retained per child.")
+
+(defconst anvil-offload--exit-reason-max-chars 255
+  "Maximum child-exit reason characters delivered to a future.")
+
+(defun anvil-offload--bounded-ends (string limit)
+  "Bound STRING to nonnegative LIMIT characters while retaining both ends."
+  (let ((limit (max 0 limit))
+        (separator "..."))
+    (cond
+     ((<= (length string) limit) string)
+     ((<= limit (length separator))
+      (substring separator 0 limit))
+     (t
+      (let* ((payload (- limit (length separator)))
+             (prefix-length (/ (+ payload 1) 2))
+             (suffix-length (- payload prefix-length)))
+        (concat
+         (substring string 0 prefix-length)
+         separator
+         (substring string (- (length string) suffix-length))))))))
+
+(defun anvil-offload--remember-junk-reply (proc line)
+  "Remember bounded first and last non-frame LINE diagnostics for PROC."
+  (let ((preview (anvil-offload--line-preview line)))
+    (unless
+        (funcall anvil-offload--process-get-primitive
+                 proc 'anvil-offload-first-junk-reply)
+      (funcall anvil-offload--process-put-primitive
+               proc 'anvil-offload-first-junk-reply preview))
+    (funcall anvil-offload--process-put-primitive
+             proc 'anvil-offload-last-junk-reply preview)
+    preview))
+
+(defun anvil-offload--junk-diagnostic (proc)
+  "Return PROC's bounded non-frame diagnostic prefix and suffix."
+  (let ((first
+         (funcall anvil-offload--process-get-primitive
+                  proc 'anvil-offload-first-junk-reply))
+        (last
+         (funcall anvil-offload--process-get-primitive
+                  proc 'anvil-offload-last-junk-reply)))
+    (cond
+     ((and (stringp first) (not (string-empty-p first))
+           (stringp last) (not (string-empty-p last))
+           (not (equal first last)))
+      (anvil-offload--bounded-ends
+       (format "%s ... %s" first last)
+       anvil-offload--junk-diagnostic-max-chars))
+     ((and (stringp first) (not (string-empty-p first))) first)
+     ((and (stringp last) (not (string-empty-p last))) last))))
+
+(defun anvil-offload--exit-reason (proc base-reason)
+  "Combine BASE-REASON with PROC's latest bounded non-frame diagnostics."
+  (condition-case nil
+      (if-let ((diagnostic (anvil-offload--junk-diagnostic proc)))
+          (let* ((prefix (format "%s (" base-reason))
+                 (available
+                  (max 0
+                       (- anvil-offload--exit-reason-max-chars
+                          (length prefix) 1))))
+            (if (= available 0)
+                (anvil-offload--bounded-ends
+                 base-reason anvil-offload--exit-reason-max-chars)
+              (format "%s%s)"
+                      prefix
+                      (anvil-offload--bounded-ends diagnostic available))))
+        (anvil-offload--bounded-ends
+         base-reason anvil-offload--exit-reason-max-chars))
+    ((error quit)
+     (anvil-offload--bounded-ends
+      base-reason anvil-offload--exit-reason-max-chars))))
 
 (defun anvil-offload--strip-ignored-junk-prefixes (string)
   "Drop known benign stdout prefixes from STRING in linear space."
@@ -1431,9 +1503,7 @@ ALLOWED-KEYS defaults to the top-level reply protocol keys."
             (cond
              ((string-blank-p line))
              ((null idx)
-              (let ((preview (anvil-offload--line-preview line)))
-                (funcall anvil-offload--process-put-primitive
-                         proc 'anvil-offload-last-junk-reply preview)
+              (let ((preview (anvil-offload--remember-junk-reply proc line)))
                 (unless
                     (funcall anvil-offload--process-get-primitive
                              proc 'anvil-junk-reply-logged)
@@ -1540,15 +1610,20 @@ global ownership for a later retry."
       (kill-buffer buffer))))
 
 (defun anvil-offload--finalize-dead-process-and-resources
-    (proc reason isolated buffer owned-buffer)
-  "Settle PROC futures, then release its exact process and buffer resources."
+    (proc base-reason isolated buffer owned-buffer)
+  "Settle PROC futures, then release its exact process and buffer resources.
+BASE-REASON excludes non-frame diagnostics, which are sampled only after the
+final filter callback has had an opportunity to run."
   (funcall anvil-offload--process-put-primitive
            proc 'anvil-offload-death-finalizer-active t)
   (unwind-protect
-      (unwind-protect
-          (anvil-offload--finalize-dead-process proc reason)
-        (anvil-offload--release-dead-process-resources
-         proc isolated buffer owned-buffer))
+      (let ((reason (anvil-offload--exit-reason proc base-reason)))
+        (funcall anvil-offload--process-put-primitive
+                 proc 'anvil-offload-death-reason reason)
+        (unwind-protect
+            (anvil-offload--finalize-dead-process proc reason)
+          (anvil-offload--release-dead-process-resources
+           proc isolated buffer owned-buffer)))
     (funcall anvil-offload--process-put-primitive
              proc 'anvil-offload-death-finalizer-active nil)))
 
@@ -1586,12 +1661,6 @@ be settled.  EVENT describes the process status."
                   (format "offload REPL exited: %s" (string-trim event))
                   buffer
                   (funcall anvil-offload--process-buffer-primitive proc))
-            (when-let ((diagnostic
-                        (funcall anvil-offload--process-get-primitive
-                                 proc 'anvil-offload-last-junk-reply)))
-              (when (and (stringp diagnostic)
-                         (not (string-empty-p diagnostic)))
-                (setq reason (format "%s (%s)" reason diagnostic))))
             (setq isolated
                   (eq
                    t
@@ -1638,7 +1707,7 @@ be settled.  EVENT describes the process status."
                   (when reason
                     (condition-case nil
                         (anvil-offload--terminalize-dead-process-silently
-                         proc reason)
+                         proc (anvil-offload--exit-reason proc reason))
                       ((error quit) nil)))
                 (anvil-offload--release-dead-process-resources
                  proc isolated buffer owned-buffer))
