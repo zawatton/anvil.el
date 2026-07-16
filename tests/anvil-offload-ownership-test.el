@@ -685,6 +685,47 @@
       (should (anvil-offload--hard-delete-process result))
       (should-not (process-live-p result)))))
 
+(ert-deftest anvil-offload-ownership-sentinel-retains-bounded-junk-diagnostic ()
+  "A dead child reports its last bounded startup line to the owning future."
+  (anvil-offload-ownership-test--with-state
+    (let* ((id 301)
+           (proc
+            (make-process
+             :name "anvil-ownership-dead-diagnostic"
+             :buffer nil
+             :command
+             (list shell-file-name shell-command-switch "cat >/dev/null")
+             :connection-type 'pipe
+             :noquery t
+             :filter #'anvil-offload--filter
+             :sentinel #'ignore))
+           (future
+            (anvil-offload-ownership-test--future
+             id proc :isolated-p t))
+           (deadline (+ (float-time) 3))
+           diagnostic)
+      (process-put proc 'anvil-offload-isolated t)
+      (anvil-offload--track-process-ownership
+       proc t anvil-offload--isolated-processes)
+      (puthash id future anvil-offload--pending)
+      (anvil-offload--filter
+       proc (concat "startup failure: " (make-string 300 ?x) "\n"))
+      (setq diagnostic
+            (process-get proc 'anvil-offload-last-junk-reply))
+      (should (string-prefix-p "startup failure:" diagnostic))
+      (should (<= (length diagnostic) 120))
+      (set-process-sentinel proc #'anvil-offload--sentinel)
+      (process-send-eof proc)
+      (while (and (< (float-time) deadline)
+                  (eq 'pending (anvil-future-status future)))
+        (accept-process-output nil 0.02))
+      (should (eq 'error (anvil-future-status future)))
+      (should (string-match-p
+               (regexp-quote diagnostic)
+               (anvil-future-error future)))
+      (should (< (length (anvil-future-error future)) 256))
+      (should-not (gethash id anvil-offload--pending)))))
+
 (ert-deftest anvil-offload-ownership-hard-delete-forgets-dead-child ()
   "Hard delete must remove an already-exited exact child from Emacs."
   (anvil-offload-ownership-test--with-state

@@ -1431,13 +1431,16 @@ ALLOWED-KEYS defaults to the top-level reply protocol keys."
             (cond
              ((string-blank-p line))
              ((null idx)
-              (unless
-                  (funcall anvil-offload--process-get-primitive
-                           proc 'anvil-junk-reply-logged)
+              (let ((preview (anvil-offload--line-preview line)))
                 (funcall anvil-offload--process-put-primitive
-                         proc 'anvil-junk-reply-logged t)
-                (message "anvil-offload: dropped junk reply line: %S"
-                         (anvil-offload--line-preview line))))
+                         proc 'anvil-offload-last-junk-reply preview)
+                (unless
+                    (funcall anvil-offload--process-get-primitive
+                             proc 'anvil-junk-reply-logged)
+                  (funcall anvil-offload--process-put-primitive
+                           proc 'anvil-junk-reply-logged t)
+                  (message "anvil-offload: dropped junk reply line: %S"
+                           preview))))
              (t
               ;; The queue offset was committed before decoding and dispatch.
               ;; A callback may service or append later frames recursively
@@ -1583,6 +1586,12 @@ be settled.  EVENT describes the process status."
                   (format "offload REPL exited: %s" (string-trim event))
                   buffer
                   (funcall anvil-offload--process-buffer-primitive proc))
+            (when-let ((diagnostic
+                        (funcall anvil-offload--process-get-primitive
+                                 proc 'anvil-offload-last-junk-reply)))
+              (when (and (stringp diagnostic)
+                         (not (string-empty-p diagnostic)))
+                (setq reason (format "%s (%s)" reason diagnostic))))
             (setq isolated
                   (eq
                    t
