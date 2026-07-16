@@ -664,6 +664,24 @@ deadlock on Windows (2026-04-16) that could not be broken with
   (should (eq 'emacsclient
               (default-value 'anvil-worker-connection-method))))
 
+(ert-deftest anvil-worker-test-dispatch-emacsclient-omits-sentinel-text ()
+  "The internal client sentinel must not contaminate the worker reply."
+  (anvil-worker-test--with-fresh-latency
+    (let ((real-start-process (symbol-function 'start-process)))
+      (cl-letf (((symbol-function 'start-process)
+                 (lambda (name buffer _program &rest _arguments)
+                   (funcall real-start-process
+                            name buffer shell-file-name shell-command-switch
+                            "printf '42\\n'"))))
+        (let ((worker (list :lane :read
+                            :name "anvil-worker-read-1"
+                            :server-file "/unused")))
+          (should
+           (equal
+            "42"
+            (anvil-worker--dispatch-via-emacsclient
+             worker "(+ 20 22)" 5))))))))
+
 (ert-deftest anvil-worker-test-dispatch-server-eval-at-roundtrips-value ()
   "`--dispatch-via-server-eval-at' returns prin1 of the server's result."
   (anvil-worker-test--with-fresh-latency

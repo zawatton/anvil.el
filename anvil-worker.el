@@ -1176,6 +1176,9 @@ Records per-call latency into `anvil-worker--metrics-latency'."
                                 (list "-e" expression)))))
       (setq t1 (float-time))
       (set-process-query-on-exit-flag proc nil)
+      ;; The default sentinel appends lifecycle text to BUF, corrupting the
+      ;; printed worker result after a successful client exit.
+      (set-process-sentinel proc #'ignore)
       (while (and (process-live-p proc)
                   (< (- (float-time) t1) timeout))
         (accept-process-output proc 0.1))
