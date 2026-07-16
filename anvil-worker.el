@@ -74,6 +74,14 @@ expressions to `:write')."
   :type 'integer
   :group 'anvil-worker)
 
+(defcustom anvil-worker-eager-spawn t
+  "Whether `anvil-worker-enable' should pre-spawn every worker.
+When nil, each lane starts its first worker on demand and health
+checks ignore workers that have never been requested.  Explicit
+`anvil-worker-spawn' and pool reset commands remain eager."
+  :type 'boolean
+  :group 'anvil-worker)
+
 (defcustom anvil-worker-batch-warmup-expressions
   '("(require 'org)"
     "(require 'cl-lib)"
@@ -443,7 +451,7 @@ how often the classifier hits each bucket vs. falls back."
 Each worker plist carries:
   :lane LANE   :index INT     :name STRING
   :server-file PATH
-  :busy  BOOLEAN
+  :busy BOOLEAN   :demanded BOOLEAN
   :last-state alive|dead|nil")
 
 (defvar anvil-worker--health-timer nil
@@ -553,15 +561,20 @@ Resets the per-lane dispatch indices."
     (let* ((size (anvil-worker--lane-size lane))
            (vec  (make-vector size nil)))
       (dotimes (i size)
-        (aset vec i
-              (list :lane lane
-                    :index i
-                    :name (anvil-worker--name lane i)
-                    :server-file (anvil-worker--server-file lane i)
-                    :busy nil
-                    :hung-checks 0
-                    :hung-unowned-logged nil
-                    :last-state nil)))
+        (let ((name (anvil-worker--name lane i)))
+          (aset vec i
+                (list :lane lane
+                      :index i
+                      :name name
+                      :server-file (anvil-worker--server-file lane i)
+                      :busy nil
+                      :demanded
+                      (and (or (gethash name anvil-worker--spawn-times)
+                               (gethash name anvil-worker--owned-processes))
+                           t)
+                      :hung-checks 0
+                      :hung-unowned-logged nil
+                      :last-state nil))))
       (setq anvil-worker--pool
             (plist-put anvil-worker--pool lane vec))))
   (setq anvil-worker--dispatch-index (list :read 0 :write 0 :batch 0)))
@@ -857,6 +870,7 @@ while four Emacs daemons are starting up."
           (step  0.5))
       (anvil-worker--map-pool
        (lambda (worker)
+         (plist-put worker :demanded t)
          (run-at-time delay nil #'anvil-worker--spawn-worker worker)
          (setq delay (+ delay step)))))
     (message "Anvil worker pool: spawned (read=%d write=%d batch=%d)"
@@ -997,6 +1011,17 @@ busy-but-alive worker when every lane member is occupied."
                      (not (plist-get worker :busy))
                      (anvil-worker--worker-alive-p worker))
             (setq chosen worker))))
+      ;; Recover or grow an idle slot before reusing an already-busy worker.
+      ;; The liveness pass above proved every candidate considered here dead;
+      ;; demanded peers need immediate recovery just as unused peers need their
+      ;; first spawn.
+      (unless chosen
+        (dotimes (off size)
+          (let* ((idx (% (+ start off) size))
+                 (worker (aref vec idx)))
+            (when (and (not chosen)
+                       (not (plist-get worker :busy)))
+              (setq chosen (anvil-worker--demand-worker worker))))))
       ;; Fallback: any alive worker (even busy).
       (unless chosen
         (dotimes (off size)
@@ -1006,22 +1031,26 @@ busy-but-alive worker when every lane member is occupied."
                        (anvil-worker--worker-alive-p worker))
               (setq chosen worker)))))
       (when chosen
+        (plist-put chosen :demanded t)
         (setq anvil-worker--dispatch-index
               (plist-put anvil-worker--dispatch-index lane
                          (% (1+ (plist-get chosen :index)) size)))))
     chosen))
 
+(defun anvil-worker--demand-worker (worker)
+  "Mark WORKER demanded, spawn it, and return it once reachable."
+  (when worker
+    (plist-put worker :demanded t)
+    (anvil-worker--spawn-worker worker)
+    (let ((deadline (+ (float-time) anvil-worker-spawn-wait)))
+      (while (and (not (anvil-worker--worker-alive-p worker))
+                  (< (float-time) deadline))
+        (sit-for 0.1)))
+    (and (anvil-worker--worker-alive-p worker) worker)))
+
 (defun anvil-worker--pick-fallback-in-lane (lane)
-  "Spawn the first worker in LANE and wait up to `anvil-worker-spawn-wait'.
-Returns the worker plist if it came alive, else nil."
-  (let ((worker (anvil-worker--worker lane 0)))
-    (when worker
-      (anvil-worker--spawn-worker worker)
-      (let ((deadline (+ (float-time) anvil-worker-spawn-wait)))
-        (while (and (not (anvil-worker--worker-alive-p worker))
-                    (< (float-time) deadline))
-          (sit-for 0.1)))
-      (and (anvil-worker--worker-alive-p worker) worker))))
+  "Demand the first worker in LANE, returning it once reachable."
+  (anvil-worker--demand-worker (anvil-worker--worker lane 0)))
 
 (defun anvil-worker--pick-worker (&optional kind expression)
   "Pick a worker for a tool call.
@@ -1213,56 +1242,58 @@ comparison visible in `anvil-worker-latency-metrics-show'."
 ;;; Health check
 
 (defun anvil-worker--health-check-one (worker)
-  "Inspect WORKER and recover dead or repeatedly unresponsive workers."
-  (let* ((alive (anvil-worker--worker-alive-p worker))
-         (quick-alive
-          (and (not alive) (anvil-worker--quick-alive-p worker)))
-         (last (plist-get worker :last-state))
-         (name (plist-get worker :name))
-         (lane (anvil-worker--lane-name (plist-get worker :lane))))
-    (cond
-     ;; A dispatched worker may legitimately keep its event loop busy longer
-     ;; than the probe timeout.  Dispatch owns its timeout and cleanup.
-     ((and (not alive) quick-alive (plist-get worker :busy))
-      (plist-put worker :hung-checks 0)
-      (plist-put worker :hung-unowned-logged nil))
-     ;; A connectable socket plus repeated failed eval probes means the worker
-     ;; event loop is wedged.  Kill only an exact process object still owned by
-     ;; this Emacs; an inherited/unowned worker is never signalled by PID guess.
-     ((and (not alive) quick-alive)
-      (let ((checks (1+ (or (plist-get worker :hung-checks) 0))))
-        (plist-put worker :hung-checks checks)
-        (unless (eq last 'dead)
-          (anvil-worker--log
-           'unresponsive
-           (format "%s lane=%s probe=%d/%d"
-                   name lane checks anvil-worker-hung-check-limit))
-          (plist-put worker :last-state 'dead))
-        (when (>= checks (max 1 anvil-worker-hung-check-limit))
-          ;; Do not unlink a connectable socket or spawn in the same tick.
-          ;; The next dead tick verifies the socket is stale before replacing.
-          (anvil-worker--terminate-owned-hung-worker worker))))
-     (t
-      (plist-put worker :hung-checks 0)
-      (plist-put worker :hung-unowned-logged nil)
+  "Inspect demanded WORKER and recover it when dead or unresponsive.
+Never-demanded lazy workers are not probed or spawned."
+  (when (plist-get worker :demanded)
+    (let* ((alive (anvil-worker--worker-alive-p worker))
+           (quick-alive
+            (and (not alive) (anvil-worker--quick-alive-p worker)))
+           (last (plist-get worker :last-state))
+           (name (plist-get worker :name))
+           (lane (anvil-worker--lane-name (plist-get worker :lane))))
       (cond
-       ((null last)
-        (plist-put worker :last-state (if alive 'alive 'dead))
-        (unless alive
+       ;; A dispatched worker may legitimately keep its event loop busy longer
+       ;; than the probe timeout.  Dispatch owns its timeout and cleanup.
+       ((and (not alive) quick-alive (plist-get worker :busy))
+        (plist-put worker :hung-checks 0)
+        (plist-put worker :hung-unowned-logged nil))
+       ;; A connectable socket plus repeated failed eval probes means the worker
+       ;; event loop is wedged.  Kill only an exact process object still owned by
+       ;; this Emacs; an inherited/unowned worker is never signalled by PID guess.
+       ((and (not alive) quick-alive)
+        (let ((checks (1+ (or (plist-get worker :hung-checks) 0))))
+          (plist-put worker :hung-checks checks)
+          (unless (eq last 'dead)
+            (anvil-worker--log
+             'unresponsive
+             (format "%s lane=%s probe=%d/%d"
+                     name lane checks anvil-worker-hung-check-limit))
+            (plist-put worker :last-state 'dead))
+          (when (>= checks (max 1 anvil-worker-hung-check-limit))
+            ;; Do not unlink a connectable socket or spawn in the same tick.
+            ;; The next dead tick verifies the socket is stale before replacing.
+            (anvil-worker--terminate-owned-hung-worker worker))))
+       (t
+        (plist-put worker :hung-checks 0)
+        (plist-put worker :hung-unowned-logged nil)
+        (cond
+         ((null last)
+          (plist-put worker :last-state (if alive 'alive 'dead))
+          (unless alive
+            (anvil-worker--log
+             'startup-dead
+             (format "%s lane=%s respawning" name lane))
+            (anvil-worker--spawn-worker worker)))
+         ((and (eq last 'alive) (not alive))
           (anvil-worker--log
-           'startup-dead
-           (format "%s lane=%s respawning" name lane))
-          (anvil-worker--spawn-worker worker)))
-       ((and (eq last 'alive) (not alive))
-        (anvil-worker--log
-         'death (format "%s lane=%s respawning" name lane))
-        (plist-put worker :last-state 'dead)
-        (anvil-worker--spawn-worker worker))
-       ((and (eq last 'dead) alive)
-        (anvil-worker--log 'recovered (format "%s lane=%s" name lane))
-        (plist-put worker :last-state 'alive))
-       ((and (eq last 'dead) (not alive))
-        (anvil-worker--spawn-worker worker)))))))
+           'death (format "%s lane=%s respawning" name lane))
+          (plist-put worker :last-state 'dead)
+          (anvil-worker--spawn-worker worker))
+         ((and (eq last 'dead) alive)
+          (anvil-worker--log 'recovered (format "%s lane=%s" name lane))
+          (plist-put worker :last-state 'alive))
+         ((and (eq last 'dead) (not alive))
+          (anvil-worker--spawn-worker worker))))))))
 
 (defun anvil-worker--health-check ()
   "Sweep every lane and respawn dead workers.  Logs only transitions."
@@ -1375,10 +1406,10 @@ Does NOT drop metrics (classify / latency) — use the UI
      anvil-worker-batch-pool-size)))
 
 (defun anvil-worker-enable ()
-  "Initialise every lane, defer spawn, start health monitoring.
-The actual `start-process' calls are deferred to a 1-second timer
-so the module-load phase of `anvil-enable' returns instantly and
-the human never sees the editor freeze."
+  "Initialise every lane and start health monitoring.
+When `anvil-worker-eager-spawn' is non-nil, defer all worker
+spawns to a 1-second timer so module loading remains responsive.
+Otherwise each lane starts only when first dispatched."
   (anvil-worker--init-pool)
   ;; Load the Phase 5 metrics UI so `M-x anvil-worker-metrics' is
   ;; discoverable without a separate `(require 'anvil-ide-worker-ui)'.
@@ -1401,9 +1432,10 @@ the human never sees the editor freeze."
    :layer 'dev
    :description "Kill all workers and respawn fresh daemons (recovers stuck pool)"
    :server-id anvil-worker--server-id)
-  ;; Defer the heavy work (start-process × N) so it does not block
-  ;; the synchronous module-load phase of `anvil-enable'.
-  (run-at-time 1 nil #'anvil-worker-spawn)
+  ;; Defer eager startup so it does not block the synchronous module-load
+  ;; phase.  Lazy sessions keep all lanes cold until their first dispatch.
+  (when anvil-worker-eager-spawn
+    (run-at-time 1 nil #'anvil-worker-spawn))
   (anvil-worker-health-timer-start))
 
 (defun anvil-worker-disable ()
