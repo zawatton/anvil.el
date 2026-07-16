@@ -123,7 +123,8 @@ anvil_mcp_capture_finish() {
 # of adopting a reparent/subreaper.  NUL is forbidden in helper output.
 anvil_mcp_exec_program() {
 	if [ -n "$ANVIL_MCP_PARENT_GUARD" ]; then
-		ANVIL_HEADLESS_PARENT_PID="$ANVIL_MCP_RUNNER_PID" exec \
+		ANVIL_HEADLESS_BRIDGE_PID="$bridge_pid" \
+			ANVIL_HEADLESS_PARENT_PID="$ANVIL_MCP_RUNNER_PID" exec \
 			"$ANVIL_MCP_PARENT_GUARD_PYTHON" -I -S \
 			"$ANVIL_MCP_PARENT_GUARD" group "$@"
 	else
@@ -168,15 +169,59 @@ anvil_mcp_exec_child() {
 	esac
 }
 
+anvil_mcp_job_is_running() {
+	local target="$1" job_pid
+	while IFS= read -r job_pid; do
+		[ "$job_pid" = "$target" ] && return 0
+	done < <(jobs -pr)
+	return 1
+}
+
+anvil_mcp_finish_runner() {
+	local status="$1" before
+	runner_published=1
+	while :; do
+		before=$signal_epoch
+		if printf '\0%s\n' "$status"; then
+			break
+		fi
+		[ "$signal_epoch" -ne "$before" ] || return 0
+	done
+	# Keep this exact process-substitution runner alive until the parent closes
+	# descriptor 7 or performs explicit convergence.  During retirement, close
+	# stdout only after exact child wait/reap and group cleanup; kernel EOF then
+	# authenticates that no child or runner writer remains.  Hold the original
+	# PID until the parent performs its final KILL, so PID reuse is impossible.
+	while :; do
+		if [ "$retirement_requested" -ne 0 ]; then
+			exec 1>&-
+			# The parent normally KILLs this exact held PID immediately.  If the
+			# bridge itself dies first, leave the hold without waiting forever.
+			while kill -0 "$bridge_pid" 2>/dev/null; do :; done
+			return 0
+		fi
+		before=$signal_epoch
+		if printf '\0%65536s' '' 2>/dev/null; then
+			continue
+		fi
+		[ "$signal_epoch" -ne "$before" ] || break
+	done
+}
+
 anvil_mcp_run_child() {
-	local guard_deadline="$1" stderr_mode="$2" input_mode="$3" input="$4"
-	local child="" rc=70 runner_pid="" timed_out=0 term_sent=0 kill_sent=0
-	shift 4
+	local bridge_pid="$1" guard_deadline="$2" stderr_mode="$3" input_mode="$4" input="$5"
+	local child="" rc=70 runner_pid="" timed_out=0 term_sent=0 kill_sent=0 before=0
+	local signal_epoch=0 runner_acked=0 runner_ack_published=0 runner_published=0
+	local retirement_requested=0
+	shift 5
 
 	# A guarded launch keeps its Python loader in the bridge group until the
 	# loaded guard validates the exact runner and moves the target.  Timeout
 	# signals cover the pre-group PID and post-group PGID.
 	trap '
+		retirement_requested=1
+		signal_epoch=$((signal_epoch + 1))
+		runner_acked=1
 		if [ "$term_sent" -eq 0 ]; then
 			term_sent=1
 			timed_out=1
@@ -187,6 +232,9 @@ anvil_mcp_run_child() {
 		fi
 	' TERM
 	trap '
+		retirement_requested=1
+		signal_epoch=$((signal_epoch + 1))
+		runner_acked=1
 		if [ "$kill_sent" -eq 0 ]; then
 			kill_sent=1
 			timed_out=1
@@ -196,6 +244,57 @@ anvil_mcp_run_child() {
 			fi
 		fi
 	' USR1
+	trap '
+		signal_epoch=$((signal_epoch + 1))
+		runner_acked=1
+	' USR2
+	trap '
+		if [ "$runner_ack_published" -eq 1 ] \
+			&& [ "$runner_published" -eq 0 ]; then
+			if [ -n "$child" ]; then
+				kill -KILL -- "-$child" 2>/dev/null \
+					|| kill -KILL "$child" 2>/dev/null || :
+				wait "$child" 2>/dev/null || :
+				child=
+			fi
+			anvil_mcp_finish_runner 70
+		fi
+	' EXIT
+	if ! printf '%s\n' "ANVIL-MCP-RUNNER-READY"; then
+		trap - EXIT TERM USR1 USR2
+		return
+	fi
+	# READY alone never authorizes a child launch.  Hold this exact writer until
+	# the parent publishes its identity and acknowledges it with USR2.  If the
+	# parent's timed READY read loses at the boundary, closing FD7 makes this
+	# filler fail with EPIPE and the runner exits before spawning anything.
+	while [ "$runner_acked" -eq 0 ]; do
+		before=$signal_epoch
+		if printf '%65536s' '' 2>/dev/null; then
+			continue
+		fi
+		[ "$runner_acked" -ne 0 ] && break
+		if [ "$signal_epoch" -eq "$before" ]; then
+			trap - EXIT TERM USR1 USR2
+			return
+		fi
+	done
+	while :; do
+		before=$signal_epoch
+		if printf '\n%s\n' "ANVIL-MCP-RUNNER-ACK"; then
+			runner_ack_published=1
+			break
+		fi
+		if [ "$signal_epoch" -eq "$before" ]; then
+			trap - EXIT TERM USR1 USR2
+			return
+		fi
+	done
+	if [ "$timed_out" -ne 0 ]; then
+		anvil_mcp_finish_runner 124
+		trap - EXIT TERM USR1 USR2
+		return
+	fi
 
 	if [ -n "$ANVIL_MCP_PARENT_GUARD" ]; then
 		[ "$guard_deadline" -le 5 ] || guard_deadline=5
@@ -205,16 +304,18 @@ anvil_mcp_run_child() {
 		if ! IFS= read -r -t "$guard_deadline" runner_pid <&4; then
 			exec 4<&-
 			kill -KILL "$child" 2>/dev/null || :
-			trap - TERM USR1
-			printf '\0%s\n' 124
+			child=
+			anvil_mcp_finish_runner 124
+			trap - EXIT TERM USR1 USR2
 			return
 		fi
 		exec 4<&-
 		case "$runner_pid" in
 		""|*[!0-9]*|0|1)
 			kill -KILL "$child" 2>/dev/null || :
-			trap - TERM USR1
-			printf '\0%s\n' 70
+			child=
+			anvil_mcp_finish_runner 70
+			trap - EXIT TERM USR1 USR2
 			return
 			;;
 		esac
@@ -226,34 +327,70 @@ anvil_mcp_run_child() {
 
 	anvil_mcp_exec_child "$stderr_mode" "$input_mode" "$input" "$@" &
 	child=$!
+	# Signals may arrive after ACK but before the exact child PID is assigned.
+	# Reconcile the strongest recorded intent before entering wait so USR1 can
+	# never be downgraded to TERM for a newly published process group.
+	if [ "$kill_sent" -ne 0 ]; then
+		kill -KILL -- "-$child" 2>/dev/null \
+			|| kill -KILL "$child" 2>/dev/null || :
+	elif [ "$term_sent" -ne 0 ]; then
+		kill -TERM -- "-$child" 2>/dev/null \
+			|| kill -TERM "$child" 2>/dev/null || :
+	fi
 	while :; do
-		if wait "$child"; then rc=0; else rc=$?; fi
-		kill -0 "$child" 2>/dev/null || break
+		if wait "$child"; then
+			rc=0
+			break
+		else
+			rc=$?
+		fi
+		# wait can return early when a runner signal trap fires.  Repeat
+		# only while Bash still owns the exact job; kill -0 is insufficient
+		# because the reaped PID may already identify an unrelated process.
+		anvil_mcp_job_is_running "$child" || break
 	done
-	trap - TERM USR1
+	# Clear trap-visible custody only after wait has reaped the exact child.
+	# Retain its group identity long enough to kill daemonized descendants.
+	local child_group="$child"
+	child=
 	# A leader that daemonized must not leave same-group descendants holding
 	# the result pipe open after the direct child exits.
-	kill -KILL -- "-$child" 2>/dev/null || :
+	kill -KILL -- "-$child_group" 2>/dev/null || :
 	[ "$timed_out" -eq 0 ] || rc=124
-	printf '\0%s\n' "$rc"
+	anvil_mcp_finish_runner "$rc"
+	trap - EXIT TERM USR1 USR2
 }
 
-# Converge the exact bounded runner while descriptor 7 remains open.
-# The runner's TERM/USR1 handlers retire both the direct child and its group.
+# Drain one bounded retirement phase.  Bash 3.2 reports both EOF and timeout
+# as read rc=1, so callers never infer meaning from that status: authentic EOF
+# merely makes this loop return immediately, while timeout advances escalation.
+anvil_mcp_drain_runner_output() {
+	local grace="${ANVIL_EMACSCLIENT_KILL_AFTER_TIMEOUT:-1}"
+	local started_seconds=$SECONDS elapsed=0 remaining="$grace" ignored=
+	while [ "$remaining" -gt 0 ]; do
+		ignored=
+		IFS= read -r -d '' -n 65536 -t "$remaining" ignored <&7 || break
+		elapsed=$((SECONDS - started_seconds))
+		remaining=$((grace - elapsed))
+		# SECONDS is whole-second on Bash 3.2.  Preserve one second for the
+		# unknown fractional remainder after crossing a wall-clock boundary.
+		[ "$elapsed" -eq 0 ] || remaining=$((remaining + 1))
+	done
+}
+
+# Converge the exact bounded runner while descriptor 7 remains open.  Never
+# trust child-controlled output as a retirement marker: TERM requests orderly
+# child/group retirement, USR1 forces it, and only then is the held PID killed.
 anvil_mcp_converge_runner() {
 	local runner="$1"
-	local grace="${ANVIL_EMACSCLIENT_KILL_AFTER_TIMEOUT:-1}"
 	case "$runner" in
 	""|*[!0-9]*) return 0 ;;
 	esac
-	if kill -0 "$runner" 2>/dev/null; then
-		kill -TERM "$runner" 2>/dev/null || :
-		if ! IFS= read -r -d '' -t "$grace" _ <&7; then
-			kill -USR1 "$runner" 2>/dev/null || :
-			IFS= read -r -d '' -t "$grace" _ <&7 || :
-		fi
-		kill -KILL "$runner" 2>/dev/null || :
-	fi
+	kill -TERM "$runner" 2>/dev/null || :
+	anvil_mcp_drain_runner_output
+	kill -USR1 "$runner" 2>/dev/null || :
+	anvil_mcp_drain_runner_output
+	kill -KILL "$runner" 2>/dev/null || :
 }
 
 # Results are returned in ANVIL_MCP_RUN_OUTPUT / STATUS.  A missing sentinel
@@ -261,28 +398,109 @@ anvil_mcp_converge_runner() {
 # the still-published runner is converged before the function returns.
 anvil_mcp_run_bounded() {
 	local deadline="$1" stderr_mode="$2" input_mode="$3" input="$4"
-	local runner status="" completed=0
+	local runner status="" runner_ready=""
+	local runner_ack="" ack_filler="" ack_error=0 ack_attempted=0 ack_sent=0
+	local started_seconds=$SECONDS elapsed remaining
 	shift 4
 	ANVIL_MCP_RUN_OUTPUT=""
 	ANVIL_MCP_RUN_STATUS=70
+	anvil_mcp_finish_pending_termination
 
 	ANVIL_MCP_RUNNER_STARTING=1
 	exec 7< <(anvil_mcp_run_child \
-		"$deadline" "$stderr_mode" "$input_mode" "$input" "$@")
+		"$$" "$deadline" "$stderr_mode" "$input_mode" "$input" "$@")
 	runner=$!
+	anvil_mcp_finish_bounded_termination "$runner" 0
+	if ! IFS= read -r -t "$deadline" runner_ready <&7 \
+		|| [ "$runner_ready" != "ANVIL-MCP-RUNNER-READY" ]; then
+		anvil_mcp_finish_bounded_termination "$runner" 0
+		ANVIL_MCP_RUN_STATUS=124
+		ANVIL_MCP_RUNNER_STARTING=0
+		ANVIL_MCP_ACTIVE_RUNNER=
+		# Without the ACK the runner is still a held writer and has launched no
+		# child.  Closing the reader retires it without a numeric-PID signal.
+		exec 7<&-
+		anvil_mcp_finish_pending_termination
+		return 0
+	fi
+	anvil_mcp_finish_bounded_termination "$runner" 0
+
+	# Publish after READY installed every custody trap, but acknowledge only
+	# after the exact numeric identity is visible to bridge signal handlers.
 	ANVIL_MCP_ACTIVE_RUNNER=$runner
 	ANVIL_MCP_RUNNER_STARTING=0
-	if [ -n "$ANVIL_MCP_PENDING_TERMINATION_STATUS" ]; then
-		status=$ANVIL_MCP_PENDING_TERMINATION_STATUS
-		ANVIL_MCP_PENDING_TERMINATION_STATUS=
-		anvil_mcp_terminate "$status"
+	anvil_mcp_finish_bounded_termination "$runner" 0
+	# Bash 3.2 exposes only whole-second SECONDS.  Once it advances, retain
+	# one second for the unknown fractional remainder instead of timing out
+	# immediately after a wall-second boundary.
+	elapsed=$((SECONDS - started_seconds))
+	remaining=$((deadline - elapsed))
+	[ "$elapsed" -eq 0 ] || remaining=$((remaining + 1))
+	if [ "$remaining" -le 0 ]; then
+		ack_error=124
+	else
+		anvil_mcp_finish_bounded_termination "$runner" 0
+		ANVIL_MCP_RUNNER_CRITICAL=1
+		if [ -z "$ANVIL_MCP_PENDING_TERMINATION_STATUS" ] \
+			&& [ "$ANVIL_MCP_ACTIVE_RUNNER" = "$runner" ]; then
+			# Once the USR2 syscall may run, launch is conservatively possible
+			# even if a bridge signal makes the compound command report failure.
+			ack_attempted=1
+			if kill -USR2 "$ANVIL_MCP_ACTIVE_RUNNER" 2>/dev/null; then
+				ack_sent=1
+			else
+				ack_error=70
+			fi
+		else
+			ack_error=70
+		fi
+		ANVIL_MCP_RUNNER_CRITICAL=0
+		anvil_mcp_finish_bounded_termination "$runner" "$ack_attempted"
+		if [ "$ack_sent" -eq 1 ]; then
+			if ! IFS= read -r -t "$remaining" ack_filler <&7; then
+				ack_error=124
+			else
+				anvil_mcp_finish_bounded_termination "$runner" 1
+				elapsed=$((SECONDS - started_seconds))
+				remaining=$((deadline - elapsed))
+				[ "$elapsed" -eq 0 ] || remaining=$((remaining + 1))
+				if [ "$remaining" -le 0 ] \
+					|| ! IFS= read -r -t "$remaining" runner_ack <&7; then
+					ack_error=124
+				elif [ "$runner_ack" != "ANVIL-MCP-RUNNER-ACK" ]; then
+					ack_error=70
+				fi
+				anvil_mcp_finish_bounded_termination "$runner" 1
+			fi
+		fi
 	fi
-	if IFS= read -r -d '' -t "$deadline" ANVIL_MCP_RUN_OUTPUT <&7; then
+	anvil_mcp_finish_bounded_termination "$runner" "$ack_attempted"
+	ack_filler=
+	runner_ack=
+	if [ "$ack_error" -ne 0 ]; then
+		ANVIL_MCP_RUN_STATUS=$ack_error
+		# An attempted ACK may have crossed the child-launch boundary; converge
+		# the still-held exact runner before withdrawing its public identity.
+		ANVIL_MCP_ACTIVE_RUNNER=
+		[ "$ack_attempted" -eq 0 ] \
+			|| [ "$runner" = "$ANVIL_MCP_RETIRED_RUNNER" ] \
+			|| anvil_mcp_converge_runner "$runner"
+		exec 7<&-
+		anvil_mcp_finish_pending_termination
+		return 0
+	fi
+
+	# ACK is the child-launch authorization point.  Give the command its full
+	# execution deadline instead of charging READY/ACK setup against it.
+	anvil_mcp_finish_bounded_termination "$runner" 1
+	remaining=$deadline
+	if [ "$remaining" -gt 0 ] \
+		&& IFS= read -r -d '' -t "$remaining" ANVIL_MCP_RUN_OUTPUT <&7; then
+		anvil_mcp_finish_bounded_termination "$runner" 1
 		if IFS= read -r -t "$ANVIL_EMACSCLIENT_KILL_AFTER_TIMEOUT" status <&7 \
 			&& [[ "$status" =~ ^[0-9]+$ ]] \
 			&& [ "$status" -le 255 ]; then
 			ANVIL_MCP_RUN_STATUS=$status
-			completed=1
 		else
 			ANVIL_MCP_RUN_OUTPUT=""
 			ANVIL_MCP_RUN_STATUS=70
@@ -291,45 +509,143 @@ anvil_mcp_run_bounded() {
 		ANVIL_MCP_RUN_OUTPUT=""
 		ANVIL_MCP_RUN_STATUS=124
 	fi
-	if [ "$completed" -eq 0 ]; then
-		anvil_mcp_converge_runner "$runner"
-	fi
-	exec 7<&-
+	anvil_mcp_finish_bounded_termination "$runner" 1
+	# Retire synchronously before PID reuse.  Child bytes—including a forged
+	# NUL/status record—can never suppress the unconditional escalation.
 	ANVIL_MCP_ACTIVE_RUNNER=
+	[ "$runner" = "$ANVIL_MCP_RETIRED_RUNNER" ] \
+		|| anvil_mcp_converge_runner "$runner"
+	# Clear the public numeric identity before closing its reader so no later
+	# bridge signal can target the retired PID.
+	exec 7<&-
+	anvil_mcp_finish_pending_termination
 }
 
-# A supervisor normally signals only the advertised bridge PID.  Forward that
-# termination to the currently bounded runner; its own TERM trap retires the
-# exact helper and process group.  Exiting then runs staged-request custody
-# cleanup before the bridge disappears.
+# A signal handler must never spawn a new runner: Bash 3.2 contaminates
+# process substitutions created while a fatal-signal trap is still active.
+# Record the first requested status and finish from the next normal-control
+# checkpoint, where bounded staging cleanup is safe again.
 ANVIL_MCP_ACTIVE_RUNNER=
 ANVIL_MCP_RUNNER_STARTING=0
 ANVIL_MCP_PENDING_TERMINATION_STATUS=
+ANVIL_MCP_RETIRED_RUNNER=
+ANVIL_MCP_RUNNER_CRITICAL=0
+ANVIL_MCP_FINALIZING=0
+ANVIL_MCP_CLEANUP_READY=0
+ANVIL_MCP_CLEANUP_ACTIVE=0
+ANVIL_MCP_CLEANUP_DONE=0
 anvil_mcp_terminate() {
-	local requested_status="$1" runner="${ANVIL_MCP_ACTIVE_RUNNER:-}"
-	local status="${ANVIL_MCP_PENDING_TERMINATION_STATUS:-$requested_status}"
+	local runner="${ANVIL_MCP_ACTIVE_RUNNER:-}"
+	[ "$ANVIL_MCP_FINALIZING" -eq 0 ] || return 0
+	[ -n "$ANVIL_MCP_PENDING_TERMINATION_STATUS" ] \
+		|| ANVIL_MCP_PENDING_TERMINATION_STATUS=$1
+	trap ':' HUP INT TERM
+	[ "$ANVIL_MCP_CLEANUP_ACTIVE" -eq 0 ] || return 0
+	exec 0<&- 2>/dev/null || :
+	if [ "$ANVIL_MCP_RUNNER_CRITICAL" -eq 1 ]; then
+		# Withdraw publication, but let the owning normal-control transaction
+		# decide whether USR2 crossed the launch boundary before convergence.
+		ANVIL_MCP_ACTIVE_RUNNER=
+		ANVIL_MCP_RUNNER_STARTING=0
+		return 0
+	fi
 	case "$runner" in
 	""|*[!0-9]*)
 		if [ "$ANVIL_MCP_RUNNER_STARTING" -eq 1 ]; then
-			[ -n "$ANVIL_MCP_PENDING_TERMINATION_STATUS" ] \
-				|| ANVIL_MCP_PENDING_TERMINATION_STATUS=$requested_status
-			return 0
+			ANVIL_MCP_RUNNER_STARTING=0
+			exec 7<&- 2>/dev/null || :
 		fi
 		;;
 	*)
+		# Withdraw the identity before callbacks or reads can reenter.  This
+		# handler may retire an existing runner, but never launches cleanup.
 		ANVIL_MCP_ACTIVE_RUNNER=
 		ANVIL_MCP_RUNNER_STARTING=0
-		ANVIL_MCP_PENDING_TERMINATION_STATUS=
-		# Repeated signals must not interrupt child/staging convergence.  Caught
-		# no-op dispositions reset to defaults in external cleanup children.
-		trap ':' HUP INT TERM
+		ANVIL_MCP_RETIRED_RUNNER=$runner
 		anvil_mcp_converge_runner "$runner"
-		exit "$status"
+		exec 7<&- 2>/dev/null || :
 		;;
 	esac
+	return 0
+}
+
+anvil_mcp_finish_pending_termination() {
+	local status
+	[ -n "$ANVIL_MCP_PENDING_TERMINATION_STATUS" ] || return 0
+	[ "$ANVIL_MCP_CLEANUP_ACTIVE" -eq 0 ] || return 0
+	status=$ANVIL_MCP_PENDING_TERMINATION_STATUS
 	ANVIL_MCP_PENDING_TERMINATION_STATUS=
+	ANVIL_MCP_RETIRED_RUNNER=
+	ANVIL_MCP_FINALIZING=1
 	trap ':' HUP INT TERM
+	anvil_mcp_cleanup_once || :
+	# This is the sole final cleanup transaction.  Do not let EXIT repeat its
+	# two bounded attempts after a failure and multiply termination latency.
+	trap - EXIT
 	exit "$status"
+}
+
+anvil_mcp_finish_bounded_termination() {
+	local runner="$1" launch_authorized="${2:-0}"
+	[ -n "$ANVIL_MCP_PENDING_TERMINATION_STATUS" ] || return 0
+	[ "$ANVIL_MCP_CLEANUP_ACTIVE" -eq 0 ] || return 0
+	ANVIL_MCP_ACTIVE_RUNNER=
+	ANVIL_MCP_RUNNER_STARTING=0
+	if [ "$launch_authorized" -eq 1 ] \
+		&& [ "$runner" != "$ANVIL_MCP_RETIRED_RUNNER" ]; then
+		anvil_mcp_converge_runner "$runner"
+	fi
+	exec 7<&- 2>/dev/null || :
+	anvil_mcp_finish_pending_termination
+}
+
+anvil_mcp_cleanup_once() {
+	local attempt=0 cleanup_rc=70
+	[ "$ANVIL_MCP_CLEANUP_READY" -eq 1 ] || return 0
+	[ "$ANVIL_MCP_CLEANUP_DONE" -eq 0 ] || return 0
+	[ "$ANVIL_MCP_CLEANUP_ACTIVE" -eq 0 ] || return 0
+	if [ -z "$ANVIL_MCP_TRANSACTION_DIRECTORY" ] \
+		&& [ ! -e "$ANVIL_MCP_REQUEST_DIRECTORY" ]; then
+		ANVIL_MCP_CLEANUP_DONE=1
+		return 0
+	fi
+	ANVIL_MCP_CLEANUP_ACTIVE=1
+	while [ "$attempt" -lt 2 ]; do
+		attempt=$((attempt + 1))
+		set +e
+		anvil_mcp_cleanup_all_staged
+		cleanup_rc=$?
+		set -e
+		if [ "$cleanup_rc" -eq 0 ] \
+			&& { [ -z "$ANVIL_MCP_TRANSACTION_DIRECTORY" ] \
+				|| [ ! -e "$ANVIL_MCP_TRANSACTION_DIRECTORY" ]; } \
+			&& [ ! -e "$ANVIL_MCP_REQUEST_DIRECTORY" ]; then
+			ANVIL_MCP_CLEANUP_DONE=1
+			break
+		fi
+		[ "$cleanup_rc" -ne 0 ] || cleanup_rc=74
+	done
+	ANVIL_MCP_CLEANUP_ACTIVE=0
+	if [ "$ANVIL_MCP_CLEANUP_DONE" -eq 0 ]; then
+		printf 'anvil-mcp: staged cleanup failed after %s attempts (rc=%s)\n' \
+			"$attempt" "$cleanup_rc" >&2
+		return "$cleanup_rc"
+	fi
+	return 0
+}
+
+anvil_mcp_exit_cleanup() {
+	local original_status=$? status
+	ANVIL_MCP_FINALIZING=1
+	trap ':' HUP INT TERM
+	anvil_mcp_cleanup_once || :
+	if [ -n "$ANVIL_MCP_PENDING_TERMINATION_STATUS" ]; then
+		status=$ANVIL_MCP_PENDING_TERMINATION_STATUS
+		ANVIL_MCP_PENDING_TERMINATION_STATUS=
+		trap - EXIT
+		exit "$status"
+	fi
+	return "$original_status"
 }
 trap 'anvil_mcp_terminate 129' HUP
 trap 'anvil_mcp_terminate 130' INT
@@ -756,6 +1072,7 @@ if [ -n "$INIT_FUNCTION" ]; then
 else
 	mcp_debug_log "INFO" "Skipping init function call (none provided)"
 fi
+anvil_mcp_finish_pending_termination
 
 # --- T71: MCP Content-Length framing read helpers --------------------
 # The standard MCP stdio transport frames messages as:
@@ -911,11 +1228,13 @@ anvil_mcp_emit_framed_response() {
 anvil_mcp_emit_response() {
 	local framed="$1"
 	local body="$2"
+	anvil_mcp_finish_pending_termination
 	if [ "$framed" = "1" ]; then
 		anvil_mcp_emit_framed_response "$body"
 	else
 		printf '%s\n' "$body"
 	fi
+	anvil_mcp_finish_pending_termination
 	ANVIL_MCP_RESPONSE_PENDING=0
 }
 
@@ -958,8 +1277,10 @@ print("anvil-response-fd-authenticated")
 ' "$expected_device" "$expected_inode"
 	status=$ANVIL_MCP_RUN_STATUS
 	exec 5<&-
-	[ "$status" -eq 0 ] \
-		&& [ "$ANVIL_MCP_RUN_OUTPUT" = "anvil-response-fd-authenticated"$'\n' ]
+	[ "$status" -eq 0 ] || return "$status"
+	[ "$ANVIL_MCP_RUN_OUTPUT" = "anvil-response-fd-authenticated"$'\n' ] \
+		|| return 70
+	return 0
 }
 
 # Validate the two published names without ever opening either for response
@@ -1041,6 +1362,7 @@ anvil_mcp_read_staged_response() {
 # bridge EXIT; never mutate a callback-reachable pathname after dispatch.
 anvil_mcp_emit_staged_response() {
 	local framed="$1" request_kind="$2"
+	anvil_mcp_finish_pending_termination
 	case "$request_kind" in
 	notification)
 		[ "$ANVIL_MCP_STAGED_RESPONSE_BYTES" -eq 0 ] || return 65
@@ -1057,6 +1379,7 @@ anvil_mcp_emit_staged_response() {
 		;;
 	*) return 65 ;;
 	esac
+	anvil_mcp_finish_pending_termination
 	ANVIL_MCP_STAGED_RESPONSE=
 	ANVIL_MCP_STAGED_RESPONSE_BYTES=0
 	ANVIL_MCP_RESPONSE_PENDING=0
@@ -1484,7 +1807,7 @@ except BaseException:
 
 anvil_mcp_cleanup_all_staged() {
 	local directory="${ANVIL_MCP_TRANSACTION_DIRECTORY:-$ANVIL_MCP_REQUEST_DIRECTORY}"
-	anvil_mcp_run_bounded "$ANVIL_EMACSCLIENT_KILL_AFTER_TIMEOUT" \
+	anvil_mcp_run_bounded "$ANVIL_MCP_REQUEST_PARSE_TIMEOUT" \
 		merge null "" "$ANVIL_MCP_PYTHON" -I -S -c '
 import errno
 import os
@@ -1552,7 +1875,8 @@ while True:
 	return "$ANVIL_MCP_RUN_STATUS"
 }
 
-trap '[ -z "$ANVIL_MCP_TRANSACTION_DIRECTORY" ] && [ ! -e "$ANVIL_MCP_REQUEST_DIRECTORY" ] || anvil_mcp_cleanup_all_staged || :' EXIT
+trap 'anvil_mcp_exit_cleanup' EXIT
+ANVIL_MCP_CLEANUP_READY=1
 
 # Emit a correlated at-most-once error.  Notifications remain silent;
 # malformed input receives a protocol error with id null.
@@ -1613,10 +1937,13 @@ anvil_mcp_synthetic_error() {
 # but one absolute request deadline starts as soon as the first byte arrives.
 mcp_debug_log "READY" "stdio request loop"
 while :; do
+	anvil_mcp_finish_pending_termination
 	_anvil_first_byte=""
 	if ! LC_ALL=C IFS= read -r -d '' -n 1 _anvil_first_byte; then
+		anvil_mcp_finish_pending_termination
 		break
 	fi
+	anvil_mcp_finish_pending_termination
 	_anvil_frame_deadline=$((SECONDS + ANVIL_MCP_FRAME_READ_TIMEOUT))
 	if [ -z "$_anvil_first_byte" ]; then
 		mcp_debug_log "FRAMING-ERROR" "phase=first-byte byte=nul"
@@ -1790,6 +2117,16 @@ while :; do
 	_anvil_response_record=${_anvil_response_record%$'\n'}
 	_anvil_response_record=${_anvil_response_record%$'\r'}
 	set -e
+	# A helper failure is already authoritative.  Do not parse partial output
+	# or replace its status with a local record-validation error.
+	if [ "$_anvil_response_prepare_rc" -ne 0 ]; then
+		exec 6<&- 2>/dev/null || :
+		anvil_mcp_capture_finish
+		anvil_mcp_synthetic_error \
+			"$_anvil_request_kind" "$_anvil_request_id" \
+			"$_anvil_framed" stage false "$_anvil_response_prepare_rc"
+		exit 74
+	fi
 	_anvil_response_payload=${_anvil_response_record%%$'\t'*}
 	_anvil_response_rest=${_anvil_response_record#*$'\t'}
 	_anvil_response_stage_path=${_anvil_response_rest%%$'\t'*}
@@ -1842,19 +2179,25 @@ while :; do
 	if [ "$_anvil_response_prepare_rc" -eq 0 ]; then
 		if ! exec 6<"$_anvil_response_stage_path"; then
 			_anvil_response_prepare_rc=74
-		elif ! anvil_mcp_validate_response_fd \
-			"$_anvil_response_device" "$_anvil_response_inode"; then
-			exec 6<&-
-			_anvil_response_prepare_rc=74
 		else
+			set +e
+			anvil_mcp_validate_response_fd \
+				"$_anvil_response_device" "$_anvil_response_inode"
+			_anvil_response_fd_rc=$?
+			set -e
+			if [ "$_anvil_response_fd_rc" -ne 0 ]; then
+				exec 6<&-
+				_anvil_response_prepare_rc=$_anvil_response_fd_rc
+			else
 			case "${OSTYPE-}" in
 			linux*) ANVIL_MCP_FD_PATH_IDENTITY=1 ;;
 			*) ANVIL_MCP_FD_PATH_IDENTITY=0 ;;
 			esac
-			if [ "$ANVIL_MCP_FD_PATH_IDENTITY" -eq 1 ] \
-				&& ! [[ "$_anvil_response_stage_path" -ef /dev/fd/6 ]]; then
-				exec 6<&-
-				_anvil_response_prepare_rc=74
+				if [ "$ANVIL_MCP_FD_PATH_IDENTITY" -eq 1 ] \
+					&& ! [[ "$_anvil_response_stage_path" -ef /dev/fd/6 ]]; then
+					exec 6<&-
+					_anvil_response_prepare_rc=74
+				fi
 			fi
 		fi
 	fi
@@ -2022,6 +2365,7 @@ done
 
 # Stop MCP if stop function is provided.  As with init, readiness may
 # retry but the potentially stateful stop expression is invoked at most once.
+anvil_mcp_finish_pending_termination
 if [ -n "$STOP_FUNCTION" ]; then
 	mcp_debug_log "INFO" "Stopping MCP with function: $STOP_FUNCTION"
 	mcp_debug_log "STOP-CALL" "readiness probe, then one emacsclient -e ($STOP_FUNCTION)"
@@ -2080,3 +2424,4 @@ if [ -n "$STOP_FUNCTION" ]; then
 else
 	mcp_debug_log "INFO" "Skipping stop function call (none provided)"
 fi
+anvil_mcp_finish_pending_termination

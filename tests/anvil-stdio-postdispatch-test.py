@@ -369,6 +369,16 @@ except ValueError:
 if script_index > 0 and script_index < len(arguments):
     script = arguments[script_index]
     if (
+        "info = os.fstat(0)" in script
+        and "anvil-response-fd-authenticated" in script
+        and os.environ.get("FAKE_RESPONSE_VALIDATE_MODE") == "status-124"
+    ):
+        marker = os.environ["FAKE_RESPONSE_VALIDATE_MARKER"]
+        with open(marker, "w", encoding="ascii") as stream:
+            stream.write(str(os.getpid()))
+        print("malformed-fd-auth")
+        raise SystemExit(124)
+    if (
         'pieces[0] == "response"' in script
         and "response staging interrupted" in script
     ):
@@ -511,13 +521,15 @@ def kill_live_target(target):
         pass
 
 
-def watch_processes(root, target):
+def watch_processes(root, target, bridge):
     if sys.platform.startswith("linux"):
         root_fd = os.pidfd_open(root, 0)
         target_fd = os.pidfd_open(target, 0)
+        bridge_fd = os.pidfd_open(bridge, 0)
         poller = select.poll()
         poller.register(root_fd, select.POLLIN)
         poller.register(target_fd, select.POLLIN)
+        poller.register(bridge_fd, select.POLLIN)
         while True:
             events = poller.poll()
             if any(fd == target_fd for fd, _event in events):
@@ -527,6 +539,9 @@ def watch_processes(root, target):
                     pass
                 return
             if any(fd == root_fd for fd, _event in events):
+                kill_live_target(target)
+                return
+            if any(fd == bridge_fd for fd, _event in events):
                 kill_live_target(target)
                 return
     if sys.platform == "darwin":
@@ -545,10 +560,16 @@ def watch_processes(root, target):
                 flags=flags,
                 fflags=select.KQ_NOTE_EXIT,
             ),
+            select.kevent(
+                bridge,
+                filter=select.KQ_FILTER_PROC,
+                flags=flags,
+                fflags=select.KQ_NOTE_EXIT,
+            ),
         ]
         queue.control(changes, 0, 0)
         while True:
-            events = queue.control(None, 2, None)
+            events = queue.control(None, 3, None)
             if any(event.ident == target for event in events):
                 try:
                     os.killpg(target, signal.SIGKILL)
@@ -558,16 +579,26 @@ def watch_processes(root, target):
             if any(event.ident == root for event in events):
                 kill_live_target(target)
                 return
+            if any(event.ident == bridge for event in events):
+                kill_live_target(target)
+                return
     raise RuntimeError(f"unsupported platform: {sys.platform}")
 
 
 if len(sys.argv) < 3 or sys.argv[1] != "group":
     raise SystemExit(70)
 raw_parent = os.environ.pop("ANVIL_HEADLESS_PARENT_PID", "")
-if not raw_parent.isascii() or not raw_parent.isdecimal():
+raw_bridge = os.environ.pop("ANVIL_HEADLESS_BRIDGE_PID", "")
+if (
+    not raw_parent.isascii()
+    or not raw_parent.isdecimal()
+    or not raw_bridge.isascii()
+    or not raw_bridge.isdecimal()
+):
     raise SystemExit(70)
 root_pid = int(raw_parent)
-if root_pid <= 1 or os.getppid() != root_pid:
+bridge_pid = int(raw_bridge)
+if root_pid <= 1 or bridge_pid <= 1 or os.getppid() != root_pid:
     raise SystemExit(70)
 
 target_pid = os.getpid()
@@ -584,7 +615,7 @@ if guard_pid == 0:
             os.close(null_fd)
         os.write(ready_write, b"R")
         os.close(ready_write)
-        watch_processes(root_pid, target_pid)
+        watch_processes(root_pid, target_pid, bridge_pid)
         os._exit(0)
     except BaseException:
         kill_live_target(target_pid)
@@ -1216,7 +1247,12 @@ def wait_for_dispatch_complete(
         if process.poll() is not None:
             raise AssertionError("bridge exited before dispatch completed")
         time.sleep(0.02)
-    raise AssertionError(f"stateful dispatch exceeded {timeout:.1f}s")
+    root = marker.parent
+    raise AssertionError(
+        f"stateful dispatch exceeded {timeout:.1f}s: "
+        f"debug={safe_text(root / 'stdio.log')} "
+        f"stderr={safe_text(root / 'bridge.stderr')}"
+    )
 
 
 def assert_no_capture_paths(temp_dir: Path) -> None:
@@ -1684,11 +1720,12 @@ def run_owner_death_case(
     parent_guard_python: str | None,
     *,
     guarded: bool,
+    pid_only: bool = False,
 ) -> None:
-    """Contrast the historical helper leak with guarded owner cleanup."""
+    """Contrast historical leaks with guarded bridge-owner cleanup."""
     if os.name != "posix":
         return
-    label = "guarded" if guarded else "unguarded"
+    label = "guarded-pid" if pid_only else ("guarded" if guarded else "unguarded")
     with tempfile.TemporaryDirectory(prefix=f"anvil-stdio-owner-{label}-") as raw_root:
         root = Path(raw_root)
         environment, paths = build_fixture(
@@ -1734,6 +1771,7 @@ def run_owner_death_case(
         )
         child_pid: int | None = None
         child_group: int | None = None
+        runner_pid: int | None = None
         try:
             wait_for_bridge_ready(paths["debug_log"], process)
             if not wait_until(
@@ -1749,7 +1787,17 @@ def run_owner_death_case(
             marker = json.loads(child_marker.read_text(encoding="utf-8"))
             assert_no_stage_fd_inheritance(marker, f"{label} client")
             child_pid = int(marker["pid"])
+            runner_pid = int(marker["parent"])
             child_group = os.getpgid(child_pid)
+            if (
+                runner_pid in (process.pid, child_pid)
+                or not process_alive(runner_pid)
+                or os.getpgid(runner_pid) != process.pid
+            ):
+                raise AssertionError(
+                    f"{label} did not identify the live bounded runner: "
+                    f"bridge={process.pid} runner={runner_pid} child={child_pid}"
+                )
             if child_group != child_pid:
                 raise AssertionError(
                     f"{label} client is not its process-group leader: "
@@ -1758,7 +1806,10 @@ def run_owner_death_case(
             if read_count(child_count) != 1:
                 raise AssertionError(f"{label} request was not dispatched once")
 
-            os.killpg(process.pid, signal.SIGKILL)
+            if pid_only:
+                os.kill(process.pid, signal.SIGKILL)
+            else:
+                os.killpg(process.pid, signal.SIGKILL)
             wait_for_bridge_reap(process)
             if guarded:
                 if not wait_until(
@@ -1768,6 +1819,18 @@ def run_owner_death_case(
                     raise AssertionError(
                         "guarded client group survived bridge-owner death"
                     )
+                if pid_only and runner_pid is not None:
+                    if not wait_until(lambda: not process_alive(runner_pid), 5):
+                        raise AssertionError(
+                            "bounded runner survived bridge-PID-only death"
+                        )
+                    if not wait_until(
+                        lambda: not process_group_alive(process.pid),
+                        5,
+                    ):
+                        raise AssertionError(
+                            "bridge group survived bridge-PID-only death"
+                        )
             elif not process_group_alive(child_group):
                 raise AssertionError(
                     "negative control did not reproduce the orphaned client"
@@ -1785,6 +1848,11 @@ def run_owner_death_case(
                     3,
                 ):
                     raise AssertionError(f"{label} client group resisted test cleanup")
+            if runner_pid is not None and process_alive(runner_pid):
+                try:
+                    os.kill(runner_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             terminate_bridge(process)
 
 
@@ -2749,7 +2817,7 @@ def run_response_prepare_interruption(
             wait_for_bridge_ready(paths["debug_log"], process)
             read_reply(
                 reader,
-                synthetic_stage_error(201, 70),
+                synthetic_stage_error(201, 124),
                 framed=False,
                 timeout_seconds=15,
             )
@@ -2767,6 +2835,78 @@ def run_response_prepare_interruption(
                 raise AssertionError("interrupted response stage was orphaned")
             if not wait_until(lambda: not process_group_alive(process.pid), 2):
                 raise AssertionError("response-preparation helper survived timeout")
+        finally:
+            reader.close()
+            terminate_bridge(process)
+
+
+def run_response_fd_validation_status_preserved(
+    stdio: Path,
+    bash: str,
+    real_helpers: dict[str, str],
+) -> None:
+    """FD authentication retains a bounded helper's exact nonzero status."""
+    with tempfile.TemporaryDirectory(prefix="anvil-response-fd-status-") as raw:
+        root = Path(raw)
+        unused = {
+            "jsonrpc": "2.0",
+            "id": 202,
+            "result": "must-not-dispatch",
+        }
+        environment, paths = build_fixture(
+            root,
+            real_helpers,
+            [printf_wire(json_bytes(unused))],
+            bash,
+        )
+        validator_marker = root / "response-fd-validator"
+        write_response_prepare_pause_wrapper(
+            paths["binary"] / "python3",
+            real_helpers["python3"],
+        )
+        environment["FAKE_RESPONSE_VALIDATE_MODE"] = "status-124"
+        environment["FAKE_RESPONSE_VALIDATE_MARKER"] = str(validator_marker)
+        process = start_bridge(
+            bash,
+            stdio,
+            environment,
+            paths["bridge_stderr"],
+            "--socket=/tmp/anvil-response-fd-status",
+            "--server-id=test",
+        )
+        reader = BinaryReader(
+            process,
+            paths["debug_log"],
+            paths["bridge_stderr"],
+            paths["helper_marker"],
+            paths["dispatch_count"],
+        )
+        try:
+            wait_for_bridge_ready(paths["debug_log"], process)
+            send(
+                process,
+                {"jsonrpc": "2.0", "id": 202, "method": "test"},
+            )
+            read_reply(
+                reader,
+                synthetic_stage_error(202, 124),
+                framed=False,
+                timeout_seconds=10,
+            )
+            process.wait(timeout=10)
+            if process.returncode != 74:
+                raise AssertionError(
+                    f"response-FD validation returned {process.returncode}: "
+                    f"{reader.diagnostics()}"
+                )
+            if not validator_marker.is_file():
+                raise AssertionError("response-FD validator was not exercised")
+            if read_count(paths["dispatch_count"]) != 0:
+                raise AssertionError("response-FD validation failure reached dispatch")
+            if list(paths["temp"].glob("anvil-mcp.*")):
+                raise AssertionError("response-FD validation left staged artifacts")
+            if not wait_until(lambda: not process_group_alive(process.pid), 2):
+                raise AssertionError("response-FD validation helper survived exit")
         finally:
             reader.close()
             terminate_bridge(process)
@@ -2821,7 +2961,7 @@ def run_response_link_capability_failure(
             )
             read_reply(
                 reader,
-                synthetic_stage_error(203, 70),
+                synthetic_stage_error(203, 1),
                 framed=False,
                 timeout_seconds=5,
             )
@@ -3403,6 +3543,15 @@ def main() -> int:
         parent_guard_python,
         guarded=True,
     )
+    run_owner_death_case(
+        stdio,
+        bash,
+        real_helpers,
+        parent_guard,
+        parent_guard_python,
+        guarded=True,
+        pid_only=True,
+    )
     run_runner_death_recovery(
         stdio,
         bash,
@@ -3425,6 +3574,7 @@ def main() -> int:
             parent_guard_python,
         )
     run_response_prepare_interruption(stdio, bash, real_helpers)
+    run_response_fd_validation_status_preserved(stdio, bash, real_helpers)
     run_response_link_capability_failure(stdio, bash, real_helpers)
     run_competitor_inode_rejection(stdio, bash, real_helpers)
     run_request_symlink_retirement(stdio, bash, real_helpers)

@@ -33,7 +33,7 @@ def percent_wire(document: dict[str, object]) -> str:
 def read_count(path: Path) -> int:
     try:
         return int(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
+    except (FileNotFoundError, ValueError):
         return 0
 
 
@@ -239,6 +239,9 @@ if "anvil-server-process-jsonrpc" in expression:
             Path(os.environ["FAKE_RUNNER_PID"]).write_text(
                 str(os.getppid()), encoding="utf-8"
             )
+        if os.environ.get("FAKE_FORGED_RUNNER_RECORD") == "1":
+            sys.stdout.buffer.write(b"\0" + b"0\n")
+            sys.stdout.buffer.flush()
         while True:
             signal.pause()
     if os.environ.get("FAKE_EXIT_DESCENDANT") == "1":
@@ -347,13 +350,26 @@ def run_bridge_while_open(
             executor.shutdown(wait=True)
 
         if not first_line:
+            returncode = process.poll()
+            failure_stderr = (
+                process.stderr.read() if returncode is not None else ""
+            )
             raise AssertionError(
-                f"bridge exited before replying with rc={process.poll()}"
+                "bridge exited before replying with "
+                f"rc={returncode} stderr={failure_stderr!r}"
             )
         if not expect_exit_after_reply and process.poll() is not None:
+            failure_stderr = process.stderr.read()
+            debug_path = root / "debug.log"
+            failure_debug = (
+                debug_path.read_text(encoding="utf-8", errors="replace")
+                if debug_path.exists()
+                else ""
+            )
             raise AssertionError(
-                f"bridge did not remain available after one request: "
-                f"rc={process.returncode}"
+                "bridge did not remain available after one request: "
+                f"rc={process.returncode} stderr={failure_stderr!r} "
+                f"debug={failure_debug!r}"
             )
         if expect_exit_after_reply and process.poll() is None:
             try:
@@ -425,7 +441,9 @@ def run_bridge_while_open(
             state_generation = (
                 stage_generation(stages[0])
                 if unpublished
-                else generation(responses[0], "response") if published else None
+                else generation(responses[0], "response")
+                if published
+                else None
             )
             if published:
                 response_info = responses[0].lstat()
@@ -452,11 +470,15 @@ def run_bridge_while_open(
                     and stat.S_IMODE(info.st_mode) == 0o600
                 )
                 if generation(child, "request") is not None:
-                    child_ok = child_ok and info.st_nlink == 1 and info.st_size <= 16_777_216
+                    child_ok = (
+                        child_ok and info.st_nlink == 1 and info.st_size <= 16_777_216
+                    )
                 elif stage_generation(child) is not None:
                     child_ok = child_ok and info.st_nlink == 1 and info.st_size == 0
                 else:
-                    child_ok = child_ok and info.st_nlink == 2 and info.st_size <= 33_554_432
+                    child_ok = (
+                        child_ok and info.st_nlink == 2 and info.st_size <= 33_554_432
+                    )
                 transaction_ok = transaction_ok and child_ok
         if transaction_paths and not transaction_ok:
             debug_log = root / "debug.log"
@@ -502,9 +524,16 @@ def run_bridge_while_open(
         stdout = first_line + remainder
         expected_returncode = 74 if expect_exit_after_reply else 0
         if process.returncode != expected_returncode:
+            debug_path = root / "debug.log"
+            failure_debug = (
+                debug_path.read_text(encoding="utf-8", errors="replace")
+                if debug_path.exists()
+                else ""
+            )
             raise AssertionError(
                 f"bridge exited {process.returncode}, expected "
-                f"{expected_returncode}: stdout={stdout!r} stderr={stderr!r}"
+                f"{expected_returncode}: stdout={stdout!r} stderr={stderr!r} "
+                f"debug={failure_debug!r}"
             )
         remaining_transactions = list(root.glob("anvil-mcp.*"))
         if remaining_transactions:
@@ -535,6 +564,8 @@ def run_case(
     retry_delay_ms: int = 50,
     retry_max: int = 5,
     dispatch_timeout: int = 10,
+    request_parse_timeout: int = 10,
+    frame_read_timeout: int = 10,
     real_emacs_delay_sec: float = 0,
     large_request: bool = False,
     exit_descendant: bool = False,
@@ -599,8 +630,8 @@ def run_case(
                 "ANVIL_EMACSCLIENT_KILL_AFTER_TIMEOUT": "1",
                 "ANVIL_EMACSCLIENT_RETRY_MAX": str(retry_max),
                 "ANVIL_EMACSCLIENT_RETRY_DELAY_MS": str(retry_delay_ms),
-                "ANVIL_MCP_REQUEST_PARSE_TIMEOUT": "2",
-                "ANVIL_MCP_FRAME_READ_TIMEOUT": "10",
+                "ANVIL_MCP_REQUEST_PARSE_TIMEOUT": str(request_parse_timeout),
+                "ANVIL_MCP_FRAME_READ_TIMEOUT": str(frame_read_timeout),
             }
         )
         started = time.monotonic()
@@ -653,6 +684,114 @@ def run_case(
             diagnostics,
             guard,
         )
+
+
+def assert_reaped_pid_alias_does_not_extend_wait(
+    stdio: Path,
+    bash: str,
+    expected: dict[str, object],
+) -> None:
+    """Prove immediate PID reuse hangs the legacy loop but not the fixed one."""
+    with tempfile.TemporaryDirectory(prefix="anvil-stdio-reaped-pid-") as raw:
+        root = Path(raw)
+        alias_marker = root / "alias-observed"
+        for source in stdio.parent.glob("*.el"):
+            (root / source.name).symlink_to(source)
+        text = stdio.read_text(encoding="utf-8")
+        function_anchor = "anvil_mcp_job_is_running() {\n"
+        child_anchor = "\tchild=$!\n\t# Signals may arrive after ACK but before the exact child PID is assigned.\n"
+        fixed_wait = """\twhile :; do
+\t\tif wait "$child"; then
+\t\t\trc=0
+\t\t\tbreak
+\t\telse
+\t\t\trc=$?
+\t\tfi
+\t\t# wait can return early when a runner signal trap fires.  Repeat
+\t\t# only while Bash still owns the exact job; kill -0 is insufficient
+\t\t# because the reaped PID may already identify an unrelated process.
+\t\tanvil_mcp_job_is_running "$child" || break
+\tdone
+"""
+        legacy_wait = """\twhile :; do
+\t\tif wait "$child"; then rc=0; else rc=$?; fi
+\t\tkill -0 "$child" 2>/dev/null || break
+\tdone
+"""
+        if (
+            text.count(function_anchor) != 1
+            or text.count(child_anchor) != 1
+            or text.count(fixed_wait) != 1
+        ):
+            raise AssertionError("reaped-PID regression injection point drifted")
+        kill_override = """kill() {
+\tif [ "${1-}" = "-0" ] \\
+\t\t&& [ "${2-}" = "${ANVIL_TEST_REAPED_CHILD_PID:-}" ]; then
+\t\tprintf alias > %s
+\t\treturn 0
+\tfi
+\tbuiltin kill "$@"
+}
+
+""" % json.dumps(str(alias_marker))
+        text = text.replace(function_anchor, kill_override + function_anchor, 1)
+        text = text.replace(
+            child_anchor,
+            "\tchild=$!\n\tANVIL_TEST_REAPED_CHILD_PID=$child\n"
+            "\t# Signals may arrive after ACK but before the exact child PID is assigned.\n",
+            1,
+        )
+        fixed = root / "anvil-stdio-fixed.sh"
+        legacy = root / "anvil-stdio-legacy.sh"
+        fixed.write_text(text, encoding="utf-8")
+        legacy.write_text(text.replace(fixed_wait, legacy_wait, 1), encoding="utf-8")
+
+        legacy_failure = ""
+        try:
+            legacy_response, *_ = run_case(
+                legacy,
+                bash,
+                readiness_timeout=1,
+                probe_timeout=1,
+                dispatch_timeout=2,
+                frame_read_timeout=1,
+            )
+        except AssertionError as error:
+            legacy_failure = str(error)
+            if "bridge exited before replying with rc=65" not in legacy_failure:
+                raise
+        else:
+            if strict_equal(legacy_response, expected):
+                raise AssertionError(
+                    "legacy wait loop unexpectedly completed through the PID alias"
+                )
+        if not alias_marker.exists():
+            raise AssertionError(
+                "legacy wait loop never exercised the injected PID alias: "
+                f"failure={legacy_failure!r}"
+            )
+        alias_marker.unlink()
+
+        response, probes, dispatches, elapsed, diagnostics, _guard = run_case(
+            fixed,
+            bash,
+            readiness_timeout=15,
+            probe_timeout=5,
+            dispatch_timeout=15,
+            request_parse_timeout=10,
+        )
+        if (
+            alias_marker.exists()
+            or not strict_equal(response, expected)
+            or probes != 1
+            or dispatches != 1
+        ):
+            raise AssertionError(
+                "fixed wait loop retained the reaped-PID alias: "
+                f"marker={alias_marker.exists()} response={response!r} "
+                f"probes={probes} dispatches={dispatches} "
+                f"elapsed={elapsed:.3f} diagnostics={diagnostics!r}"
+            )
 
 
 def assert_readiness_error(response: dict[str, object], rc: int = 75) -> None:
@@ -783,17 +922,66 @@ def assert_signal_cleanup(
     bash: str,
     *,
     repeat: bool,
+    forged_record: bool = False,
+    cleanup_failure: bool = False,
+    owner_death_after_hold: bool = False,
 ) -> None:
     if os.name != "posix":
         return
 
-    label = "repeat" if repeat else "single"
+    if cleanup_failure:
+        label = "cleanup-failure"
+    elif owner_death_after_hold:
+        label = "owner-death-after-hold"
+    else:
+        label = "forged-record" if forged_record else ("repeat" if repeat else "single")
     with tempfile.TemporaryDirectory(prefix=f"anvil-stdio-signal-{label}-") as raw:
         root = Path(raw)
         binary = root / "bin"
         binary.mkdir()
         fake = binary / "emacsclient"
         write_fake_emacsclient(fake)
+        cleanup_attempt_path = root / "cleanup-attempts"
+        exit_cleanup_path = root / "exit-cleanup-entries"
+        bridge = stdio
+        if cleanup_failure:
+            bridge = root / "anvil-stdio-cleanup-failure.sh"
+            source = stdio.read_text(encoding="utf-8")
+            needle = "anvil_mcp_cleanup_all_staged() {\n"
+            injected = (
+                needle
+                + '\tif [ -n "${ANVIL_TEST_CLEANUP_FAILURE:-}" ]; then\n'
+                + "\t\tattempts=0\n"
+                + '\t\tif [ -f "$FAKE_CLEANUP_ATTEMPTS" ]; then\n'
+                + '\t\t\tIFS= read -r attempts < "$FAKE_CLEANUP_ATTEMPTS" || :\n'
+                + "\t\tfi\n"
+                + '\t\tprintf \'%s\\n\' "$((attempts + 1))" '
+                + '> "$FAKE_CLEANUP_ATTEMPTS"\n'
+                + "\t\treturn 74\n"
+                + "\tfi\n"
+            )
+            if source.count(needle) != 1:
+                raise AssertionError("cleanup failure injection point drifted")
+            source = source.replace(needle, injected, 1)
+            exit_needle = "anvil_mcp_exit_cleanup() {\n"
+            exit_injected = (
+                exit_needle
+                + '\tif [ -n "${ANVIL_TEST_CLEANUP_FAILURE:-}" ]; then\n'
+                + "\t\texit_entries=0\n"
+                + '\t\tif [ -f "$FAKE_EXIT_CLEANUP_ENTRIES" ]; then\n'
+                + '\t\t\tIFS= read -r exit_entries '
+                + '< "$FAKE_EXIT_CLEANUP_ENTRIES" || :\n'
+                + "\t\tfi\n"
+                + '\t\tprintf \'%s\\n\' "$((exit_entries + 1))" '
+                + '> "$FAKE_EXIT_CLEANUP_ENTRIES"\n'
+                + "\tfi\n"
+            )
+            if source.count(exit_needle) != 1:
+                raise AssertionError("EXIT cleanup injection point drifted")
+            make_executable(
+                bridge,
+                source.replace(exit_needle, exit_injected, 1),
+            )
         hang_pid_path = root / "hang-pid"
         descendant_pid_path = root / "descendant-pid"
         runner_pid_path = root / "runner-pid"
@@ -828,6 +1016,10 @@ def assert_signal_cleanup(
                 "FAKE_DISPATCH_ERROR": "0",
                 "FAKE_MALFORMED_OUTPUT": "0",
                 "FAKE_HANG_DISPATCH": "1",
+                "FAKE_FORGED_RUNNER_RECORD": "1" if forged_record else "0",
+                "FAKE_CLEANUP_ATTEMPTS": str(cleanup_attempt_path),
+                "FAKE_EXIT_CLEANUP_ENTRIES": str(exit_cleanup_path),
+                "ANVIL_TEST_CLEANUP_FAILURE": "1" if cleanup_failure else "",
                 "FAKE_IGNORE_TERM": "0",
                 "FAKE_TERM_COUNT": str(term_count_path),
                 "FAKE_HANG_PID": str(hang_pid_path),
@@ -844,14 +1036,14 @@ def assert_signal_cleanup(
                 "ANVIL_EMACSCLIENT_KILL_AFTER_TIMEOUT": "1",
                 "ANVIL_EMACSCLIENT_RETRY_MAX": "2",
                 "ANVIL_EMACSCLIENT_RETRY_DELAY_MS": "0",
-                "ANVIL_MCP_REQUEST_PARSE_TIMEOUT": "2",
+                "ANVIL_MCP_REQUEST_PARSE_TIMEOUT": "5",
                 "ANVIL_MCP_FRAME_READ_TIMEOUT": "2",
             }
         )
         process = subprocess.Popen(
             [
                 bash,
-                str(stdio),
+                str(bridge),
                 "--socket=/tmp/anvil-readiness-test",
                 "--server-id=anvil",
             ],
@@ -865,6 +1057,7 @@ def assert_signal_cleanup(
         fake_pid: int | None = None
         runner_pid: int | None = None
         descendant_pid: int | None = None
+        bridge_stopped = False
         try:
             if (
                 process.stdin is None
@@ -875,7 +1068,7 @@ def assert_signal_cleanup(
             process.stdin.write(json.dumps(request, separators=(",", ":")) + "\n")
             process.stdin.flush()
 
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + 10
             while time.monotonic() < deadline:
                 if process.poll() is not None:
                     break
@@ -886,25 +1079,50 @@ def assert_signal_cleanup(
                     and list(root.glob("anvil-mcp.*"))
                 ):
                     fake_pid = int(hang_pid_path.read_text(encoding="utf-8"))
-                    runner_pid = int(
-                        runner_pid_path.read_text(encoding="utf-8")
-                    )
+                    runner_pid = int(runner_pid_path.read_text(encoding="utf-8"))
                     descendant_pid = int(
                         descendant_pid_path.read_text(encoding="utf-8")
                     )
                     break
                 time.sleep(0.02)
-            if (
-                fake_pid is None
-                or runner_pid is None
-                or descendant_pid is None
-            ):
+            if fake_pid is None or runner_pid is None or descendant_pid is None:
+                returncode = process.poll()
+                failure_stderr = (
+                    process.stderr.read() if returncode is not None else ""
+                )
+                debug_path = root / "debug.log"
+                failure_debug = (
+                    debug_path.read_text(encoding="utf-8", errors="replace")
+                    if debug_path.exists()
+                    else ""
+                )
                 raise AssertionError(
                     "large request did not reach its staged hanging dispatch "
-                    "with a same-group descendant"
+                    "with a same-group descendant: "
+                    f"rc={returncode} stderr={failure_stderr!r} "
+                    f"debug={failure_debug!r}"
                 )
 
-            if repeat:
+            if forged_record:
+                retirement_deadline = time.monotonic() + 5
+                while time.monotonic() < retirement_deadline:
+                    if (
+                        not process_alive(fake_pid)
+                        and not process_alive(runner_pid)
+                        and not process_alive(descendant_pid)
+                    ):
+                        break
+                    time.sleep(0.02)
+                if (
+                    process_alive(fake_pid)
+                    or process_alive(runner_pid)
+                    or process_alive(descendant_pid)
+                ):
+                    raise AssertionError(
+                        "forged child NUL/status suppressed runner escalation"
+                    )
+                process.terminate()
+            elif repeat:
                 os.kill(runner_pid, signal.SIGTERM)
                 term_deadline = time.monotonic() + 1
                 while (
@@ -917,11 +1135,63 @@ def assert_signal_cleanup(
                         "direct runner TERM did not reach its exact child"
                     )
                 time.sleep(0.1)
-                if process.poll() is not None or not process_alive(runner_pid):
+                if (
+                    process.poll() is not None
+                    or not process_alive(runner_pid)
+                    or not process_alive(fake_pid)
+                    or not process_alive(descendant_pid)
+                ):
                     raise AssertionError(
-                        "runner exited before bridge termination was exercised"
+                        "runner lost exact custody after the first TERM"
                     )
-            process.terminate()
+
+                # Freeze the reader so the status pipe remains open while the
+                # exact runner reaps its child and enters the held-writer path.
+                os.kill(process.pid, signal.SIGSTOP)
+                bridge_stopped = True
+                time.sleep(0.05)
+                os.kill(runner_pid, signal.SIGUSR1)
+                kill_deadline = time.monotonic() + 1
+                while (
+                    (
+                        process_alive(fake_pid)
+                        or process_alive(descendant_pid)
+                    )
+                    and time.monotonic() < kill_deadline
+                ):
+                    time.sleep(0.01)
+                if (
+                    process_alive(fake_pid)
+                    or process_alive(descendant_pid)
+                    or not process_alive(runner_pid)
+                ):
+                    raise AssertionError(
+                        "runner did not retain exact custody after TERM then USR1"
+                    )
+
+                if owner_death_after_hold:
+                    # Kill only the frozen bridge leader.  Its reader vanishes,
+                    # and the already-closed runner writer must not spin forever.
+                    os.kill(process.pid, signal.SIGKILL)
+                    bridge_stopped = False
+                else:
+                    # Signals that interrupt the held pipe write must not let the
+                    # runner escape before the parent closes its reader.
+                    for repeated_signal in (signal.SIGTERM, signal.SIGUSR1):
+                        os.kill(runner_pid, repeated_signal)
+                        time.sleep(0.05)
+                        if not process_alive(runner_pid):
+                            raise AssertionError(
+                                "signal-interrupted held runner exited before FD7 closed"
+                            )
+
+                    # Queue bridge termination while its reader is still frozen;
+                    # SIGCONT delivers it before normal response processing resumes.
+                    process.terminate()
+                    os.kill(process.pid, signal.SIGCONT)
+                    bridge_stopped = False
+            else:
+                process.terminate()
             try:
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired as error:
@@ -931,6 +1201,7 @@ def assert_signal_cleanup(
 
             stdout = process.stdout.read()
             stderr = process.stderr.read()
+            stage_retained = cleanup_failure or owner_death_after_hold
             deadline = time.monotonic() + 2
             child_alive = True
             runner_alive = True
@@ -962,30 +1233,44 @@ def assert_signal_cleanup(
                     and not runner_alive
                     and not descendant_alive
                     and not group_alive
-                    and not staged
+                    and (bool(staged) if stage_retained else not staged)
                 ):
                     break
                 time.sleep(0.02)
+            cleanup_attempts = read_count(cleanup_attempt_path)
+            exit_cleanup_entries = read_count(exit_cleanup_path)
+            expected_returncode = (
+                -signal.SIGKILL if owner_death_after_hold else 143
+            )
             if (
-                process.returncode != 143
+                process.returncode != expected_returncode
                 or read_count(term_count_path) != 1
                 or child_alive
                 or runner_alive
                 or descendant_alive
                 or group_alive
-                or staged
-                or stdout
+                or (not staged if stage_retained else bool(staged))
+                or cleanup_attempts != (2 if cleanup_failure else 0)
+                or exit_cleanup_entries != 0
+                or (stdout and not forged_record)
                 or "substring expression" in stderr
             ):
                 raise AssertionError(
-                    "direct bridge SIGTERM failed custody: "
+                    f"{label} bridge termination failed custody: "
                     f"rc={process.returncode} terms={read_count(term_count_path)} "
                     f"child_alive={child_alive} runner_alive={runner_alive} "
                     f"descendant_alive={descendant_alive} group_alive={group_alive} "
+                    f"cleanup_attempts={cleanup_attempts} "
+                    f"exit_cleanup_entries={exit_cleanup_entries} "
                     f"staged={[path.name for path in staged]!r} "
                     f"stdout={stdout!r} stderr={stderr!r}"
                 )
         finally:
+            if bridge_stopped and process.poll() is None:
+                try:
+                    os.kill(process.pid, signal.SIGCONT)
+                except ProcessLookupError:
+                    pass
             if process.stdin is not None:
                 try:
                     process.stdin.close()
@@ -1016,11 +1301,19 @@ def assert_signal_cleanup(
                     pass
 
 
-def assert_signal_publication(stdio: Path, bash: str) -> None:
+def assert_signal_publication(
+    stdio: Path,
+    bash: str,
+    *,
+    delivered_ack: bool,
+) -> None:
     if os.name != "posix":
         return
 
-    with tempfile.TemporaryDirectory(prefix="anvil-stdio-publication-") as raw:
+    label = "delivered-ack" if delivered_ack else "pre-ack"
+    with tempfile.TemporaryDirectory(
+        prefix=f"anvil-stdio-publication-{label}-"
+    ) as raw:
         root = Path(raw)
         binary = root / "bin"
         binary.mkdir()
@@ -1052,19 +1345,54 @@ else:
 
         bridge = root / "anvil-stdio-publication.sh"
         source = stdio.read_text(encoding="utf-8")
-        needle = "\trunner=$!\n\tANVIL_MCP_ACTIVE_RUNNER=$runner\n"
-        injected = (
-            '\tif [ -n "${ANVIL_TEST_SIGNAL_PUBLICATION:-}" ]; then\n'
-            "\t\tunset ANVIL_TEST_SIGNAL_PUBLICATION\n"
-            '\t\twhile [ ! -s "$FAKE_PUBLICATION_READY" ]; do :; done\n'
-            '\t\tkill -TERM "$$"\n'
-            "\tfi\n" + needle
-        )
+        needle = "\t\tANVIL_MCP_RUNNER_CRITICAL=1\n"
         if source.count(needle) != 1:
             raise AssertionError("runner publication injection point drifted")
-        make_executable(bridge, source.replace(needle, injected, 1))
+        if delivered_ack:
+            injected = (
+                needle
+                + "\t\tanvil_mcp_test_deliver_ack() {\n"
+                + '\t\t\tlocal target="$1" attempts=0 ignored\n'
+                + '\t\t\tbuiltin kill -USR2 "$target" || return 1\n'
+                + '\t\t\tIFS= read -r -t 5 ignored <&7 || :\n'
+                + '\t\t\tIFS= read -r -t 5 ignored <&7 || :\n'
+                + '\t\t\twhile [ ! -e "$FAKE_PUBLICATION_READY" ] '
+                + '&& [ "$attempts" -lt 500 ]; do\n'
+                + "\t\t\t\tattempts=$((attempts + 1))\n"
+                + "\t\t\t\tcommand sleep 0.01\n"
+                + "\t\t\tdone\n"
+                + '\t\t\tbuiltin kill -TERM "$$"\n'
+                + "\t\t\treturn 1\n"
+                + "\t\t}\n"
+                + '\t\tprintf \'%s\' "$runner" '
+                + '> "$FAKE_RUNNER_PUBLICATION_READY"\n'
+            )
+            source = source.replace(needle, injected, 1)
+            ack_needle = (
+                'kill -USR2 "$ANVIL_MCP_ACTIVE_RUNNER" 2>/dev/null'
+            )
+            if source.count(ack_needle) != 1:
+                raise AssertionError("ACK syscall injection point drifted")
+            source = source.replace(
+                ack_needle,
+                'anvil_mcp_test_deliver_ack "$ANVIL_MCP_ACTIVE_RUNNER"',
+                1,
+            )
+        else:
+            injected = (
+                needle
+                + '\t\tif [ -n "${ANVIL_TEST_SIGNAL_PUBLICATION:-}" ]; then\n'
+                + "\t\t\tunset ANVIL_TEST_SIGNAL_PUBLICATION\n"
+                + '\t\t\tprintf \'%s\' "$runner" '
+                + '> "$FAKE_RUNNER_PUBLICATION_READY"\n'
+                + '\t\t\tkill -TERM "$$"\n'
+                + "\t\tfi\n"
+            )
+            source = source.replace(needle, injected, 1)
+        make_executable(bridge, source)
 
-        ready_path = root / "publication-ready"
+        ready_path = root / "publication-helper-ready"
+        runner_ready_path = root / "publication-runner-ready"
         environment = os.environ.copy()
         environment.pop("ANVIL_MCP_PARENT_GUARD", None)
         environment.pop("ANVIL_MCP_PARENT_GUARD_PYTHON", None)
@@ -1076,6 +1404,7 @@ else:
                 "ANVIL_TEST_SIGNAL_PUBLICATION": "1",
                 "FAKE_PUBLICATION_ONCE": str(root / "publication-once"),
                 "FAKE_PUBLICATION_READY": str(ready_path),
+                "FAKE_RUNNER_PUBLICATION_READY": str(runner_ready_path),
                 "ANVIL_MCP_READINESS_MODE": "emacs",
                 "ANVIL_EMACSCLIENT_PROBE_TIMEOUT": "5",
                 "ANVIL_EMACSCLIENT_READINESS_TIMEOUT": "5",
@@ -1097,6 +1426,7 @@ else:
             text=True,
             start_new_session=True,
         )
+        runner_pid: int | None = None
         helper_pid: int | None = None
         try:
             if process.stdin is None:
@@ -1106,35 +1436,43 @@ else:
 
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
-                if ready_path.exists():
-                    helper_pid = int(ready_path.read_text(encoding="utf-8"))
+                if runner_ready_path.exists():
+                    runner_pid = int(
+                        runner_ready_path.read_text(encoding="utf-8")
+                    )
                     break
                 if process.poll() is not None:
                     break
                 time.sleep(0.02)
-            if helper_pid is None:
+            if runner_pid is None:
                 raise AssertionError(
-                    "stubborn prepublication helper was never observed"
+                    "pre-ACK runner identity was never published"
                 )
             try:
-                process.wait(timeout=5)
+                process.wait(timeout=15)
             except subprocess.TimeoutExpired as error:
                 raise AssertionError(
                     "signal during runner publication did not converge"
                 ) from error
 
+            stdout = process.stdout.read() if process.stdout is not None else ""
+            stderr = process.stderr.read() if process.stderr is not None else ""
+            helper_started = ready_path.exists()
+            if helper_started:
+                helper_pid = int(ready_path.read_text(encoding="utf-8"))
             deadline = time.monotonic() + 2
-            helper_alive = True
+            runner_alive = True
             group_alive = True
+            helper_alive = helper_pid is not None
             while time.monotonic() < deadline:
                 try:
-                    os.kill(helper_pid, 0)
+                    os.kill(runner_pid, 0)
                 except ProcessLookupError:
-                    helper_alive = False
+                    runner_alive = False
                 except PermissionError:
-                    helper_alive = True
+                    runner_alive = True
                 else:
-                    helper_alive = True
+                    runner_alive = True
                 try:
                     os.killpg(process.pid, 0)
                 except ProcessLookupError:
@@ -1143,14 +1481,30 @@ else:
                     group_alive = True
                 else:
                     group_alive = True
-                if not helper_alive and not group_alive:
+                helper_alive = (
+                    helper_pid is not None and process_alive(helper_pid)
+                )
+                if not runner_alive and not group_alive and not helper_alive:
                     break
                 time.sleep(0.02)
-            if process.returncode != 143 or helper_alive or group_alive:
+            staged = list(root.glob("anvil-mcp.*"))
+            if (
+                process.returncode != 143
+                or runner_alive
+                or group_alive
+                or helper_alive
+                or helper_started != delivered_ack
+                or staged
+                or stdout
+                or "substring expression" in stderr
+            ):
                 raise AssertionError(
-                    "runner publication signal lost custody: "
-                    f"rc={process.returncode} helper_alive={helper_alive} "
-                    f"group_alive={group_alive}"
+                    f"{label} publication signal lost custody: "
+                    f"rc={process.returncode} runner_alive={runner_alive} "
+                    f"group_alive={group_alive} helper_alive={helper_alive} "
+                    f"helper_started={helper_started} "
+                    f"staged={[path.name for path in staged]!r} "
+                    f"stdout={stdout!r} stderr={stderr!r}"
                 )
         finally:
             if process.stdin is not None:
@@ -1162,6 +1516,11 @@ else:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+            if runner_pid is not None:
+                try:
+                    os.kill(runner_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             if helper_pid is not None:
                 try:
                     os.kill(helper_pid, signal.SIGKILL)
@@ -1169,6 +1528,60 @@ else:
                     pass
             if process.poll() is None:
                 process.wait(timeout=2)
+
+
+def assert_drain_phase_budget(stdio: Path, bash: str) -> None:
+    """Each drain retains a full grace period across whole-second ticks."""
+    source = stdio.read_text(encoding="utf-8")
+    start = source.index("anvil_mcp_drain_runner_output() {")
+    end = source.index("\n}\n\n# Converge", start) + 2
+    drain_function = source[start:end]
+    with tempfile.TemporaryDirectory(prefix="anvil-stdio-drain-budget-") as raw:
+        root = Path(raw)
+        script = root / "drain-budget.sh"
+        make_executable(
+            script,
+            f"""#!{bash}
+set -e
+{drain_function}
+ANVIL_EMACSCLIENT_KILL_AFTER_TIMEOUT=1
+exec 7< <(
+    trap 'exit 0' TERM
+    while :; do
+        printf '\\0' || exit 0
+    done 2>/dev/null
+)
+writer=$!
+SECONDS=0
+sleep 0.95
+before=$SECONDS
+anvil_mcp_drain_runner_output
+elapsed=$((SECONDS - before))
+kill -KILL "$writer" 2>/dev/null || :
+exec 7<&-
+printf '%s\\n' "$elapsed"
+""",
+        )
+        completed = subprocess.run(
+            [bash, str(script)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=6,
+        )
+        try:
+            elapsed = int(completed.stdout.strip())
+        except ValueError as error:
+            raise AssertionError(
+                f"drain phase emitted invalid timing: {completed.stdout!r}"
+            ) from error
+        if completed.returncode != 0 or elapsed < 2:
+            raise AssertionError(
+                "drain phase lost its fractional grace at a SECONDS boundary: "
+                f"rc={completed.returncode} elapsed={elapsed} "
+                f"stderr={completed.stderr!r}"
+            )
 
 
 def assert_exit_without_staging(stdio: Path, bash: str) -> None:
@@ -1185,7 +1598,7 @@ import sys
 
 code = "\\n".join(sys.argv[1:])
 if (
-    "for name in os.listdir(directory):" in code
+    "def generation_file(name, prefix):" in code
     and "os.rmdir(directory)" in code
 ):
     Path(os.environ["FAKE_CLEANUP_INVOKED"]).write_text(
@@ -1298,6 +1711,7 @@ def main() -> int:
         raise AssertionError(f"real Emacs is not executable: {real_emacs}")
     os.environ["ANVIL_TEST_REAL_EMACS"] = real_emacs
     expected = {"jsonrpc": "2.0", "id": 17, "result": {"ready": True}}
+    assert_reaped_pid_alias_does_not_extend_wait(stdio, bash, expected)
 
     success, probes, dispatches, _elapsed, stderr, _guard = run_case(
         stdio, bash, nil_before=2
@@ -1457,9 +1871,19 @@ def main() -> int:
     assert_lifecycle_guard(stdio, bash, "stop", malformed=True)
     assert_lifecycle_guard(stdio, bash, "init", split_sentinel=True)
     assert_lifecycle_guard(stdio, bash, "stop", split_sentinel=True)
-    assert_signal_publication(stdio, bash)
+    assert_drain_phase_budget(stdio, bash)
+    assert_signal_publication(stdio, bash, delivered_ack=False)
+    assert_signal_publication(stdio, bash, delivered_ack=True)
     assert_signal_cleanup(stdio, bash, repeat=False)
     assert_signal_cleanup(stdio, bash, repeat=True)
+    assert_signal_cleanup(stdio, bash, repeat=False, forged_record=True)
+    assert_signal_cleanup(stdio, bash, repeat=False, cleanup_failure=True)
+    assert_signal_cleanup(
+        stdio,
+        bash,
+        repeat=True,
+        owner_death_after_hold=True,
+    )
     assert_exit_without_staging(stdio, bash)
     assert_invalid_configuration(stdio, bash, "ANVIL_EMACSCLIENT_RETRY_MAX", "09")
     assert_invalid_configuration(

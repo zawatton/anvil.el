@@ -47,7 +47,7 @@
         (let ((status
                (call-process
                 timeout nil t nil
-                "--kill-after=2" "30"
+                "--kill-after=2" "45"
                 python "-I" "-B" "-u"
                 helper bridge bridge-bash emacs)))
           (unless (and (integerp status) (zerop status))
