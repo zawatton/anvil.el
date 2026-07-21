@@ -139,23 +139,21 @@
           (cons nil (make-hash-table :test #'eq)))
          (anvil-host--cleanup-timer nil)
          (anvil-host--cleanup-active nil)
-         helper observed)
+         helper timer observed)
     (unwind-protect
         (progn
+          (should (zerop (call-process "mkfifo" nil nil nil release)))
           ;; Spawn before the host transaction so the helper is foreign to its
-          ;; identity snapshot.  Only servicing that foreign process can
-          ;; create the release gate awaited by the owned child.
+          ;; identity snapshot.  A timer releases its blocking pipe only after
+          ;; the owned child has opened the FIFO, without polling in a shell.
           (setq helper
                 (make-process
                  :name "anvil-host-foreign-release-helper"
                  :buffer nil
                  :command
-                 (list
-                  shell-file-name shell-command-switch
-                  (format
-                   (concat "while [ ! -e %s ]; do sleep 0.01; done; "
-                           "printf x; exec sleep 30")
-                   (shell-quote-argument started)))
+                 (list shell-file-name shell-command-switch
+                       (concat "IFS= read -r ignored || exit; printf x; "
+                               "IFS= read -r -t 2 ignored"))
                  :connection-type 'pipe
                  :coding 'binary
                  :noquery t
@@ -170,7 +168,17 @@
                           anvil-host-child-shell-file-name
                           anvil-host-child-shell-command-switch
                           (getenv "ANVIL_HOST_PRIVATE_MARKER")))
-                   (write-region "" nil release nil 'silent))))
+                   (write-region "\n" nil release nil 'silent))))
+          (setq timer
+                (run-at-time
+                 0.05 0.05
+                 (lambda ()
+                   (when (and (file-exists-p started)
+                              (processp helper)
+                              (process-live-p helper))
+                     (process-send-string helper "\n")
+                     (cancel-timer timer)
+                     (setq timer nil)))))
           (let ((anvil-host-child-process-environment child-environment)
                 (anvil-host-child-exec-path (copy-sequence exec-path))
                 (anvil-host-child-shell-file-name shell-file-name)
@@ -180,18 +188,20 @@
               (anvil-host-reentrancy-test--result 0 "secret" "")
               (anvil-host--run
                (format
-                (concat ": > %s; "
-                        "while [ ! -e %s ]; do sleep 0.01; done; "
+                (concat "exec 9<> %s; : > %s; "
+                        "IFS= read -r -t 2 ignored <&9 || exit 99; "
                         "printf '%%s' \"$ANVIL_HOST_PRIVATE_MARKER\"")
-                (shell-quote-argument started)
-                (shell-quote-argument release))
-               'utf-8-unix directory 2))))
+                (shell-quote-argument release)
+                (shell-quote-argument started))
+               'utf-8-unix directory 3))))
           (should
            (equal (list baseline-directory nil nil nil nil nil) observed))
-          (should (file-exists-p release))
+          (should (file-exists-p started))
           ;; The owned transaction must not sweep its preexisting helper.
           (should (process-live-p helper))
           (anvil-host-reentrancy-test--assert-clean nil nil))
+      (when (timerp timer)
+        (cancel-timer timer))
       (when (and (processp helper) (process-live-p helper))
         (delete-process helper))
       (anvil-host-reentrancy-test--force-clean nil nil)
@@ -229,14 +239,15 @@
                           (regexp-quote stderr-canary)
                           (buffer-string))))))
                (buffer-list))))
+          (should (zerop (call-process "mkfifo" nil nil nil release)))
           (setq timer
                 (run-at-time
-                 0.01 0.01
+                 0.05 0.05
                  (lambda ()
                    (when (file-exists-p filter-seen)
                      (setq scanned t
                            exposed (visible-canary-buffer))
-                     (write-region "" nil release nil 'silent)
+                     (write-region "\n" nil release nil 'silent)
                      (when (timerp timer)
                        (cancel-timer timer)
                        (setq timer nil))))))
@@ -256,15 +267,14 @@
                     process))))
             (let* ((command
                     (format
-                     (concat "printf %s; printf %s >&2; sleep 0.1; "
+                     (concat "exec 9<> %s; "
+                             "printf %s; printf %s >&2; sleep 0.1; "
                              ": > %s; "
-                             "i=0; while [ ! -e %s ] && [ $i -lt 400 ]; do "
-                             "i=$((i + 1)); sleep 0.01; done; [ -e %s ]")
+                             "IFS= read -r -t 4 ignored <&9 || exit 99")
+                     (shell-quote-argument release)
                      (shell-quote-argument stdout-canary)
                      (shell-quote-argument stderr-canary)
-                     (shell-quote-argument filter-seen)
-                     (shell-quote-argument release)
-                     (shell-quote-argument release)))
+                     (shell-quote-argument filter-seen)))
                    (result
                     (anvil-host--run command 'utf-8-unix directory 6)))
               (should
@@ -1767,7 +1777,6 @@
   "A background stderr holder cannot extend cleanup to the child timeout."
   (skip-unless (memq system-type '(gnu/linux darwin)))
   (let* ((directory (make-temp-file "anvil-host-detached-" t))
-         (release (expand-file-name "release" directory))
          (finished (expand-file-name "finished" directory))
          (anvil-host--cleanup-state (cons nil (make-hash-table :test #'eq)))
          (anvil-host--cleanup-timer nil)
@@ -1779,12 +1788,10 @@
         (progn
           (setq result
                 (anvil-host--run
-                 (format
-                  (concat
-                   "(while [ ! -e %s ]; do sleep 0.01; done; "
-                   ": > %s) &")
-                  (shell-quote-argument release)
-                  (shell-quote-argument finished))
+                 ;; A bounded kernel sleep outlives the cleanup deadline while
+                 ;; guaranteeing self-termination if the test runner dies.
+                 (format "(sleep 2; : > %s) &"
+                         (shell-quote-argument finished))
                  'utf-8-unix directory 2)
                 elapsed (- (float-time) started))
           (should (equal (anvil-host-reentrancy-test--result 0 "" "") result))
@@ -1792,15 +1799,12 @@
           ;; The configured child cleanup timeout is 1.5s.  Pipe closure must
           ;; remain near the documented 0.2s drain instead of waiting for it.
           (should (< elapsed 0.8))
-          (write-region "" nil release nil 'silent)
-          (let ((deadline (+ (float-time) 2)))
+          (let ((deadline (+ (float-time) 3)))
             (while (and (not (file-exists-p finished))
                         (< (float-time) deadline))
               (sleep-for 0.01)))
           (should (file-exists-p finished))
           (anvil-host-reentrancy-test--assert-clean nil nil))
-      (unless (file-exists-p release)
-        (write-region "" nil release nil 'silent))
       (anvil-host-reentrancy-test--force-clean nil nil)
       (delete-directory directory t))))
 
