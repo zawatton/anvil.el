@@ -1337,6 +1337,7 @@ else:
     os.close(descriptor)
     with open(ready, "w", encoding="utf-8") as stream:
         stream.write(str(os.getpid()))
+    signal.alarm(30)
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     while True:
         signal.pause()
