@@ -13,46 +13,85 @@
 
 ## Completed
 
-- Diagnosed false dead worker reporting versus real root watchdog restarts.
-- Verified ai-nix contains no Anvil lifecycle implementation and requires no task change.
-- Presented and received approval for the design.
-- Committed and pushed design commit 4e10d7e4101610e0ca895c474b568136b11c5694.
+- Diagnosed false dead worker reporting separately from real 45-second root
+  watchdog restarts.
+- Verified ai-nix contains no Anvil lifecycle implementation and needs no task
+  change.
+- Received design approval and pushed initial design commit
+  4e10d7e4101610e0ca895c474b568136b11c5694.
 - User selected fail-closed pagination for oversized unbounded file reads.
-- Activated Wiggum autonomous continuation.
-- Corrected the design invariant so offset alone cannot bypass a missing limit.
-- Drafted the frozen test-first implementation plan.
-- Ran the first independent fess audit of planning commit b0bd6d7; it found a nonexistent Darwin attribute, broken focused-test quoting, incomplete worker coverage, underspecified telemetry, and ordering contradictions.
-- Verified by experiment that a raw inherited activity FD preserves inode identity but leaks into arbitrary Emacs subprocesses.
-- Replaced that unsafe handoff with a one-shot private Unix socket: the monitor alone owns and writes the fixed activity/event inodes, then unlinks the socket after accepting root Emacs.
-- Froze schema version 1, exact keys/enums, run-ID stale detection, byte ceilings, mandatory O_NOFOLLOW, metadata provenance, and definitive rebase/pin/push ordering.
+- Activated Wiggum autonomous continuation and drafted the test-first plan.
+- First fess audit of b0bd6d7 found incorrect Darwin attributes, broken focused
+  selectors, incomplete worker coverage, telemetry gaps, and publication-order
+  contradictions.
+- Correction commit 9634dba fixed those findings and was independently audited.
+- Packaged macOS Emacs experiments proved local Unix sockets survive pathname
+  unlink/rebind, omit explicit `:type 'stream`, and are close-on-exec.
+- A second audit and focused contract reviews found blocking socket/file I/O,
+  unauthenticated event paths, response-builder gaps, fractional-limit bypass,
+  TOCTOU file loading, mutating worker probes, JSON escape expansion, stale
+  watchdog attribution, unbounded probe helpers, and post-gate rebases.
+- The frozen design now removes watchdog-path record files entirely: activity is
+  in monitor memory and each launch uses one private nonblocking event pipe.
+- The file guard now performs an authoritative maximum-plus-one-byte read, the
+  generic cap counts projected JSON-string bytes across every tool error path,
+  reporting uses a non-mutating endpoint observer, and the supervisor helper is
+  nonblocking, bounded, and timeout-contained.
+- The plan now freezes runnable packaged-Emacs commands, named red-green Python
+  groups, exact support/launcher provenance, socket-path preflight, startup and
+  cached-response phases, per-exit watchdog clearing, revision-bearing version
+  output, and no post-gate history mutation.
+- A capability-topology audit then closed the final lifecycle gaps: shared-host
+  mode is explicitly compatibility-only, parent-guard containment is preserved
+  through strict next-launch stale-socket recovery, and one exit finalizer now
+  clears watchdog attribution after both natural and intentional daemon exits.
+- Final upstream review moved the sanitizer boundary ahead of params/lazy
+  loading, protected the persistent harness hook with safe condition/tool
+  allowlists, added a second post-disclosure guard, and covered Emacs unibyte
+  JSON escaping without materializing encoder output.
+- Final cross-repository review replaced unsafe full-loader pagination with a
+  chunked, byte-capped, timer-yielding page scan; suppressed semantic duplicate
+  activity phases; and made terminal supervisor shutdown invalidate stale
+  status on stop, finalizer, or publication failure. Both focused and whole-
+  plan audits now report no Critical or Important findings.
 
 ## Current state
 
-- Anvil source was clean before the current documentation edit batch.
-- Dedicated Anvil reported no modified target buffers; this cannot cover the separate interactive development Emacs.
-- /Users/johnw/src/nix main has pre-existing unrelated edits:
-  - config/packages.nix
-  - docs/PI-AGENT-WIGGUM-PLAN.md
-- The Nix checkout is also one commit ahead of origin/main.
-- /Users/johnw/src/ai-nix is clean and its HEAD matches the revision pinned by the Nix lock.
-- No code implementation has begun.
-- Planning commit b0bd6d7 is local and the audited corrections are the only current uncommitted changes.
-- Next action is self-review, commit, independently re-audit, and push the corrected design/plan/handoff; then execute Task 0 exactly as written.
+- No source-code implementation has begun.
+- The signed planning HEAD contains exactly the three resilience documents;
+  the Anvil parent checkout is clean.
+- Dedicated Anvil reported no modified file buffers before the latest edit
+  batches; this does not cover the separate interactive development Emacs.
+- Precursor planning commits b0bd6d7 and 9634dba plus the signed planning HEAD
+  are local after the pushed design commit.
+- /Users/johnw/src/nix main is synchronized with origin/main at
+  7bf56931bd00c9f546cae8e64147d825661d0da7 and currently has a user-owned
+  `config/packages.nix` modification that must remain untouched.
+- /Users/johnw/src/ai-nix is read-only for this task at
+  0610fd1283cf5ee52a5c71cbc8411a647b37dd7c and now has unrelated user-owned
+  modifications/untracked files that must remain untouched.
+- Task 0 remains blocked only on the amended commit-bound audit, push, and
+  local/remote equality.
 
 ## Stop-and-escalate counters
 
 - Repeated failing gate signature: 0 of 3.
 - Unusable subagent output: 0 of 2.
 - Unresolved rebase conflict: 0.
-- Requirement ambiguity: 0 active; the first audit's schema, descriptor, test-topology, provenance, and ordering ambiguities are now resolved in the frozen documents.
+- Requirement ambiguity: 0 active.
 - Destructive action required: no.
 
 ## Resume procedure
 
-1. Re-read the Wiggum skill, frozen design, frozen plan, and this handoff.
-2. Verify both repository states with Anvil structured git status.
-3. Finish the correction commit, independent re-audit, and push of the planning branch.
-4. Execute Task 0: verify the published base, create the isolated Anvil worktree, and run every baseline gate.
-5. Start Task 1 with the three exact failing worker-state tests.
-6. After each logical commit: independent fess audit, partner-observation scan, and progress-ledger update.
-7. Keep all Nix implementation in /Users/johnw/src/nix-anvil-root-resilience and preserve the dirty main checkout.
+1. Re-read the Wiggum skill, frozen design, plan, and this handoff.
+2. Verify live Anvil, Nix, and ai-nix state; live artifacts override this
+   snapshot.
+3. Independently audit the exact signed planning commit object. Fix every
+   Critical/Important finding by amending and re-audit until clean.
+4. Push the exact audited planning HEAD, then verify local/remote equality.
+5. Execute Task 0 and its packaged-Emacs baseline in the isolated Anvil
+   worktree.
+6. Continue each test-first task with per-commit fess audit, partner-observation
+   scan, and progress-ledger update.
+7. Keep Nix implementation in /Users/johnw/src/nix-anvil-root-resilience and
+   preserve unrelated user state.
