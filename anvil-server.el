@@ -124,8 +124,9 @@ tight non-yielding loop.  Nil (default) imposes no limit."
   "Maximum projected JSON-string bytes returned inline by a tool.
 
 The limit is measured after JSON string escaping, but excludes the two
-surrounding quote delimiters.  Nil, zero, or a negative integer disables
-rejection and preserves legacy behavior.  Every other value fails closed."
+surrounding quote delimiters.  A positive integer enables rejection.  Nil,
+zero, or a negative integer disables it and preserves legacy behavior.  Every
+other value fails closed."
   :type '(choice (const :tag "No limit" nil) integer)
   :group 'anvil-server)
 
