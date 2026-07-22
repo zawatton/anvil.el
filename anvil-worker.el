@@ -1244,8 +1244,7 @@ or mutates WORKER."
                               :service server-file))
                        (memq (process-status process)
                              '(open run connect)))
-                   (file-error nil)
-                   (error nil))
+                   (file-error nil))
                (when (processp process)
                  (delete-process process))))))))
 

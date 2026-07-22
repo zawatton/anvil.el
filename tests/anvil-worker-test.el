@@ -752,16 +752,15 @@ deadlock on Windows (2026-04-16) that could not be broken with
 
 (ert-deftest anvil-worker-test-reporting-endpoint-nowait ()
   "The real reporting observer never waits for a local socket connect."
-  (let ((server-use-tcp nil)
-        (worker '(:server-file "/tmp/anvil-worker-reporting-test.sock"))
+  (let* ((server-use-tcp nil)
+         (server-file (make-temp-file "anvil-worker-reporting-"))
+         (worker (list :server-file server-file))
         (fake-process (make-pipe-process
                        :name "anvil-worker-reporting-test-pipe"
                        :noquery t))
         captured)
     (unwind-protect
-        (cl-letf (((symbol-function 'file-exists-p)
-                   (lambda (_path) t))
-                  ((symbol-function 'make-network-process)
+        (cl-letf (((symbol-function 'make-network-process)
                    (lambda (&rest arguments)
                      (setq captured arguments)
                      fake-process))
@@ -777,7 +776,22 @@ deadlock on Windows (2026-04-16) that could not be broken with
           (should (eq t (plist-get captured :noquery)))
           (should-not (plist-get captured :buffer)))
       (when (process-live-p fake-process)
-        (delete-process fake-process)))))
+        (delete-process fake-process))
+      (delete-file server-file))))
+
+(ert-deftest anvil-worker-test-reporting-endpoint-propagates-errors ()
+  "Unexpected observer errors remain visible to callers."
+  (let* ((server-use-tcp nil)
+         (server-file (make-temp-file "anvil-worker-reporting-"))
+         (worker (list :server-file server-file)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'make-network-process)
+                   (lambda (&rest _arguments)
+                     (error "test programming error"))))
+          (should-error
+           (anvil-worker--reporting-endpoint-alive-p worker)
+           :type 'error))
+      (delete-file server-file))))
 
 (ert-deftest anvil-worker-test-status-nonblocking ()
   "Pool status reports all states without lifecycle side effects."
