@@ -8,6 +8,7 @@
 ;;; Code:
 
 (require 'ert)
+(require 'cl-lib)
 (require 'anvil-file)
 
 (defun anvil-file-test--with-tmp (content fn)
@@ -67,6 +68,14 @@ BINDINGS is a `let' binding list for delta-cache defcustoms."
   "Overwrite PATH with CONTENT using UTF-8."
   (let ((coding-system-for-write 'utf-8-unix))
     (write-region content nil path nil 'silent)))
+
+(defun anvil-file-test--error-text (thunk)
+  "Call THUNK and return the printed condition from its expected error."
+  (condition-case err
+      (progn
+        (funcall thunk)
+        (ert-fail "expected an error"))
+    (error (format "%S" err))))
 
 ;;;; --- json-object-add ------------------------------------------------------
 
@@ -270,6 +279,260 @@ BINDINGS is a `let' binding list for delta-cache defcustoms."
       (when (file-exists-p p2) (delete-file p2)))))
 
 ;;;; --- :warnings integration (Doc 05 Phase 2) -----------------------------
+
+(ert-deftest anvil-file-test-unbounded-read-cap ()
+  "Unbounded reads reject over-cap regular files without loading their bodies."
+  (let* ((payload (concat "private-" (make-string 9 ?x)))
+         (path (make-temp-file "anvil-file-cap-" nil ".txt"))
+         (link (concat path "-link"))
+         (literal-insert (symbol-function 'insert-file-contents-literally))
+         (max-request 0)
+         (max-retained 0))
+    (should (= 17 (string-bytes payload)))
+    (unwind-protect
+        (progn
+          (anvil-file-test--write path payload)
+          (make-symbolic-link path link)
+          (let ((anvil-file-max-inline-read-bytes 16))
+            (cl-letf (((symbol-function 'anvil--insert-file)
+                       (lambda (&rest _)
+                         (ert-fail "unbounded full-body loader was called")))
+                      ((symbol-function 'insert-file-contents-literally)
+                       (lambda (filename &optional visit beg end replace)
+                         (setq max-request
+                               (max max-request (- (or end 0) (or beg 0))))
+                         (prog1
+                             (funcall literal-insert filename visit beg end replace)
+                           (setq max-retained (max max-retained (buffer-size)))))))
+              (dolist (candidate (list path link))
+                (let ((message
+                       (anvil-file-test--error-text
+                        (lambda () (anvil-file-read candidate)))))
+                  (should (string-match-p "maximum 16 bytes" message))
+                  (should (string-match-p "offset=0" message))
+                  (should (string-match-p "limit=200" message))
+                  (should-not (string-match-p (regexp-quote payload) message))
+                  (should-not (string-match-p (regexp-quote candidate) message))))))
+          ;; A stale preliminary size must not authorize a cap-plus-one body.
+          (let ((anvil-file-max-inline-read-bytes 16))
+            (cl-letf (((symbol-function 'anvil--insert-file)
+                       (lambda (&rest _)
+                         (ert-fail "unbounded full-body loader was called")))
+                      ((symbol-function 'file-attribute-size)
+                       (lambda (_attrs) 16))
+                      ((symbol-function 'insert-file-contents-literally)
+                       (lambda (filename &optional visit beg end replace)
+                         (setq max-request
+                               (max max-request (- (or end 0) (or beg 0))))
+                         (prog1
+                             (funcall literal-insert filename visit beg end replace)
+                           (setq max-retained (max max-retained (buffer-size)))))))
+              (let ((message
+                     (anvil-file-test--error-text
+                      (lambda () (anvil-file-read path)))))
+                (should (string-match-p "at least 17 bytes" message))
+                (should (string-match-p "offset=0" message))
+                (should (string-match-p "limit=200" message))
+                (should-not (string-match-p (regexp-quote payload) message)))))
+          (should (<= max-request 17))
+          (should (<= max-retained 17)))
+      (ignore-errors (delete-file link))
+      (ignore-errors (delete-file path)))))
+
+(ert-deftest anvil-file-test-read-argument-validation ()
+  "Direct and MCP reads accept only valid integer pagination arguments."
+  (let ((body-touched nil))
+    (cl-letf (((symbol-function 'anvil--prepare-path)
+               (lambda (&rest _)
+                 (setq body-touched t)
+                 (ert-fail "path preparation reached for an invalid range")))
+              ((symbol-function 'anvil--insert-file)
+               (lambda (&rest _)
+                 (setq body-touched t)
+                 (ert-fail "file body reached for an invalid range"))))
+      (dolist (offset '(0.5 -1 "0"))
+        (should-error (anvil-file-read "/unused" offset 1)))
+      (dolist (limit '(0.5 0 -1 "1"))
+        (should-error (anvil-file-read "/unused" 0 limit)))
+      (should-not body-touched)))
+  (let ((calls nil))
+    (cl-letf (((symbol-function 'anvil-file-read)
+               (lambda (path &optional offset limit)
+                 (push (list path offset limit) calls)
+                 '(:ok t))))
+      (dolist (limit '("1.0" "0" "-1" "+1" "1x" "１"))
+        (should-error (anvil-file--tool-read "/unused" "0" limit)))
+      (dolist (offset '("0.5" "-1" "+0" "0x" "０"))
+        (should-error (anvil-file--tool-read "/unused" offset "1")))
+      (should-not calls)
+      (should (string-match-p
+               ":ok t"
+               (anvil-file--tool-read "/unused" "0" "1")))
+      (should (equal '(("/unused" 0 1)) calls)))))
+
+(ert-deftest anvil-file-test-read-limit-boundaries ()
+  "Inline caps and streamed pages preserve boundaries without full loads."
+  ;; Exact-cap and small UTF-8 bodies survive; cap-plus-one does not.
+  (dolist (body '("0123456789abcdef" "hé🙂\n"))
+    (anvil-file-test--with-tmp
+     body
+     (lambda (path)
+       (let* ((anvil-file-max-inline-read-bytes 16)
+              (result (anvil-file-read path)))
+         (should (equal body (plist-get result :content)))))))
+  (anvil-file-test--with-tmp
+   "0123456789abcdefg"
+   (lambda (path)
+     (let ((anvil-file-max-inline-read-bytes 16))
+       (should-error (anvil-file-read path)))))
+
+  ;; Disabling the cap preserves the legacy loader for bounded and unbounded
+  ;; requests alike.
+  (anvil-file-test--with-tmp
+   "first\nsecond\n"
+   (lambda (path)
+     (let ((loader (symbol-function 'anvil--insert-file))
+           (loads 0))
+       (cl-letf (((symbol-function 'anvil--insert-file)
+                  (lambda (target)
+                    (cl-incf loads)
+                    (funcall loader target))))
+         (dolist (cap '(nil 0 -1))
+           (let ((anvil-file-max-inline-read-bytes cap))
+             (should (equal "first\nsecond\n"
+                            (plist-get (anvil-file-read path) :content)))
+             (should (equal "first\n"
+                            (plist-get (anvil-file-read path 0 1) :content)))))
+         (should (= 6 loads))))))
+
+  ;; A UTF-8 character straddles the fixed raw-chunk boundary.  Pagination
+  ;; still returns exact lines and never requests or retains too much data.
+  (let* ((first (concat (make-string (1- anvil-file--stream-chunk-bytes) ?a)
+                        "🙂\n"))
+         (body (concat first "second\n\nlast"))
+         (initial-size (string-bytes body)))
+    (anvil-file-test--with-tmp
+     body
+     (lambda (path)
+       (let ((anvil-file-max-inline-read-bytes 70000)
+             (literal-insert (symbol-function 'insert-file-contents-literally))
+             (buffer-insert (symbol-function 'insert-buffer-substring))
+             (max-chunk 0)
+             (max-page 0)
+             (requests nil))
+         (cl-letf (((symbol-function 'anvil--insert-file)
+                    (lambda (&rest _)
+                      (ert-fail "streamed pagination called the full loader")))
+                   ((symbol-function 'insert-file-contents-literally)
+                    (lambda (filename &optional visit beg end replace)
+                      (push (cons beg end) requests)
+                      (prog1
+                          (funcall literal-insert filename visit beg end replace)
+                        (setq max-chunk (max max-chunk (buffer-size))))))
+                   ((symbol-function 'insert-buffer-substring)
+                    (lambda (buffer &optional start end)
+                      (prog1
+                          (funcall buffer-insert buffer start end)
+                        (setq max-page (max max-page (buffer-size)))))))
+           (let ((whole (anvil-file-read path 0 200))
+                 (one (anvil-file-read path 0 1))
+                 (empty (anvil-file-read path 2 1))
+                 (last (anvil-file-read path 3 1))
+                 (past (anvil-file-read path 10 1)))
+             (should (equal body (plist-get whole :content)))
+             (should (= 4 (plist-get whole :total-lines)))
+             (should (= 4 (plist-get whole :lines-returned)))
+             (should (equal first (plist-get one :content)))
+             (should (= 1 (plist-get one :lines-returned)))
+             (should (equal "\n" (plist-get empty :content)))
+             (should (= 1 (plist-get empty :lines-returned)))
+             (should (equal "last" (plist-get last :content)))
+             (should (= 1 (plist-get last :lines-returned)))
+             (should (equal "" (plist-get past :content)))
+             (should (= 0 (plist-get past :lines-returned))))
+           (should requests)
+           (dolist (range requests)
+             (should (<= (- (cdr range) (car range))
+                         anvil-file--stream-chunk-bytes))
+             (should (<= (cdr range) initial-size)))
+           (should (<= max-chunk anvil-file--stream-chunk-bytes))
+           (should (<= max-page (1+ anvil-file-max-inline-read-bytes)))
+           (should (<= (+ max-chunk max-page)
+                       (+ anvil-file--stream-chunk-bytes
+                          1 anvil-file-max-inline-read-bytes))))))))
+
+  ;; A selected page may itself be too large, but its body never enters the
+  ;; diagnostic.
+  (anvil-file-test--with-tmp
+   "SECRETS!\nok\n"
+   (lambda (path)
+     (let* ((anvil-file-max-inline-read-bytes 8)
+            (message
+             (anvil-file-test--error-text
+              (lambda () (anvil-file-read path 0 1)))))
+       (should (string-match-p "lower.*limit" message))
+       (should (string-match-p "filtered.*region" message))
+       (should-not (string-match-p "SECRETS!" message)))))
+
+  ;; Growth and replacement during a scan are content-free retry failures,
+  ;; and the frozen initial size remains the maximum requested byte offset.
+  (dolist (change '(grow replace))
+    (anvil-file-test--with-tmp
+     "original\nbody\n"
+     (lambda (path)
+       (let* ((anvil-file-max-inline-read-bytes 64)
+              (initial-size (file-attribute-size (file-attributes path)))
+              (literal-insert (symbol-function 'insert-file-contents-literally))
+              (changed nil)
+              (max-end 0)
+              (message
+               (cl-letf (((symbol-function 'insert-file-contents-literally)
+                          (lambda (filename &optional visit beg end replace-buffer)
+                            (setq max-end (max max-end (or end 0)))
+                            (prog1
+                                (funcall literal-insert filename visit beg end
+                                         replace-buffer)
+                              (unless changed
+                                (setq changed t)
+                                (pcase change
+                                  ('grow
+                                   (let ((coding-system-for-write 'utf-8-unix))
+                                     (write-region "GROWTH-SECRET\n" nil filename
+                                                   t 'silent)))
+                                  ('replace
+                                   (let ((replacement
+                                          (make-temp-file
+                                           (file-name-nondirectory filename)
+                                           nil ".replacement")))
+                                     (unwind-protect
+                                         (progn
+                                           (anvil-file-test--write
+                                            replacement "REPLACEMENT-SECRET\n")
+                                           (rename-file replacement filename t))
+                                       (ignore-errors
+                                         (delete-file replacement)))))))))))
+                 (anvil-file-test--error-text
+                  (lambda () (anvil-file-read path 0 1))))))
+         (should (string-match-p "changed.*retry" message))
+         (should-not (string-match-p "SECRET" message))
+         (should (<= max-end initial-size))))))
+
+  ;; Seventeen fixed chunks force the cooperative yield, which must let an
+  ;; already-ready timer run even when the requested page is beyond EOF.
+  (anvil-file-test--with-tmp
+   (make-string (* 17 anvil-file--stream-chunk-bytes) ?z)
+   (lambda (path)
+     (let ((anvil-file-max-inline-read-bytes 8)
+           (fired nil)
+           (timer nil))
+       (unwind-protect
+           (progn
+             (setq timer (run-at-time 0 nil (lambda () (setq fired t))))
+             (let ((result (anvil-file-read path 1 1)))
+               (should (equal "" (plist-get result :content)))
+               (should (= 1 (plist-get result :total-lines))))
+             (should fired))
+         (when timer (cancel-timer timer)))))))
 
 (ert-deftest anvil-file-test-read-warnings-empty-without-buffer ()
   "anvil-file-read returns :warnings nil when no buffer visits the file."
