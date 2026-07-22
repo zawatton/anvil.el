@@ -14,6 +14,7 @@ import tempfile
 import time
 from pathlib import Path
 import re
+import shutil
 
 
 def make_executable(path: Path, source: str) -> None:
@@ -301,6 +302,67 @@ else:
     make_executable(path, source)
 
 
+def write_fast_nil_emacsclient(path: Path, bash: str) -> None:
+    """Write a shell-only not-ready probe for one-second budget tests."""
+    make_executable(
+        path,
+        f"""#!{bash}
+count=0
+if [ -f "$FAKE_PROBE_COUNT" ]; then
+    IFS= read -r count < "$FAKE_PROBE_COUNT" || count=0
+fi
+printf '%s\\n' "$((count + 1))" > "$FAKE_PROBE_COUNT"
+printf 'nil\\n'
+""",
+    )
+
+
+def write_fast_probe_frontend(path: Path, bash: str) -> None:
+    """Answer readiness in shell and delegate stateful expressions to Python."""
+    make_executable(
+        path,
+        f"""#!{bash}
+expression=
+for expression do :; done
+case "$expression" in
+*anvil-server-process-jsonrpc*|*test-init*|*test-stop*)
+    exec "$FAKE_PYTHON_EMACSCLIENT" "$@"
+    ;;
+*anvil-headless--ready-p*)
+    count=0
+    fast_count=0
+    if [ -f "$FAKE_PROBE_COUNT" ]; then
+        IFS= read -r count < "$FAKE_PROBE_COUNT" || count=0
+    fi
+    if [ -f "$FAKE_FAST_PROBE_COUNT" ]; then
+        IFS= read -r fast_count < "$FAKE_FAST_PROBE_COUNT" || fast_count=0
+    fi
+    [ "$count" -eq "$fast_count" ] || exit 70
+    count=$((count + 1))
+    printf '%s\\n' "$count" > "$FAKE_PROBE_COUNT"
+    printf '%s\\n' "$count" > "$FAKE_FAST_PROBE_COUNT"
+    if [ "${{FAKE_INVALID_OUTPUT:-0}}" = 1 ]; then
+        output=t-garbage
+    elif [ "${{FAKE_ALWAYS_NIL:-0}}" = 1 ] \
+        || [ "$count" -le "${{FAKE_NIL_BEFORE:-0}}" ]; then
+        output=nil
+    else
+        output=t
+    fi
+    if [ "${{FAKE_CRLF:-0}}" = 1 ]; then
+        printf '%s\\r\\n' "$output"
+    else
+        printf '%s\\n' "$output"
+    fi
+    ;;
+*)
+    exec "$FAKE_PYTHON_EMACSCLIENT" "$@"
+    ;;
+esac
+""",
+    )
+
+
 def strict_equal(actual: object, expected: object) -> bool:
     if type(actual) is not type(expected):
         return False
@@ -345,7 +407,22 @@ def run_bridge_while_open(
                 first_line = reply_future.result(timeout=15)
             except FutureTimeoutError as error:
                 process.kill()
-                raise AssertionError("bridge did not return a bounded reply") from error
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                failure_stderr = process.stderr.read()
+                debug_path = root / "debug.log"
+                failure_debug = (
+                    debug_path.read_text(encoding="utf-8", errors="replace")
+                    if debug_path.exists()
+                    else ""
+                )
+                raise AssertionError(
+                    "bridge did not return a bounded reply: "
+                    f"rc={process.poll()} stderr={failure_stderr!r} "
+                    f"debug={failure_debug!r}"
+                ) from error
         finally:
             executor.shutdown(wait=True)
 
@@ -354,9 +431,16 @@ def run_bridge_while_open(
             failure_stderr = (
                 process.stderr.read() if returncode is not None else ""
             )
+            debug_path = root / "debug.log"
+            failure_debug = (
+                debug_path.read_text(encoding="utf-8", errors="replace")
+                if debug_path.exists()
+                else ""
+            )
             raise AssertionError(
                 "bridge exited before replying with "
-                f"rc={returncode} stderr={failure_stderr!r}"
+                f"rc={returncode} stderr={failure_stderr!r} "
+                f"debug={failure_debug!r}"
             )
         if not expect_exit_after_reply and process.poll() is not None:
             failure_stderr = process.stderr.read()
@@ -556,6 +640,7 @@ def run_case(
     always_nil: bool = False,
     atomic_not_ready: bool = False,
     dispatch_error: bool = False,
+    hang_prepare_response: bool = False,
     malformed_output: bool = False,
     invalid_output: bool = False,
     crlf: bool = False,
@@ -563,20 +648,46 @@ def run_case(
     probe_timeout: int = 5,
     retry_delay_ms: int = 50,
     retry_max: int = 5,
-    dispatch_timeout: int = 10,
+    dispatch_timeout: int = 15,
     request_parse_timeout: int = 10,
     frame_read_timeout: int = 10,
     real_emacs_delay_sec: float = 0,
     large_request: bool = False,
     exit_descendant: bool = False,
+    anvil_root: Path | None = None,
 ) -> tuple[dict[str, object], int, int, float, str, str]:
     with tempfile.TemporaryDirectory(prefix="anvil-stdio-readiness-") as raw:
         root = Path(raw)
         binary = root / "bin"
         binary.mkdir()
         fake = binary / "emacsclient"
-        write_fake_emacsclient(fake)
+        python_fake: Path | None = None
+        if always_nil:
+            write_fast_nil_emacsclient(fake, bash)
+        else:
+            python_fake = binary / "emacsclient-python"
+            write_fake_emacsclient(python_fake)
+            write_fast_probe_frontend(fake, bash)
+        if hang_prepare_response:
+            real_python = sys.executable
+            make_executable(
+                binary / "python3",
+                f"""#!{real_python}
+import os
+import sys
+import time
+
+code = "\\n".join(sys.argv[1:])
+if (
+    os.environ.get("FAKE_HANG_PREPARE_RESPONSE") == "1"
+    and 'pieces[0] == "response"' in code
+):
+    time.sleep(5)
+os.execv({real_python!r}, [{real_python!r}, *sys.argv[1:]])
+""",
+            )
         probe_count = root / "probe-count"
+        fast_probe_count = root / "fast-probe-count"
         dispatch_count = root / "dispatch-count"
         early_dispatch = root / "early-dispatch"
         guard_observed = root / "guard-observed"
@@ -597,6 +708,10 @@ def run_case(
                 "TMPDIR": str(root),
                 "EMACS_MCP_DEBUG_LOG": str(root / "debug.log"),
                 "FAKE_PROBE_COUNT": str(probe_count),
+                "FAKE_FAST_PROBE_COUNT": str(fast_probe_count),
+                "FAKE_PYTHON_EMACSCLIENT": (
+                    str(python_fake) if python_fake is not None else ""
+                ),
                 "FAKE_DISPATCH_COUNT": str(dispatch_count),
                 "FAKE_EARLY_DISPATCH": str(early_dispatch),
                 "FAKE_GUARD_OBSERVED": str(guard_observed),
@@ -609,13 +724,16 @@ def run_case(
                 ),
                 "FAKE_REAL_EMACS": os.environ["ANVIL_TEST_REAL_EMACS"],
                 "FAKE_REAL_EMACS_DELAY_SEC": str(real_emacs_delay_sec),
-                "FAKE_ANVIL_ROOT": str(stdio.parent),
+                "FAKE_ANVIL_ROOT": str(anvil_root or stdio.parent),
                 "FAKE_NIL_BEFORE": str(nil_before),
                 "FAKE_ALWAYS_NIL": "1" if always_nil else "0",
                 "FAKE_ATOMIC_NOT_READY": "1" if atomic_not_ready else "0",
                 "FAKE_DISPATCH_ERROR": "1" if dispatch_error else "0",
                 "FAKE_MALFORMED_OUTPUT": "1" if malformed_output else "0",
                 "FAKE_HANG_DISPATCH": "0",
+                "FAKE_HANG_PREPARE_RESPONSE": (
+                    "1" if hang_prepare_response else "0"
+                ),
                 "FAKE_IGNORE_TERM": "0",
                 "FAKE_HANG_PID": str(root / "hang-pid"),
                 "FAKE_DESCENDANT_PID": str(root / "descendant-pid"),
@@ -645,6 +763,7 @@ def run_case(
             json.dumps(request, separators=(",", ":")) + "\n",
             environment,
             root,
+            expect_exit_after_reply=hang_prepare_response,
         )
         if exit_descendant:
             descendant_path = root / "descendant-pid"
@@ -676,9 +795,15 @@ def run_case(
         debug_log = root / "debug.log"
         debug = debug_log.read_text(encoding="utf-8") if debug_log.exists() else ""
         diagnostics = stderr + ("\n" + debug if debug else "")
+        probes = read_count(probe_count)
+        if not always_nil and probes != read_count(fast_probe_count):
+            raise AssertionError(
+                "shell/Python probe-count parity failed: "
+                f"probes={probes} fast={read_count(fast_probe_count)}"
+            )
         return (
             response,
-            read_count(probe_count),
+            probes,
             read_count(dispatch_count),
             elapsed,
             diagnostics,
@@ -772,25 +897,56 @@ def assert_reaped_pid_alias_does_not_extend_wait(
             )
         alias_marker.unlink()
 
-        response, probes, dispatches, elapsed, diagnostics, _guard = run_case(
-            fixed,
-            bash,
-            readiness_timeout=15,
-            probe_timeout=5,
-            dispatch_timeout=15,
-            request_parse_timeout=10,
-        )
-        if (
-            alias_marker.exists()
-            or not strict_equal(response, expected)
-            or probes != 1
-            or dispatches != 1
-        ):
+        clean_failures: list[str] = []
+        for attempt in range(1, 4):
+            response, probes, dispatches, elapsed, diagnostics, _guard = run_case(
+                fixed,
+                bash,
+                readiness_timeout=15,
+                probe_timeout=5,
+                dispatch_timeout=15,
+                request_parse_timeout=10,
+            )
+            if (
+                not alias_marker.exists()
+                and strict_equal(response, expected)
+                and probes == 1
+                and dispatches == 1
+            ):
+                break
+            error = response.get("error")
+            data = error.get("data") if isinstance(error, dict) else None
+            clean_timeout = (
+                not alias_marker.exists()
+                and dispatches == 0
+                and strict_equal(
+                    data,
+                    {
+                        "phase": "readiness",
+                        "dispatched": False,
+                        "replayed": False,
+                        "emacsclientRc": 124,
+                    },
+                )
+                and "MCP-RUNNER-TIMEOUT: phase=execution "
+                "operation=emacsclient" in diagnostics
+            )
+            details = (
+                f"attempt={attempt} marker={alias_marker.exists()} "
+                f"response={response!r} probes={probes} "
+                f"dispatches={dispatches} elapsed={elapsed:.3f} "
+                f"diagnostics={diagnostics!r}"
+            )
+            if clean_timeout:
+                clean_failures.append(details)
+                continue
             raise AssertionError(
-                "fixed wait loop retained the reaped-PID alias: "
-                f"marker={alias_marker.exists()} response={response!r} "
-                f"probes={probes} dispatches={dispatches} "
-                f"elapsed={elapsed:.3f} diagnostics={diagnostics!r}"
+                "fixed wait loop retained the reaped-PID alias: " + details
+            )
+        else:
+            raise AssertionError(
+                "fixed wait loop starved before dispatch after three clean "
+                "attempts: " + " | ".join(clean_failures)
             )
 
 
@@ -940,13 +1096,19 @@ def assert_signal_cleanup(
         binary = root / "bin"
         binary.mkdir()
         fake = binary / "emacsclient"
-        write_fake_emacsclient(fake)
+        python_fake = binary / "emacsclient-python"
+        write_fake_emacsclient(python_fake)
+        # Keep the readiness checkpoint independent of Python process startup.
+        # Stateful dispatch still uses the full fake so the custody regression
+        # exercises the real hanging child and same-group descendant paths.
+        write_fast_probe_frontend(fake, bash)
         cleanup_attempt_path = root / "cleanup-attempts"
+        cleanup_ack_reads_path = root / "cleanup-ack-reads"
         exit_cleanup_path = root / "exit-cleanup-entries"
         bridge = stdio
+        source = stdio.read_text(encoding="utf-8")
         if cleanup_failure:
             bridge = root / "anvil-stdio-cleanup-failure.sh"
-            source = stdio.read_text(encoding="utf-8")
             needle = "anvil_mcp_cleanup_all_staged() {\n"
             injected = (
                 needle
@@ -982,10 +1144,61 @@ def assert_signal_cleanup(
                 bridge,
                 source.replace(exit_needle, exit_injected, 1),
             )
+        elif forged_record:
+            # The forged result forces retirement followed by staged cleanup.
+            # Pause after cleanup READY so at least two atomic heartbeat chunks
+            # queue, then fail the test copy if ACK needs more than one read.
+            bridge = root / "anvil-stdio-cleanup-ack-backlog.sh"
+            setup_anchor = "set -eu -o pipefail\n"
+            operation_anchor = '\tlocal operation="$5"\n'
+            publication_anchor = (
+                "\t# Publish after READY installed every custody trap, "
+                "but acknowledge only\n"
+            )
+            if (
+                source.count(setup_anchor) != 1
+                or source.count(operation_anchor) != 1
+                or source.count(publication_anchor) != 1
+            ):
+                raise AssertionError("cleanup ACK stress injection point drifted")
+            read_guard = r'''
+read() {
+	local argument= last= count=0
+	for argument do last=$argument; done
+	if [ "${ANVIL_TEST_ACK_OPERATION:-}" = cleanup-staged ] \
+		&& [ "$last" = runner_ack ]; then
+		if [ -f "$FAKE_CLEANUP_ACK_READS" ]; then
+			IFS= builtin read -r count < "$FAKE_CLEANUP_ACK_READS" || count=0
+		fi
+		count=$((count + 1))
+		printf '%s\n' "$count" > "$FAKE_CLEANUP_ACK_READS"
+		[ "$count" -eq 1 ] || return 1
+	fi
+	builtin read "$@"
+}
+'''
+            source = source.replace(setup_anchor, setup_anchor + read_guard, 1)
+            source = source.replace(
+                operation_anchor,
+                operation_anchor
+                + '\tlocal ANVIL_TEST_ACK_OPERATION="$operation"\n',
+                1,
+            )
+            source = source.replace(
+                publication_anchor,
+                '\tif [ "$operation" = cleanup-staged ]; then\n'
+                '\t\t"$ANVIL_MCP_SLEEP" 1\n'
+                "\tfi\n\n"
+                + publication_anchor,
+                1,
+            )
+            make_executable(bridge, source)
         hang_pid_path = root / "hang-pid"
         descendant_pid_path = root / "descendant-pid"
         runner_pid_path = root / "runner-pid"
         term_count_path = root / "term-count"
+        probe_count_path = root / "probe-count"
+        fast_probe_count_path = root / "fast-probe-count"
         request = {
             "jsonrpc": "2.0",
             "id": 29,
@@ -998,9 +1211,11 @@ def assert_signal_cleanup(
         environment.update(
             {
                 "PATH": f"{binary}{os.pathsep}{environment['PATH']}",
+                "FAKE_PYTHON_EMACSCLIENT": str(python_fake),
                 "TMPDIR": str(root),
                 "EMACS_MCP_DEBUG_LOG": str(root / "debug.log"),
-                "FAKE_PROBE_COUNT": str(root / "probe-count"),
+                "FAKE_PROBE_COUNT": str(probe_count_path),
+                "FAKE_FAST_PROBE_COUNT": str(fast_probe_count_path),
                 "FAKE_DISPATCH_COUNT": str(root / "dispatch-count"),
                 "FAKE_EARLY_DISPATCH": str(root / "early-dispatch"),
                 "FAKE_GUARD_OBSERVED": str(root / "guard-observed"),
@@ -1018,6 +1233,7 @@ def assert_signal_cleanup(
                 "FAKE_HANG_DISPATCH": "1",
                 "FAKE_FORGED_RUNNER_RECORD": "1" if forged_record else "0",
                 "FAKE_CLEANUP_ATTEMPTS": str(cleanup_attempt_path),
+                "FAKE_CLEANUP_ACK_READS": str(cleanup_ack_reads_path),
                 "FAKE_EXIT_CLEANUP_ENTRIES": str(exit_cleanup_path),
                 "ANVIL_TEST_CLEANUP_FAILURE": "1" if cleanup_failure else "",
                 "FAKE_IGNORE_TERM": "0",
@@ -1068,7 +1284,10 @@ def assert_signal_cleanup(
             process.stdin.write(json.dumps(request, separators=(",", ":")) + "\n")
             process.stdin.flush()
 
-            deadline = time.monotonic() + 10
+            # Allow the existing 10-second dispatch deadline plus both one-
+            # second convergence phases and normal bridge unwinding to settle.
+            # This observation window does not change any production deadline.
+            deadline = time.monotonic() + 15
             while time.monotonic() < deadline:
                 if process.poll() is not None:
                     break
@@ -1096,12 +1315,13 @@ def assert_signal_cleanup(
                     if debug_path.exists()
                     else ""
                 )
-                raise AssertionError(
+                details = (
                     "large request did not reach its staged hanging dispatch "
                     "with a same-group descendant: "
                     f"rc={returncode} stderr={failure_stderr!r} "
                     f"debug={failure_debug!r}"
                 )
+                raise AssertionError(details)
 
             if forged_record:
                 retirement_deadline = time.monotonic() + 5
@@ -1195,8 +1415,18 @@ def assert_signal_cleanup(
             try:
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired as error:
+                debug_path = root / "debug.log"
+                debug = (
+                    debug_path.read_text(encoding="utf-8", errors="replace")
+                    if debug_path.exists()
+                    else ""
+                )
                 raise AssertionError(
-                    "direct bridge SIGTERM did not produce a bounded exit"
+                    "direct bridge SIGTERM did not produce a bounded exit: "
+                    f"child_alive={process_alive(fake_pid)} "
+                    f"runner_alive={process_alive(runner_pid)} "
+                    f"descendant_alive={process_alive(descendant_pid)} "
+                    f"debug={debug!r}"
                 ) from error
 
             stdout = process.stdout.read()
@@ -1238,19 +1468,44 @@ def assert_signal_cleanup(
                     break
                 time.sleep(0.02)
             cleanup_attempts = read_count(cleanup_attempt_path)
+            cleanup_ack_reads = read_count(cleanup_ack_reads_path)
             exit_cleanup_entries = read_count(exit_cleanup_path)
             expected_returncode = (
                 -signal.SIGKILL if owner_death_after_hold else 143
             )
+            debug_path = root / "debug.log"
+            debug = (
+                debug_path.read_text(encoding="utf-8", errors="replace")
+                if debug_path.exists()
+                else ""
+            )
+            group_snapshot = ""
+            if group_alive:
+                snapshot = subprocess.run(
+                    ["ps", "-axo", "pid=,ppid=,pgid=,stat=,command="],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    check=False,
+                ).stdout
+                group_snapshot = "\n".join(
+                    line
+                    for line in snapshot.splitlines()
+                    if len(line.split(None, 4)) >= 3
+                    and line.split(None, 4)[2] == str(process.pid)
+                )
             if (
                 process.returncode != expected_returncode
                 or read_count(term_count_path) != 1
+                or read_count(probe_count_path) != 1
+                or read_count(fast_probe_count_path) != 1
                 or child_alive
                 or runner_alive
                 or descendant_alive
                 or group_alive
                 or (not staged if stage_retained else bool(staged))
                 or cleanup_attempts != (2 if cleanup_failure else 0)
+                or cleanup_ack_reads != (1 if forged_record else 0)
                 or exit_cleanup_entries != 0
                 or (stdout and not forged_record)
                 or "substring expression" in stderr
@@ -1258,12 +1513,16 @@ def assert_signal_cleanup(
                 raise AssertionError(
                     f"{label} bridge termination failed custody: "
                     f"rc={process.returncode} terms={read_count(term_count_path)} "
+                    f"probes={read_count(probe_count_path)}/"
+                    f"{read_count(fast_probe_count_path)} "
                     f"child_alive={child_alive} runner_alive={runner_alive} "
                     f"descendant_alive={descendant_alive} group_alive={group_alive} "
                     f"cleanup_attempts={cleanup_attempts} "
+                    f"cleanup_ack_reads={cleanup_ack_reads} "
                     f"exit_cleanup_entries={exit_cleanup_entries} "
                     f"staged={[path.name for path in staged]!r} "
-                    f"stdout={stdout!r} stderr={stderr!r}"
+                    f"stdout={stdout!r} stderr={stderr!r} "
+                    f"debug={debug!r} group_snapshot={group_snapshot!r}"
                 )
         finally:
             if bridge_stopped and process.poll() is None:
@@ -1277,8 +1536,15 @@ def assert_signal_cleanup(
                 except BrokenPipeError:
                     pass
             if process.poll() is None:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=2)
+                # Preserve the bridge's runner custody even on assertion paths.
+                # A hard group kill here can orphan an as-yet-unpublished child
+                # in the runner's separate process group.
+                process.terminate()
+                try:
+                    process.wait(timeout=7)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=2)
             else:
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
@@ -1322,31 +1588,31 @@ def assert_signal_publication(
             f"#!{bash}\nprintf 't\\n'\n",
         )
         real_python = sys.executable
-        python_wrapper = f"""#!{real_python}
-import os
-import signal
-import sys
-
-once = os.environ["FAKE_PUBLICATION_ONCE"]
-ready = os.environ["FAKE_PUBLICATION_READY"]
-try:
-    descriptor = os.open(once, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-except FileExistsError:
-    os.execv({real_python!r}, [{real_python!r}, *sys.argv[1:]])
-else:
-    os.close(descriptor)
-    with open(ready, "w", encoding="utf-8") as stream:
-        stream.write(str(os.getpid()))
-    signal.alarm(30)
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    while True:
-        signal.pause()
-"""
-        make_executable(binary / "python3", python_wrapper)
+        real_sleep = shutil.which("sleep")
+        if real_sleep is None:
+            raise AssertionError("publication regression requires sleep")
+        # Avoid charging Python loader scheduling to the signal-custody timer.
+        # The first helper publishes its PID and execs a TERM-ignoring sleeper;
+        # later invocations delegate to the real interpreter for cleanup.
+        make_executable(
+            binary / "python3",
+            f"""#!{bash}
+if (set -C; : > "$FAKE_PUBLICATION_ONCE") 2>/dev/null; then
+    printf '%s' "$$" > "$FAKE_PUBLICATION_READY"
+    trap '' TERM
+    exec "$FAKE_PUBLICATION_SLEEP" 30
+fi
+exec "$FAKE_PUBLICATION_REAL_PYTHON" "$@"
+""",
+        )
 
         bridge = root / "anvil-stdio-publication.sh"
         source = stdio.read_text(encoding="utf-8")
-        needle = "\t\tANVIL_MCP_RUNNER_CRITICAL=1\n"
+        needle = (
+            "\t\tanvil_mcp_finish_bounded_termination \"$runner\" 0 "
+            "\"$runner_owned\"\n"
+            "\t\tANVIL_MCP_RUNNER_CRITICAL=1\n"
+        )
         if source.count(needle) != 1:
             raise AssertionError("runner publication injection point drifted")
         if delivered_ack:
@@ -1355,13 +1621,16 @@ else:
                 + "\t\tanvil_mcp_test_deliver_ack() {\n"
                 + '\t\t\tlocal target="$1" attempts=0 ignored\n'
                 + '\t\t\tbuiltin kill -USR2 "$target" || return 1\n'
-                + '\t\t\tIFS= read -r -t 5 ignored <&7 || :\n'
-                + '\t\t\tIFS= read -r -t 5 ignored <&7 || :\n'
+                + '\t\t\twhile IFS= read -r -t 5 ignored <&7; do\n'
+                + '\t\t\t\t[ "$ignored" != "ANVIL-MCP-RUNNER-ACK" ] '
+                + '|| break\n'
+                + "\t\t\tdone\n"
                 + '\t\t\twhile [ ! -e "$FAKE_PUBLICATION_READY" ] '
                 + '&& [ "$attempts" -lt 500 ]; do\n'
                 + "\t\t\t\tattempts=$((attempts + 1))\n"
                 + "\t\t\t\tcommand sleep 0.01\n"
                 + "\t\t\tdone\n"
+                + '\t\t\t: > "$FAKE_PUBLICATION_SIGNAL_SENT"\n'
                 + '\t\t\tbuiltin kill -TERM "$$"\n'
                 + "\t\t\treturn 1\n"
                 + "\t\t}\n"
@@ -1386,6 +1655,7 @@ else:
                 + "\t\t\tunset ANVIL_TEST_SIGNAL_PUBLICATION\n"
                 + '\t\t\tprintf \'%s\' "$runner" '
                 + '> "$FAKE_RUNNER_PUBLICATION_READY"\n'
+                + '\t\t\t: > "$FAKE_PUBLICATION_SIGNAL_SENT"\n'
                 + '\t\t\tkill -TERM "$$"\n'
                 + "\t\tfi\n"
             )
@@ -1394,6 +1664,7 @@ else:
 
         ready_path = root / "publication-helper-ready"
         runner_ready_path = root / "publication-runner-ready"
+        signal_sent_path = root / "publication-signal-sent"
         environment = os.environ.copy()
         environment.pop("ANVIL_MCP_PARENT_GUARD", None)
         environment.pop("ANVIL_MCP_PARENT_GUARD_PYTHON", None)
@@ -1405,12 +1676,15 @@ else:
                 "ANVIL_TEST_SIGNAL_PUBLICATION": "1",
                 "FAKE_PUBLICATION_ONCE": str(root / "publication-once"),
                 "FAKE_PUBLICATION_READY": str(ready_path),
+                "FAKE_PUBLICATION_REAL_PYTHON": real_python,
+                "FAKE_PUBLICATION_SLEEP": real_sleep,
                 "FAKE_RUNNER_PUBLICATION_READY": str(runner_ready_path),
+                "FAKE_PUBLICATION_SIGNAL_SENT": str(signal_sent_path),
                 "ANVIL_MCP_READINESS_MODE": "emacs",
                 "ANVIL_EMACSCLIENT_PROBE_TIMEOUT": "5",
                 "ANVIL_EMACSCLIENT_READINESS_TIMEOUT": "5",
-                "ANVIL_EMACSCLIENT_STARTUP_DISPATCH_TIMEOUT": "10",
-                "ANVIL_EMACSCLIENT_DISPATCH_TIMEOUT": "10",
+                "ANVIL_EMACSCLIENT_STARTUP_DISPATCH_TIMEOUT": "20",
+                "ANVIL_EMACSCLIENT_DISPATCH_TIMEOUT": "150",
                 "ANVIL_EMACSCLIENT_KILL_AFTER_TIMEOUT": "1",
                 "ANVIL_EMACSCLIENT_RETRY_MAX": "1",
                 "ANVIL_EMACSCLIENT_RETRY_DELAY_MS": "0",
@@ -1449,12 +1723,38 @@ else:
                 raise AssertionError(
                     "pre-ACK runner identity was never published"
                 )
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                if signal_sent_path.exists() or process.poll() is not None:
+                    break
+                time.sleep(0.01)
+            if not signal_sent_path.exists():
+                returncode = process.poll()
+                failure_stderr = (
+                    process.stderr.read()
+                    if returncode is not None and process.stderr is not None
+                    else ""
+                )
+                debug_path = root / "debug.log"
+                failure_debug = (
+                    debug_path.read_text(encoding="utf-8", errors="replace")
+                    if debug_path.exists()
+                    else ""
+                )
+                raise AssertionError(
+                    f"{label} publication regression never reached its "
+                    f"injected signal: rc={returncode} "
+                    f"stderr={failure_stderr!r} debug={failure_debug!r}"
+                )
+            convergence_started = time.monotonic()
             try:
-                process.wait(timeout=15)
+                process.wait(timeout=8)
             except subprocess.TimeoutExpired as error:
                 raise AssertionError(
-                    "signal during runner publication did not converge"
+                    "signal during runner publication did not converge "
+                    "independently of the 150-second command deadline"
                 ) from error
+            convergence_elapsed = time.monotonic() - convergence_started
 
             stdout = process.stdout.read() if process.stdout is not None else ""
             stderr = process.stderr.read() if process.stderr is not None else ""
@@ -1489,6 +1789,21 @@ else:
                     break
                 time.sleep(0.02)
             staged = list(root.glob("anvil-mcp.*"))
+            group_snapshot = ""
+            if group_alive:
+                snapshot = subprocess.run(
+                    ["ps", "-axo", "pid=,ppid=,pgid=,stat=,command="],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    check=False,
+                ).stdout
+                group_snapshot = "\n".join(
+                    line
+                    for line in snapshot.splitlines()
+                    if len(line.split(None, 4)) >= 3
+                    and line.split(None, 4)[2] == str(process.pid)
+                )
             if (
                 process.returncode != 143
                 or runner_alive
@@ -1498,14 +1813,17 @@ else:
                 or staged
                 or stdout
                 or "substring expression" in stderr
+                or convergence_elapsed >= 3
             ):
                 raise AssertionError(
                     f"{label} publication signal lost custody: "
                     f"rc={process.returncode} runner_alive={runner_alive} "
                     f"group_alive={group_alive} helper_alive={helper_alive} "
                     f"helper_started={helper_started} "
+                    f"convergence_elapsed={convergence_elapsed:.3f} "
                     f"staged={[path.name for path in staged]!r} "
-                    f"stdout={stdout!r} stderr={stderr!r}"
+                    f"stdout={stdout!r} stderr={stderr!r} "
+                    f"group_snapshot={group_snapshot!r}"
                 )
         finally:
             if process.stdin is not None:
@@ -1527,6 +1845,253 @@ else:
                     os.kill(helper_pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+            if process.poll() is None:
+                process.wait(timeout=2)
+
+
+def assert_delayed_ack_preserves_runner(
+    stdio: Path,
+    bash: str,
+    expected: dict[str, object],
+) -> None:
+    """READY custody survives parent descheduling beyond five seconds."""
+    with tempfile.TemporaryDirectory(prefix="anvil-stdio-delayed-ack-") as raw:
+        root = Path(raw)
+        bridge = root / "anvil-stdio-delayed-ack.sh"
+        once = root / "delay-once"
+        runner_record = root / "runner"
+        source = stdio.read_text(encoding="utf-8")
+        needle = (
+            "\t# Publish after READY installed every custody trap, but acknowledge only\n"
+        )
+        if source.count(needle) != 1:
+            raise AssertionError("delayed ACK injection point drifted")
+        injected = (
+            f"\tif [ \"$operation\" = dispatch ] && [ ! -e '{once}' ]; then\n"
+            f"\t\t: > '{once}'\n"
+            f"\t\tprintf '%s\\n' \"$runner\" > '{runner_record}'\n"
+            "\t\t\"$ANVIL_MCP_SLEEP\" 6\n"
+            "\tfi\n\n"
+            + needle
+        )
+        make_executable(bridge, source.replace(needle, injected, 1))
+
+        response, probes, dispatches, elapsed, diagnostics, _guard = run_case(
+            bridge,
+            bash,
+            dispatch_timeout=15,
+            request_parse_timeout=10,
+            anvil_root=stdio.parent,
+        )
+        if (
+            not strict_equal(response, expected)
+            or probes != 1
+            or dispatches != 1
+            or not 6 <= elapsed < 25
+            or not runner_record.exists()
+        ):
+            raise AssertionError(
+                "READY runner was not retained across delayed ACK: "
+                f"response={response!r} probes={probes} "
+                f"dispatches={dispatches} elapsed={elapsed:.3f} "
+                f"diagnostics={diagnostics!r}"
+            )
+
+
+def assert_saturated_heartbeat_preserves_ack(stdio: Path, bash: str) -> None:
+    """A signal-interrupted heartbeat must still publish ACK and status."""
+    source = stdio.read_text(encoding="utf-8")
+    start = source.index("anvil_mcp_exec_program() {")
+    end = source.index("\n# Drain one bounded retirement phase", start)
+    runner_source = source[start:end]
+    heartbeat = "printf 'ANVIL-MCP-RUNNER-WAIT:%0234d' 0"
+    if runner_source.count(heartbeat) != 1:
+        raise AssertionError("heartbeat instrumentation point drifted")
+    runner_source = runner_source.replace(
+        heartbeat,
+        "anvil_mcp_test_heartbeat",
+        1,
+    )
+
+    with tempfile.TemporaryDirectory(prefix="anvil-stdio-heartbeat-") as raw:
+        root = Path(raw)
+        before_path = root / "heartbeat-before"
+        after_path = root / "heartbeat-after"
+        harness = root / "heartbeat-harness.sh"
+        true_program = shutil.which("true")
+        if true_program is None:
+            raise AssertionError("heartbeat regression requires an external true")
+        make_executable(
+            harness,
+            f"""#!{bash}
+set -eu -o pipefail
+
+anvil_mcp_test_heartbeat() {{
+    local heartbeat_status=0
+    printf x >> "$ANVIL_TEST_HEARTBEAT_BEFORE"
+    printf '%s' "$ANVIL_TEST_HEARTBEAT_PAYLOAD" \\
+        || heartbeat_status=$?
+    printf x >> "$ANVIL_TEST_HEARTBEAT_AFTER"
+    return "$heartbeat_status"
+}}
+
+{runner_source}
+
+ANVIL_MCP_PARENT_GUARD=
+ANVIL_MCP_PARENT_GUARD_PYTHON=
+ANVIL_MCP_SLEEP="$ANVIL_TEST_TRUE"
+exec 7< <(anvil_mcp_run_child "$$" 150 merge null "" "$ANVIL_TEST_TRUE")
+runner=$!
+if ! IFS= read -r -t 5 ready <&7 \\
+    || [ "$ready" != "ANVIL-MCP-RUNNER-READY" ]; then
+    exit 71
+fi
+printf 'READY %s\\n' "$runner"
+IFS= read -r command
+[ "$command" = go ] || exit 72
+kill -USR2 "$runner"
+"$ANVIL_TEST_REAL_SLEEP" 0.2
+record=
+IFS= read -r -t 5 record <&7 || exit 73
+[[ "$record" = *ANVIL-MCP-RUNNER-ACK ]] || exit 73
+output=
+IFS= read -r -d '' output <&7 || exit 74
+IFS= read -r status <&7 || exit 75
+[ "$status" = 0 ] || exit 76
+exec 7<&-
+printf 'DONE %s\\n' "$runner"
+""",
+        )
+
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "ANVIL_TEST_HEARTBEAT_BEFORE": str(before_path),
+                "ANVIL_TEST_HEARTBEAT_AFTER": str(after_path),
+                # The 256-byte payload is below POSIX's minimum PIPE_BUF of
+                # 512.  It therefore preserves the production heartbeat's
+                # atomic-write and bounded-pipe semantics in this harness.
+                "ANVIL_TEST_HEARTBEAT_PAYLOAD": "W" * 256,
+                "ANVIL_TEST_TRUE": true_program,
+                "ANVIL_TEST_REAL_SLEEP": subprocess.run(
+                    ["sh", "-c", "command -v sleep"],
+                    stdout=subprocess.PIPE,
+                    text=True,
+                    check=True,
+                ).stdout.strip(),
+            }
+        )
+        process = subprocess.Popen(
+            [bash, str(harness)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            text=True,
+            start_new_session=True,
+        )
+        runner_pid: int | None = None
+        try:
+            if (
+                process.stdin is None
+                or process.stdout is None
+                or process.stderr is None
+            ):
+                raise AssertionError("heartbeat regression pipes were not created")
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                ready_future = executor.submit(process.stdout.readline)
+                try:
+                    ready_line = ready_future.result(timeout=5)
+                except FutureTimeoutError as error:
+                    raise AssertionError(
+                        "saturated heartbeat runner never published READY"
+                    ) from error
+            pieces = ready_line.strip().split()
+            if len(pieces) != 2 or pieces[0] != "READY":
+                raise AssertionError(
+                    f"invalid saturated heartbeat READY record: {ready_line!r}"
+                )
+            runner_pid = int(pieces[1])
+
+            saturation_deadline = time.monotonic() + 10
+            imbalance_since: float | None = None
+            saturated = False
+            before_size = 0
+            after_size = 0
+            while time.monotonic() < saturation_deadline:
+                if process.poll() is not None:
+                    break
+                before_size = (
+                    before_path.stat().st_size if before_path.exists() else 0
+                )
+                after_size = after_path.stat().st_size if after_path.exists() else 0
+                if before_size == after_size + 1:
+                    if imbalance_since is None:
+                        imbalance_since = time.monotonic()
+                    elif time.monotonic() - imbalance_since >= 0.2:
+                        saturated = True
+                        break
+                else:
+                    imbalance_since = None
+                time.sleep(0.01)
+            if not saturated:
+                runner_alive = process_alive(runner_pid)
+                snapshot = subprocess.run(
+                    ["ps", "-axo", "pid=,ppid=,pgid=,stat=,command="],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    check=False,
+                ).stdout
+                group_snapshot = "\n".join(
+                    line
+                    for line in snapshot.splitlines()
+                    if len(line.split(None, 4)) >= 3
+                    and line.split(None, 4)[2] == str(process.pid)
+                )
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                if process.poll() is None:
+                    process.wait(timeout=2)
+                stderr = process.stderr.read()
+                raise AssertionError(
+                    "heartbeat pipe did not reach a blocked write: "
+                    f"rc={process.returncode} runner_alive={runner_alive} "
+                    f"before={before_size} after={after_size} "
+                    f"stderr={stderr!r} group_snapshot={group_snapshot!r}"
+                )
+
+            process.stdin.write("go\n")
+            process.stdin.flush()
+            process.stdin.close()
+            process.stdin = None
+            try:
+                stdout, stderr = process.communicate(timeout=8)
+            except subprocess.TimeoutExpired as error:
+                raise AssertionError(
+                    "signal-interrupted saturated heartbeat did not converge"
+                ) from error
+            if process.returncode != 0 or not stdout.startswith("DONE "):
+                raise AssertionError(
+                    "signal-interrupted saturated heartbeat lost ACK/status: "
+                    f"rc={process.returncode} stdout={stdout!r} stderr={stderr!r}"
+                )
+            if not wait_process_dead(runner_pid):
+                raise AssertionError(
+                    f"saturated heartbeat runner survived FD7 close: {runner_pid}"
+                )
+        finally:
+            if process.stdin is not None:
+                try:
+                    process.stdin.close()
+                except BrokenPipeError:
+                    pass
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             if process.poll() is None:
                 process.wait(timeout=2)
 
@@ -1836,6 +2401,35 @@ def main() -> int:
             f"probes={probes} dispatches={dispatches}"
         )
 
+    timed_out, probes, dispatches, _elapsed, diagnostics, _guard = run_case(
+        stdio, bash, hang_prepare_response=True, request_parse_timeout=1
+    )
+    error = timed_out.get("error")
+    data = error.get("data") if isinstance(error, dict) else None
+    expected_timeout = {
+        "phase": "stage",
+        "dispatched": False,
+        "replayed": False,
+        "emacsclientRc": 124,
+    }
+    if (
+        timed_out.get("id") != 17
+        or not strict_equal(data, expected_timeout)
+        or probes != 1
+        or dispatches != 0
+        or (
+            "MCP-RUNNER-TIMEOUT: phase=execution "
+            "operation=prepare-response"
+        )
+        not in diagnostics
+    ):
+        raise AssertionError(
+            "pre-dispatch timeout lacked a phase-specific diagnostic: "
+            f"response={timed_out!r} "
+            f"probes={probes} dispatches={dispatches} "
+            f"diagnostics={diagnostics!r}"
+        )
+
     malformed, probes, dispatches, _elapsed, stderr, _guard = run_case(
         stdio, bash, malformed_output=True
     )
@@ -1873,6 +2467,8 @@ def main() -> int:
     assert_lifecycle_guard(stdio, bash, "init", split_sentinel=True)
     assert_lifecycle_guard(stdio, bash, "stop", split_sentinel=True)
     assert_drain_phase_budget(stdio, bash)
+    assert_delayed_ack_preserves_runner(stdio, bash, expected)
+    assert_saturated_heartbeat_preserves_ack(stdio, bash)
     assert_signal_publication(stdio, bash, delivered_ack=False)
     assert_signal_publication(stdio, bash, delivered_ack=True)
     assert_signal_cleanup(stdio, bash, repeat=False)

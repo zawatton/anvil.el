@@ -97,7 +97,7 @@
         (should
          (string-match-p
           (regexp-quote "remaining=$((grace - elapsed))") source))
-        (should (= 4
+        (should (= 3
                    (how-many
                     (regexp-quote "-t \"$remaining\"")
                     (point-min) (point-max))))

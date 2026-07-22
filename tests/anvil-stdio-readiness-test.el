@@ -86,6 +86,24 @@
         (should
          (string-match-p
           (regexp-quote "ANVIL_MCP_NOT_READY_SENTINEL")
+          source))
+        (should-not
+         (string-match-p
+          (regexp-quote
+           "[ \"$ack_wait_count\" -lt 50 ]")
+          source))
+        (should
+         (string-match-p
+          (regexp-quote "ANVIL-MCP-RUNNER-WAIT")
+          source))
+        (should-not (string-match-p "ack_deadline" source))
+        (should-not
+         (string-match-p
+          (regexp-quote "printf '%65536s' ''")
+          source))
+        (should
+         (string-match-p
+          (regexp-quote "phase=ack operation=$operation")
           source))))))
 
 (provide 'anvil-stdio-readiness-test)

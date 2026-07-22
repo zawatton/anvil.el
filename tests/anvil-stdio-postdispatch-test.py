@@ -1290,8 +1290,12 @@ def wait_for_dispatch_complete(
                     if error.errno != errno.ENXIO:
                         raise
                     if process.poll() is not None:
+                        root = marker.parent
                         raise AssertionError(
-                            "bridge exited before dispatch acknowledgement"
+                            "bridge exited before dispatch acknowledgement: "
+                            f"rc={process.returncode} "
+                            f"debug={safe_text(root / 'stdio.log')} "
+                            f"stderr={safe_text(root / 'bridge.stderr')}"
                         ) from error
                     time.sleep(0.01)
                     continue
@@ -1302,7 +1306,13 @@ def wait_for_dispatch_complete(
                 return
             raise AssertionError("fake client did not open acknowledgement FIFO")
         if process.poll() is not None:
-            raise AssertionError("bridge exited before dispatch completed")
+            root = marker.parent
+            raise AssertionError(
+                "bridge exited before dispatch completed: "
+                f"rc={process.returncode} "
+                f"debug={safe_text(root / 'stdio.log')} "
+                f"stderr={safe_text(root / 'bridge.stderr')}"
+            )
         time.sleep(0.02)
     root = marker.parent
     raise AssertionError(

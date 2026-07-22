@@ -260,28 +260,34 @@ anvil_mcp_run_child() {
 			anvil_mcp_finish_runner 70
 		fi
 	' EXIT
+	# READY alone never authorizes the requested command.  Hold this exact writer
+	# until the parent publishes its identity and acknowledges it with USR2.  Each
+	# 256-byte heartbeat is below POSIX's minimum PIPE_BUF, so it either completes
+	# atomically or blocks without a partial chunk.  Heartbeats have no newline:
+	# after ACK appends the sole line terminator, the parent drains the finite pipe
+	# backlog with one bounded read.  Closing FD7 produces EPIPE without launching.
 	if ! printf '%s\n' "ANVIL-MCP-RUNNER-READY"; then
 		trap - EXIT TERM USR1 USR2
 		return
 	fi
-	# READY alone never authorizes a child launch.  Hold this exact writer until
-	# the parent publishes its identity and acknowledges it with USR2.  If the
-	# parent's timed READY read loses at the boundary, closing FD7 makes this
-	# filler fail with EPIPE and the runner exits before spawning anything.
-	while [ "$runner_acked" -eq 0 ]; do
+	while [ "$runner_acked" -eq 0 ] \
+		&& kill -0 "$bridge_pid" 2>/dev/null; do
 		before=$signal_epoch
-		if printf '%65536s' '' 2>/dev/null; then
-			continue
-		fi
-		[ "$runner_acked" -ne 0 ] && break
-		if [ "$signal_epoch" -eq "$before" ]; then
-			trap - EXIT TERM USR1 USR2
-			return
+		if ! printf 'ANVIL-MCP-RUNNER-WAIT:%0234d' 0 2>/dev/null; then
+			if [ "$signal_epoch" -eq "$before" ]; then
+				trap - EXIT TERM USR1 USR2
+				return
+			fi
+			break
 		fi
 	done
+	[ "$runner_acked" -ne 0 ] || {
+		trap - EXIT TERM USR1 USR2
+		return
+	}
 	while :; do
 		before=$signal_epoch
-		if printf '\n%s\n' "ANVIL-MCP-RUNNER-ACK"; then
+		if printf '%s\n' "ANVIL-MCP-RUNNER-ACK"; then
 			runner_ack_published=1
 			break
 		fi
@@ -398,10 +404,19 @@ anvil_mcp_converge_runner() {
 # the still-published runner is converged before the function returns.
 anvil_mcp_run_bounded() {
 	local deadline="$1" stderr_mode="$2" input_mode="$3" input="$4"
+	local operation="$5"
 	local runner status="" runner_ready=""
-	local runner_ack="" ack_filler="" ack_error=0 ack_attempted=0 ack_sent=0
+	local runner_ack="" ack_error=0 ack_attempted=0 ack_sent=0
+	local runner_owned=0
 	local started_seconds=$SECONDS elapsed remaining
-	shift 4
+	shift 5
+	case "$operation" in
+	emacsclient|probe-delay|dispatch|frame-line|frame-body|request-metadata|prepare-response|validate-response-fd|stage-request|cleanup-staged)
+		;;
+	*)
+		operation=unknown
+		;;
+	esac
 	ANVIL_MCP_RUN_OUTPUT=""
 	ANVIL_MCP_RUN_STATUS=70
 	anvil_mcp_finish_pending_termination
@@ -413,23 +428,36 @@ anvil_mcp_run_bounded() {
 	anvil_mcp_finish_bounded_termination "$runner" 0
 	if ! IFS= read -r -t "$deadline" runner_ready <&7 \
 		|| [ "$runner_ready" != "ANVIL-MCP-RUNNER-READY" ]; then
+		mcp_debug_log "RUNNER-TIMEOUT" \
+			"phase=ready operation=$operation"
 		anvil_mcp_finish_bounded_termination "$runner" 0
 		ANVIL_MCP_RUN_STATUS=124
 		ANVIL_MCP_RUNNER_STARTING=0
 		ANVIL_MCP_ACTIVE_RUNNER=
-		# Without the ACK the runner is still a held writer and has launched no
-		# child.  Closing the reader retires it without a numeric-PID signal.
+		# Before a validated READY, numeric runner custody is not published.  The
+		# heartbeat observes this close and retires without risking a reused PID.
 		exec 7<&-
 		anvil_mcp_finish_pending_termination
 		return 0
 	fi
-	anvil_mcp_finish_bounded_termination "$runner" 0
 
 	# Publish after READY installed every custody trap, but acknowledge only
-	# after the exact numeric identity is visible to bridge signal handlers.
+	# after the exact numeric identity is visible to bridge signal handlers.  A
+	# signal at the read/publication boundary either closes FD7 before this
+	# critical section or leaves it open for the owning checkpoint below.
+	ANVIL_MCP_RUNNER_CRITICAL=1
+	if [ -n "$ANVIL_MCP_PENDING_TERMINATION_STATUS" ] \
+		|| [ "$ANVIL_MCP_RUNNER_STARTING" -eq 0 ]; then
+		ANVIL_MCP_RUNNER_CRITICAL=0
+		exec 7<&-
+		anvil_mcp_finish_pending_termination
+		return 0
+	fi
 	ANVIL_MCP_ACTIVE_RUNNER=$runner
 	ANVIL_MCP_RUNNER_STARTING=0
-	anvil_mcp_finish_bounded_termination "$runner" 0
+	runner_owned=1
+	ANVIL_MCP_RUNNER_CRITICAL=0
+	anvil_mcp_finish_bounded_termination "$runner" 0 "$runner_owned"
 	# Bash 3.2 exposes only whole-second SECONDS.  Once it advances, retain
 	# one second for the unknown fractional remainder instead of timing out
 	# immediately after a wall-second boundary.
@@ -438,8 +466,10 @@ anvil_mcp_run_bounded() {
 	[ "$elapsed" -eq 0 ] || remaining=$((remaining + 1))
 	if [ "$remaining" -le 0 ]; then
 		ack_error=124
+		mcp_debug_log "RUNNER-TIMEOUT" \
+			"phase=ack operation=$operation step=budget"
 	else
-		anvil_mcp_finish_bounded_termination "$runner" 0
+		anvil_mcp_finish_bounded_termination "$runner" 0 "$runner_owned"
 		ANVIL_MCP_RUNNER_CRITICAL=1
 		if [ -z "$ANVIL_MCP_PENDING_TERMINATION_STATUS" ] \
 			&& [ "$ANVIL_MCP_ACTIVE_RUNNER" = "$runner" ]; then
@@ -455,48 +485,49 @@ anvil_mcp_run_bounded() {
 			ack_error=70
 		fi
 		ANVIL_MCP_RUNNER_CRITICAL=0
-		anvil_mcp_finish_bounded_termination "$runner" "$ack_attempted"
+		anvil_mcp_finish_bounded_termination \
+			"$runner" "$ack_attempted" "$runner_owned"
 		if [ "$ack_sent" -eq 1 ]; then
-			if ! IFS= read -r -t "$remaining" ack_filler <&7; then
+			anvil_mcp_finish_bounded_termination \
+				"$runner" 1 "$runner_owned"
+			elapsed=$((SECONDS - started_seconds))
+			remaining=$((deadline - elapsed))
+			[ "$elapsed" -eq 0 ] || remaining=$((remaining + 1))
+			runner_ack=
+			if [ "$remaining" -le 0 ] \
+				|| ! IFS= read -r -t "$remaining" runner_ack <&7; then
 				ack_error=124
-			else
-				anvil_mcp_finish_bounded_termination "$runner" 1
-				elapsed=$((SECONDS - started_seconds))
-				remaining=$((deadline - elapsed))
-				[ "$elapsed" -eq 0 ] || remaining=$((remaining + 1))
-				if [ "$remaining" -le 0 ] \
-					|| ! IFS= read -r -t "$remaining" runner_ack <&7; then
-					ack_error=124
-				elif [ "$runner_ack" != "ANVIL-MCP-RUNNER-ACK" ]; then
-					ack_error=70
-				fi
-				anvil_mcp_finish_bounded_termination "$runner" 1
+				mcp_debug_log "RUNNER-TIMEOUT" \
+					"phase=ack operation=$operation step=record"
+			elif [[ "$runner_ack" != *ANVIL-MCP-RUNNER-ACK ]]; then
+				ack_error=70
 			fi
+			anvil_mcp_finish_bounded_termination \
+				"$runner" 1 "$runner_owned"
 		fi
 	fi
-	anvil_mcp_finish_bounded_termination "$runner" "$ack_attempted"
-	ack_filler=
+	anvil_mcp_finish_bounded_termination \
+		"$runner" "$ack_attempted" "$runner_owned"
 	runner_ack=
 	if [ "$ack_error" -ne 0 ]; then
 		ANVIL_MCP_RUN_STATUS=$ack_error
-		# An attempted ACK may have crossed the child-launch boundary; converge
+		# An attempted ACK may have crossed the requested-command boundary; converge
 		# the still-held exact runner before withdrawing its public identity.
 		ANVIL_MCP_ACTIVE_RUNNER=
-		[ "$ack_attempted" -eq 0 ] \
-			|| [ "$runner" = "$ANVIL_MCP_RETIRED_RUNNER" ] \
+		[ "$runner" = "$ANVIL_MCP_RETIRED_RUNNER" ] \
 			|| anvil_mcp_converge_runner "$runner"
 		exec 7<&-
 		anvil_mcp_finish_pending_termination
 		return 0
 	fi
 
-	# ACK is the child-launch authorization point.  Give the command its full
+	# ACK authorizes the requested command.  Give it its full
 	# execution deadline instead of charging READY/ACK setup against it.
-	anvil_mcp_finish_bounded_termination "$runner" 1
+	anvil_mcp_finish_bounded_termination "$runner" 1 "$runner_owned"
 	remaining=$deadline
 	if [ "$remaining" -gt 0 ] \
 		&& IFS= read -r -d '' -t "$remaining" ANVIL_MCP_RUN_OUTPUT <&7; then
-		anvil_mcp_finish_bounded_termination "$runner" 1
+		anvil_mcp_finish_bounded_termination "$runner" 1 "$runner_owned"
 		if IFS= read -r -t "$ANVIL_EMACSCLIENT_KILL_AFTER_TIMEOUT" status <&7 \
 			&& [[ "$status" =~ ^[0-9]+$ ]] \
 			&& [ "$status" -le 255 ]; then
@@ -508,8 +539,10 @@ anvil_mcp_run_bounded() {
 	else
 		ANVIL_MCP_RUN_OUTPUT=""
 		ANVIL_MCP_RUN_STATUS=124
+		mcp_debug_log "RUNNER-TIMEOUT" \
+			"phase=execution operation=$operation"
 	fi
-	anvil_mcp_finish_bounded_termination "$runner" 1
+	anvil_mcp_finish_bounded_termination "$runner" 1 "$runner_owned"
 	# Retire synchronously before PID reuse.  Child bytes—including a forged
 	# NUL/status record—can never suppress the unconditional escalation.
 	ANVIL_MCP_ACTIVE_RUNNER=
@@ -586,13 +619,14 @@ anvil_mcp_finish_pending_termination() {
 }
 
 anvil_mcp_finish_bounded_termination() {
-	local runner="$1" launch_authorized="${2:-0}"
+	local runner="$1" launch_authorized="${2:-0}" runner_owned="${3:-0}"
 	[ -n "$ANVIL_MCP_PENDING_TERMINATION_STATUS" ] || return 0
 	[ "$ANVIL_MCP_CLEANUP_ACTIVE" -eq 0 ] || return 0
 	ANVIL_MCP_ACTIVE_RUNNER=
 	ANVIL_MCP_RUNNER_STARTING=0
-	if [ "$launch_authorized" -eq 1 ] \
-		&& [ "$runner" != "$ANVIL_MCP_RETIRED_RUNNER" ]; then
+	if [ "$runner" != "$ANVIL_MCP_RETIRED_RUNNER" ] \
+		&& { [ "$launch_authorized" -eq 1 ] \
+			|| [ "$runner_owned" -eq 1 ]; }; then
 		anvil_mcp_converge_runner "$runner"
 	fi
 	exec 7<&- 2>/dev/null || :
@@ -791,7 +825,7 @@ anvil_emacsclient_once() {
 	shift
 	if [ "${1-}" = "--" ]; then shift; fi
 
-	anvil_mcp_run_bounded "$timeout_seconds" merge null "" \
+	anvil_mcp_run_bounded "$timeout_seconds" merge null "" emacsclient \
 		"$ANVIL_MCP_EMACSCLIENT" -a false "$@"
 	return "$ANVIL_MCP_RUN_STATUS"
 }
@@ -815,7 +849,7 @@ anvil_emacsclient_probe_delay() {
 		printf -v delay_sec '%d.%03d' \
 			"$((delay_ms / 1000))" "$((delay_ms % 1000))"
 		local delay_cap=$((delay_ms / 1000 + 1))
-		anvil_mcp_run_bounded "$delay_cap" merge null "" \
+		anvil_mcp_run_bounded "$delay_cap" merge null "" probe-delay \
 			"$ANVIL_MCP_SLEEP" "$delay_sec"
 	fi
 }
@@ -924,7 +958,7 @@ anvil_emacsclient_dispatch_once() {
 	shift
 	if [ "${1-}" = "--" ]; then shift; fi
 
-	anvil_mcp_run_bounded "$timeout_seconds" separate null "" \
+	anvil_mcp_run_bounded "$timeout_seconds" separate null "" dispatch \
 		"$ANVIL_MCP_EMACSCLIENT" -a false "$@"
 	return "$ANVIL_MCP_RUN_STATUS"
 }
@@ -1100,7 +1134,7 @@ anvil_mcp_read_binary_line() {
 	frame_remaining=$((frame_deadline - SECONDS))
 	[ "$frame_remaining" -gt 0 ] || return 1
 	exec 5<&0
-	anvil_mcp_run_bounded "$frame_remaining" merge descriptor "" \
+	anvil_mcp_run_bounded "$frame_remaining" merge descriptor "" frame-line \
 		"$ANVIL_MCP_PYTHON" -I -S -c '
 import os
 import sys
@@ -1182,7 +1216,7 @@ anvil_mcp_read_framed_message() {
 	mcp_debug_log "FRAMING" \
 		"body reader start bytes=$content_length remaining=$frame_remaining"
 	exec 5<&0
-	anvil_mcp_run_bounded "$frame_remaining" merge descriptor "" \
+	anvil_mcp_run_bounded "$frame_remaining" merge descriptor "" frame-body \
 		"$ANVIL_MCP_PYTHON" -I -S -c '
 import os
 import sys
@@ -1248,6 +1282,7 @@ anvil_mcp_validate_response_fd() {
 		return 74
 	fi
 	anvil_mcp_run_bounded "$ANVIL_MCP_REQUEST_PARSE_TIMEOUT" merge descriptor "" \
+		validate-response-fd \
 		"$ANVIL_MCP_PYTHON" -I -S -c '
 import os
 import stat
@@ -1415,7 +1450,7 @@ anvil_mcp_retire_staged_request() {
 anvil_mcp_request_metadata() {
 	local request="$1" transaction_directory="${2:-}"
 	anvil_mcp_run_bounded "$ANVIL_MCP_REQUEST_PARSE_TIMEOUT" \
-		merge input "$request" "$ANVIL_MCP_PYTHON" -I -S -c '
+		merge input "$request" request-metadata "$ANVIL_MCP_PYTHON" -I -S -c '
 import base64
 import json
 import math
@@ -1543,7 +1578,7 @@ else:
 anvil_mcp_prepare_response() {
 	local requested_directory="$1" basename="$2"
 	anvil_mcp_run_bounded "$ANVIL_MCP_REQUEST_PARSE_TIMEOUT" \
-		merge null "" "$ANVIL_MCP_PYTHON" -I -S -c '
+		merge null "" prepare-response "$ANVIL_MCP_PYTHON" -I -S -c '
 import base64
 import os
 import signal
@@ -1720,7 +1755,7 @@ except BaseException:
 anvil_mcp_stage_request() {
 	local request="$1" basename="$2" directory="$3"
 	anvil_mcp_run_bounded "$ANVIL_MCP_REQUEST_PARSE_TIMEOUT" \
-		merge input "$request" "$ANVIL_MCP_PYTHON" -I -S -c '
+		merge input "$request" stage-request "$ANVIL_MCP_PYTHON" -I -S -c '
 import base64
 import os
 import signal
@@ -1808,7 +1843,7 @@ except BaseException:
 anvil_mcp_cleanup_all_staged() {
 	local directory="${ANVIL_MCP_TRANSACTION_DIRECTORY:-$ANVIL_MCP_REQUEST_DIRECTORY}"
 	anvil_mcp_run_bounded "$ANVIL_MCP_REQUEST_PARSE_TIMEOUT" \
-		merge null "" "$ANVIL_MCP_PYTHON" -I -S -c '
+		merge null "" cleanup-staged "$ANVIL_MCP_PYTHON" -I -S -c '
 import errno
 import os
 import stat
