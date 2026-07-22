@@ -29,7 +29,7 @@ The clearest trigger was an unbounded file-read of a 149,239-line Rust file. Anv
 - Do not increase watchdog deadlines to hide root starvation.
 - Do not route all file or shell operations through the worker pool.
 - Do not return an oversized file automatically in a subprocess; the large result would still need to cross root Emacs and the MCP transport.
-- Do not record request arguments, paths, expressions, output, request identifiers, environment values, or other potentially sensitive data.
+- Do not record request arguments, paths, expressions, output, request identifiers, caller-derived environment values, or other potentially sensitive data. The generated non-secret run ID is the sole environment-carried protocol value.
 - Do not change ai-nix; it contains no Anvil worker or watchdog implementation.
 - Do not alter unrelated existing changes in /Users/johnw/src/nix/config/packages.nix or /Users/johnw/src/nix/docs/PI-AGENT-WIGGUM-PLAN.md.
 
@@ -109,45 +109,96 @@ Do not reroute shell-run or shell-tee-grep. Their process wait already yields to
 
 ### Root activity record
 
-The Nix-generated dedicated root will maintain a private fixed-inode activity record in its per-agent runtime directory. The file is mode 0600 and owned by the user. Updates overwrite the already-open inode; they do not replace the file or follow a new pathname.
+The launcher creates a private Unix-domain stream endpoint plus separate
+fixed-inode activity and event records in the canonical mode-0700 per-agent
+runtime directory.  The monitor exclusively owns the two regular-file
+descriptors.  Root Emacs receives only the endpoint pathname and a run
+identifier, connects once with `make-network-process`, and sends bounded
+activity messages over that connection.  After accepting the root connection,
+the monitor unlinks the socket pathname.  Consequently all later updates use
+the established connection, pathname replacement cannot redirect them, and no
+raw diagnostic descriptor is inherited by root subprocesses.
 
-The root records only bounded metadata:
+The activity protocol and persisted record use schema version 1 with exactly
+these JSON keys:
 
-- schema version;
-- daemon PID;
-- phase: startup, parse, dispatch, tool-call, result-encode, response-write, or idle;
-- JSON-RPC method from a fixed allowlist;
-- tool identifier only when it matches a currently registered tool;
-- phase start time and observation time in Unix milliseconds.
+- `schema_version`: integer `1`;
+- `run_id`: exactly 32 lowercase hexadecimal characters, freshly generated
+  by the supervisor for this daemon launch;
+- `daemon_pid`: the positive root daemon PID;
+- `sequence`: a non-negative integer that strictly increases per root;
+- `phase`: one of `startup`, `parse`, `dispatch`, `tool-call`,
+  `result-encode`, `response-write`, or `idle`;
+- `method`: one of `none`, `initialize`,
+  `notifications/initialized`, `ping`, `tools/list`, `tools/call`,
+  `resources/list`, `resources/read`, `resources/templates/list`, or
+  `other`;
+- `tool`: JSON null, or a currently registered tool identifier no longer
+  than 128 UTF-8 bytes;
+- `phase_started_unix_ms` and `observed_at_unix_ms`: non-negative integer
+  Unix milliseconds.
 
-Nix-local advice around the Anvil request boundary updates this record. Arguments, request IDs, paths, expressions, raw JSON, results, and environment values are prohibited.
+One newline-terminated activity message is at most 1,024 UTF-8 bytes.  The
+monitor accepts only the expected run identifier and daemon PID, a sequence
+greater than the last accepted sequence, exact keys, valid enum values, and
+valid integer fields.  It serializes accepted metadata back to at most 1,024
+UTF-8 bytes through its already-open activity descriptor, truncates at byte
+zero, and fsyncs it.  An invalid or partial message is discarded while the
+last valid activity remains authoritative.
+
+Nix-local advice around the Anvil request boundary emits these messages.
+Unrecognized methods become `other`; a tool becomes null unless it exists in
+the active registered-tool table.  Arguments, request IDs, paths, expressions,
+raw JSON, results, and caller-derived environment values are prohibited; the
+generated non-secret run identifier is the sole environment-carried protocol
+value.
 
 The activity record is separate from the synchronization lease. Rewriting the lease would advance its generation and could reset dispatch_started, weakening the dispatch deadline.
 
 ### Watchdog event record
 
-The watchdog monitor receives a pre-opened private result inode. Immediately after a failure is revalidated and immediately before SIGKILL, it writes one sanitized event with:
+Immediately after a failure is revalidated and immediately before SIGKILL, the
+monitor writes one schema-version-1 event through its private fixed-inode
+descriptor.  Every event contains exactly:
 
-- schema version and daemon PID;
-- cause: startup-timeout, heartbeat-timeout, dispatch-timeout, lock-integrity-failure, monitor-state-invalid, durable-refresh-failure, or monitor-internal-error;
-- last activity phase, method, and registered tool identifier;
-- observation time and daemon uptime;
-- heartbeat age and limit when relevant;
-- dispatch age and limit when relevant.
+- `schema_version`, `run_id`, and `daemon_pid` under the same constraints
+  as the activity record;
+- `cause`: one of `startup-timeout`, `heartbeat-timeout`,
+  `dispatch-timeout`, `lock-integrity-failure`,
+  `monitor-state-invalid`, `durable-refresh-failure`, or
+  `monitor-internal-error`;
+- `phase`: an activity phase or `unknown`;
+- `method`: one of the activity method enum values;
+- `tool`: null or at most 128 UTF-8 bytes;
+- `observed_at_unix_ms` and `daemon_uptime_ms`: non-negative integers;
+- `heartbeat_age_ms`, `heartbeat_limit_ms`, `dispatch_age_ms`, and
+  `dispatch_limit_ms`: non-negative integers when that deadline has an
+  anchor, otherwise null.
 
-When heartbeat and dispatch deadlines have both expired, classify the cause whose absolute deadline elapsed first. Diagnostic-write failure must never prevent the required kill.
+The event is canonical compact UTF-8 JSON no larger than 4,096 bytes.  All
+durations are integer milliseconds derived from monotonic time; only
+`observed_at_unix_ms` is wall-clock time.  The monitor truncates and rewinds
+the fixed inode before writing, fsyncs best-effort, and never allows a
+diagnostic-write failure to suppress SIGKILL.
+
+When heartbeat and dispatch deadlines have both expired, classify the cause
+whose absolute deadline elapsed first.  Integrity, refresh, and internal
+failure sites use their exact named causes rather than a timeout fallback.
 
 ### Supervisor status
 
-On daemon exit, agent-supervisor.py will read the event through a safe, non-symlink path and validate:
+The supervisor generates the run identifier before each daemon launch, passes
+it in the launch environment, and retains it on that process object.  On exit,
+`read_watchdog_event(runtime_dir, expected_pid, expected_uid,
+expected_run_id)` opens the event with mandatory `O_NOFOLLOW`, reads at most
+4,097 bytes, and validates the exact schema, regular-file ownership and mode
+0600, enums, bounds, integer types, PID, and run identifier.  A record is stale
+exactly when its `run_id` differs from `expected_run_id`; no wall-clock
+heuristic is used.
 
-- file ownership and mode;
-- schema and enum values;
-- bounded string lengths;
-- daemon PID equality with the process that exited;
-- integer timestamp and duration fields.
-
-A valid event becomes last_watchdog in the existing supervisor status. Invalid, stale, or wrong-PID records are ignored. restart_reason remains daemon-exited:CODE for backward compatibility.
+A valid event becomes `last_watchdog` in the existing supervisor status.
+Invalid, stale, oversized, or wrong-PID records are ignored.
+`restart_reason` remains `daemon-exited:CODE` for backward compatibility.
 
 The Nix deployment layer will append one bounded root line to anvil-worker-probe containing restart count and the last watchdog cause, phase, and tool. Upstream anvil-worker.el will not depend on the deployment-specific supervisor schema.
 
@@ -155,7 +206,7 @@ The Nix deployment layer will append one bounded root line to anvil-worker-probe
 
 No diagnostic artifact may contain user-controlled argument values. Tests will use a unique sentinel in a path, expression, and request argument and assert that the sentinel is absent from the activity record, watchdog record, supervisor status, probe output, and diagnostic logs.
 
-All diagnostic files are private regular files with stable identities. Symlinks, unexpected ownership, permissive modes, wrong daemon PIDs, unknown enum values, and oversized fields fail closed. Diagnostic validation failure affects observability only; it must not weaken watchdog termination or supervisor restart behavior.
+Both diagnostic records are private regular files with stable identities; the transient socket is private and is unlinked after the root connects. `O_NOFOLLOW` is mandatory for every diagnostic open on supported Darwin and Linux deployments, and launcher configuration fails if it is unavailable. Symlinks, unexpected ownership, permissive modes, wrong daemon PIDs, stale run identifiers, unknown enum values, and oversized fields fail closed. Diagnostic validation failure affects observability only; it must not weaken watchdog termination or supervisor restart behavior.
 
 ## Testing Strategy
 
@@ -168,8 +219,9 @@ In tests/anvil-worker-test.el:
 - table-test all five worker states;
 - verify reachable plus undemanded reports alive;
 - verify busy takes precedence over recorded failures;
-- invoke the real probe on a cold pool and assert cold, demanded=no, no dead row, no worker spawn, and no full liveness probe;
-- verify recorded failures render unresponsive and include the bounded failure count.
+- invoke both real status paths, fail if either spawns or calls the full liveness probe, and assert the quick endpoint check runs exactly once per worker in each path;
+- assert cold, demanded=no, no false dead row, and exact last=alive/dead/unknown rendering;
+- verify recorded failures render unresponsive with the bounded failure count and busy takes precedence.
 
 In tests/anvil-file-test.el:
 
@@ -180,7 +232,7 @@ In tests/anvil-file-test.el:
 - assert small unbounded reads remain unchanged;
 - assert disabling the configured limit retains legacy behavior.
 
-In tests/anvil-server-test.el:
+In tests/anvil-test.el:
 
 - register a handler whose result exceeds the configured inline limit;
 - assert the response is bounded and omits the rejected payload;
@@ -195,8 +247,9 @@ Extend watchdog-test.py to cover:
 
 - each cause classification;
 - simultaneous deadline precedence;
-- private file mode and stable inode handling;
-- bounded schema validation;
+- private file mode, stable inode handling, one-shot socket connection, and socket-path replacement after acceptance;
+- exact schema validation, 1,024-byte activity messages, and 4,096-byte event records;
+- proof that a root subprocess does not inherit a writable activity-record descriptor;
 - diagnostic-write failure still leading to kill;
 - secret sentinel non-retention.
 
@@ -218,14 +271,14 @@ Run the focused Python and ERT tests, the complete packages/anvil-mcp checks, th
 
 ## Delivery Sequence
 
-1. Commit and push this approved specification in the Anvil repository.
-2. Add failing Anvil tests and confirm their expected failures.
-3. Implement worker reporting and bounded result behavior; run all Anvil gates.
-4. Commit and push the Anvil changes.
-5. Update /Users/johnw/src/nix/packages/anvil-mcp/source.nix to the pushed Anvil revision and new fixed-output hash.
-6. Add failing Nix watchdog and supervisor tests, then implement the generated diagnostics.
-7. Run all Anvil-MCP package tests and ./build system.
-8. Commit and push only task-owned Nix files, preserving unrelated working-tree changes.
+1. Commit, independently audit, and push this corrected specification and plan.
+2. Create the isolated Anvil worktree from the verified remote planning commit and prove the baseline.
+3. Add failing Anvil tests and confirm their expected failures.
+4. Implement worker reporting and bounded result behavior; run all Anvil gates.
+5. Commit and audit the Anvil changes, rebase once onto the fetched parent, rerun the full gates, and push the definitive Anvil revision.
+6. Pin that published revision and archive hash in an isolated Nix worktree, using its committer timestamp and package header version as metadata provenance.
+7. Add failing Nix watchdog and supervisor tests, then implement the generated diagnostics.
+8. Rebase the Nix branch onto origin/main, run all Anvil-MCP checks and ./build system, audit, and push only task-owned changes.
 9. Switch the Hera Darwin configuration.
 10. Restart or reacquire an agent bridge so it receives the new generation.
 11. Production-smoke cold worker reporting, paginated-read rejection, watchdog status schema, and normal tool execution.

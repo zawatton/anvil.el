@@ -21,6 +21,10 @@
 - Activated Wiggum autonomous continuation.
 - Corrected the design invariant so offset alone cannot bypass a missing limit.
 - Drafted the frozen test-first implementation plan.
+- Ran the first independent fess audit of planning commit b0bd6d7; it found a nonexistent Darwin attribute, broken focused-test quoting, incomplete worker coverage, underspecified telemetry, and ordering contradictions.
+- Verified by experiment that a raw inherited activity FD preserves inode identity but leaks into arbitrary Emacs subprocesses.
+- Replaced that unsafe handoff with a one-shot private Unix socket: the monitor alone owns and writes the fixed activity/event inodes, then unlinks the socket after accepting root Emacs.
+- Froze schema version 1, exact keys/enums, run-ID stale detection, byte ceilings, mandatory O_NOFOLLOW, metadata provenance, and definitive rebase/pin/push ordering.
 
 ## Current state
 
@@ -32,21 +36,23 @@
 - The Nix checkout is also one commit ahead of origin/main.
 - /Users/johnw/src/ai-nix is clean and its HEAD matches the revision pinned by the Nix lock.
 - No code implementation has begun.
-- Next action is self-review, commit, and fess-audit of the corrected design, frozen plan, and this handoff; then execute Task 1.
+- Planning commit b0bd6d7 is local and the audited corrections are the only current uncommitted changes.
+- Next action is self-review, commit, independently re-audit, and push the corrected design/plan/handoff; then execute Task 0 exactly as written.
 
 ## Stop-and-escalate counters
 
 - Repeated failing gate signature: 0 of 3.
 - Unusable subagent output: 0 of 2.
 - Unresolved rebase conflict: 0.
-- Requirement ambiguity: none.
+- Requirement ambiguity: 0 active; the first audit's schema, descriptor, test-topology, provenance, and ordering ambiguities are now resolved in the frozen documents.
 - Destructive action required: no.
 
 ## Resume procedure
 
 1. Re-read the Wiggum skill, frozen design, frozen plan, and this handoff.
 2. Verify both repository states with Anvil structured git status.
-3. Run baseline Anvil tests before Task 1.
-4. Start Task 1 with the failing worker-state tests.
-5. After each logical commit: independent fess audit, partner-observation scan, handoff update.
-6. Keep all Nix implementation in /Users/johnw/src/nix-anvil-root-resilience and preserve the dirty main checkout.
+3. Finish the correction commit, independent re-audit, and push of the planning branch.
+4. Execute Task 0: verify the published base, create the isolated Anvil worktree, and run every baseline gate.
+5. Start Task 1 with the three exact failing worker-state tests.
+6. After each logical commit: independent fess audit, partner-observation scan, and progress-ledger update.
+7. Keep all Nix implementation in /Users/johnw/src/nix-anvil-root-resilience and preserve the dirty main checkout.

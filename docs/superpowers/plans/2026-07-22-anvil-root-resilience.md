@@ -16,14 +16,17 @@
 - A large file read requires a positive limit; offset alone does not make a read bounded.
 - anvil-server-max-inline-result-bytes defaults to 2,097,152 UTF-8 bytes.
 - Rejected file contents and rejected tool results never appear in errors or telemetry.
-- Watchdog telemetry never records arguments, paths, expressions, request IDs, raw JSON, results, environment values, or output.
-- The synchronization lease and the activity record remain separate; activity updates never change dispatch generation.
-- restart_reason remains daemon-exited:CODE; last_watchdog is additive and accepted only for a valid matching daemon PID.
+- Watchdog telemetry never records arguments, paths, expressions, request IDs, raw JSON, results, output, or caller-derived environment values; the generated non-secret run ID is the sole environment-carried protocol value.
+- The synchronization lease and activity channel remain separate; activity updates never change dispatch generation.
+- Watchdog schema version is exactly 1; activity messages/records are at most 1,024 UTF-8 bytes and events at most 4,096 bytes.
+- Root Emacs receives a one-shot Unix socket connection, never a writable activity-record descriptor; the monitor owns both fixed record inodes.
+- Diagnostic opens require O_NOFOLLOW on Darwin/Linux and fail configuration if it is unavailable.
+- restart_reason remains daemon-exited:CODE; last_watchdog is additive and accepted only for the exact matching daemon PID and 32-hex-character launch run ID.
 - Existing 45-second heartbeat and 225-second dispatch deadlines remain unchanged.
 - ai-nix is read-only for this task.
 - Preserve unrelated edits in /Users/johnw/src/nix/config/packages.nix and /Users/johnw/src/nix/docs/PI-AGENT-WIGGUM-PLAN.md.
 - Every behavior change follows a witnessed red-green cycle.
-- Every work commit receives an independent fess audit; final completion also requires whole-branch review, full gates, local rebase, push, Hera switch, and production smoke.
+- Every work commit receives an independent fess audit; final completion also requires whole-branch review, full gates, an Anvil rebase before the definitive pin, a Nix rebase before its push, Hera switch, and production smoke.
 
 ---
 
@@ -34,19 +37,32 @@
 
 **Interfaces:**
 - Produces: /Users/johnw/src/emacs-lisp/anvil-root-resilience on branch fix/anvil-root-resilience.
-- Base: fork/fix/issue-53-interrupted-hangs at the committed plan revision.
+- Base: the fetched fork/fix/issue-53-interrupted-hangs remote-tracking ref at this audited planning commit.
 
-- [ ] **Step 1: Detect worktree state and create the child branch**
+- [ ] **Step 1: Verify the published planning base**
 
 From /Users/johnw/src/emacs-lisp/anvil.el run:
 
     git fetch fork
+    local_base=$(git rev-parse fix/issue-53-interrupted-hangs)
+    remote_base=$(git rev-parse fork/fix/issue-53-interrupted-hangs)
+    test "$local_base" = "$remote_base"
+    test "$remote_base" = "$(git rev-parse HEAD)"
+
+The three revisions must match. If the remote ref is not this audited planning
+commit, push the already-audited parent branch and repeat the check before
+creating any child worktree.
+
+- [ ] **Step 2: Detect worktree state and create the child branch**
+
+Confirm neither the target path nor branch already exists. Then run:
+
     git worktree add /Users/johnw/src/emacs-lisp/anvil-root-resilience \
-      -b fix/anvil-root-resilience fix/issue-53-interrupted-hangs
+      -b fix/anvil-root-resilience fork/fix/issue-53-interrupted-hangs
 
 Do not rewrite fix/issue-53-interrupted-hangs. All later Anvil source and test work runs in the new worktree.
 
-- [ ] **Step 2: Verify the clean baseline**
+- [ ] **Step 3: Verify the clean baseline**
 
 From /Users/johnw/src/emacs-lisp/anvil-root-resilience run:
 
@@ -57,9 +73,9 @@ From /Users/johnw/src/emacs-lisp/anvil-root-resilience run:
 
 Expected: every command exits zero. A failing baseline triggers root-cause investigation before implementation.
 
-- [ ] **Step 3: Initialize durable progress**
+- [ ] **Step 4: Initialize durable progress**
 
-Create the ignored .superpowers/sdd/progress.md ledger and record Task 0 complete with the baseline command results. Update the tracked handoff current-repository path to the isolated worktree in the first implementation commit.
+Create the ignored .superpowers/sdd/progress.md ledger and record Task 0 complete with the exact baseline command results. The tracked handoff path update belongs to the Task 1 commit, where the handoff is explicitly listed.
 
 ---
 
@@ -69,15 +85,16 @@ Create the ignored .superpowers/sdd/progress.md ledger and record Task 0 complet
 - Modify: anvil-worker.el
 - Modify: tests/anvil-worker-test.el
 - Modify: openspec/specs/worker-pool-spawn-deferred/spec.md
+- Modify: docs/superpowers/handoffs/2026-07-22-anvil-root-resilience.md
 
 **Interfaces:**
 - Produces: anvil-worker--reported-state WORKER ENDPOINT-ALIVE returning one of cold, alive, busy, unresponsive, or dead.
 - Consumes: worker plist keys :busy, :hung-checks, :demanded, :last-state, :server-file.
 - Preserves: anvil-worker--quick-alive-p as the only endpoint check used by reporting.
 
-- [ ] **Step 1: Add failing state-classifier tests**
+- [ ] **Step 1: Add three exact failing worker tests**
 
-Add one ERT table that exercises the exact precedence:
+Create `anvil-worker-test-reported-state-precedence` with this table:
 
     (dolist (case
              '(((:demanded nil) nil cold)
@@ -89,15 +106,34 @@ Add one ERT table that exercises the exact precedence:
         (should (eq expected
                     (anvil-worker--reported-state worker endpoint)))))
 
-Add a probe regression with a cold pool. Stub anvil-worker--quick-alive-p to nil, anvil-worker-spawn and anvil-worker--worker-alive-p to fail if called, then assert the rendered text contains cold and demanded=no and contains no worker row labeled dead.
+Create `anvil-worker-test-status-nonblocking` around the real
+`anvil-worker-status`. Install a pool with at least one worker in each
+relevant state, count `anvil-worker--quick-alive-p` calls by worker, and make
+`anvil-worker-spawn` and `anvil-worker--worker-alive-p` fail immediately if
+called. Assert the quick check is called exactly once per worker and the
+rendered status contains the exact `state=`, `demanded=`, and `last=`
+fields.
+
+Create `anvil-worker-test-probe-rendering` around the real MCP probe. Cover a
+cold never-demanded worker, an unresponsive reachable worker with
+`probe-failures=1/LIMIT`, and a reachable busy worker that also has stale
+probe failures. Assert cold rows are not dead, `last=alive`, `last=dead`,
+and `last=unknown` render as required, busy wins over unresponsive, and the quick check runs exactly once per worker.
 
 - [ ] **Step 2: Run the focused worker tests and witness RED**
 
-Run:
+Run this single-quoted, non-vacuous selector:
 
-    emacs --batch -Q -L . -L tests       -l tests/anvil-worker-test.el       --eval "(ert-run-tests-batch-and-exit "^anvil-worker-test-.*reported\|^anvil-worker-test-.*probe")"
+    emacs --batch -Q -L . -L tests -l ert -l tests/anvil-worker-test.el \
+      --eval '(let* ((selector "^anvil-worker-test-\\(reported-state-precedence\\|status-nonblocking\\|probe-rendering\\)$")
+                     (selected (ert-select-tests selector t)))
+                (unless (= 3 (length selected))
+                  (error "expected 3 focused worker tests, selected %d"
+                         (length selected)))
+                (ert-run-tests-batch-and-exit selector))'
 
-Expected failure: void-function anvil-worker--reported-state or cold probe output still rendered as dead.
+Expected failure: `anvil-worker--reported-state` is absent or an existing
+status/probe path performs the full liveness check or renders the wrong state.
 
 - [ ] **Step 3: Implement the minimal classifier and formatter**
 
@@ -114,36 +150,49 @@ Add near the existing pool status functions:
        ((not (plist-get worker :demanded)) 'cold)
        (t 'dead)))
 
-Add a formatter shared by anvil-worker-status and anvil-worker--tool-probe. It emits state, demanded=yes or no, last=alive, dead, or unknown, conditional PID, and conditional probe-failures=N/LIMIT. Both callers compute endpoint-alive once with anvil-worker--quick-alive-p and pass it to the helper.
+Add a formatter shared by `anvil-worker-status` and
+`anvil-worker--tool-probe`. It emits state, demanded=yes or no, last=alive,
+dead, or unknown, conditional PID, and conditional
+probe-failures=N/LIMIT. Both callers compute endpoint-alive exactly once with
+`anvil-worker--quick-alive-p` and pass it to the helper.
 
-Update the registered probe description to name all five states. Do not change health, spawn, ownership, or recovery functions.
+Update the registered probe description to name all five states. Do not change
+health, spawn, ownership, or recovery functions.
 
-- [ ] **Step 4: Update the worker-pool observability requirement**
+- [ ] **Step 4: Update the worker-pool observability requirement and handoff**
 
 Add an acceptance scenario to worker-pool-spawn-deferred/spec.md:
 
 - never-demanded plus absent endpoint reports cold;
 - demanded plus absent endpoint reports dead;
 - reachable endpoint reports alive, busy, or unresponsive;
-- status reporting performs no spawn or full liveness probe.
+- status and probe reporting perform no spawn or full liveness probe.
+
+Update the handoff current repository/branch to the isolated worktree and record
+the Task 0 baseline evidence.
 
 - [ ] **Step 5: Verify GREEN and the full worker suites**
 
 Run the focused command from Step 2, then:
 
-    emacs --batch -Q -L . -L tests       -l tests/anvil-worker-test.el       -f ert-run-tests-batch-and-exit
+    emacs --batch -Q -L . -L tests \
+      -l ert -l tests/anvil-worker-test.el \
+      -f ert-run-tests-batch-and-exit
 
-    emacs --batch -Q -L . -L tests       -l tests/anvil-worker-pool-test.el       -f ert-run-tests-batch-and-exit
+    emacs --batch -Q -L . -L tests \
+      -l ert -l tests/anvil-worker-pool-test.el \
+      -f ert-run-tests-batch-and-exit
 
 Expected: all selected tests pass with zero unexpected results.
 
 - [ ] **Step 6: Commit and independently audit**
 
-Stage only the three task files and commit:
+Stage only the four listed task files and commit:
 
     git commit -S -m "Report lazy Anvil workers as cold"
 
-Dispatch a read-only fess audit for the commit using the frozen spec and this task. Verify and fix every real finding before Task 2.
+Dispatch a read-only fess audit for the commit using the frozen spec and this
+task. Verify and fix every real finding before Task 2.
 
 ---
 
@@ -157,58 +206,79 @@ Dispatch a read-only fess audit for the commit using the frozen spec and this ta
 - Produces: anvil-file-max-unbounded-read-bytes, default 1,048,576.
 - Produces: anvil-file--guard-unbounded-read ABS LIMIT.
 - Consumes: file-attribute-size without reading file contents.
+- Defines a bounded request as one with a numeric LIMIT greater than zero.
 
-- [ ] **Step 1: Add failing read-boundary tests**
+- [ ] **Step 1: Add two exact failing read-boundary tests**
 
-Create an oversized temporary file while dynamically binding the threshold to 16 bytes. Around anvil-file-read, stub anvil--insert-file so any body load fails the test. Assert that both calls below signal user-error containing file size, limit, offset, and limit 200 guidance:
+Create `anvil-file-test-unbounded-read-guard`. Make an oversized temporary
+file while dynamically binding the threshold to 16 bytes. Around
+`anvil-file-read`, stub `anvil--insert-file` so any body load fails the
+test. Assert that all of these signal `user-error` with the exact file size,
+configured maximum, `offset=0`, and `limit=200` fields, and that the unique
+file contents are absent from the message:
 
     (anvil-file-read path)
     (anvil-file-read path 50 nil)
+    (anvil-file-read path 50 0)
 
-Add positive cases proving a small unbounded read is unchanged, a large read with limit 1 returns one line, and a nil or zero guard restores legacy behavior.
+Create `anvil-file-test-read-limit-boundaries`. Prove a small unbounded read
+is unchanged, a large read with positive limit 1 returns one line, and nil,
+zero, or negative `anvil-file-max-unbounded-read-bytes` restores legacy
+behavior. Count body-loader calls so rejected reads prove the guard runs first.
 
 - [ ] **Step 2: Run focused file tests and witness RED**
 
-Run:
+    emacs --batch -Q -L . -L tests -l ert -l tests/anvil-file-test.el \
+      --eval '(let* ((selector "^anvil-file-test-\\(unbounded-read-guard\\|read-limit-boundaries\\)$")
+                     (selected (ert-select-tests selector t)))
+                (unless (= 2 (length selected))
+                  (error "expected 2 focused file tests, selected %d"
+                         (length selected)))
+                (ert-run-tests-batch-and-exit selector))'
 
-    emacs --batch -Q -L . -L tests       -l tests/anvil-file-test.el       --eval "(ert-run-tests-batch-and-exit "^anvil-file-test-.*unbounded\|^anvil-file-test-.*read-limit")"
-
-Expected failure: oversized calls reach anvil--insert-file or do not signal.
+Expected failure: oversized calls reach `anvil--insert-file` or do not signal
+the exact bounded `user-error`.
 
 - [ ] **Step 3: Implement the early guard**
 
 Add:
 
     (defcustom anvil-file-max-unbounded-read-bytes (* 1024 1024)
-      "Maximum regular-file size accepted when file-read has no LIMIT.
-Nil or a non-positive value disables the guard."
+      "Maximum regular-file size accepted without a positive LIMIT.
+    Nil or a non-positive value disables the guard."
       :type '(choice (const :tag "Disabled" nil) integer)
       :group 'anvil-file)
 
     (defun anvil-file--guard-unbounded-read (abs limit)
-      "Reject an oversized read of ABS when LIMIT is absent."
-      (let* ((cap anvil-file-max-unbounded-read-bytes)
-             (attrs (file-attributes abs 'integer))
-             (size (and attrs
-                        (null (file-attribute-type attrs))
-                        (file-attribute-size attrs))))
+      "Reject an oversized read of ABS unless LIMIT is positive."
+      (let ((cap anvil-file-max-unbounded-read-bytes))
         (when (and (numberp cap) (> cap 0)
-                   (null limit) size (> size cap))
-          (user-error
-           (concat "file-read refused unbounded %d-byte file "
-                   "(inline limit %d); retry with offset="0" "
-                   "and limit="200", then advance offset")
-           size cap))))
+                   (not (and (numberp limit) (> limit 0))))
+          (let* ((attrs (file-attributes abs 'integer))
+                 (size (and attrs
+                            (null (file-attribute-type attrs))
+                            (file-attribute-size attrs))))
+            (when (and size (> size cap))
+              (user-error
+               (concat "file-read refused unbounded %d-byte file "
+                       "(maximum %d); retry with offset=0 and limit=200, "
+                       "then advance offset")
+               size cap))))))
 
-Call this helper after anvil--prepare-path and before anvil-file-warn-if-diverged or anvil--insert-file. Offset is intentionally not part of the decision.
+Call this helper after `anvil--prepare-path` and before
+`anvil-file-warn-if-diverged` or `anvil--insert-file`. Offset is
+intentionally not part of the decision.
 
-Update the tool docstring and registered description so clients know that large files require a positive limit.
+Update the tool docstring and registered description so clients know that large
+files require a positive limit.
 
 - [ ] **Step 4: Verify GREEN and all file tests**
 
 Run the focused command, then:
 
-    emacs --batch -Q -L . -L tests       -l tests/anvil-file-test.el       -f ert-run-tests-batch-and-exit
+    emacs --batch -Q -L . -L tests \
+      -l ert -l tests/anvil-file-test.el \
+      -f ert-run-tests-batch-and-exit
 
 Expected: all tests pass with zero unexpected results.
 
@@ -226,32 +296,46 @@ Run the per-commit fess audit and resolve every verified finding.
 
 **Files:**
 - Modify: anvil-server.el
-- Modify: tests/anvil-server-test.el
+- Modify: tests/anvil-test.el
+- Modify at closeout: docs/superpowers/handoffs/2026-07-22-anvil-root-resilience.md
 
 **Interfaces:**
 - Produces: anvil-server-max-inline-result-bytes, default 2,097,152.
 - Produces: anvil-server--enforce-inline-result-limit TOOL-NAME RESULT-TEXT returning RESULT-TEXT or signaling anvil-server-tool-error.
 - Integration point: immediately after result-text construction and before disclosure, metrics, MCP wrapping, or anvil-server--respond-with-result.
 
-- [ ] **Step 1: Add failing end-to-end server tests**
+- [ ] **Step 1: Add two exact failing server tests**
 
-Register a temporary tool returning a unique payload longer than a dynamically bound 32-byte cap. Send a real tools/call JSON-RPC request through anvil-server-process-jsonrpc. Assert:
+In the existing aggregate `tests/anvil-test.el`, create
+`anvil-test-inline-result-limit-end-to-end`. Register a temporary tool
+returning a unique payload longer than a dynamically bound 32-byte cap. Send a
+real `tools/call` JSON-RPC request through
+`anvil-server-process-jsonrpc`. Assert:
 
-- response is valid JSON-RPC;
-- tool result has isError true;
-- error names the tool, observed byte count, and configured limit;
-- unique payload is absent;
+- the response is valid JSON-RPC;
+- the tool result has `isError` true;
+- the error names only the registered tool, observed UTF-8 byte count, limit,
+  and bounded-interface guidance;
+- the unique payload is absent;
 - disclosure and metrics hooks do not receive the rejected payload.
 
-Add boundary tests: exactly 32 UTF-8 bytes succeeds; 33 bytes fails; a multibyte string is measured after UTF-8 encoding; nil and zero disable the guard.
+Create `anvil-test-inline-result-limit-boundaries`: exactly 32 UTF-8 bytes
+succeeds, 33 fails, a multibyte string is measured after UTF-8 encoding, and
+nil, zero, or negative configuration disables the guard. Always unregister the
+fixture tool in `unwind-protect`.
 
 - [ ] **Step 2: Run focused server tests and witness RED**
 
-Run:
+    emacs --batch -Q -L . -L tests -l ert -l tests/anvil-test.el \
+      --eval '(let* ((selector "^anvil-test-inline-result-limit-\\(end-to-end\\|boundaries\\)$")
+                     (selected (ert-select-tests selector t)))
+                (unless (= 2 (length selected))
+                  (error "expected 2 focused server tests, selected %d"
+                         (length selected)))
+                (ert-run-tests-batch-and-exit selector))'
 
-    emacs --batch -Q -L . -L tests       -l tests/anvil-server-test.el       --eval "(ert-run-tests-batch-and-exit "^anvil-server-test-.*inline-result")"
-
-Expected failure: oversized payload is returned or the guard function is absent.
+Expected failure: the oversized payload is returned or the guard function is
+absent.
 
 - [ ] **Step 3: Implement the result guard**
 
@@ -259,7 +343,7 @@ Add near server dispatch configuration:
 
     (defcustom anvil-server-max-inline-result-bytes (* 2 1024 1024)
       "Maximum UTF-8 bytes returned inline by one tool.
-Nil or a non-positive value disables the guard."
+    Nil or a non-positive value disables the guard."
       :type '(choice (const :tag "Disabled" nil) integer)
       :group 'anvil-server)
 
@@ -283,19 +367,22 @@ Nil or a non-positive value disables the guard."
                  tool-name bytes cap))))
             result-text))))
 
-Apply it as a separate let-star binding before anvil-disclosure-budget-apply. Never interpolate result-text into the error.
+Apply it as a separate `let*` binding before
+`anvil-disclosure-budget-apply`, metrics payload recording, MCP wrapping, and
+`anvil-server--respond-with-result`. Never interpolate `result-text` into
+the error.
 
 - [ ] **Step 4: Verify GREEN and full server tests**
 
 Run the focused command, then:
 
-    emacs --batch -Q -L . -L tests       -l tests/anvil-server-test.el       -f ert-run-tests-batch-and-exit
+    emacs --batch -Q -L . -L tests \
+      -l ert -l tests/anvil-test.el \
+      -f ert-run-tests-batch-and-exit
 
 Expected: all tests pass with zero unexpected results.
 
 - [ ] **Step 5: Run all upstream Anvil gates**
-
-Run:
 
     make test
     make test-all
@@ -304,68 +391,104 @@ Run:
 
 Expected: every command exits zero with no test failures or compile errors.
 
-- [ ] **Step 6: Commit, audit, and push upstream Anvil**
+- [ ] **Step 6: Commit and independently audit the server guard**
 
-Commit:
+Commit only `anvil-server.el` and `tests/anvil-test.el`:
 
     git commit -S -m "Reject oversized inline Anvil results"
 
-Run the per-commit fess audit. After verified findings are fixed, run:
+Run the per-commit fess audit and resolve every verified finding.
+
+- [ ] **Step 7: Finalize Anvil before the Nix pin**
+
+Drain partner observations, run an independent whole-branch review against the
+frozen design and plan, fix all Critical and Important findings, rerun all four
+gates, and perform a final fess audit of the last work commit.
+
+Update and commit the tracked handoff with the Anvil gate/review evidence. Then
+establish the definitive published history exactly once:
 
     git fetch fork
     git rebase fork/fix/issue-53-interrupted-hangs
+    make test
+    make test-all
+    make lint
+    make byte-compile
     git push -u fork fix/anvil-root-resilience
     git status --short --branch
 
-Record the resulting Anvil revision in the handoff.
+If the branch was already published before this final rebase, use
+`git push --force-with-lease` only after verifying the remote still names the
+pre-rebase tip. No Anvil history rewrite is allowed after Task 4 computes the
+published archive hash.
+
+Record the definitive `git rev-parse HEAD` in the ignored progress ledger for
+Task 4.
 
 ---
 
-### Task 4: Pin the verified Anvil revision in an isolated Nix worktree
+### Task 4: Pin the definitive Anvil revision in an isolated Nix worktree
 
 **Files:**
 - Modify: packages/anvil-mcp/source.nix
-- Create or update: docs/superpowers/handoffs/2026-07-22-anvil-root-resilience.md in the Anvil repository only
 
 **Interfaces:**
-- Consumes: the pushed Anvil commit from Task 3.
-- Produces: matching rev and SRI sha256 in source.nix.
+- Consumes: the published, final Anvil commit from Task 3.
+- Produces: matching date, hash, rev, and version metadata in source.nix.
+- Provenance: committer ISO timestamp from `%cI`; version from the single
+  `;; Version:` header in that revision's `anvil.el`.
 
 - [ ] **Step 1: Create an isolated Nix worktree**
 
-From /Users/johnw/src/nix, detect worktree state. Because main contains unrelated changes, create a sibling linked worktree on branch fix/anvil-root-resilience, based on the current committed local main. Do not touch the dirty checkout.
-
-Use:
+From /Users/johnw/src/nix, inspect existing worktrees and branches first.
+Because main contains unrelated changes, create a sibling linked worktree on
+branch fix/anvil-root-resilience based on the current committed local main.
+Do not touch the dirty checkout.
 
     git fetch origin
+    nix_base=$(git rev-parse main)
     git worktree add /Users/johnw/src/nix-anvil-root-resilience \
-      -b fix/anvil-root-resilience main
+      -b fix/anvil-root-resilience "$nix_base"
 
-Confirm the new worktree is clean. Run every Nix command through direnv exec ..
+Confirm the new worktree is clean and its HEAD equals `$nix_base`. Run every
+Nix command through `direnv exec .`.
 
-- [ ] **Step 2: Compute the source hash**
+- [ ] **Step 2: Compute all source metadata from the published commit**
 
-Run:
-
-    anvil_rev=$(git -C /Users/johnw/src/emacs-lisp/anvil-root-resilience rev-parse HEAD)
+    anvil_repo=/Users/johnw/src/emacs-lisp/anvil-root-resilience
+    anvil_rev=$(git -C "$anvil_repo" rev-parse HEAD)
+    test "$anvil_rev" = "$(git -C "$anvil_repo" rev-parse fork/fix/anvil-root-resilience)"
+    anvil_date=$(git -C "$anvil_repo" show -s --format=%cI "$anvil_rev")
+    version_lines=$(git -C "$anvil_repo" show "$anvil_rev:anvil.el" |
+      sed -n 's/^;; Version:[[:space:]]*//p')
+    test "$(printf '%s\n' "$version_lines" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
+    anvil_version=$version_lines
     base32_hash=$(nix-prefetch-url --unpack \
       "https://github.com/jwiegley/anvil.el/archive/${anvil_rev}.tar.gz")
     sri_hash=$(nix hash convert --hash-algo sha256 --to sri "$base32_hash")
-    printf 'rev=%s\nhash=%s\n' "$anvil_rev" "$sri_hash"
+    printf 'date=%s\nrev=%s\nversion=%s\nhash=%s\n' \
+      "$anvil_date" "$anvil_rev" "$anvil_version" "$sri_hash"
 
-Use the printed revision and SRI hash exactly in source.nix.
+Use the four printed values exactly. Do not bump the package version merely
+because the revision changed.
 
-- [ ] **Step 3: Update source.nix and verify evaluation**
+- [ ] **Step 3: Update source.nix and verify the Darwin package**
 
-Replace date, hash, rev, and version metadata with the pushed revision and computed hash. Keep owner and repo unchanged.
+Replace only `date`, `hash`, `rev`, and `version`; keep owner and repo
+unchanged.
 
-Run:
+    direnv exec . nix eval --raw \
+      .#packages.aarch64-darwin.anvil-mcp-dedicated.currentAnvilRev
 
-    direnv exec . nix eval --raw       .#packages.aarch64-darwin.anvil-mcp-headless.currentAnvilRev
+The output must equal `$anvil_rev`. Then run:
 
-Expected output is the exact pushed Anvil revision.
+    direnv exec . nix build \
+      .#checks.aarch64-darwin.anvil-mcp-dedicated -L
 
-- [ ] **Step 4: Commit and audit the pin**
+Linux `anvil-mcp-headless` checks are optional here and may be run only when
+a Linux builder is explicitly available; they are not Darwin attributes.
+
+- [ ] **Step 4: Commit and independently audit the pin**
 
 Commit only source.nix:
 
@@ -381,63 +504,108 @@ Run an independent fess audit against the pin commit before watchdog work.
 - Modify: packages/anvil-mcp/default.nix
 - Modify: packages/anvil-mcp/watchdog-test.py
 - Modify: packages/anvil-mcp/timeout-ordering-test.py when generated constant coverage requires it
+- Modify: packages/anvil-mcp/agent-supervisor.py
+- Modify: packages/anvil-mcp/agent-supervisor-test.py for launch-run-id coverage
 
 **Interfaces:**
-- Produces in generated Python: select_deadline_cause, sanitize_activity, write_watchdog_event.
-- Produces private files: .anvil-root-activity.json and .anvil-root-watchdog.json.
+- Produces in generated Python: validate_activity, select_deadline_cause, and write_watchdog_event.
+- Produces private entries: .anvil-root-activity.sock,
+  .anvil-root-activity.json, and .anvil-root-watchdog.json.
+- Uses schema version 1, a 1,024-byte activity-message/record ceiling, and a
+  4,096-byte event ceiling exactly as frozen in the design.
+- Makes `O_NOFOLLOW` mandatory; absence is a configuration error.
 - Preserves timeoutPolicy values and lease generation semantics.
 
-- [ ] **Step 1: Add failing watchdog tests**
+- [ ] **Step 1: Add failing watchdog protocol and cause tests**
 
-Add deterministic tests for:
+Use the launcher definitions extracted by the existing test harness, not a
+parallel hand-written implementation. Add deterministic tests for:
 
-- startup-timeout;
-- heartbeat-timeout;
-- dispatch-timeout;
-- simultaneous expiry choosing the earlier absolute deadline;
-- lock-integrity-failure;
-- monitor-state-invalid;
-- durable-refresh-failure;
-- monitor-internal-error;
-- mode 0600 and stable inode;
-- a diagnostic write failure still calling the kill path;
-- a unique secret sentinel absent from serialized activity and event records.
+- all seven cause enums;
+- heartbeat/dispatch simultaneous expiry choosing the earlier absolute
+  deadline;
+- exact activity and event key sets, enum sets, field types, and millisecond
+  units;
+- 1,024-byte activity and 4,096-byte event ceilings;
+- startup activity and strictly increasing sequence validation;
+- 32-character lowercase-hex run identifiers and matching daemon PIDs;
+- unknown method mapping to `other` and registered-only, 128-byte tool names;
+- mandatory `O_NOFOLLOW`, regular files, owner UID, mode 0600, and stable
+  activity/event inodes;
+- one root socket connection, socket unlink after acceptance, and continued
+  writes to the original activity inode after socket-path replacement;
+- no writable activity-record descriptor visible to a root subprocess;
+- a diagnostic write failure still invoking the kill path;
+- a unique secret sentinel absent from serialized activity/event records and
+  diagnostics.
 
-Use real temporary files and os.open with O_NOFOLLOW where supported. Do not mock JSON shapes independently of the generated launcher; extract and execute the generated helper definitions as the existing test harness does.
+Make the generated `write_watchdog_event` available as the fixture writer used
+by Task 6 supervisor tests; a valid supervisor fixture must never be assembled
+independently.
 
-- [ ] **Step 2: Build the focused check and witness RED**
+- [ ] **Step 2: Build the Darwin check and witness RED**
 
-Run:
+    direnv exec . nix build \
+      .#checks.aarch64-darwin.anvil-mcp-dedicated -L
 
-    direnv exec . nix build       .#checks.aarch64-darwin.anvil-mcp-headless -L
+Expected failure is in the watchdog/run-id tests because the protocol helpers
+and monitor-owned records do not yet exist.
 
-Expected failure is in watchdog-test.py because the event helpers or records do not yet exist.
+- [ ] **Step 3: Implement the monitor-owned activity channel**
 
-- [ ] **Step 3: Implement private activity and event records**
+In `dedicatedLockLauncher`:
 
-In dedicatedLockLauncher:
+- fail configuration immediately if `O_NOFOLLOW` or required Unix-domain
+  socket support is unavailable;
+- create the activity and event files under the canonical mode-0700 runtime
+  directory with `O_CREAT|O_EXCL|O_NOFOLLOW`, mode 0600;
+- validate regular-file type, owner UID, mode, link count, device, and inode;
+- create a private mode-0600 Unix stream endpoint and give its pathname, not a
+  record descriptor, to root Emacs;
+- keep activity/event descriptors and the accepted connection private to the
+  monitor; close them in the execing parent;
+- accept exactly one root connection, validate schema/run-id/PID/sequence on
+  each newline-delimited message, unlink the socket after acceptance, and
+  rewrite/fsync the fixed activity inode only for a valid message;
+- retain at most 1,024 bytes of pending input and close a peer that exceeds the
+  bound or sends malformed frames;
+- serialize only the exact version-1 fields frozen in the design.
 
-- create both files under the canonical 0700 runtime directory;
-- open with O_CREAT, O_RDWR, O_NOFOLLOW when available, mode 0600;
-- validate regular-file type, owner UID, mode, device, and inode;
-- keep activity and event descriptors separate from pulse and lease descriptors;
-- serialize only version, daemon_pid, enum phase/cause/method, registered tool, and integer timing fields;
-- bound phase, method, tool, and cause strings before serialization;
-- fsync each final event best-effort, but never allow telemetry failure to suppress SIGKILL.
+In generated Emacs Lisp, connect once with `make-network-process`, mark the
+process no-query, and send compact UTF-8 activity records at startup, parse,
+dispatch, tool-call, result-encode, response-write, and idle. Map methods
+through the fixed enum and emit a tool only after exact lookup in the active
+registered-tool table. Never send params, arguments, request IDs, paths,
+expressions, results, raw JSON, or caller-derived environment values. The generated run ID is the sole environment-carried protocol value. Scrub the socket path
+and run identifier from worker/offload subprocess environments.
 
-Refactor kill_parent_if to accept a cause/event factory that runs only after the verifier confirms the failure still exists. In the deadline branch, compute heartbeat and dispatch absolute deadlines and select the one that expired first.
+In `agent-supervisor.py`, generate `secrets.token_hex(16)` before each
+daemon launch, pass it as `ANVIL_EMACS_WATCHDOG_RUN_ID`, and retain it on the
+process object for Task 6. Add a unit test proving a fresh exact-format value is
+passed and retained.
 
-Nix-generated Emacs advice updates the activity inode at startup, parse, dispatch, tool-call, result-encode, response-write, and idle. It writes a tool only when gethash finds that identifier in the active registered tool table. It never writes params or request data.
+- [ ] **Step 4: Implement exact event attribution**
 
-- [ ] **Step 4: Verify GREEN**
+Refactor `kill_parent_if` to accept a cause/event factory that runs only
+after the verifier confirms the failure still exists. Write the exact
+version-1 event through the pre-opened event descriptor immediately before
+SIGKILL. Truncate/rewind first and fsync best-effort, but never let telemetry
+failure suppress the kill.
 
-Re-run the headless check from Step 2. The check invokes watchdog-test.py and timeout-ordering-test.py with the exact generated launcher and policy paths from the derivation.
+At timeout, compute heartbeat and dispatch absolute deadlines and choose the
+one that elapsed first. Name integrity, monitor-state, durable-refresh, and
+internal failures at their actual call sites. The synchronization lease and
+activity channel remain independent.
 
-Expected: the full headless check exits zero and both named tests report success in the build log.
+- [ ] **Step 5: Verify GREEN**
 
-- [ ] **Step 5: Commit and audit watchdog attribution**
+Re-run the Darwin dedicated check. It must invoke
+`watchdog-test.py`, `timeout-ordering-test.py`, and the launch-run-id unit
+test against the exact generated launcher.
 
-Commit the task files:
+- [ ] **Step 6: Commit and independently audit watchdog attribution**
+
+Commit the listed files:
 
     git commit -S -m "Record dedicated Anvil watchdog causes"
 
@@ -455,67 +623,92 @@ Run the per-commit fess audit and resolve every verified finding.
 - Modify: packages/anvil-mcp/headless-smoke.py or headless-smoke.nix only where integration assertions belong
 
 **Interfaces:**
-- Produces: read_watchdog_event(path, expected_pid, expected_uid) returning a sanitized dict or None.
+- Produces: read_watchdog_event(runtime_dir, expected_pid, expected_uid,
+  expected_run_id) returning a sanitized dict or None.
+- Defines stale exactly as run_id inequality; PID mismatch is a separate
+  rejection.
 - Adds: last_watchdog to supervisor status only for a valid matching event.
 - Preserves: restart_reason daemon-exited:CODE.
-- Adds one Nix-local probe line with restart count, cause, phase, and registered tool.
+- Adds one Nix-local probe line with restart count, cause, phase, and registered
+  tool.
 
-- [ ] **Step 1: Add failing supervisor unit tests**
+- [ ] **Step 1: Add failing supervisor unit tests using the generated writer**
 
-Use real files to cover:
+Have the Nix check pass the Task 5 generated event-writer artifact to
+`agent-supervisor-test.py`. Use that writer for every valid fixture; mutate
+one field at a time only for rejection tests. Cover:
 
 - valid event adoption;
-- wrong PID and stale event rejection;
-- symlink rejection;
-- wrong owner or mode rejection where the platform permits;
-- unknown cause, phase, or method rejection;
-- oversized tool rejection;
-- non-integer timing rejection;
+- stale run ID and wrong PID as distinct rejections;
+- symlink rejection and mandatory `O_NOFOLLOW`;
+- wrong owner, link count, or mode rejection where the platform permits;
+- exact key-set rejection, unknown schema/cause/phase/method rejection, and
+  non-null invalid optional deadline fields;
+- over-128-byte tool and over-4,096-byte record rejection by reading at most
+  4,097 bytes;
+- bool rejection for integer fields, since Python bool is an int subclass;
 - restart_reason unchanged;
-- secret sentinel absent from returned status.
+- the secret sentinel absent from the sanitized return/status.
 
 - [ ] **Step 2: Add failing forced-timeout smoke assertions**
 
 Extend the existing heartbeat and dispatch watchdog scenarios. Require:
 
-- non-yielding root failure records heartbeat-timeout and the last phase/tool;
-- recursive dispatch overrun records dispatch-timeout;
-- supervisor restart_count increases;
-- restart_reason remains daemon-exited:-9;
-- probe output includes the bounded root summary;
-- the secret sentinel is absent from activity, event, status, probe, and logs.
+- non-yielding root failure records `heartbeat-timeout` and the last
+  phase/registered tool;
+- recursive dispatch overrun records `dispatch-timeout`;
+- supervisor `restart_count` increases;
+- `restart_reason` remains `daemon-exited:-9`;
+- probe output contains exactly one bounded line with
+  `root-restarts=N cause=CAUSE phase=PHASE tool=TOOL-OR-none`;
+- the secret sentinel is absent from activity, event, status, probe, daemon
+  diagnostics, and test logs.
 
-- [ ] **Step 3: Run the headless check and witness RED**
+- [ ] **Step 3: Run the Darwin check and witness RED**
 
-Run the same Nix headless check. Expected failure: missing last_watchdog or probe summary.
+    direnv exec . nix build \
+      .#checks.aarch64-darwin.anvil-mcp-dedicated -L
+
+Expected failure: missing strict event ingestion, `last_watchdog`, or probe
+summary.
 
 - [ ] **Step 4: Implement strict event ingestion**
 
-In agent-supervisor.py:
+In `agent-supervisor.py`:
 
-- use os.open with O_RDONLY, O_NOFOLLOW when available;
-- fstat and validate regular type, owner, and mode 0600;
-- read a bounded maximum, decode UTF-8, parse JSON;
-- require exact schema version, matching daemon_pid, allowed enums, bounded registered tool, and integer non-negative timings;
-- return None for invalid or stale telemetry because diagnostics are optional, while preserving the process restart;
-- after daemon.poll returns, read the matching event before starting the replacement root and store it as last_watchdog;
-- keep restart_reason unchanged.
+- require `O_NOFOLLOW`; open relative to a validated runtime-directory
+  descriptor with `O_RDONLY|O_NOFOLLOW`;
+- `fstat` and validate regular type, owner, mode 0600, and link count one;
+- read no more than 4,097 bytes and reject a record over 4,096 bytes;
+- decode strict UTF-8 and parse JSON;
+- require the exact schema-version-1 key set, matching daemon PID and retained
+  run ID, allowed enums, a null or at-most-128-byte registered tool, and
+  non-negative integer timings that explicitly reject bool;
+- return None for invalid, stale, or wrong-PID telemetry because diagnostics
+  are optional, while preserving process restart;
+- after `daemon.poll` returns, read the event with that process's PID and
+  retained run ID before starting the replacement root, and store a valid
+  result as `last_watchdog`;
+- keep `restart_reason` unchanged.
 
-In default.nix, advise anvil-worker--tool-probe only in the dedicated deployment. Append a single root line that reads the supervisor status safely and prints restart count plus cause, phase, and tool. Never include paths, arguments, or raw status.
+In `default.nix`, advise `anvil-worker--tool-probe` only in the dedicated
+deployment. Read the supervisor status through its existing validated path and
+append exactly one bounded root line. Never include paths, arguments, request
+IDs, raw status, or unvalidated strings.
 
-- [ ] **Step 5: Verify GREEN and complete Nix package gates**
+- [ ] **Step 5: Verify GREEN and complete Nix gates**
 
-Run:
-
-    direnv exec . nix build       .#checks.aarch64-darwin.anvil-mcp-headless -L
-
-    direnv exec . nix build       .#checks.aarch64-darwin.anvil-mcp-dedicated -L
+    direnv exec . nix build \
+      .#checks.aarch64-darwin.anvil-mcp-dedicated -L
 
     direnv exec . nix flake check -L
 
-Expected: all commands exit zero.
+    direnv exec . ./build system
 
-- [ ] **Step 6: Commit and audit supervisor integration**
+Run Linux headless checks only when an explicit Linux builder is available.
+Expected: every applicable command exits zero.
+
+- [ ] **Step 6: Commit and independently audit supervisor integration**
 
 Commit:
 
@@ -525,89 +718,126 @@ Run the per-commit fess audit and resolve every verified finding.
 
 ---
 
-### Task 7: Whole-branch review, deployment, and production proof
+### Task 7: Whole-branch review, publication, deployment, and production proof
 
 **Files:**
-- Update only the handoff document with final evidence.
-- Do not create code changes unless an audit or runtime failure proves they are required.
+- No planned tracked changes; keep final evidence in the ignored progress ledger.
+- Create code or test changes only when review or runtime evidence proves they
+  are required.
 
 **Interfaces:**
-- Consumes: all Anvil and Nix commits.
-- Produces: pushed branches, switched Hera generation, and production evidence satisfying every acceptance criterion.
+- Consumes: the already-published definitive Anvil revision and all Nix commits.
+- Produces: a pushed Nix branch, switched Hera generation, and production
+  evidence satisfying every acceptance criterion.
 
 - [ ] **Step 1: Drain partner observations**
 
-In each repository, inspect doc/observations for regular non-hidden Markdown files. If present, run the partner-cleanup workflow before final review and verify its cleanup commit.
+In each repository, inspect `doc/observations` for regular non-hidden Markdown
+files. If present, run the partner-cleanup workflow before final review and
+verify its cleanup commit.
 
-- [ ] **Step 2: Run independent whole-branch reviews**
+- [ ] **Step 2: Run independent whole-branch and cross-repository reviews**
 
-Generate review packages from each merge base to HEAD. Dispatch the strongest available reviewer against the frozen spec, plan, test evidence, and full diffs. Fix all Critical and Important findings in one coherent fix wave, rerun covering tests, and re-review.
+Generate review packages from each merge base to HEAD. Dispatch the strongest
+available reviewer against the frozen spec, plan, test evidence, generated
+launcher, supervisor, and full diffs. Fix all Critical and Important findings
+in one coherent wave, rerun covering tests, and re-review.
+
+An Anvil fix discovered after Task 4 must follow this complete order: commit and
+audit the fix, rerun all Anvil gates, push the new fast-forward Anvil tip,
+recompute its published archive hash, update and commit the Nix pin, audit that
+pin commit, and rerun all Nix gates. Never leave `source.nix` naming an
+unpublished or superseded Anvil revision.
 
 - [ ] **Step 3: Run final fess audits**
 
-Audit the last work commit in each repository, even when the most recent commit only fixed earlier findings. Require explicit coverage of stubs, vacuous tests, fixture drift, error swallowing, suppressions, fallback smuggling, spec drift, scope creep, documentation drift, verification gaps, and loose ends.
+Audit the last work commit in each repository, even when the most recent commit
+only fixes earlier findings. Require explicit coverage of stubs, vacuous tests,
+fixture drift, error swallowing, suppressions, fallback smuggling, spec drift,
+scope creep, documentation drift, verification gaps, and loose ends.
 
-- [ ] **Step 4: Rebase locally and rerun full gates**
+- [ ] **Step 4: Rebase only the Nix branch and rerun full gates**
 
-For Anvil:
+Anvil history was finalized before the pin and must not be rewritten here.
+Fetch and verify it instead:
 
-    git fetch fork
-    git rebase fork/fix/issue-53-interrupted-hangs
-    make test
-    make test-all
-    make lint
-    make byte-compile
+    git -C /Users/johnw/src/emacs-lisp/anvil-root-resilience fetch fork
+    test "$(git -C /Users/johnw/src/emacs-lisp/anvil-root-resilience rev-parse HEAD)" = \
+      "$(git -C /Users/johnw/src/emacs-lisp/anvil-root-resilience rev-parse fork/fix/anvil-root-resilience)"
 
 For Nix:
 
     git fetch origin
-    git rebase main
+    git rebase origin/main
+    direnv exec . nix build \
+      .#checks.aarch64-darwin.anvil-mcp-dedicated -L
     direnv exec . nix flake check -L
     direnv exec . ./build system
 
-Resolve conflicts without guessing intent. Recompute and update source.nix only if rebasing Anvil changes the pinned revision.
+After the rebase, verify the evaluated `currentAnvilRev` still equals the
+published Anvil branch tip. Resolve conflicts without guessing intent. Any
+post-rebase task change requires a commit, independent fess audit, and the
+covering gates again.
 
-- [ ] **Step 5: Push both branches**
+- [ ] **Step 5: Push and prove both repositories are synchronized**
 
-In /Users/johnw/src/emacs-lisp/anvil-root-resilience:
+The Anvil branch should already be published. Satisfy its landing check without
+rewriting history:
 
     git pull --rebase fork fix/anvil-root-resilience
     git push -u fork fix/anvil-root-resilience
     git status --short --branch
 
-In /Users/johnw/src/nix-anvil-root-resilience:
+For the Nix branch, do not pull a remote feature ref that does not exist:
 
-    git pull --rebase origin fix/anvil-root-resilience
+    if git ls-remote --exit-code --heads origin fix/anvil-root-resilience >/dev/null
+    then
+      git pull --rebase origin fix/anvil-root-resilience
+    else
+      git fetch origin
+      git rebase origin/main
+    fi
     git push -u origin fix/anvil-root-resilience
     git status --short --branch
 
-Both statuses must show no task-owned uncommitted changes and no ahead/behind divergence.
+Both statuses must show no task-owned uncommitted changes and no ahead/behind
+divergence. The evaluated Nix pin must equal the pushed Anvil tip.
 
 - [ ] **Step 6: Switch Hera**
 
 From the clean Nix worktree:
 
-    direnv exec . sudo darwin-rebuild switch       --flake .#hera       --override-input ai-nix /Users/johnw/src/ai-nix
+    direnv exec . sudo darwin-rebuild switch \
+      --flake .#hera \
+      --override-input ai-nix /Users/johnw/src/ai-nix
 
-Do not modify ai-nix. Confirm exit zero and record the active generation.
+Do not modify ai-nix. Confirm exit zero and record the active generation and
+evaluated Anvil revision.
 
 - [ ] **Step 7: Acquire a fresh bridge and run production smoke**
 
-A pre-existing per-agent bridge retains its old generation. Start or reacquire a fresh bridge after the switch, then prove:
+A pre-existing per-agent bridge retains its old generation. Start or reacquire
+a fresh bridge after the switch, then prove:
 
-- anvil-mcp --version resolves to the newly pinned revision/version;
+- `anvil-mcp --version` resolves to the newly pinned version/revision;
 - a new lazy worker pool reports cold, demanded=no, and no dead rows;
-- probing does not create worker processes;
-- an oversized unbounded file-read returns pagination guidance without root restart;
+- both status paths use one quick check per worker and create no worker process;
+- an oversized unbounded file-read returns explicit `offset=0 limit=200`
+  guidance without a root restart;
 - the same file with a positive limit returns a bounded page;
 - a small normal file-read succeeds;
-- ordinary emacs-eval and shell-run succeed;
-- supervisor restart_count stays unchanged throughout non-faulting smoke;
-- forced heartbeat and dispatch scenarios in the packaged smoke expose their exact last_watchdog causes;
+- ordinary `emacs-eval` and `shell-run` succeed;
+- supervisor `restart_count` stays unchanged throughout non-faulting smoke;
+- packaged forced heartbeat and dispatch scenarios expose their exact
+  `last_watchdog` causes;
 - no secret sentinel appears in retained diagnostics.
 
-- [ ] **Step 8: Final completion audit and cleanup**
+- [ ] **Step 8: Final requirement audit and cleanup**
 
-Walk every acceptance criterion in the frozen design and bind it to direct evidence. Clear task-created stashes, remove the Nix worktree only after its branch is pushed and integrated state is safe, prune worktrees and remote branches that are already merged, and leave unrelated user changes untouched.
+Walk every acceptance criterion in the frozen design and bind it to direct
+evidence in the progress ledger. Confirm no regular partner observations
+remain. Clear task-created stashes, prune stale worktree metadata, and remove
+task-created worktrees only after their branches are pushed and their removal
+cannot discard evidence. Leave unrelated user changes untouched.
 
 Mark the persistent goal complete only after all evidence is present.
