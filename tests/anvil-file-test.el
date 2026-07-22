@@ -282,6 +282,7 @@ BINDINGS is a `let' binding list for delta-cache defcustoms."
 
 (ert-deftest anvil-file-test-unbounded-read-cap ()
   "Unbounded reads reject over-cap regular files without loading their bodies."
+  (should (= 1048576 anvil-file-max-inline-read-bytes))
   (let* ((payload (concat "private-" (make-string 9 ?x)))
          (path (make-temp-file "anvil-file-cap-" nil ".txt"))
          (link (concat path "-link"))
@@ -305,14 +306,17 @@ BINDINGS is a `let' binding list for delta-cache defcustoms."
                              (funcall literal-insert filename visit beg end replace)
                            (setq max-retained (max max-retained (buffer-size)))))))
               (dolist (candidate (list path link))
-                (let ((message
-                       (anvil-file-test--error-text
-                        (lambda () (anvil-file-read candidate)))))
-                  (should (string-match-p "maximum 16 bytes" message))
-                  (should (string-match-p "offset=0" message))
-                  (should (string-match-p "limit=200" message))
-                  (should-not (string-match-p (regexp-quote payload) message))
-                  (should-not (string-match-p (regexp-quote candidate) message))))))
+                (dolist (offset '(nil 1))
+                  (let ((message
+                         (anvil-file-test--error-text
+                          (lambda ()
+                            (anvil-file-read candidate offset nil)))))
+                    (should (string-match-p "maximum 16 bytes" message))
+                    (should (string-match-p "offset=0" message))
+                    (should (string-match-p "limit=200" message))
+                    (should-not (string-match-p (regexp-quote payload) message))
+                    (should-not
+                     (string-match-p (regexp-quote candidate) message)))))))
           ;; A stale preliminary size must not authorize a cap-plus-one body.
           (let ((anvil-file-max-inline-read-bytes 16))
             (cl-letf (((symbol-function 'anvil--insert-file)
@@ -372,6 +376,10 @@ BINDINGS is a `let' binding list for delta-cache defcustoms."
 
 (ert-deftest anvil-file-test-read-limit-boundaries ()
   "Inline caps and streamed pages preserve boundaries without full loads."
+  (should (= 1048576 anvil-file-max-inline-read-bytes))
+  (should (= 65536 anvil-file--stream-chunk-bytes))
+  (should (= 16 anvil-file--stream-yield-chunks))
+  (should (= 0.001 anvil-file--stream-yield-seconds))
   ;; Exact-cap and small UTF-8 bodies survive; cap-plus-one does not.
   (dolist (body '("0123456789abcdef" "hé🙂\n"))
     (anvil-file-test--with-tmp

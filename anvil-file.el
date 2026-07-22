@@ -178,10 +178,10 @@ without reopening TARGET."
     (when (> (buffer-size) cap)
       (erase-buffer)
       (anvil-file--signal-unbounded-overflow (1+ cap) cap t))
-    (let ((raw (buffer-string)))
-      (erase-buffer)
-      (set-buffer-multibyte t)
-      (insert (decode-coding-string raw 'utf-8)))))
+    ;; Decode the bounded raw prefix in place.  Do not create a second raw
+    ;; string while the buffer still retains the original CAP bytes.
+    (set-buffer-multibyte t)
+    (decode-coding-region (point-min) (point-max) 'utf-8)))
 
 (defun anvil-file--signal-stream-changed ()
   "Signal a content-free diagnostic for a changing streamed file."
@@ -289,6 +289,10 @@ raw chunk and CAP+1 selected raw bytes are retained at a time."
           (when page-overflow
             (with-current-buffer page-buffer (erase-buffer))
             (anvil-file--signal-page-overflow cap))
+          ;; The final raw chunk is no longer needed once generation and page
+          ;; bounds have been verified.  Release it before decoding or
+          ;; extracting the selected page.
+          (with-current-buffer chunk-buffer (erase-buffer))
           (let* ((total-lines (+ newline-count
                                  (if (and saw-bytes
                                           (not last-byte-newline))
@@ -298,9 +302,11 @@ raw chunk and CAP+1 selected raw bytes are retained at a time."
                   (max 0 (min limit (- total-lines offset))))
                  (decoded
                   (with-current-buffer page-buffer
-                    (decode-coding-region (point-min) (point-max) 'utf-8)
                     (set-buffer-multibyte t)
-                    (buffer-string))))
+                    (decode-coding-region (point-min) (point-max) 'utf-8)
+                    (prog1 (buffer-substring-no-properties
+                            (point-min) (point-max))
+                      (erase-buffer)))))
             (setq content decoded)
             (list :content content
                   :total-lines total-lines
@@ -410,12 +416,17 @@ otherwise a list of human-readable strings flagging divergence
                 (forward-line off)
                 (let ((beg (point))
                       (end (point-max)))
-                  (list :file abs
-                        :content (buffer-substring-no-properties beg end)
-                        :total-lines total
-                        :offset off
-                        :lines-returned (count-lines beg end)
-                        :warnings warnings))))))
+                  (let ((content (buffer-substring-no-properties beg end))
+                        (lines-returned (count-lines beg end)))
+                    ;; Release the bounded decoded body before the result
+                    ;; escapes this temporary buffer.
+                    (erase-buffer)
+                    (list :file abs
+                          :content content
+                          :total-lines total
+                          :offset off
+                          :lines-returned lines-returned
+                          :warnings warnings)))))))
       (with-temp-buffer
         (anvil--insert-file abs)
         (let ((total (count-lines (point-min) (point-max))))
