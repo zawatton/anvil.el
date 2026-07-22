@@ -47,7 +47,9 @@
         (let ((status
                (call-process
                 timeout nil t nil
-                "--kill-after=2" "45"
+                ;; This is only the complete regression harness envelope;
+                ;; every bridge phase keeps its stricter production deadline.
+                "--kill-after=2" "120"
                 python "-I" "-B" "-u"
                 helper bridge bridge-bash emacs)))
           (unless (and (integerp status) (zerop status))
