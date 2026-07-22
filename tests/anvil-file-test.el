@@ -600,6 +600,71 @@ BINDINGS is a `let' binding list for delta-cache defcustoms."
          (should-not (buffer-live-p page-buffer))
          (should-not (buffer-live-p chunk-buffer)))))))
 
+(ert-deftest anvil-file-test-page-overflow-prefers-change-race ()
+  "A generation race wins over page overflow without scanning onward."
+  (let ((body (concat "RACE-CONTENT-SENTINEL\n"
+                      (make-string
+                       (* 17 anvil-file--stream-chunk-bytes) ?z))))
+    (anvil-file-test--with-tmp
+     body
+     (lambda (path)
+       (let ((anvil-file-max-inline-read-bytes 8)
+             (literal-insert
+              (symbol-function 'insert-file-contents-literally))
+             (generate-buffer (symbol-function 'generate-new-buffer))
+             (signal-changed
+              (symbol-function 'anvil-file--signal-stream-changed))
+             page-buffer
+             chunk-buffer
+             retained-at-signal
+             (reads 0)
+             (yields 0))
+         (cl-letf (((symbol-function 'anvil--insert-file)
+                    (lambda (&rest _)
+                      (ert-fail "overflow race called the full loader")))
+                   ((symbol-function 'generate-new-buffer)
+                    (lambda (name &rest arguments)
+                      (let ((buffer (apply generate-buffer name arguments)))
+                        (cond
+                         ((equal name " *anvil-file-page*")
+                          (setq page-buffer buffer))
+                         ((equal name " *anvil-file-chunk*")
+                          (setq chunk-buffer buffer)))
+                        buffer)))
+                   ((symbol-function 'insert-file-contents-literally)
+                    (lambda (filename &optional visit beg end replace)
+                      (cl-incf reads)
+                      (prog1
+                          (funcall literal-insert
+                                   filename visit beg end replace)
+                        (when (= reads 1)
+                          (with-temp-file filename
+                            (insert "replacement\n"))))))
+                   ((symbol-function 'accept-process-output)
+                    (lambda (&rest _)
+                      (cl-incf yields)
+                      nil))
+                   ((symbol-function 'anvil-file--signal-page-overflow)
+                    (lambda (&rest _)
+                      (ert-fail "overflow won over a generation change")))
+                   ((symbol-function 'anvil-file--signal-stream-changed)
+                    (lambda ()
+                      (setq retained-at-signal
+                            (list
+                             (with-current-buffer page-buffer (buffer-size))
+                             (with-current-buffer chunk-buffer (buffer-size))))
+                      (funcall signal-changed))))
+           (let ((message
+                  (anvil-file-test--error-text
+                   (lambda () (anvil-file-read path 0 1)))))
+             (should (string-match-p "File changed" message))
+             (should-not (string-match-p "RACE-CONTENT-SENTINEL" message))))
+         (should (= 1 reads))
+         (should (= 0 yields))
+         (should (equal '(0 0) retained-at-signal))
+         (should-not (buffer-live-p page-buffer))
+         (should-not (buffer-live-p chunk-buffer)))))))
+
 (ert-deftest anvil-file-test-read-warnings-empty-without-buffer ()
   "anvil-file-read returns :warnings nil when no buffer visits the file."
   (anvil-file-test--with-tmp
