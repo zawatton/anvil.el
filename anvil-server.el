@@ -1507,6 +1507,7 @@ does not call a JSON encoder or materialize the escaped string."
                     ((memq character '(8 9 10 12 13)) 2)
                     ((< character 32) 6)
                     ((and (not multibyte) (>= character 128)) 5)
+                    ((>= character #x200000) 5)
                     ((< character #x80) 1)
                     ((< character #x800) 2)
                     ((< character #x10000) 3)
@@ -1523,8 +1524,8 @@ Return the fixed placeholder `<oversized-tool-id>' otherwise."
            (string-match-p
             "\\`[A-Za-z0-9][A-Za-z0-9._/-]\\{0,127\\}\\'"
             tool-name))
-      tool-name
-    "<oversized-tool-id>"))
+      (substring-no-properties tool-name)
+    (copy-sequence "<oversized-tool-id>")))
 
 (defconst anvil-server--safe-condition-symbols
   '(void-function
@@ -1552,10 +1553,11 @@ Return the fixed placeholder `<oversized-tool-id>' otherwise."
        (> anvil-server-max-inline-result-bytes 0)))
 
 (defun anvil-server--inline-overflow-diagnostic
-    (tool-name class text projected)
-  "Build a bounded diagnostic for rejected TEXT.
+    (tool-name class raw-bytes projected)
+  "Build a bounded diagnostic for rejected tool output.
 TOOL-NAME is sanitized before rendering.  CLASS is a fixed internal symbol and
-PROJECTED is the early-stop projected byte observation."
+RAW-BYTES is the unescaped byte count.  PROJECTED is the early-stop projected
+byte observation."
   (format
    (concat "Tool %s %s exceeds the inline response limit "
            "(raw-bytes=%d projected-bytes-at-least=%d limit=%d). "
@@ -1568,7 +1570,7 @@ PROJECTED is the early-stop projected byte observation."
      ('quit "quit error text")
      ('not-found "not-found error text")
      (_ "error text"))
-   (string-bytes text)
+   raw-bytes
    projected
    anvil-server-max-inline-result-bytes))
 
@@ -1580,17 +1582,17 @@ RESULT-TEXT."
   (unless (stringp result-text)
     (signal 'wrong-type-argument (list 'stringp result-text)))
   (if (not (anvil-server--inline-result-limit-enabled-p))
-      result-text
+      (substring-no-properties result-text)
     (let* ((limit anvil-server-max-inline-result-bytes)
            (projected
             (anvil-server--projected-json-string-bytes result-text limit)))
       (if (<= projected limit)
-          result-text
+          (substring-no-properties result-text)
         (signal
          'anvil-server-inline-result-too-large
          (list
           (anvil-server--inline-overflow-diagnostic
-           tool-name 'returned result-text projected)))))))
+           tool-name 'returned (string-bytes result-text) projected)))))))
 
 (defun anvil-server--legacy-tool-error-text (tool-name class condition)
   "Reconstruct the historical response text for CLASS and CONDITION."
@@ -1605,29 +1607,54 @@ RESULT-TEXT."
            (cadr condition)
          "Tool error contained non-string data"))))
 
-(defun anvil-server--bounded-tool-error-text (tool-name class condition)
-  "Return a string representation of tool CONDITION without object printing."
+(defun anvil-server--bounded-tool-error-segments (tool-name class condition)
+  "Return safe string segments for tool CONDITION without object printing.
+The caller projects each segment before concatenating them."
   (let ((data (and (consp condition) (cadr condition))))
     (pcase class
       ('not-found
-       (format "Tool not found: %s"
-               (anvil-server--safe-tool-label tool-name)))
+       (list "Tool not found: " (anvil-server--safe-tool-label tool-name)))
       ('macro
-       (if (stringp data) (concat "Error: " data)
-         "Tool handler signaled non-string error data"))
+       (if (stringp data) (list "Error: " data)
+         (list "Tool handler signaled non-string error data")))
       ('generic
        (if (stringp data)
-           (concat "Internal error executing tool: " data)
-         "Internal error executing tool with non-string data"))
+           (list "Internal error executing tool: " data)
+         (list "Internal error executing tool with non-string data")))
       ('quit
-       (if (stringp data) (concat "Tool handler quit: " data)
-         "Tool handler quit"))
+       (if (stringp data) (list "Tool handler quit: " data)
+         (list "Tool handler quit")))
       ('invalid-params
-       (if (stringp data) data "Invalid tool parameters"))
+       (list (if (stringp data) data "Invalid tool parameters")))
       ('tool-error
-       (if (stringp data) data "Tool reported non-string error data"))
+       (list (if (stringp data) data
+               "Tool reported non-string error data")))
       (_
-       (if (stringp data) data "Tool error contained non-string data")))))
+       (list (if (stringp data) data
+               "Tool error contained non-string data"))))))
+
+(defun anvil-server--project-error-segments (segments limit)
+  "Project JSON bytes for SEGMENTS without concatenating them.
+LIMIT is the enabled non-negative byte cap.  Return a plist containing exact
+`:raw', an early-stop `:projected' count, and `:overflow'."
+  (let ((raw 0)
+        (projected 0)
+        (overflow nil))
+    (dolist (segment segments)
+      (setq raw (+ raw (string-bytes segment))))
+    (while (and segments (not overflow))
+      (let* ((remaining (- limit projected))
+             (segment-projected
+              (anvil-server--projected-json-string-bytes
+               (car segments) remaining)))
+        (setq projected (+ projected segment-projected)
+              overflow (> projected limit)
+              segments (cdr segments))))
+    (list :raw raw :projected projected :overflow overflow)))
+
+(defun anvil-server--join-error-segments (segments)
+  "Concatenate error SEGMENTS after projected-size validation."
+  (apply #'concat segments))
 
 (defun anvil-server--sanitize-tool-error (tool-name class condition)
   "Return a bounded, reconstructed representation of tool CONDITION.
@@ -1641,23 +1668,28 @@ function catches all internal errors and quits so it never signals."
              (enabled (anvil-server--inline-result-limit-enabled-p))
              (text
               (if enabled
-                  (anvil-server--bounded-tool-error-text
-                   tool-name class condition)
+                  (let* ((segments
+                          (anvil-server--bounded-tool-error-segments
+                           tool-name class condition))
+                         (projection
+                          (anvil-server--project-error-segments
+                           segments anvil-server-max-inline-result-bytes)))
+                    (if (plist-get projection :overflow)
+                        (anvil-server--inline-overflow-diagnostic
+                         tool-name class
+                         (plist-get projection :raw)
+                         (plist-get projection :projected))
+                      (anvil-server--join-error-segments segments)))
                 (anvil-server--legacy-tool-error-text
                  tool-name class condition))))
-        (when enabled
-          (let ((projected
-                 (anvil-server--projected-json-string-bytes
-                  text anvil-server-max-inline-result-bytes)))
-            (when (> projected anvil-server-max-inline-result-bytes)
-              (setq text
-                    (anvil-server--inline-overflow-diagnostic
-                     tool-name class text projected)))))
+        (setq text (substring-no-properties text))
         (list :condition (list symbol text) :text text :tool label))
     (quit
-     '(:condition (error "") :text "" :tool "<oversized-tool-id>"))
+     (list :condition (list 'error "")
+           :text "" :tool (copy-sequence "<oversized-tool-id>")))
     (error
-     '(:condition (error "") :text "" :tool "<oversized-tool-id>"))))
+     (list :condition (list 'error "")
+           :text "" :tool (copy-sequence "<oversized-tool-id>")))))
 
 (defvar anvil-server-tool-error-hook nil
   "Abnormal hook run when a tool handler error is observed.
@@ -1857,8 +1889,7 @@ SERVER-ID is resolved through `anvil-server-id-aliases'."
   "Return non-nil when VALUE has the JSON object/alist representation."
   (or (null value)
       (and (listp value)
-           (cl-every (lambda (entry) (and (consp entry) (car entry)))
-                     value))))
+           (cl-every #'consp value))))
 
 (defun anvil-server--tool-error-result (context text)
   "Return an MCP tool-error result for CONTEXT containing bounded TEXT."
@@ -1888,15 +1919,15 @@ SERVER-ID is resolved through `anvil-server-id-aliases'."
           (anvil-server--handle-tools-call-unsafe
            id params method-metrics server-id))
       (anvil-server-inline-result-too-large
-       (anvil-server-metrics--track-tool-call
-        (anvil-server--safe-tool-label tool-name) t)
-       (anvil-server--metrics-bump
-        (anvil-server-metrics-errors method-metrics))
-       (anvil-server--tool-error-result
-        context
-        (if (and (consp err) (stringp (cadr err)))
-            (cadr err)
-          "Inline tool result exceeded the response limit")))
+       (let* ((sanitized
+               (anvil-server--sanitize-tool-error
+                tool-name 'inline-result err))
+              (label (plist-get sanitized :tool)))
+         (anvil-server-metrics--track-tool-call label t)
+         (anvil-server--metrics-bump
+          (anvil-server-metrics-errors method-metrics))
+         (anvil-server--tool-error-result
+          context (plist-get sanitized :text))))
       (anvil-server-invalid-params
        (let* ((sanitized
                (anvil-server--sanitize-tool-error
@@ -2129,15 +2160,15 @@ complete boundary around parameter extraction, lookup, and lazy loading."
                 (anvil-server--respond-with-result
                  context formatted-result))
             (anvil-server-inline-result-too-large
-             (anvil-server-metrics--track-tool-call
-              (anvil-server--safe-tool-label tool-name) t)
-             (anvil-server--metrics-bump
-              (anvil-server-metrics-errors method-metrics))
-             (anvil-server--tool-error-result
-              context
-              (if (and (consp err) (stringp (cadr err)))
-                  (cadr err)
-                "Inline tool result exceeded the response limit")))
+             (let* ((sanitized
+                     (anvil-server--sanitize-tool-error
+                      tool-name 'inline-result err))
+                    (label (plist-get sanitized :tool)))
+               (anvil-server-metrics--track-tool-call label t)
+               (anvil-server--metrics-bump
+                (anvil-server-metrics-errors method-metrics))
+               (anvil-server--tool-error-result
+                context (plist-get sanitized :text))))
             ;; Handle invalid parameter errors
             (anvil-server-invalid-params
              (let* ((sanitized
