@@ -194,10 +194,25 @@ without reopening TARGET."
            "Retry with a lower limit or use a filtered or region tool.")
    cap))
 
+(defun anvil-file--abort-page-overflow
+    (page-buffer chunk-buffer target initial cap)
+  "Erase retained bytes and reject TARGET's overflowing page.
+PAGE-BUFFER and CHUNK-BUFFER are cleared before any error can escape.
+INITIAL is revalidated so a race already observed by this read retains
+the existing content-free changed-file precedence."
+  (with-current-buffer page-buffer
+    (erase-buffer))
+  (with-current-buffer chunk-buffer
+    (erase-buffer))
+  (unless (equal initial (anvil-file--file-generation target))
+    (anvil-file--signal-stream-changed))
+  (anvil-file--signal-page-overflow cap))
+
 (defun anvil-file--read-streamed-page (target offset limit cap)
   "Stream TARGET and return the OFFSET/LIMIT page bounded by CAP bytes.
-The entire file is scanned for an exact line count, but only one fixed
-raw chunk and CAP+1 selected raw bytes are retained at a time."
+Successful reads scan the entire file for an exact line count.  An overflowing
+selected page aborts immediately.  At most one fixed raw chunk and CAP+1
+selected raw bytes are retained at a time."
   (let* ((initial (anvil-file--file-generation target))
          (initial-size (and initial (plist-get initial :size)))
          (page-buffer (generate-new-buffer " *anvil-file-page*"))
@@ -210,7 +225,6 @@ raw chunk and CAP+1 selected raw bytes are retained at a time."
          (saw-bytes nil)
          (last-byte-newline nil)
          (page-bytes 0)
-         (page-overflow nil)
          content)
     (unless initial
       (kill-buffer page-buffer)
@@ -251,10 +265,10 @@ raw chunk and CAP+1 selected raw bytes are retained at a time."
                                  chunk-buffer segment-start
                                  (+ segment-start take)))
                               (cl-incf page-bytes take))
-                            (when (> page-bytes cap)
-                              (setq page-overflow t))
-                            (when (< take length)
-                              (setq page-overflow t))))
+                            (when (or (> page-bytes cap)
+                                      (< take length))
+                              (anvil-file--abort-page-overflow
+                               page-buffer chunk-buffer target initial cap))))
                         (cl-incf newline-count)
                         (cl-incf line-index)
                         (setq segment-start (point)))
@@ -271,10 +285,10 @@ raw chunk and CAP+1 selected raw bytes are retained at a time."
                                  chunk-buffer segment-start
                                  (+ segment-start take)))
                               (cl-incf page-bytes take))
-                            (when (> page-bytes cap)
-                              (setq page-overflow t))
-                            (when (< take length)
-                              (setq page-overflow t)))))))
+                            (when (or (> page-bytes cap)
+                                      (< take length))
+                              (anvil-file--abort-page-overflow
+                               page-buffer chunk-buffer target initial cap)))))))
                 (file-error
                  (with-current-buffer page-buffer (erase-buffer))
                  (anvil-file--signal-stream-changed)))
@@ -286,9 +300,6 @@ raw chunk and CAP+1 selected raw bytes are retained at a time."
                        (equal initial (anvil-file--file-generation target)))
             (with-current-buffer page-buffer (erase-buffer))
             (anvil-file--signal-stream-changed))
-          (when page-overflow
-            (with-current-buffer page-buffer (erase-buffer))
-            (anvil-file--signal-page-overflow cap))
           ;; The final raw chunk is no longer needed once generation and page
           ;; bounds have been verified.  Release it before decoding or
           ;; extracting the selected page.

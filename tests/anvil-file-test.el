@@ -542,6 +542,64 @@ BINDINGS is a `let' binding list for delta-cache defcustoms."
              (should fired))
          (when timer (cancel-timer timer)))))))
 
+(ert-deftest anvil-file-test-page-overflow-stops-stream ()
+  "A rejected page stops before later chunks or cooperative yields."
+  (let ((body (concat "SECRETS!\n"
+                      (make-string
+                       (* 17 anvil-file--stream-chunk-bytes) ?z))))
+    (anvil-file-test--with-tmp
+     body
+     (lambda (path)
+       (let ((anvil-file-max-inline-read-bytes 8)
+             (literal-insert
+              (symbol-function 'insert-file-contents-literally))
+             (generate-buffer (symbol-function 'generate-new-buffer))
+             (signal-overflow
+              (symbol-function 'anvil-file--signal-page-overflow))
+             page-buffer
+             chunk-buffer
+             retained-at-signal
+             (reads 0)
+             (yields 0))
+         (cl-letf (((symbol-function 'anvil--insert-file)
+                    (lambda (&rest _)
+                      (ert-fail "page overflow called the full loader")))
+                   ((symbol-function 'generate-new-buffer)
+                    (lambda (name &rest arguments)
+                      (let ((buffer (apply generate-buffer name arguments)))
+                        (cond
+                         ((equal name " *anvil-file-page*")
+                          (setq page-buffer buffer))
+                         ((equal name " *anvil-file-chunk*")
+                          (setq chunk-buffer buffer)))
+                        buffer)))
+                   ((symbol-function 'insert-file-contents-literally)
+                    (lambda (filename &optional visit beg end replace)
+                      (cl-incf reads)
+                      (funcall literal-insert
+                               filename visit beg end replace)))
+                   ((symbol-function 'accept-process-output)
+                    (lambda (&rest _)
+                      (cl-incf yields)
+                      nil))
+                   ((symbol-function 'anvil-file--signal-page-overflow)
+                    (lambda (cap)
+                      (setq retained-at-signal
+                            (list
+                             (with-current-buffer page-buffer (buffer-size))
+                             (with-current-buffer chunk-buffer (buffer-size))))
+                      (funcall signal-overflow cap))))
+           (let ((message
+                  (anvil-file-test--error-text
+                   (lambda () (anvil-file-read path 0 1)))))
+             (should (string-match-p "lower.*limit" message))
+             (should-not (string-match-p "SECRETS!" message))))
+         (should (= 1 reads))
+         (should (= 0 yields))
+         (should (equal '(0 0) retained-at-signal))
+         (should-not (buffer-live-p page-buffer))
+         (should-not (buffer-live-p chunk-buffer)))))))
+
 (ert-deftest anvil-file-test-read-warnings-empty-without-buffer ()
   "anvil-file-read returns :warnings nil when no buffer visits the file."
   (anvil-file-test--with-tmp
