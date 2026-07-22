@@ -120,6 +120,15 @@ tight non-yielding loop.  Nil (default) imposes no limit."
   :type '(choice (const :tag "No timeout" nil) number)
   :group 'anvil-server)
 
+(defcustom anvil-server-max-inline-result-bytes (* 2 1024 1024)
+  "Maximum projected JSON-string bytes returned inline by a tool.
+
+The limit is measured after JSON string escaping, but excludes the two
+surrounding quote delimiters.  Nil, zero, a negative number, or any
+non-integer value disables rejection and preserves legacy behavior."
+  :type '(choice (const :tag "No limit" nil) integer)
+  :group 'anvil-server)
+
 ;;; Public Constants
 
 (defconst anvil-server-name "anvil"
@@ -144,6 +153,9 @@ tight non-yielding loop.  Nil (default) imposes no limit."
 
 (defconst anvil-server-jsonrpc-error-internal -32603
   "JSON-RPC 2.0 Internal Error code.")
+
+(define-error 'anvil-server-inline-result-too-large
+  "MCP inline tool result is too large")
 
 ;;; Internal Constants
 
@@ -1473,11 +1485,187 @@ Errors raised by hook functions are caught and logged; they do not
 mask or modify the handler's result.  Keep hook functions cheap —
 they run on every successful dispatch.")
 
+(defun anvil-server--projected-json-string-bytes (text &optional stop-after)
+  "Return TEXT's UTF-8 byte size after `json-encode-string' escaping.
+
+The surrounding JSON quote delimiters are not counted.  When STOP-AFTER is a
+non-negative integer, return as soon as the count exceeds it.  This function
+does not call a JSON encoder or materialize the escaped string."
+  (unless (stringp text)
+    (signal 'wrong-type-argument (list 'stringp text)))
+  (let ((index 0)
+        (total 0)
+        (multibyte (multibyte-string-p text))
+        (stop (and (integerp stop-after) (>= stop-after 0) stop-after)))
+    (catch 'done
+      (while (< index (length text))
+        (let ((character (aref text index)))
+          (setq total
+                (+ total
+                   (cond
+                    ((or (= character ?\") (= character ?\\)) 2)
+                    ((memq character '(8 9 10 12 13)) 2)
+                    ((< character 32) 6)
+                    ((and (not multibyte) (>= character 128)) 5)
+                    ((< character #x80) 1)
+                    ((< character #x800) 2)
+                    ((< character #x10000) 3)
+                    (t 4))))
+          (setq index (1+ index))
+          (when (and stop (> total stop))
+            (throw 'done total))))
+      total)))
+
+(defun anvil-server--safe-tool-label (tool-name)
+  "Return TOOL-NAME when it has the telemetry-safe ASCII grammar.
+Return the fixed placeholder `<oversized-tool-id>' otherwise."
+  (if (and (stringp tool-name)
+           (string-match-p
+            "\\`[A-Za-z0-9][A-Za-z0-9._/-]\\{0,127\\}\\'"
+            tool-name))
+      tool-name
+    "<oversized-tool-id>"))
+
+(defconst anvil-server--safe-condition-symbols
+  '(void-function
+    error-process-exited-abnormally
+    file-missing
+    file-error
+    wrong-type-argument
+    wrong-number-of-arguments
+    error
+    anvil-server-tool-error
+    anvil-server-invalid-params
+    anvil-server-inline-result-too-large)
+  "Condition symbols allowed to cross the tool-error telemetry boundary.")
+
+(defun anvil-server--safe-condition-symbol (condition)
+  "Return CONDITION's allowlisted symbol, or canonical `error'."
+  (let ((symbol (if (consp condition) (car condition) condition)))
+    (if (memq symbol anvil-server--safe-condition-symbols)
+        symbol
+      'error)))
+
+(defun anvil-server--inline-result-limit-enabled-p ()
+  "Return non-nil when the inline result byte limit is enabled."
+  (and (integerp anvil-server-max-inline-result-bytes)
+       (> anvil-server-max-inline-result-bytes 0)))
+
+(defun anvil-server--inline-overflow-diagnostic
+    (tool-name class text projected)
+  "Build a bounded diagnostic for rejected TEXT.
+TOOL-NAME is sanitized before rendering.  CLASS is a fixed internal symbol and
+PROJECTED is the early-stop projected byte observation."
+  (format
+   (concat "Tool %s %s exceeds the inline response limit "
+           "(raw-bytes=%d projected-bytes-at-least=%d limit=%d). "
+           "Use a paginated, filtered, tee, or asynchronous interface.")
+   (anvil-server--safe-tool-label tool-name)
+   (pcase class
+     ('returned "result")
+     ('invalid-params "invalid-params error text")
+     ('tool-error "tool-error text")
+     ('quit "quit error text")
+     ('not-found "not-found error text")
+     (_ "error text"))
+   (string-bytes text)
+   projected
+   anvil-server-max-inline-result-bytes))
+
+(defun anvil-server--enforce-inline-result-limit (tool-name result-text)
+  "Return RESULT-TEXT, or reject an oversized inline tool result.
+
+The signaled condition contains only a bounded diagnostic; it never contains
+RESULT-TEXT."
+  (unless (stringp result-text)
+    (signal 'wrong-type-argument (list 'stringp result-text)))
+  (if (not (anvil-server--inline-result-limit-enabled-p))
+      result-text
+    (let* ((limit anvil-server-max-inline-result-bytes)
+           (projected
+            (anvil-server--projected-json-string-bytes result-text limit)))
+      (if (<= projected limit)
+          result-text
+        (signal
+         'anvil-server-inline-result-too-large
+         (list
+          (anvil-server--inline-overflow-diagnostic
+           tool-name 'returned result-text projected)))))))
+
+(defun anvil-server--legacy-tool-error-text (tool-name class condition)
+  "Reconstruct the historical response text for CLASS and CONDITION."
+  (pcase class
+    ('macro (format "Error: %S" condition))
+    ('generic
+     (format "Internal error executing tool: %s"
+             (error-message-string condition)))
+    ('quit (format "Tool handler quit: %S" condition))
+    ('not-found (format "Tool not found: %s" tool-name))
+    (_ (if (and (consp condition) (stringp (cadr condition)))
+           (cadr condition)
+         "Tool error contained non-string data"))))
+
+(defun anvil-server--bounded-tool-error-text (tool-name class condition)
+  "Return a string representation of tool CONDITION without object printing."
+  (let ((data (and (consp condition) (cadr condition))))
+    (pcase class
+      ('not-found
+       (format "Tool not found: %s"
+               (anvil-server--safe-tool-label tool-name)))
+      ('macro
+       (if (stringp data) (concat "Error: " data)
+         "Tool handler signaled non-string error data"))
+      ('generic
+       (if (stringp data)
+           (concat "Internal error executing tool: " data)
+         "Internal error executing tool with non-string data"))
+      ('quit
+       (if (stringp data) (concat "Tool handler quit: " data)
+         "Tool handler quit"))
+      ('invalid-params
+       (if (stringp data) data "Invalid tool parameters"))
+      ('tool-error
+       (if (stringp data) data "Tool reported non-string error data"))
+      (_
+       (if (stringp data) data "Tool error contained non-string data")))))
+
+(defun anvil-server--sanitize-tool-error (tool-name class condition)
+  "Return a bounded, reconstructed representation of tool CONDITION.
+
+The result is `(:condition CELL :text TEXT :tool LABEL)'.  CELL is always a
+new condition cell containing only an allowlisted symbol and TEXT.  This
+function catches all internal errors and quits so it never signals."
+  (condition-case nil
+      (let* ((label (anvil-server--safe-tool-label tool-name))
+             (symbol (anvil-server--safe-condition-symbol condition))
+             (enabled (anvil-server--inline-result-limit-enabled-p))
+             (text
+              (if enabled
+                  (anvil-server--bounded-tool-error-text
+                   tool-name class condition)
+                (anvil-server--legacy-tool-error-text
+                 tool-name class condition))))
+        (when enabled
+          (let ((projected
+                 (anvil-server--projected-json-string-bytes
+                  text anvil-server-max-inline-result-bytes)))
+            (when (> projected anvil-server-max-inline-result-bytes)
+              (setq text
+                    (anvil-server--inline-overflow-diagnostic
+                     tool-name class text projected)))))
+        (list :condition (list symbol text) :text text :tool label))
+    (quit
+     '(:condition (error "") :text "" :tool "<oversized-tool-id>"))
+    (error
+     '(:condition (error "") :text "" :tool "<oversized-tool-id>"))))
+
 (defvar anvil-server-tool-error-hook nil
   "Abnormal hook run when a tool handler error is observed.
 Functions are called with (ERR TOOL-NAME SOURCE):
-  ERR        — the raw error condition cell from `condition-case'.
-  TOOL-NAME  — the active tool id, or nil when the hook fires from
+  ERR        — a newly constructed condition cell containing only an
+               allowlisted symbol and bounded text.
+  TOOL-NAME  — the fixed-grammar active tool id or
+               `<oversized-tool-id>', including when the hook fires from
                `anvil-server-with-error-handling' without a tool
                name in scope.
   SOURCE     — call-site hint symbol:
@@ -1503,7 +1691,9 @@ the correct tool even when fired from inside
 the dispatcher-level name.")
 
 (defun anvil-server--run-tool-error-hook (err tool-name source)
-  "Run `anvil-server-tool-error-hook' with ERR / TOOL-NAME / SOURCE.
+  "Run `anvil-server-tool-error-hook' with sanitized arguments.
+ERR must be a newly constructed allowlisted condition, and TOOL-NAME must be a
+fixed-grammar label or `<oversized-tool-id>'.  SOURCE is a fixed call-site hint.
 Hook errors are caught and logged so telemetry never breaks the
 main dispatch flow."
   (when anvil-server-tool-error-hook
@@ -1663,12 +1853,104 @@ SERVER-ID is resolved through `anvil-server-id-aliases'."
     (anvil-server--jsonrpc-response
      id `((resourceTemplates . ,template-list)))))
 
+(defun anvil-server--object-alist-p (value)
+  "Return non-nil when VALUE has the JSON object/alist representation."
+  (or (null value)
+      (and (listp value)
+           (cl-every (lambda (entry) (and (consp entry) (car entry)))
+                     value))))
+
+(defun anvil-server--tool-error-result (context text)
+  "Return an MCP tool-error result for CONTEXT containing bounded TEXT."
+  (anvil-server--respond-with-result
+   context
+   `((content . ,(vector `((type . "text") (text . ,text))))
+     (isError . t))))
+
 (defun anvil-server--handle-tools-call
     (id params method-metrics server-id)
-  "Handle tools/call request with ID and PARAMS for SERVER-ID.
+  "Handle tools/call inside a complete tool-derived error boundary."
+  (let ((tool-name nil)
+        (context (list :id id)))
+    (condition-case err
+        (progn
+          (unless (anvil-server--object-alist-p params)
+            (signal 'anvil-server-invalid-params
+                    '("Invalid tools/call parameters")))
+          (setq tool-name (alist-get 'name params))
+          (unless (stringp tool-name)
+            (signal 'anvil-server-invalid-params
+                    '("Invalid tools/call parameters")))
+          (unless (anvil-server--object-alist-p
+                   (alist-get 'arguments params))
+            (signal 'anvil-server-invalid-params
+                    '("Invalid tools/call parameters")))
+          (anvil-server--handle-tools-call-unsafe
+           id params method-metrics server-id))
+      (anvil-server-inline-result-too-large
+       (anvil-server-metrics--track-tool-call
+        (anvil-server--safe-tool-label tool-name) t)
+       (anvil-server--metrics-bump
+        (anvil-server-metrics-errors method-metrics))
+       (anvil-server--tool-error-result
+        context
+        (if (and (consp err) (stringp (cadr err)))
+            (cadr err)
+          "Inline tool result exceeded the response limit")))
+      (anvil-server-invalid-params
+       (let* ((sanitized
+               (anvil-server--sanitize-tool-error
+                tool-name 'invalid-params err))
+              (label (plist-get sanitized :tool)))
+         (anvil-server-metrics--track-tool-call label t)
+         (anvil-server--metrics-bump
+          (anvil-server-metrics-errors method-metrics))
+         (anvil-server--run-tool-error-hook
+          (plist-get sanitized :condition)
+          label 'dispatcher-validation)
+         (anvil-server--jsonrpc-error
+          id anvil-server-jsonrpc-error-invalid-params
+          (plist-get sanitized :text))))
+      (anvil-server-tool-error
+       (let* ((sanitized
+               (anvil-server--sanitize-tool-error
+                tool-name 'tool-error err))
+              (label (plist-get sanitized :tool)))
+         (anvil-server-metrics--track-tool-call label t)
+         (anvil-server--metrics-bump
+          (anvil-server-metrics-errors method-metrics))
+         (anvil-server--tool-error-result
+          context (plist-get sanitized :text))))
+      (quit
+       (let* ((sanitized
+               (anvil-server--sanitize-tool-error tool-name 'quit err))
+              (label (plist-get sanitized :tool)))
+         (anvil-server-metrics--track-tool-call label t)
+         (anvil-server--metrics-bump
+          (anvil-server-metrics-errors method-metrics))
+         (anvil-server--jsonrpc-error
+          id anvil-server-jsonrpc-error-internal
+          (plist-get sanitized :text))))
+      (error
+       (let* ((sanitized
+               (anvil-server--sanitize-tool-error tool-name 'generic err))
+              (label (plist-get sanitized :tool)))
+         (anvil-server-metrics--track-tool-call label t)
+         (anvil-server--metrics-bump
+          (anvil-server-metrics-errors method-metrics))
+         (anvil-server--run-tool-error-hook
+          (plist-get sanitized :condition) label 'tool-body)
+         (anvil-server--jsonrpc-error
+          id anvil-server-jsonrpc-error-internal
+          (plist-get sanitized :text)))))))
+
+(defun anvil-server--handle-tools-call-unsafe
+    (id params method-metrics server-id)
+  "Execute a validated tools/call request with ID and PARAMS for SERVER-ID.
 METHOD-METRICS is used to track errors for this method.  SERVER-ID
 is resolved through `anvil-server-id-aliases' before tool lookup so
-virtual server-ids share the same handler pool."
+virtual server-ids share the same handler pool.  The public wrapper owns the
+complete boundary around parameter extraction, lookup, and lazy loading."
   (let* ((tool-name (alist-get 'name params))
          (resolved-id (anvil-server--resolve-id server-id))
          (tools-table (gethash resolved-id anvil-server--tools))
@@ -1817,9 +2099,15 @@ virtual server-ids share the same handler pool."
                           " hash-table / vector), got: %s")
                          (type-of result)))))))
                    (result-text
+                    (anvil-server--enforce-inline-result-limit
+                     tool-name result-text))
+                   (result-text
                     (if (fboundp 'anvil-disclosure-budget-apply)
                         (anvil-disclosure-budget-apply tool-name result-text)
                       result-text))
+                   (result-text
+                    (anvil-server--enforce-inline-result-limit
+                     tool-name result-text))
                    ;; Wrap the handler result in the MCP format
                    (formatted-result
                     `((content
@@ -1840,51 +2128,78 @@ virtual server-ids share the same handler pool."
                             (error-message-string hook-err))))
                 (anvil-server--respond-with-result
                  context formatted-result))
+            (anvil-server-inline-result-too-large
+             (anvil-server-metrics--track-tool-call
+              (anvil-server--safe-tool-label tool-name) t)
+             (anvil-server--metrics-bump
+              (anvil-server-metrics-errors method-metrics))
+             (anvil-server--tool-error-result
+              context
+              (if (and (consp err) (stringp (cadr err)))
+                  (cadr err)
+                "Inline tool result exceeded the response limit")))
             ;; Handle invalid parameter errors
             (anvil-server-invalid-params
-             (anvil-server-metrics--track-tool-call tool-name t)
-             (anvil-server--metrics-bump (anvil-server-metrics-errors method-metrics))
-             (anvil-server--run-tool-error-hook
-              err tool-name 'dispatcher-validation)
-             (anvil-server--jsonrpc-error
-              id
-              anvil-server-jsonrpc-error-invalid-params
-              (cadr err)))
+             (let* ((sanitized
+                     (anvil-server--sanitize-tool-error
+                      tool-name 'invalid-params err))
+                    (label (plist-get sanitized :tool)))
+               (anvil-server-metrics--track-tool-call label t)
+               (anvil-server--metrics-bump
+                (anvil-server-metrics-errors method-metrics))
+               (anvil-server--run-tool-error-hook
+                (plist-get sanitized :condition)
+                label 'dispatcher-validation)
+               (anvil-server--jsonrpc-error
+                id anvil-server-jsonrpc-error-invalid-params
+                (plist-get sanitized :text))))
             ;; Handle tool-specific errors thrown with
             ;; anvil-server-tool-throw
             (anvil-server-tool-error
-             (anvil-server-metrics--track-tool-call tool-name t)
-             (anvil-server--metrics-bump (anvil-server-metrics-errors method-metrics))
-             (let ((formatted-error
-                    `((content
-                       .
-                       ,(vector
-                         `((type . "text") (text . ,(cadr err)))))
-                      (isError . t))))
-               (anvil-server--respond-with-result
-                context formatted-error)))
+             (let* ((sanitized
+                     (anvil-server--sanitize-tool-error
+                      tool-name 'tool-error err))
+                    (label (plist-get sanitized :tool)))
+               (anvil-server-metrics--track-tool-call label t)
+               (anvil-server--metrics-bump
+                (anvil-server-metrics-errors method-metrics))
+               (anvil-server--tool-error-result
+                context (plist-get sanitized :text))))
             (quit
-             (anvil-server-metrics--track-tool-call tool-name t)
-             (cl-incf (anvil-server-metrics-errors method-metrics))
-             (anvil-server--jsonrpc-error
-              id anvil-server-jsonrpc-error-internal
-              (format "Tool handler quit: %S" err)))
+             (let* ((sanitized
+                     (anvil-server--sanitize-tool-error
+                      tool-name 'quit err))
+                    (label (plist-get sanitized :tool)))
+               (anvil-server-metrics--track-tool-call label t)
+               (anvil-server--metrics-bump
+                (anvil-server-metrics-errors method-metrics))
+               (anvil-server--jsonrpc-error
+                id anvil-server-jsonrpc-error-internal
+                (plist-get sanitized :text))))
             ;; Keep existing handling for all other errors
             (error
-             (anvil-server-metrics--track-tool-call tool-name t)
-             (anvil-server--metrics-bump (anvil-server-metrics-errors method-metrics))
-             (anvil-server--run-tool-error-hook
-              err tool-name 'tool-body)
-             (anvil-server--jsonrpc-error
-              id anvil-server-jsonrpc-error-internal
-              (format "Internal error executing tool: %s"
-                      (error-message-string err))))))
-      (anvil-server-metrics--track-tool-call tool-name t)
-      (anvil-server--metrics-bump (anvil-server-metrics-errors method-metrics))
-      (anvil-server--jsonrpc-error
-       id
-       anvil-server-jsonrpc-error-invalid-request
-       (format "Tool not found: %s" tool-name)))))
+             (let* ((sanitized
+                     (anvil-server--sanitize-tool-error
+                      tool-name 'generic err))
+                    (label (plist-get sanitized :tool)))
+               (anvil-server-metrics--track-tool-call label t)
+               (anvil-server--metrics-bump
+                (anvil-server-metrics-errors method-metrics))
+               (anvil-server--run-tool-error-hook
+                (plist-get sanitized :condition) label 'tool-body)
+               (anvil-server--jsonrpc-error
+                id anvil-server-jsonrpc-error-internal
+                (plist-get sanitized :text))))))
+      (let* ((sanitized
+              (anvil-server--sanitize-tool-error
+               tool-name 'not-found '(error "Tool not found")))
+             (label (plist-get sanitized :tool)))
+        (anvil-server-metrics--track-tool-call label t)
+        (anvil-server--metrics-bump
+         (anvil-server-metrics-errors method-metrics))
+        (anvil-server--jsonrpc-error
+         id anvil-server-jsonrpc-error-invalid-request
+         (plist-get sanitized :text))))))
 
 ;;; Offload dispatch (Doc 03 Phase 2b)
 
@@ -2004,12 +2319,18 @@ See also: `anvil-server-tool-throw'"
        (progn
          ,@body)
      (quit
-      (anvil-server-tool-throw
+     (anvil-server-tool-throw
        "Interrupted (quit) — the user pressed C-g.  Avoid running code that blocks the Emacs UI."))
      (error
-      (anvil-server--run-tool-error-hook
-       err anvil-server--current-tool-name 'tool-body)
-      (anvil-server-tool-throw (format "Error: %S" err)))))
+      (let* ((sanitized
+              (anvil-server--sanitize-tool-error
+               anvil-server--current-tool-name 'macro err))
+             (condition (plist-get sanitized :condition))
+             (label (plist-get sanitized :tool))
+             (text (plist-get sanitized :text)))
+        (anvil-server--run-tool-error-hook
+         condition label 'tool-body)
+        (anvil-server-tool-throw text)))))
 
 ;;; Tool helpers
 
