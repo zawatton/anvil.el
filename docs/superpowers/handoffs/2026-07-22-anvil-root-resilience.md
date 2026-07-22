@@ -80,8 +80,11 @@
 - /Users/johnw/src/ai-nix is read-only for this task at
   0610fd1283cf5ee52a5c71cbc8411a647b37dd7c and now has unrelated user-owned
   modifications/untracked files that must remain untouched.
-- Task 0 is complete. Its two isolated all-module baseline suites remain
-  assigned for diagnosis while implementation proceeds in disjoint files.
+- Task 0's baseline is characterized. The deterministic stale post-dispatch
+  source-contract assertion was repaired in signed commit `a870ddf`; the two
+  longer isolated stdio failures reproduced as scheduler/order-sensitive
+  inherited failures whose exact subcases pass independently. The inherited
+  package-lint baseline remains to be reconciled before the final full gate.
 
 ## Stop-and-escalate counters
 
@@ -96,10 +99,10 @@
 1. Re-read the Wiggum skill, frozen design, plan, and this handoff.
 2. Verify live Anvil, Nix, and ai-nix state; live artifacts override this
    snapshot.
-3. Stage only Task 1's four listed files, create the signed `Report lazy Anvil
-   workers as cold` commit, and independently audit that exact commit.
-4. Fix every real audit finding and repeat the focused and full worker gates
-   before proceeding past Task 1.
+3. Reverify the Task 1 audit repair after signed commits `f9b2b9e` and its
+   reporting-only `:nowait` follow-up; repeat the focused and full worker gates.
+4. Independently re-audit the exact Task 1 follow-up commit and resolve every
+   real finding before proceeding past Task 1.
 5. Reconcile the concurrently implemented Tasks 2 and 3 without mixing their
    disjoint file ownership into Task 1's commit.
 6. Continue each test-first task with per-commit fess audit, partner-observation

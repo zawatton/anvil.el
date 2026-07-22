@@ -1219,13 +1219,35 @@ comparison visible in `anvil-worker-latency-metrics-show'."
 (defun anvil-worker--reporting-endpoint-alive-p (worker)
   "Return non-nil when WORKER's endpoint is reachable for reporting.
 
-This observer checks only the cached server-file and the existing
-OS-level PID or local-connect predicate.  It never probes worker
-evaluation, deletes a server-file, logs, spawns, or mutates WORKER."
+This observer checks only the cached server-file and an OS-level PID or
+`:nowait' local-connect observation.  It never waits for connection
+completion, probes worker evaluation, deletes a server-file, logs, spawns,
+or mutates WORKER."
   (let ((server-file (plist-get worker :server-file)))
     (and (stringp server-file)
          (file-exists-p server-file)
-         (not (anvil-worker--server-file-stale-p server-file)))))
+         (if server-use-tcp
+             (let ((pid (anvil-worker--server-file-pid server-file)))
+               (and pid (process-attributes pid) t))
+           (let (process)
+             (unwind-protect
+                 (condition-case nil
+                     (progn
+                       (setq process
+                             (make-network-process
+                              :name "anvil-worker-reporting-check"
+                              :family 'local
+                              :server nil
+                              :nowait t
+                              :noquery t
+                              :buffer nil
+                              :service server-file))
+                       (memq (process-status process)
+                             '(open run connect)))
+                   (file-error nil)
+                   (error nil))
+               (when (processp process)
+                 (delete-process process))))))))
 
 (defun anvil-worker--reported-state (worker endpoint-alive)
   "Return WORKER's nonblocking externally reported state."

@@ -750,6 +750,35 @@ deadlock on Windows (2026-04-16) that could not be broken with
       (should (eq expected
                   (anvil-worker--reported-state worker endpoint))))))
 
+(ert-deftest anvil-worker-test-reporting-endpoint-nowait ()
+  "The real reporting observer never waits for a local socket connect."
+  (let ((server-use-tcp nil)
+        (worker '(:server-file "/tmp/anvil-worker-reporting-test.sock"))
+        (fake-process (make-pipe-process
+                       :name "anvil-worker-reporting-test-pipe"
+                       :noquery t))
+        captured)
+    (unwind-protect
+        (cl-letf (((symbol-function 'file-exists-p)
+                   (lambda (_path) t))
+                  ((symbol-function 'make-network-process)
+                   (lambda (&rest arguments)
+                     (setq captured arguments)
+                     fake-process))
+                  ((symbol-function 'anvil-worker--server-file-stale-p)
+                   (lambda (&rest _)
+                     (ert-fail "reporting called the blocking stale probe")))
+                  ((symbol-function 'accept-process-output)
+                   (lambda (&rest _)
+                     (ert-fail "reporting waited for connection completion"))))
+          (should (anvil-worker--reporting-endpoint-alive-p worker))
+          (should (eq t (plist-get captured :nowait)))
+          (should (eq 'local (plist-get captured :family)))
+          (should (eq t (plist-get captured :noquery)))
+          (should-not (plist-get captured :buffer)))
+      (when (process-live-p fake-process)
+        (delete-process fake-process)))))
+
 (ert-deftest anvil-worker-test-status-nonblocking ()
   "Pool status reports all states without lifecycle side effects."
   (anvil-worker-test--with-pool '(:read 5) nil
