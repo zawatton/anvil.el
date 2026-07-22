@@ -73,7 +73,7 @@ Worker spawning, health recovery, ownership checks, grace periods, and metrics r
 
 Add anvil-file-max-unbounded-read-bytes, defaulting to 1,048,576 bytes.
 
-Before anvil-file-read inserts file contents, it will inspect the regular file size. When both offset and limit are omitted and the file exceeds the configured limit, it will signal a tool error containing:
+Before anvil-file-read inserts file contents, it will inspect the regular file size. When limit is omitted, regardless of whether offset is present, and the file exceeds the configured limit, it will signal a tool error containing:
 
 - the file size;
 - the configured inline limit;
@@ -82,7 +82,7 @@ Before anvil-file-read inserts file contents, it will inspect the regular file s
 
 The failure must happen before anvil--insert-file or any equivalent body-loading function runs. It must not include file contents.
 
-A caller that supplies offset or limit retains the current paginated behavior. Small unbounded reads retain their current behavior. A nil or non-positive configured limit disables this file-specific guard for installations that explicitly require legacy behavior.
+A caller that supplies a positive limit retains the current paginated behavior. Supplying offset alone does not bypass the guard because the result remains unbounded. Small unbounded reads retain their current behavior. A nil or non-positive configured limit disables this file-specific guard for installations that explicitly require legacy behavior.
 
 The file-read tool description will state that large files require pagination.
 
