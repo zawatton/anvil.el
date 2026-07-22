@@ -103,12 +103,13 @@
 
 ## Current state
 
-- The isolated upstream branch is `fix/anvil-root-resilience` at signed HEAD
-  `2a4ebbf`, with its committed implementation series above the pushed PR #55
-  planning head `41a0145`. It has not been pushed or opened as a PR yet.
-- All implementation code paths are committed; only this handoff update is
-  pending. Generated Python bytecode was removed. Dedicated Anvil reported no
-  modified file buffers before both final code commits.
+- The isolated upstream branch is `fix/anvil-root-resilience`; its signed
+  implementation tip is `2a4ebbf`, followed by signed handoff-only commits,
+  above the pushed PR #55 planning head `41a0145`. It has not been pushed or
+  opened as a PR yet.
+- All implementation code paths and this handoff are committed. Generated
+  Python bytecode was removed. Dedicated Anvil reported no modified file
+  buffers before both final code commits.
 - The independent whole-branch review found only the immediate-overflow and
   malformed-limit issues above. Both repairs and their follow-up review
   findings are closed. The one planned rebase onto the fetched, unchanged
