@@ -1216,6 +1216,51 @@ comparison visible in `anvil-worker-latency-metrics-show'."
 
 ;;; Pool status
 
+(defun anvil-worker--reporting-endpoint-alive-p (worker)
+  "Return non-nil when WORKER's endpoint is reachable for reporting.
+
+This observer checks only the cached server-file and the existing
+OS-level PID or local-connect predicate.  It never probes worker
+evaluation, deletes a server-file, logs, spawns, or mutates WORKER."
+  (let ((server-file (plist-get worker :server-file)))
+    (and (stringp server-file)
+         (file-exists-p server-file)
+         (not (anvil-worker--server-file-stale-p server-file)))))
+
+(defun anvil-worker--reported-state (worker endpoint-alive)
+  "Return WORKER's nonblocking externally reported state."
+  (cond
+   ((and endpoint-alive (plist-get worker :busy)) 'busy)
+   ((and endpoint-alive
+         (> (or (plist-get worker :hung-checks) 0) 0))
+    'unresponsive)
+   (endpoint-alive 'alive)
+   ((not (plist-get worker :demanded)) 'cold)
+   (t 'dead)))
+
+(defun anvil-worker--format-reported-status (worker endpoint-alive)
+  "Format WORKER using the observed ENDPOINT-ALIVE state."
+  (let* ((state (anvil-worker--reported-state worker endpoint-alive))
+         (last (pcase (plist-get worker :last-state)
+                 ('alive "alive")
+                 ('dead "dead")
+                 (_ "unknown")))
+         (failures (or (plist-get worker :hung-checks) 0))
+         (pid (and endpoint-alive
+                   (anvil-worker--server-file-pid
+                    (plist-get worker :server-file)))))
+    (concat
+     (format "%s: state=%s demanded=%s last=%s"
+             (plist-get worker :name)
+             state
+             (if (plist-get worker :demanded) "yes" "no")
+             last)
+     (if pid (format " pid=%d" pid) "")
+     (if (> failures 0)
+         (format " probe-failures=%d/%d"
+                 failures anvil-worker-hung-check-limit)
+       ""))))
+
 ;;;###autoload
 (defun anvil-worker-status ()
   "Display per-lane pool status."
@@ -1229,12 +1274,12 @@ comparison visible in `anvil-worker-latency-metrics-show'."
           (push (format "[%s]" (anvil-worker--lane-name lane)) lines)
           (dotimes (i (length vec))
             (let* ((worker (aref vec i))
-                   (alive (anvil-worker--worker-alive-p worker))
-                   (busy  (plist-get worker :busy)))
-              (push (format "  %s: %s%s"
-                            (plist-get worker :name)
-                            (if alive "alive" "dead")
-                            (if busy " [busy]" ""))
+                   (endpoint-alive
+                    (anvil-worker--reporting-endpoint-alive-p worker)))
+              (push (concat
+                     "  "
+                     (anvil-worker--format-reported-status
+                      worker endpoint-alive))
                     lines))))))
     (message "Anvil worker pool (read=%d write=%d batch=%d):\n%s"
              anvil-worker-read-pool-size
@@ -1342,10 +1387,11 @@ Never-demanded lazy workers are not probed or spawned."
   "MCP server ID for `anvil-worker' tool registration.")
 
 (defun anvil-worker--tool-probe ()
-  "Return a per-lane status report: workers, PIDs, metrics summary.
+  "Return per-lane worker states, PIDs, and metrics summary.
 
-Uses the non-blocking `quick-alive-p' check so the response is
-cheap enough to poll at interactive rates."
+States are cold, alive, busy, unresponsive, or dead.  Reporting
+uses a non-mutating endpoint observation, so the response is cheap
+enough to poll at interactive rates."
   (anvil-server-with-error-handling
     (unless anvil-worker--pool
       (anvil-worker--init-pool))
@@ -1360,17 +1406,13 @@ cheap enough to poll at interactive rates."
           (when (and vec (> (length vec) 0))
             (push (format "  [%s]" (anvil-worker--lane-name lane)) lines)
             (dotimes (i (length vec))
-              (let* ((w      (aref vec i))
-                     (alive  (anvil-worker--quick-alive-p w))
-                     (busy   (plist-get w :busy))
-                     (sfile  (plist-get w :server-file))
-                     (pid    (and alive
-                                  (anvil-worker--server-file-pid sfile))))
-                (push (format "    %s: %s%s%s"
-                              (plist-get w :name)
-                              (if alive "alive" "dead")
-                              (if pid (format " pid=%d" pid) "")
-                              (if busy " [busy]" ""))
+              (let* ((worker (aref vec i))
+                     (endpoint-alive
+                      (anvil-worker--reporting-endpoint-alive-p worker)))
+                (push (concat
+                       "    "
+                       (anvil-worker--format-reported-status
+                        worker endpoint-alive))
                       lines))))))
       (push "" lines)
       (push (format "classify: %S"
@@ -1425,7 +1467,8 @@ Otherwise each lane starts only when first dispatched."
    :id "anvil-worker-probe"
    :intent '(worker admin)
    :layer 'dev
-   :description "Per-lane worker status: name, alive/busy, PID, metrics summary"
+   :description
+   "Per-lane worker status: cold/alive/busy/unresponsive/dead, PID, metrics"
    :read-only t
    :server-id anvil-worker--server-id)
   (anvil-server-register-tool

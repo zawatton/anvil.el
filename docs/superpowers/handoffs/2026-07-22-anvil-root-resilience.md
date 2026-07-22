@@ -4,8 +4,8 @@
 **Mode:** Autonomous Wiggum continuation.
 **Frozen design:** docs/superpowers/specs/2026-07-22-anvil-root-resilience-design.md
 **Frozen plan:** docs/superpowers/plans/2026-07-22-anvil-root-resilience.md
-**Current repository:** /Users/johnw/src/emacs-lisp/anvil.el
-**Current branch:** fix/issue-53-interrupted-hangs
+**Current repository:** /Users/johnw/src/emacs-lisp/anvil-root-resilience
+**Current branch:** fix/anvil-root-resilience
 **Nix deployment repository:** /Users/johnw/src/nix
 **Nix implementation worktree:** not created yet
 **Journal:** not in use
@@ -54,24 +54,34 @@
   activity phases; and made terminal supervisor shutdown invalidate stale
   status on stop, finalizer, or publication failure. Both focused and whole-
   plan audits now report no Critical or Important findings.
+- Created the isolated Anvil implementation worktree on
+  `fix/anvil-root-resilience` from signed, pushed planning commit `41a0145`.
+- Task 0's exact packaged-Emacs baseline passed `make test` 40/40. The broader
+  `make test-all` selected 2,507 of 2,745 tests across 109 files and found three
+  unexpected results confined to `anvil-stdio-postdispatch-test.el` and
+  `anvil-stdio-readiness-test.el`; every other suite passed.
+- Task 1's non-vacuous three-test RED run failed for the intended missing
+  classifier and legacy blocking/mutating reporting calls. After the minimal
+  worker-reporting implementation, the same selector passed 3/3.
+- Task 1's full packaged-Emacs verification passed the worker suite 68/68 and
+  the worker-pool suite 16/16, both with zero unexpected results.
 
 ## Current state
 
-- No source-code implementation has begun.
-- The signed planning HEAD contains exactly the three resilience documents;
-  the Anvil parent checkout is clean.
+- Task 1 implementation, tests, and documentation are present in the isolated
+  worktree with its focused and full worker verification green.
+- The signed planning HEAD `41a0145` is pushed and the Anvil parent checkout is
+  clean.
 - Dedicated Anvil reported no modified file buffers before the latest edit
   batches; this does not cover the separate interactive development Emacs.
-- Precursor planning commits b0bd6d7 and 9634dba plus the signed planning HEAD
-  are local after the pushed design commit.
 - /Users/johnw/src/nix main is synchronized with origin/main at
   7bf56931bd00c9f546cae8e64147d825661d0da7 and currently has a user-owned
   `config/packages.nix` modification that must remain untouched.
 - /Users/johnw/src/ai-nix is read-only for this task at
   0610fd1283cf5ee52a5c71cbc8411a647b37dd7c and now has unrelated user-owned
   modifications/untracked files that must remain untouched.
-- Task 0 remains blocked only on the amended commit-bound audit, push, and
-  local/remote equality.
+- Task 0 is complete. Its two isolated all-module baseline suites remain
+  assigned for diagnosis while implementation proceeds in disjoint files.
 
 ## Stop-and-escalate counters
 
@@ -86,12 +96,14 @@
 1. Re-read the Wiggum skill, frozen design, plan, and this handoff.
 2. Verify live Anvil, Nix, and ai-nix state; live artifacts override this
    snapshot.
-3. Independently audit the exact signed planning commit object. Fix every
-   Critical/Important finding by amending and re-audit until clean.
-4. Push the exact audited planning HEAD, then verify local/remote equality.
-5. Execute Task 0 and its packaged-Emacs baseline in the isolated Anvil
-   worktree.
+3. Stage only Task 1's four listed files, create the signed `Report lazy Anvil
+   workers as cold` commit, and independently audit that exact commit.
+4. Fix every real audit finding and repeat the focused and full worker gates
+   before proceeding past Task 1.
+5. Reconcile the concurrently implemented Tasks 2 and 3 without mixing their
+   disjoint file ownership into Task 1's commit.
 6. Continue each test-first task with per-commit fess audit, partner-observation
    scan, and progress-ledger update.
-7. Keep Nix implementation in /Users/johnw/src/nix-anvil-root-resilience and
+7. Create Nix implementation worktree
+   /Users/johnw/src/nix-anvil-root-resilience and
    preserve unrelated user state.

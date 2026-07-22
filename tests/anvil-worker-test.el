@@ -738,12 +738,139 @@ deadlock on Windows (2026-04-16) that could not be broken with
 
 ;;;; --- MCP probe / reset-pool tools --------------------------------------
 
+(ert-deftest anvil-worker-test-reported-state-precedence ()
+  "Reporting classifies worker state with one deterministic precedence."
+  (dolist (case
+           '(((:demanded nil) nil cold)
+             ((:demanded t) nil dead)
+             ((:demanded nil) t alive)
+             ((:demanded t :hung-checks 1) t unresponsive)
+             ((:demanded t :hung-checks 1 :busy t) t busy)))
+    (pcase-let ((`(,worker ,endpoint ,expected) case))
+      (should (eq expected
+                  (anvil-worker--reported-state worker endpoint))))))
+
+(ert-deftest anvil-worker-test-status-nonblocking ()
+  "Pool status reports all states without lifecycle side effects."
+  (anvil-worker-test--with-pool '(:read 5) nil
+    (pcase-let* ((`[,cold ,dead ,alive ,unresponsive ,busy]
+                  (anvil-worker--lane-pool :read))
+                 (workers (list cold dead alive unresponsive busy))
+                 (reachable (list alive unresponsive busy))
+                 (checks (make-hash-table :test #'eq)))
+      (plist-put cold :last-state nil)
+      (plist-put dead :demanded t)
+      (plist-put dead :last-state 'dead)
+      (plist-put alive :demanded t)
+      (plist-put alive :last-state 'alive)
+      (plist-put unresponsive :demanded t)
+      (plist-put unresponsive :hung-checks 1)
+      (plist-put unresponsive :last-state 'dead)
+      (plist-put busy :demanded t)
+      (plist-put busy :hung-checks 1)
+      (plist-put busy :busy t)
+      (plist-put busy :last-state 'alive)
+      (let ((before (copy-tree anvil-worker--pool t)))
+        (cl-labels ((forbid (name)
+                      (lambda (&rest _args)
+                        (ert-fail (format "%s must not run during status"
+                                          name)))))
+          (cl-letf (((symbol-function
+                      'anvil-worker--reporting-endpoint-alive-p)
+                     (lambda (worker)
+                       (puthash worker
+                                (1+ (gethash worker checks 0))
+                                checks)
+                       (memq worker reachable)))
+                    ((symbol-function 'anvil-worker-spawn)
+                     (forbid 'anvil-worker-spawn))
+                    ((symbol-function 'anvil-worker--worker-alive-p)
+                     (forbid 'anvil-worker--worker-alive-p))
+                    ((symbol-function 'anvil-worker--quick-alive-p)
+                     (forbid 'anvil-worker--quick-alive-p))
+                    ((symbol-function 'delete-file)
+                     (forbid 'delete-file))
+                    ((symbol-function 'anvil-worker--log)
+                     (forbid 'anvil-worker--log)))
+            (let ((report (anvil-worker-status)))
+              (dolist (row
+                       '("anvil-worker-read-1: state=cold demanded=no last=unknown"
+                         "anvil-worker-read-2: state=dead demanded=yes last=dead"
+                         "anvil-worker-read-3: state=alive demanded=yes last=alive"
+                         "anvil-worker-read-4: state=unresponsive demanded=yes last=dead"
+                         "anvil-worker-read-5: state=busy demanded=yes last=alive"))
+                (should (string-match-p (regexp-quote row) report))))))
+        (dolist (worker workers)
+          (should (= 1 (gethash worker checks 0))))
+        (should (equal before anvil-worker--pool))))))
+
+(ert-deftest anvil-worker-test-probe-rendering ()
+  "The MCP probe renders lifecycle evidence without mutating workers."
+  (anvil-worker-test--with-pool '(:read 3) nil
+    (pcase-let* ((`[,cold ,unresponsive ,busy]
+                  (anvil-worker--lane-pool :read))
+                 (workers (list cold unresponsive busy))
+                 (reachable (list unresponsive busy))
+                 (checks (make-hash-table :test #'eq)))
+      (plist-put cold :last-state 'alive)
+      (plist-put unresponsive :demanded t)
+      (plist-put unresponsive :hung-checks 1)
+      (plist-put unresponsive :last-state 'dead)
+      (plist-put busy :demanded t)
+      (plist-put busy :hung-checks 2)
+      (plist-put busy :busy t)
+      (plist-put busy :last-state nil)
+      (let ((before (copy-tree anvil-worker--pool t)))
+        (cl-labels ((forbid (name)
+                      (lambda (&rest _args)
+                        (ert-fail (format "%s must not run during probe"
+                                          name)))))
+          (cl-letf (((symbol-function
+                      'anvil-worker--reporting-endpoint-alive-p)
+                     (lambda (worker)
+                       (puthash worker
+                                (1+ (gethash worker checks 0))
+                                checks)
+                       (memq worker reachable)))
+                    ((symbol-function 'anvil-worker-spawn)
+                     (forbid 'anvil-worker-spawn))
+                    ((symbol-function 'anvil-worker--worker-alive-p)
+                     (forbid 'anvil-worker--worker-alive-p))
+                    ((symbol-function 'anvil-worker--quick-alive-p)
+                     (forbid 'anvil-worker--quick-alive-p))
+                    ((symbol-function 'delete-file)
+                     (forbid 'delete-file))
+                    ((symbol-function 'anvil-worker--log)
+                     (forbid 'anvil-worker--log))
+                    ((symbol-function 'anvil-worker--server-file-pid)
+                     (lambda (_server-file) 99999)))
+            (let ((report (anvil-worker--tool-probe)))
+              (should (string-match-p
+                       (regexp-quote
+                        "anvil-worker-read-1: state=cold demanded=no last=alive")
+                       report))
+              (should (string-match-p
+                       (regexp-quote
+                        (concat
+                         "anvil-worker-read-2: state=unresponsive demanded=yes"
+                         " last=dead pid=99999 probe-failures=1/3"))
+                       report))
+              (should (string-match-p
+                       (regexp-quote
+                        (concat
+                         "anvil-worker-read-3: state=busy demanded=yes"
+                         " last=unknown pid=99999 probe-failures=2/3"))
+                       report)))))
+        (dolist (worker workers)
+          (should (= 1 (gethash worker checks 0))))
+        (should (equal before anvil-worker--pool))))))
+
 (ert-deftest anvil-worker-test-tool-probe-reports-per-lane ()
   "`anvil-worker--tool-probe' returns a string with lane headers and metrics."
   (anvil-worker-test--with-pool
       '(:read 2 :write 1 :batch 1)
       '("anvil-worker-read-1" "anvil-worker-write-1")
-    (cl-letf (((symbol-function 'anvil-worker--quick-alive-p)
+    (cl-letf (((symbol-function 'anvil-worker--reporting-endpoint-alive-p)
                (lambda (w)
                  (member (plist-get w :name)
                          anvil-worker--alive-set)))
@@ -758,13 +885,15 @@ deadlock on Windows (2026-04-16) that could not be broken with
         (should (string-match-p "\\[read\\]" report))
         (should (string-match-p "\\[write\\]" report))
         (should (string-match-p "\\[batch\\]" report))
-        ;; alive workers get pid= suffix
+        ;; Reachable workers get the alive state and pid= suffix.
         (should (string-match-p
-                 "anvil-worker-read-1: alive pid=99999"
+                 (concat "anvil-worker-read-1: state=alive demanded=no"
+                         " last=unknown pid=99999")
                  report))
-        ;; dead workers do NOT get pid=
+        ;; Never-demanded absent workers are cold and do not get pid=.
         (should (string-match-p
-                 "anvil-worker-read-2: dead\\($\\|\n\\)"
+                 (concat "anvil-worker-read-2: state=cold demanded=no"
+                         " last=unknown\\($\\|\n\\)")
                  report))
         (should (string-match-p "classify:" report))
         (should (string-match-p "latency:" report))))))
