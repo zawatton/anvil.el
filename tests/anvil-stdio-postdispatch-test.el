@@ -89,11 +89,19 @@
           (regexp-quote
            "local grace=\"${ANVIL_EMACSCLIENT_KILL_AFTER_TIMEOUT:-1}\"")
           source))
-        (should (= 2
+        (should
+         (string-match-p
+          (regexp-quote
+           "local started_seconds=$SECONDS elapsed=0 remaining=\"$grace\"")
+          source))
+        (should
+         (string-match-p
+          (regexp-quote "remaining=$((grace - elapsed))") source))
+        (should (= 4
                    (how-many
-                    (regexp-quote "-t \"$grace\"")
+                    (regexp-quote "-t \"$remaining\"")
                     (point-min) (point-max))))
-        (should (= 2
+        (should (= 4
                    (how-many
                     (regexp-quote
                      "anvil_mcp_converge_runner \"$runner\"")
