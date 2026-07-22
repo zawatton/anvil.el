@@ -322,8 +322,11 @@ BINDINGS is a `let' binding list for delta-cache defcustoms."
             (cl-letf (((symbol-function 'anvil--insert-file)
                        (lambda (&rest _)
                          (ert-fail "unbounded full-body loader was called")))
-                      ((symbol-function 'file-attribute-size)
-                       (lambda (_attrs) 16))
+                      ;; Mock Anvil's generation boundary rather than the
+                      ;; byte-compiler-inlinable file-attribute accessor.
+                      ((symbol-function 'anvil-file--file-generation)
+                       (lambda (_target)
+                         '(:identity (1 . 2) :size 16 :mtime (0 0 0 0))))
                       ((symbol-function 'insert-file-contents-literally)
                        (lambda (filename &optional visit beg end replace)
                          (setq max-request
