@@ -124,8 +124,8 @@ tight non-yielding loop.  Nil (default) imposes no limit."
   "Maximum projected JSON-string bytes returned inline by a tool.
 
 The limit is measured after JSON string escaping, but excludes the two
-surrounding quote delimiters.  Nil, zero, a negative number, or any
-non-integer value disables rejection and preserves legacy behavior."
+surrounding quote delimiters.  Nil, zero, or a negative integer disables
+rejection and preserves legacy behavior.  Every other value fails closed."
   :type '(choice (const :tag "No limit" nil) integer)
   :group 'anvil-server)
 
@@ -156,6 +156,9 @@ non-integer value disables rejection and preserves legacy behavior."
 
 (define-error 'anvil-server-inline-result-too-large
   "MCP inline tool result is too large")
+
+(define-error 'anvil-server-invalid-inline-result-limit
+  "MCP inline result limit has an invalid value")
 
 ;;; Internal Constants
 
@@ -1548,9 +1551,14 @@ Return the fixed placeholder `<oversized-tool-id>' otherwise."
       'error)))
 
 (defun anvil-server--inline-result-limit-enabled-p ()
-  "Return non-nil when the inline result byte limit is enabled."
-  (and (integerp anvil-server-max-inline-result-bytes)
-       (> anvil-server-max-inline-result-bytes 0)))
+  "Return non-nil when the inline result byte limit is enabled.
+Signal a content-free configuration error for every unsupported value."
+  (cond
+   ((null anvil-server-max-inline-result-bytes) nil)
+   ((integerp anvil-server-max-inline-result-bytes)
+    (> anvil-server-max-inline-result-bytes 0))
+   (t
+    (signal 'anvil-server-invalid-inline-result-limit nil))))
 
 (defun anvil-server--inline-overflow-diagnostic
     (tool-name class raw-bytes projected)

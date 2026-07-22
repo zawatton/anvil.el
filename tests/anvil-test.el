@@ -1390,7 +1390,7 @@ that slip through plist detection (alist entries), otherwise
      (anvil-server--enforce-inline-result-limit
       "tool" (make-string 9 #x1f600))
      :type 'anvil-server-inline-result-too-large))
-  (dolist (disabled '(nil 0 -1 malformed))
+  (dolist (disabled '(nil 0 -1))
     (let ((anvil-server-max-inline-result-bytes disabled))
       (should (equal "legacy"
                      (anvil-server--enforce-inline-result-limit
@@ -1468,6 +1468,157 @@ that slip through plist detection (alist entries), otherwise
                :tool "<oversized-tool-id>")
             (anvil-server--sanitize-tool-error
              "request-owned" 'generic '(error "request-owned"))))))
+
+(ert-deftest anvil-test-inline-result-limit-malformed-config-fails-closed ()
+  "Malformed inline limits fail closed across every tool error boundary."
+  (let* ((server-id "anvil-test-inline-malformed-limit")
+         (anvil-test--inline-payload
+          (concat "MALFORMED-LIMIT-REQUEST-SENTINEL-"
+                  (make-string 4096 ?x)))
+         (anvil-server--running t)
+         (fallback '(:condition (error "") :text ""
+                     :tool "<oversized-tool-id>"))
+         (tool-ids
+          '("inline.malformed-success"
+            "inline.malformed-macro"
+            "inline.malformed-tool-error"
+            "inline.malformed-generic"
+            "inline.malformed-wrong-type"
+            "inline.malformed-quit"
+            "inline.malformed-spoof"
+            "inline.malformed-lazy-generic"
+            "inline.malformed-lazy-tool-error")))
+    (unwind-protect
+        (progn
+          (dolist (registration
+                   `((anvil-test--inline-payload-tool
+                      "inline.malformed-success")
+                     (anvil-test--inline-macro-error-tool
+                      "inline.malformed-macro")
+                     (anvil-test--inline-direct-error-tool
+                      "inline.malformed-tool-error")
+                     (anvil-test--inline-generic-error-tool
+                      "inline.malformed-generic")
+                     (anvil-test--inline-wrong-type-tool
+                      "inline.malformed-wrong-type")
+                     (anvil-test--inline-quit-tool
+                      "inline.malformed-quit")
+                     (anvil-test--inline-spoof-overflow-tool
+                      "inline.malformed-spoof")))
+            (anvil-server-register-tool
+             (car registration)
+             :id (cadr registration) :description "malformed limit fixture"
+             :server-id server-id))
+          (let ((table (anvil-server--get-server-tools server-id)))
+            (puthash
+             "inline.malformed-lazy-generic"
+             (list :id "inline.malformed-lazy-generic" :json-fragment "{}"
+                   :lazy-placeholder t
+                   :lazy-loader
+                   (lambda (&rest _)
+                     (error "%s" anvil-test--inline-payload)))
+             table)
+            (puthash
+             "inline.malformed-lazy-tool-error"
+             (list :id "inline.malformed-lazy-tool-error"
+                   :json-fragment "{}" :lazy-placeholder t
+                   :lazy-loader
+                   (lambda (&rest _)
+                     (anvil-server-tool-throw anvil-test--inline-payload)))
+             table))
+          (dolist (malformed '(t 1.5 "not-an-integer"))
+            (let ((anvil-server-max-inline-result-bytes malformed))
+              (should-error
+               (anvil-server--enforce-inline-result-limit
+                "inline.malformed-success" anvil-test--inline-payload)
+               :type 'anvil-server-invalid-inline-result-limit)
+              (dolist (class '(inline-result macro invalid-params tool-error
+                                             quit generic not-found))
+                (should
+                 (equal
+                  fallback
+                  (anvil-server--sanitize-tool-error
+                   anvil-test--inline-payload class
+                   (list 'request-owned-condition
+                         anvil-test--inline-payload)))))
+              (dolist
+                  (case
+                   `(("success"
+                      ((name . "inline.malformed-success") (arguments . ()))
+                      ,anvil-server-jsonrpc-error-internal)
+                     ("macro"
+                      ((name . "inline.malformed-macro") (arguments . ()))
+                      nil)
+                     ("tool-error"
+                      ((name . "inline.malformed-tool-error")
+                       (arguments . ()))
+                      nil)
+                     ("generic"
+                      ((name . "inline.malformed-generic") (arguments . ()))
+                      ,anvil-server-jsonrpc-error-internal)
+                     ("wrong-type"
+                      ((name . "inline.malformed-wrong-type")
+                       (arguments . ()))
+                      ,anvil-server-jsonrpc-error-internal)
+                     ("quit"
+                      ((name . "inline.malformed-quit") (arguments . ()))
+                      ,anvil-server-jsonrpc-error-internal)
+                     ("spoofed-overflow"
+                      ((name . "inline.malformed-spoof") (arguments . ()))
+                      nil)
+                     ("inner-invalid-params"
+                      ((name . "inline.malformed-success")
+                       (arguments
+                        . ((unexpected . ,anvil-test--inline-payload))))
+                      ,anvil-server-jsonrpc-error-invalid-params)
+                     ("outer-invalid-params"
+                      [,anvil-test--inline-payload]
+                      ,anvil-server-jsonrpc-error-invalid-params)
+                     ("lazy-generic"
+                      ((name . "inline.malformed-lazy-generic")
+                       (arguments . ()))
+                      ,anvil-server-jsonrpc-error-internal)
+                     ("lazy-tool-error"
+                      ((name . "inline.malformed-lazy-tool-error")
+                       (arguments . ()))
+                      nil)
+                     ("not-found"
+                      ((name . ,anvil-test--inline-payload) (arguments . ()))
+                      ,anvil-server-jsonrpc-error-invalid-request)))
+                (ert-info ((format "limit type %S, path %s"
+                                   (type-of malformed) (car case)))
+                  (let* ((hook-values nil)
+                         (anvil-server-tool-error-hook
+                          (list
+                           (lambda (&rest values)
+                             (push values hook-values))))
+                         (response
+                          (anvil-server--handle-tools-call
+                           105 (cadr case) (make-anvil-server-metrics)
+                           server-id))
+                         (decoded (json-read-from-string response))
+                         (expected-code (caddr case)))
+                    (should (< (string-bytes response) 1024))
+                    (should-not
+                     (string-match-p "MALFORMED-LIMIT-REQUEST-SENTINEL"
+                                     response))
+                    (if expected-code
+                        (let ((error-object (alist-get 'error decoded)))
+                          (should (= expected-code
+                                     (alist-get 'code error-object)))
+                          (should (equal ""
+                                         (alist-get 'message error-object))))
+                      (let ((result (alist-get 'result decoded)))
+                        (should (eq t (alist-get 'isError result)))
+                        (should (equal ""
+                                       (anvil-test--response-text response)))))
+                    (dolist (values hook-values)
+                      (should-not
+                       (string-match-p
+                        "MALFORMED-LIMIT-REQUEST-SENTINEL"
+                        (format "%S" values))))))))))
+      (dolist (tool-id tool-ids)
+        (ignore-errors (anvil-server-unregister-tool tool-id server-id))))))
 
 (ert-deftest anvil-test-inline-result-projects-wide-and-raw-characters ()
   "The projector matches Emacs's five-byte extended character encoding."
