@@ -71,11 +71,17 @@ def terminate_group(process: subprocess.Popen[bytes] | None) -> None:
                     except ProcessLookupError:
                         pass
         deadline = time.monotonic() + timeout
-        while process_group_alive(group) and time.monotonic() < deadline:
+        while time.monotonic() < deadline:
+            # Reap a dead group leader while descendants converge.  On Linux,
+            # an unreaped zombie keeps its process-group ID observable to
+            # killpg(2), so waiting for the group to disappear before polling
+            # the Popen object can never make progress.
+            process.poll()
+            if not process_group_alive(group):
+                return
             time.sleep(0.02)
+        process.poll()
         if not process_group_alive(group):
-            if process.poll() is None:
-                process.wait(timeout=timeout)
             return
     raise AssertionError(f"process group survived SIGKILL: {group}")
 
