@@ -1574,6 +1574,7 @@ byte observation."
    (anvil-server--safe-tool-label tool-name)
    (pcase class
      ('returned "result")
+     ('inline-result "inline-result error text")
      ('invalid-params "invalid-params error text")
      ('tool-error "tool-error text")
      ('quit "quit error text")
@@ -1586,8 +1587,9 @@ byte observation."
 (defun anvil-server--enforce-inline-result-limit (tool-name result-text)
   "Return RESULT-TEXT, or reject an oversized inline tool result.
 
-The signaled condition contains only a bounded diagnostic; it never contains
-RESULT-TEXT."
+The signaled condition contains only numeric byte observations; it never
+contains RESULT-TEXT."
+  (ignore tool-name)
   (unless (stringp result-text)
     (signal 'wrong-type-argument (list 'stringp result-text)))
   (if (not (anvil-server--inline-result-limit-enabled-p))
@@ -1597,11 +1599,36 @@ RESULT-TEXT."
             (anvil-server--projected-json-string-bytes result-text limit)))
       (if (<= projected limit)
           (substring-no-properties result-text)
-        (signal
-         'anvil-server-inline-result-too-large
-         (list
-          (anvil-server--inline-overflow-diagnostic
-           tool-name 'returned (string-bytes result-text) projected)))))))
+        (signal 'anvil-server-inline-result-too-large
+                (list (string-bytes result-text) projected))))))
+
+(defun anvil-server--internal-inline-overflow-result
+    (context tool-name condition method-metrics)
+  "Return the MCP error response for an internal result overflow.
+CONDITION must come from an immediately enclosing call to
+`anvil-server--enforce-inline-result-limit'.  Its fixed numeric fields are
+validated and the diagnostic is reconstructed here; no condition supplied by
+a tool handler or disclosure hook is trusted as an internal overflow."
+  (let ((raw-bytes (cadr condition))
+        (projected (caddr condition))
+        (limit anvil-server-max-inline-result-bytes))
+    (unless (and (integerp raw-bytes) (> raw-bytes 0)
+                 (<= raw-bytes most-positive-fixnum)
+                 (integerp projected) (>= projected 0)
+                 (<= projected most-positive-fixnum)
+                 (integerp limit) (> limit 0)
+                 (> projected limit)
+                 (<= (- projected limit) 6)
+                 (null (cdddr condition)))
+      (signal 'error nil))
+    (let ((label (anvil-server--safe-tool-label tool-name)))
+      (anvil-server-metrics--track-tool-call label t)
+      (anvil-server--metrics-bump
+       (anvil-server-metrics-errors method-metrics))
+      (anvil-server--respond-with-tool-error
+       context
+       (anvil-server--inline-overflow-diagnostic
+        tool-name 'returned raw-bytes projected)))))
 
 (defun anvil-server--legacy-tool-error-text (tool-name class condition)
   "Reconstruct the historical response text for CLASS and CONDITION."
@@ -1900,7 +1927,7 @@ SERVER-ID is resolved through `anvil-server-id-aliases'."
       (and (listp value)
            (cl-every #'consp value))))
 
-(defun anvil-server--tool-error-result (context text)
+(defun anvil-server--respond-with-tool-error (context text)
   "Return an MCP tool-error result for CONTEXT containing bounded TEXT."
   (anvil-server--respond-with-result
    context
@@ -1935,7 +1962,7 @@ SERVER-ID is resolved through `anvil-server-id-aliases'."
          (anvil-server-metrics--track-tool-call label t)
          (anvil-server--metrics-bump
           (anvil-server-metrics-errors method-metrics))
-         (anvil-server--tool-error-result
+         (anvil-server--respond-with-tool-error
           context (plist-get sanitized :text))))
       (anvil-server-invalid-params
        (let* ((sanitized
@@ -1959,7 +1986,7 @@ SERVER-ID is resolved through `anvil-server-id-aliases'."
          (anvil-server-metrics--track-tool-call label t)
          (anvil-server--metrics-bump
           (anvil-server-metrics-errors method-metrics))
-         (anvil-server--tool-error-result
+         (anvil-server--respond-with-tool-error
           context (plist-get sanitized :text))))
       (quit
        (let* ((sanitized
@@ -2008,8 +2035,10 @@ complete boundary around parameter extraction, lookup, and lazy loading."
               (gethash tool-name tools-table))))
     (if tool
         (let ((handler (plist-get tool :handler))
-              (context (list :id id)))
-          (condition-case err
+              (context (list :id id))
+              (overflow-tag (make-symbol "anvil-server-inline-overflow")))
+          (catch overflow-tag
+            (condition-case err
               (let*
                   ((arglist
                     (progn
@@ -2139,15 +2168,27 @@ complete boundary around parameter extraction, lookup, and lazy loading."
                           " hash-table / vector), got: %s")
                          (type-of result)))))))
                    (result-text
-                    (anvil-server--enforce-inline-result-limit
-                     tool-name result-text))
+                    (condition-case overflow
+                        (anvil-server--enforce-inline-result-limit
+                         tool-name result-text)
+                      (anvil-server-inline-result-too-large
+                       (throw
+                        overflow-tag
+                        (anvil-server--internal-inline-overflow-result
+                         context tool-name overflow method-metrics)))))
                    (result-text
                     (if (fboundp 'anvil-disclosure-budget-apply)
                         (anvil-disclosure-budget-apply tool-name result-text)
                       result-text))
                    (result-text
-                    (anvil-server--enforce-inline-result-limit
-                     tool-name result-text))
+                    (condition-case overflow
+                        (anvil-server--enforce-inline-result-limit
+                         tool-name result-text)
+                      (anvil-server-inline-result-too-large
+                       (throw
+                        overflow-tag
+                        (anvil-server--internal-inline-overflow-result
+                         context tool-name overflow method-metrics)))))
                    ;; Wrap the handler result in the MCP format
                    (formatted-result
                     `((content
@@ -2176,7 +2217,7 @@ complete boundary around parameter extraction, lookup, and lazy loading."
                (anvil-server-metrics--track-tool-call label t)
                (anvil-server--metrics-bump
                 (anvil-server-metrics-errors method-metrics))
-               (anvil-server--tool-error-result
+               (anvil-server--respond-with-tool-error
                 context (plist-get sanitized :text))))
             ;; Handle invalid parameter errors
             (anvil-server-invalid-params
@@ -2203,7 +2244,7 @@ complete boundary around parameter extraction, lookup, and lazy loading."
                (anvil-server-metrics--track-tool-call label t)
                (anvil-server--metrics-bump
                 (anvil-server-metrics-errors method-metrics))
-               (anvil-server--tool-error-result
+               (anvil-server--respond-with-tool-error
                 context (plist-get sanitized :text))))
             (quit
              (let* ((sanitized
@@ -2229,7 +2270,7 @@ complete boundary around parameter extraction, lookup, and lazy loading."
                 (plist-get sanitized :condition) label 'tool-body)
                (anvil-server--jsonrpc-error
                 id anvil-server-jsonrpc-error-internal
-                (plist-get sanitized :text))))))
+                (plist-get sanitized :text)))))))
       (let* ((sanitized
               (anvil-server--sanitize-tool-error
                tool-name 'not-found '(error "Tool not found")))

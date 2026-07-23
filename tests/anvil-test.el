@@ -1045,6 +1045,15 @@ that slip through plist detection (alist entries), otherwise
   (signal 'anvil-server-inline-result-too-large
           (list anvil-test--inline-payload)))
 
+(defun anvil-test--inline-token-aware-spoof-overflow-tool ()
+  "Spoof the overflow condition using any published marker or a lookalike."
+  (signal 'anvil-server-inline-result-too-large
+          (list (if (boundp 'anvil-server--inline-result-overflow-token)
+                    (symbol-value
+                     'anvil-server--inline-result-overflow-token)
+                  (make-symbol "anvil-server-inline-result-overflow"))
+                anvil-test--inline-payload)))
+
 (defun anvil-test--inline-property-error-tool ()
   "Signal an ordinary error whose text carries fixture properties."
   (signal 'error (list anvil-test--inline-payload)))
@@ -1097,6 +1106,14 @@ that slip through plist detection (alist entries), otherwise
                      (result (alist-get 'result decoded))
                      (text (anvil-test--response-text response)))
                 (should (eq t (alist-get 'isError result)))
+                (should
+                 (equal
+                  (concat
+                   "Tool inline.escape-heavy result exceeds the inline "
+                   "response limit (raw-bytes=80 "
+                   "projected-bytes-at-least=34 limit=32). Use a paginated, "
+                   "filtered, tee, or asynchronous interface.")
+                  text))
                 (should (string-match-p "inline response limit" text))
                 (should (string-match-p "limit=32" text))
                 (should-not (string-match-p "INLINE-SENTINEL" response))
@@ -1117,6 +1134,14 @@ that slip through plist detection (alist entries), otherwise
                    (anvil-server--handle-tools-call
                     92 `((name . ,tool-id) (arguments . ()))
                     (make-anvil-server-metrics) server-id)))
+              (should
+               (equal
+                (concat
+                 "Tool inline.escape-heavy result exceeds the inline "
+                 "response limit (raw-bytes=84 "
+                 "projected-bytes-at-least=34 limit=32). Use a paginated, "
+                 "filtered, tee, or asynchronous interface.")
+                (anvil-test--response-text response)))
               (should (string-match-p "inline response limit" response))
               (should-not (string-match-p "DISCLOSURE-SENTINEL" response)))))
       (ignore-errors (anvil-server-unregister-tool tool-id server-id)))))
@@ -1663,6 +1688,10 @@ that slip through plist detection (alist entries), otherwise
            :id "inline.spoof-handler" :description "spoof fixture"
            :server-id server-id)
           (anvil-server-register-tool
+           #'anvil-test--inline-token-aware-spoof-overflow-tool
+           :id "inline.spoof-token-aware" :description "spoof fixture"
+           :server-id server-id)
+          (anvil-server-register-tool
            #'anvil-test--inline-payload-tool
            :id "inline.spoof-disclosure" :description "spoof fixture"
            :server-id server-id)
@@ -1675,7 +1704,8 @@ that slip through plist detection (alist entries), otherwise
                    (signal 'anvil-server-inline-result-too-large
                            (list anvil-test--inline-payload))))
            (anvil-server--get-server-tools server-id))
-          (dolist (tool-id '("inline.spoof-handler" "inline.spoof-loader"))
+          (dolist (tool-id '("inline.spoof-handler" "inline.spoof-token-aware"
+                            "inline.spoof-loader"))
             (let* ((response
                     (anvil-server--handle-tools-call
                      105 `((name . ,tool-id) (arguments . ()))
@@ -1684,6 +1714,12 @@ that slip through plist detection (alist entries), otherwise
               (should (stringp text))
               (should-not
                (string-match-p "SPOOFED-OVERFLOW-SENTINEL" response))
+              (if (equal tool-id "inline.spoof-token-aware")
+                  (should (equal "Tool error contained non-string data" text))
+                (should
+                 (string-match-p
+                  "inline-result error text exceeds" text)))
+              (should-not (string-match-p " result exceeds" text))
               (should
                (<= (anvil-server--projected-json-string-bytes text)
                    anvil-server-max-inline-result-bytes))))
@@ -1705,11 +1741,62 @@ that slip through plist detection (alist entries), otherwise
               (should-not
                (string-match-p "SPOOFED-OVERFLOW-SENTINEL" response))
               (should
+               (string-match-p "inline-result error text exceeds" text))
+              (should-not (string-match-p " result exceeds" text))
+              (should
                (<= (anvil-server--projected-json-string-bytes text)
                    anvil-server-max-inline-result-bytes)))))
       (dolist (id '("inline.spoof-handler" "inline.spoof-loader"
-                    "inline.spoof-disclosure"))
+                    "inline.spoof-token-aware" "inline.spoof-disclosure"))
         (ignore-errors (anvil-server-unregister-tool id server-id))))))
+
+(ert-deftest anvil-test-inline-result-malformed-internal-count-is-bounded ()
+  "An impossible internal overflow count must use the ordinary error path."
+  (let* ((server-id "anvil-test-inline-malformed-internal")
+         (tool-id "inline.malformed-internal")
+         (anvil-server-max-inline-result-bytes 512)
+         (anvil-server--running t)
+         (anvil-test--inline-payload "safe")
+         (impossible-count (expt 10 1000))
+         (malformed-counts
+          (list
+           (list impossible-count 513)
+           (list 80 (1+ most-positive-fixnum))
+           (list 0 513)
+           (list 80 512)
+           (list 80 519)
+           (list 80 513 'extra)
+           (list "80" 513))))
+    (unwind-protect
+        (progn
+          (anvil-server-register-tool
+           #'anvil-test--inline-payload-tool
+           :id tool-id :description "malformed internal fixture"
+           :server-id server-id)
+          (dolist (counts malformed-counts)
+            (cl-letf (((symbol-function
+                        'anvil-server--enforce-inline-result-limit)
+                       (lambda (&rest _)
+                         (signal 'anvil-server-inline-result-too-large
+                                 counts))))
+              (let* ((response
+                      (anvil-server--handle-tools-call
+                       107 `((name . ,tool-id) (arguments . ()))
+                       (make-anvil-server-metrics) server-id))
+                     (decoded (json-read-from-string response))
+                     (error-object (alist-get 'error decoded))
+                     (message (alist-get 'message error-object)))
+                (should (= -32603 (alist-get 'code error-object)))
+                (should
+                 (equal "Internal error executing tool with non-string data"
+                        message))
+                (should-not
+                 (string-match-p
+                  (number-to-string impossible-count) response))
+                (should
+                 (<= (anvil-server--projected-json-string-bytes message)
+                     anvil-server-max-inline-result-bytes))))))
+      (ignore-errors (anvil-server-unregister-tool tool-id server-id)))))
 
 (ert-deftest anvil-test-inline-result-error-hook-strips-properties ()
   "The real dispatcher hook receives plain sanitized error text."
