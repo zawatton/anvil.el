@@ -378,8 +378,9 @@ anvil_mcp_drain_runner_output() {
 		IFS= read -r -d '' -n 65536 -t "$remaining" ignored <&7 || break
 		elapsed=$((SECONDS - started_seconds))
 		remaining=$((grace - elapsed))
-		# SECONDS is whole-second on Bash 3.2.  Preserve one second for the
-		# unknown fractional remainder after crossing a wall-clock boundary.
+		# SECONDS is whole-second on Bash 3.2.  Retain one additional read
+		# interval after a tick; the two integer endpoints conservatively permit
+		# less than two extra wall seconds for this drain phase.
 		[ "$elapsed" -eq 0 ] || remaining=$((remaining + 1))
 	done
 }
@@ -460,9 +461,10 @@ anvil_mcp_run_bounded() {
 	runner_owned=1
 	ANVIL_MCP_RUNNER_CRITICAL=0
 	anvil_mcp_finish_bounded_termination "$runner" 0 "$runner_owned"
-	# Bash 3.2 exposes only whole-second SECONDS.  Once it advances, retain
-	# one second for the unknown fractional remainder instead of timing out
-	# immediately after a wall-second boundary.
+	# Bash 3.2 exposes only whole-second SECONDS.  Once it advances, retain one
+	# additional read interval instead of timing out immediately after a wall
+	# boundary; the two integer endpoints conservatively permit less than two
+	# extra wall seconds across READY and ACK.
 	elapsed=$((SECONDS - started_seconds))
 	remaining=$((control_deadline - elapsed))
 	[ "$elapsed" -eq 0 ] || remaining=$((remaining + 1))
