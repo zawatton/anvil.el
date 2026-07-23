@@ -49,7 +49,7 @@
                 timeout nil t nil
                 ;; This is only the complete regression harness envelope;
                 ;; every bridge phase keeps its stricter production deadline.
-                "--kill-after=2" "120"
+                "--kill-after=90" "900"
                 python "-I" "-B" "-u"
                 helper bridge bridge-bash emacs)))
           (unless (and (integerp status) (zerop status))

@@ -3,9 +3,9 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import json
 import os
+import selectors
 import signal
 import stat
 import subprocess
@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 import re
 import shutil
+from typing import BinaryIO
 
 
 def make_executable(path: Path, source: str) -> None:
@@ -203,6 +204,16 @@ def atomically_guards(body):
 
 
 if "anvil-server-process-jsonrpc" in expression:
+    if os.environ.get("FAKE_ACTIVE_CHILD"):
+        active_child = Path(os.environ["FAKE_ACTIVE_CHILD"])
+        active_child_pending = active_child.with_name(
+            f".{active_child.name}.{os.getpid()}.pending"
+        )
+        active_child_pending.write_text(
+            f"{os.getpid()} {os.getpgrp()}\n",
+            encoding="ascii",
+        )
+        os.replace(active_child_pending, active_child)
     if os.environ.get("FAKE_ATOMIC_NOT_READY") == "1":
         if not atomically_guards("anvil-server-process-jsonrpc"):
             bump("FAKE_DISPATCH_COUNT")
@@ -377,6 +388,638 @@ def strict_equal(actual: object, expected: object) -> bool:
     return actual == expected
 
 
+HARNESS_MAX_CAPTURE_BYTES = 1_048_576
+HARNESS_CHILD_RECORD_MAX_BYTES = 128
+HARNESS_SESSION_REAP_SECONDS = 0.5
+HARNESS_SESSION_VALIDATE_SECONDS = 2.0
+HARNESS_TERM_GRACE_SECONDS = 4.0
+HARNESS_KILL_GRACE_SECONDS = 2.0
+HARNESS_FINAL_VERIFY_SECONDS = 2 * HARNESS_KILL_GRACE_SECONDS
+HARNESS_OBSERVER_MARGIN_SECONDS = 10.0
+
+
+def bounded_text(path: Path, maximum: int = 65_536) -> str:
+    """Return a bounded UTF-8 diagnostic tail from PATH."""
+    try:
+        with path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            stream.seek(max(0, size - maximum), os.SEEK_SET)
+            data = stream.read(maximum)
+    except OSError:
+        return ""
+    return data.decode("utf-8", errors="replace")
+
+
+class BoundedPipeReader:
+    """Read one subprocess pipe without threads or unbounded waits."""
+
+    def __init__(self, stream: BinaryIO) -> None:
+        self.stream = stream
+        self.buffer = bytearray()
+        self.eof = False
+        self.selector = selectors.DefaultSelector()
+        self.selector.register(stream, selectors.EVENT_READ)
+
+    def fill(self, deadline: float) -> None:
+        """Read one bounded chunk before DEADLINE."""
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not self.selector.select(remaining):
+            raise TimeoutError("bounded pipe read timed out")
+        chunk = os.read(self.stream.fileno(), 64 * 1024)
+        if not chunk:
+            self.eof = True
+            return
+        if len(self.buffer) + len(chunk) > HARNESS_MAX_CAPTURE_BYTES:
+            raise AssertionError("bridge output exceeded the harness capture limit")
+        self.buffer.extend(chunk)
+
+    def line(self, deadline: float) -> bytes:
+        """Return one LF-terminated record before DEADLINE."""
+        while True:
+            newline = self.buffer.find(b"\n")
+            if newline >= 0:
+                value = bytes(self.buffer[: newline + 1])
+                del self.buffer[: newline + 1]
+                return value
+            if self.eof:
+                raise EOFError("bridge closed stdout before a complete reply")
+            self.fill(deadline)
+
+    def remainder(self, deadline: float) -> bytes:
+        """Return remaining bytes after observing EOF before DEADLINE."""
+        while not self.eof:
+            self.fill(deadline)
+        value = bytes(self.buffer)
+        self.buffer.clear()
+        return value
+
+    def close(self) -> None:
+        """Close only the selector; stream ownership remains with Popen."""
+        self.selector.close()
+
+
+def write_all(stream: BinaryIO, data: bytes, deadline: float) -> None:
+    """Write every byte in DATA to STREAM before the absolute DEADLINE."""
+    descriptor = stream.fileno()
+    was_blocking = os.get_blocking(descriptor)
+    selector = selectors.DefaultSelector()
+    os.set_blocking(descriptor, False)
+    selector.register(stream, selectors.EVENT_WRITE)
+    remaining_data = memoryview(data)
+    try:
+        while remaining_data:
+            remaining_time = deadline - time.monotonic()
+            if remaining_time <= 0 or not selector.select(remaining_time):
+                raise TimeoutError("bounded pipe write timed out")
+            try:
+                written = os.write(descriptor, remaining_data)
+            except BlockingIOError:
+                continue
+            if written <= 0:
+                raise BrokenPipeError("bounded pipe write made no progress")
+            remaining_data = remaining_data[written:]
+    finally:
+        selector.close()
+        if not stream.closed:
+            os.set_blocking(descriptor, was_blocking)
+
+
+def bounded_stream_text(stream: BinaryIO | None, timeout: float = 2.0) -> str:
+    """Read STREAM to EOF within TIMEOUT and a fixed capture limit."""
+    if stream is None:
+        return ""
+    selector = selectors.DefaultSelector()
+    selector.register(stream, selectors.EVENT_READ)
+    chunks = bytearray()
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not selector.select(remaining):
+                raise AssertionError("subprocess diagnostic pipe did not close")
+            chunk = os.read(stream.fileno(), 64 * 1024)
+            if not chunk:
+                return bytes(chunks).decode("utf-8", errors="replace")
+            if len(chunks) + len(chunk) > HARNESS_MAX_CAPTURE_BYTES:
+                raise AssertionError("subprocess diagnostic exceeded capture limit")
+            chunks.extend(chunk)
+    finally:
+        selector.close()
+
+
+class SessionDiscoveryDeadline(AssertionError):
+    """A caller-owned process-discovery phase exhausted its deadline."""
+
+
+def session_processes(
+    session_id: int, *, deadline: float | None = None
+) -> dict[int, int]:
+    """Return live PID-to-PGID entries freshly validated in SESSION_ID.
+
+    When DEADLINE is non-nil, process launch, collection, reaping, and row
+    validation all remain inside that caller-owned absolute deadline.
+    """
+    natural_wait_deadline = time.monotonic() + 2
+    if deadline is None:
+        wait_deadline = natural_wait_deadline
+    else:
+        wait_deadline = min(
+            natural_wait_deadline,
+            deadline - HARNESS_SESSION_REAP_SECONDS,
+        )
+        if wait_deadline <= time.monotonic():
+            raise SessionDiscoveryDeadline(
+                "process-session discovery phase deadline expired"
+            )
+    deadline_limited = wait_deadline < natural_wait_deadline
+    try:
+        with tempfile.TemporaryFile() as capture:
+            process = subprocess.Popen(
+                ["ps", "-axo", "pid=,stat="],
+                stdin=subprocess.DEVNULL,
+                stdout=capture,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                process.wait(timeout=max(0, wait_deadline - time.monotonic()))
+            except subprocess.TimeoutExpired as error:
+                process.kill()
+                reap_deadline = time.monotonic() + 2
+                if deadline is not None:
+                    reap_deadline = min(reap_deadline, deadline)
+                try:
+                    process.wait(
+                        timeout=max(0, reap_deadline - time.monotonic())
+                    )
+                except subprocess.TimeoutExpired as reap_error:
+                    raise AssertionError(
+                        "process-session discovery could not be reaped"
+                    ) from reap_error
+                if deadline_limited:
+                    raise SessionDiscoveryDeadline(
+                        "process-session discovery phase deadline expired"
+                    ) from error
+                raise AssertionError(
+                    "process-session discovery did not finish"
+                ) from error
+            if process.returncode != 0:
+                raise AssertionError(
+                    f"process-session discovery exited {process.returncode}"
+                )
+            capture.seek(0, os.SEEK_END)
+            size = capture.tell()
+            if size > HARNESS_MAX_CAPTURE_BYTES:
+                raise AssertionError(
+                    "process-session discovery exceeded capture limit"
+                )
+            capture.seek(0)
+            rows = capture.read(size).decode("ascii", errors="strict")
+    except AssertionError:
+        raise
+    except (OSError, UnicodeError, subprocess.SubprocessError) as error:
+        raise AssertionError("process-session discovery failed") from error
+
+    processes: dict[int, int] = {}
+    validation_deadline = time.monotonic() + HARNESS_SESSION_VALIDATE_SECONDS
+    if deadline is not None:
+        validation_deadline = min(validation_deadline, deadline)
+    for line in rows.splitlines():
+        if time.monotonic() >= validation_deadline:
+            if deadline is not None and validation_deadline == deadline:
+                raise SessionDiscoveryDeadline(
+                    "process-session validation phase deadline expired"
+                )
+            raise AssertionError("process-session validation did not finish")
+        pieces = line.split(None, 1)
+        if not pieces or any(not piece.isascii() for piece in pieces):
+            continue
+        pid_text = pieces[0]
+        # Darwin may print an empty STAT field for an otherwise live orphan.
+        # A zombie is still reported with a leading Z and must not hold cleanup
+        # open, but an empty field is not evidence that the process disappeared.
+        state = pieces[1] if len(pieces) == 2 else ""
+        if not pid_text.isdigit() or state.startswith("Z"):
+            continue
+        pid = int(pid_text)
+        if pid <= 1:
+            continue
+        try:
+            first_session = os.getsid(pid)
+            if first_session != session_id:
+                continue
+            pgid = os.getpgid(pid)
+            second_session = os.getsid(pid)
+            if first_session == session_id == second_session and pgid > 1:
+                processes[pid] = pgid
+        except OSError:
+            pass
+    return processes
+
+
+def session_process_groups(session_id: int) -> set[int]:
+    """Return process groups freshly proven to belong to SESSION_ID."""
+    return set(session_processes(session_id).values())
+
+
+def process_exited_without_reaping(process: subprocess.Popen[bytes]) -> bool:
+    """Observe PROCESS exit while retaining its PID/session ownership anchor."""
+    if process.returncode is not None:
+        return True
+    try:
+        result = os.waitid(
+            os.P_PID,
+            process.pid,
+            os.WEXITED | os.WNOHANG | os.WNOWAIT,
+        )
+    except (AttributeError, ChildProcessError, OSError):
+        return False
+    return result is not None
+
+
+def wait_process_exit_unreaped(
+    process: subprocess.Popen[bytes], timeout: float
+) -> bool:
+    """Wait boundedly for PROCESS exit without releasing its PID/session."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process_exited_without_reaping(process):
+            return True
+        time.sleep(0.02)
+    return process_exited_without_reaping(process)
+
+
+def signal_owned_process(pid: int, session_id: int, signum: int) -> bool:
+    """Signal PID only while it is still proven to belong to SESSION_ID."""
+    if pid <= 1:
+        return False
+    try:
+        if os.getsid(pid) != session_id:
+            return False
+        os.kill(pid, signum)
+    except (PermissionError, ProcessLookupError):
+        return False
+    return True
+
+
+def defer_termination_signals() -> tuple[tuple[object, object], list[int]]:
+    """Record TERM/INT until one bounded custody transaction completes."""
+    previous = (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT))
+    pending: list[int] = []
+
+    def defer(signum: int, _frame: object) -> None:
+        if not pending:
+            pending.append(signum)
+
+    signal.signal(signal.SIGTERM, defer)
+    signal.signal(signal.SIGINT, defer)
+    return previous, pending
+
+
+def restore_termination_signals(
+    state: tuple[tuple[object, object], list[int]],
+) -> None:
+    """Restore saved handlers, then deliver any deferred termination."""
+    handlers, pending = state
+    signal.signal(signal.SIGTERM, handlers[0])
+    signal.signal(signal.SIGINT, handlers[1])
+    for signum in pending:
+        handler = handlers[0] if signum == signal.SIGTERM else handlers[1]
+        if handler == signal.SIG_IGN:
+            continue
+        if handler == signal.SIG_DFL:
+            raise SystemExit(128 + signum)
+        if not callable(handler):
+            raise AssertionError("invalid termination handler")
+        handler(signum, None)
+
+
+def recorded_child_group(path: Path, session_id: int) -> int | None:
+    """Return PATH's live, self-led child group when owned by SESSION_ID."""
+    try:
+        with path.open("rb") as stream:
+            encoded = stream.read(HARNESS_CHILD_RECORD_MAX_BYTES + 1)
+        if len(encoded) > HARNESS_CHILD_RECORD_MAX_BYTES:
+            return None
+        raw = encoded.decode("ascii", errors="strict")
+    except (OSError, UnicodeError):
+        return None
+    pieces = raw.split()
+    if len(pieces) != 2 or any(not piece.isascii() for piece in pieces):
+        return None
+    if any(not piece.isdigit() for piece in pieces):
+        return None
+    try:
+        pid, pgid = (int(piece) for piece in pieces)
+    except ValueError:
+        return None
+    if pid <= 1 or pid != pgid:
+        return None
+    try:
+        owned = os.getpgid(pid) == pgid and os.getsid(pid) == session_id
+        return pgid if owned else None
+    except (OSError, OverflowError):
+        return None
+
+
+def signal_group(pgid: int | None, signum: int) -> None:
+    """Best-effort signal PGID when it is a validated positive integer."""
+    if os.name != "posix" or pgid is None or pgid <= 1:
+        return
+    try:
+        os.killpg(pgid, signum)
+    except (PermissionError, ProcessLookupError):
+        pass
+
+
+def close_process_pipes(process: subprocess.Popen[bytes]) -> None:
+    """Close PROCESS pipes without reading them."""
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None and not stream.closed:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
+def popen_with_termination_deferred(
+    *args: object, **kwargs: object
+) -> tuple[
+    subprocess.Popen[bytes], tuple[tuple[object, object], list[int]]
+]:
+    """Spawn a process while deferring TERM/INT until cleanup is registered."""
+    previous = defer_termination_signals()
+    try:
+        process = subprocess.Popen(*args, **kwargs)
+    except BaseException:
+        restore_termination_signals(previous)
+        raise
+    return process, previous
+
+
+def bounded_runner_budget(timeout: int, kill_after: int) -> float:
+    """Return the conservative wall envelope of one production runner."""
+    return float(2 * timeout + 3 * kill_after + 3)
+
+
+def reply_observer_budget(
+    *,
+    frame_timeout: int,
+    parse_timeout: int,
+    readiness_timeout: int,
+    dispatch_timeout: int,
+    kill_after: int,
+    large_request: bool,
+) -> float:
+    """Outlive every bounded production phase that may precede first EOF."""
+    parse_phases = 3 + int(large_request)
+    first_reply = (
+        bounded_runner_budget(frame_timeout, kill_after)
+        + parse_phases * bounded_runner_budget(parse_timeout, kill_after)
+        + bounded_runner_budget(readiness_timeout, kill_after)
+        + 2
+        + bounded_runner_budget(dispatch_timeout, kill_after)
+    )
+    # An error may exit without a reply, in which case EOF follows as many as
+    # two bounded cleanup-staged attempts rather than preceding them.
+    return (
+        first_reply
+        + 2 * bounded_runner_budget(parse_timeout, kill_after)
+        + HARNESS_OBSERVER_MARGIN_SECONDS
+    )
+
+
+def shutdown_observer_budget(parse_timeout: int, kill_after: int) -> float:
+    """Outlive both production cleanup attempts after stdin reaches EOF."""
+    return (
+        2 * bounded_runner_budget(parse_timeout, kill_after)
+        + HARNESS_OBSERVER_MARGIN_SECONDS
+    )
+
+
+def terminate_bridge(
+    process: subprocess.Popen[bytes],
+    active_child: Path | None,
+    *,
+    term_grace: float = HARNESS_TERM_GRACE_SECONDS,
+) -> bool:
+    """Boundedly retire PROCESS and report a freshly observed orphan group."""
+    previous = defer_termination_signals()
+    try:
+        return _terminate_bridge(
+            process,
+            active_child,
+            term_grace=term_grace,
+        )
+    finally:
+        restore_termination_signals(previous)
+
+
+def _terminate_bridge(
+    process: subprocess.Popen[bytes],
+    active_child: Path | None,
+    *,
+    term_grace: float,
+) -> bool:
+    """Implement `terminate_bridge` while TERM/INT cannot interrupt custody."""
+    if process.stdin is not None and not process.stdin.closed:
+        try:
+            process.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+        process.stdin = None
+
+    if process.returncode is not None:
+        close_process_pipes(process)
+        return False
+
+    session_id = process.pid
+    orphan_group_observed = False
+    discovery_errors: list[str] = []
+
+    def discover_groups(
+        deadline: float,
+    ) -> tuple[set[int], set[int]] | None:
+        nonlocal orphan_group_observed
+        try:
+            processes = session_processes(session_id, deadline=deadline)
+        except SessionDiscoveryDeadline:
+            return None
+        except AssertionError as error:
+            message = str(error)
+            if message not in discovery_errors:
+                discovery_errors.append(message)
+            return None
+        groups = set(processes.values())
+        if any(
+            group != session_id and group not in processes for group in groups
+        ):
+            orphan_group_observed = True
+        if active_child is not None:
+            child_group = recorded_child_group(active_child, session_id)
+            if child_group is not None:
+                groups.add(child_group)
+        return groups, set(processes)
+
+    # TERM only the bridge leader.  Its production handler owns orderly runner
+    # convergence and staged cleanup; signalling newly created cleanup groups
+    # here would sabotage the very grace period this harness promises.
+    if process.returncode is None:
+        signal_owned_process(process.pid, session_id, signal.SIGTERM)
+
+    deadline = time.monotonic() + term_grace
+    quiet_exit_scans = 0
+    while time.monotonic() < deadline:
+        discovered = discover_groups(deadline)
+        if discovered is None:
+            break
+        groups, pids = discovered
+        has_children = bool((pids - {process.pid}) or (groups - {session_id}))
+        if process_exited_without_reaping(process) and not has_children:
+            quiet_exit_scans += 1
+            if quiet_exit_scans >= 2:
+                break
+        else:
+            quiet_exit_scans = 0
+        time.sleep(0.1)
+
+    # Keep the session leader unreaped until every owned group has received
+    # SIGKILL.  That prevents its numeric session/group identity from being
+    # reused while a late atomic child publication is still possible.
+    signal_group(session_id, signal.SIGKILL)
+    deadline = time.monotonic() + HARNESS_KILL_GRACE_SECONDS
+    quiet_exit_scans = 0
+    while time.monotonic() < deadline:
+        discovered = discover_groups(deadline)
+        if discovered is None:
+            break
+        groups, pids = discovered
+        for group in groups:
+            signal_group(group, signal.SIGKILL)
+        has_children = bool((pids - {process.pid}) or (groups - {session_id}))
+        if process_exited_without_reaping(process) and not has_children:
+            quiet_exit_scans += 1
+            if quiet_exit_scans >= 2:
+                break
+        else:
+            quiet_exit_scans = 0
+        time.sleep(0.05)
+
+    # One last session-owned escalation occurs while the leader is unreaped.
+    signal_group(session_id, signal.SIGKILL)
+
+    retained_processes: dict[int, int] = {}
+    verification_deadline = time.monotonic() + HARNESS_KILL_GRACE_SECONDS
+    while time.monotonic() < verification_deadline:
+        try:
+            retained_processes = session_processes(
+                session_id, deadline=verification_deadline
+            )
+        except SessionDiscoveryDeadline as error:
+            message = str(error)
+            if message not in discovery_errors:
+                discovery_errors.append(message)
+            break
+        except AssertionError as error:
+            message = str(error)
+            if message not in discovery_errors:
+                discovery_errors.append(message)
+            break
+        retained_processes.pop(process.pid, None)
+        if not retained_processes:
+            break
+        for group in set(retained_processes.values()):
+            signal_group(group, signal.SIGKILL)
+        time.sleep(0.05)
+
+    leader_exited = process_exited_without_reaping(process)
+    if not leader_exited:
+        signal_owned_process(process.pid, session_id, signal.SIGKILL)
+        leader_exited = wait_process_exit_unreaped(
+            process, HARNESS_KILL_GRACE_SECONDS
+        )
+
+    # The leader stays unreaped through a final child scan.  This closes the
+    # last-fork race between the earlier empty scan and leader termination.
+    retained_processes = {}
+    verification_deadline = time.monotonic() + HARNESS_FINAL_VERIFY_SECONDS
+    quiet_exit_scans = 0
+    while time.monotonic() < verification_deadline:
+        try:
+            retained_processes = session_processes(
+                session_id, deadline=verification_deadline
+            )
+        except SessionDiscoveryDeadline as error:
+            message = str(error)
+            if message not in discovery_errors:
+                discovery_errors.append(message)
+            break
+        except AssertionError as error:
+            message = str(error)
+            if message not in discovery_errors:
+                discovery_errors.append(message)
+            break
+        retained_processes.pop(process.pid, None)
+        for group in set(retained_processes.values()):
+            signal_group(group, signal.SIGKILL)
+        leader_exited = process_exited_without_reaping(process)
+        if leader_exited and not retained_processes:
+            quiet_exit_scans += 1
+            if quiet_exit_scans >= 2:
+                break
+        else:
+            quiet_exit_scans = 0
+        time.sleep(0.05)
+
+    if quiet_exit_scans < 2:
+        discovery_errors.append(
+            "harness cleanup did not prove a quiet final session"
+        )
+    if leader_exited and not retained_processes:
+        process.wait(timeout=max(0, verification_deadline - time.monotonic()))
+    elif not leader_exited:
+        discovery_errors.append("bridge leader could not be reaped")
+    close_process_pipes(process)
+    if retained_processes:
+        raise AssertionError(
+            "harness cleanup retained session children "
+            f"{sorted(retained_processes)!r}"
+        )
+    if discovery_errors:
+        raise AssertionError(
+            "harness cleanup session discovery failed: "
+            + "; ".join(discovery_errors)
+        )
+    return orphan_group_observed
+
+
+def cleanup_fixture_process(
+    process: subprocess.Popen[bytes],
+    *,
+    term_grace: float,
+    active_child: Path | None = None,
+    reader: BoundedPipeReader | None = None,
+    resume: bool = False,
+) -> None:
+    """Complete one fixture cleanup without asynchronous TERM/INT reentry."""
+    previous = defer_termination_signals()
+    try:
+        if reader is not None:
+            reader.close()
+        if resume and process.returncode is None:
+            signal_owned_process(process.pid, process.pid, signal.SIGCONT)
+        if process.returncode is None:
+            _terminate_bridge(
+                process,
+                active_child,
+                term_grace=term_grace,
+            )
+        else:
+            close_process_pipes(process)
+    finally:
+        restore_termination_signals(previous)
+
+
 def run_bridge_while_open(
     command: list[str],
     request: str,
@@ -384,85 +1027,97 @@ def run_bridge_while_open(
     root: Path,
     *,
     expect_exit_after_reply: bool = False,
+    reply_timeout: float = 60.0,
+    shutdown_timeout: float = 60.0,
 ) -> tuple[str, str]:
-    process = subprocess.Popen(
-        command,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=environment,
-        text=True,
-        bufsize=1,
+    stderr_path = root / "bridge.stderr"
+    active_child = Path(
+        environment.get("FAKE_ACTIVE_CHILD", str(root / "active-child"))
     )
     try:
-        if process.stdin is None or process.stdout is None or process.stderr is None:
+        active_child.unlink()
+    except FileNotFoundError:
+        pass
+    options: dict[str, object] = {}
+    if os.name == "posix":
+        options["start_new_session"] = True
+    stderr_handle = stderr_path.open("wb")
+    try:
+        process, custody_defer = popen_with_termination_deferred(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=stderr_handle,
+            env=environment,
+            bufsize=0,
+            **options,
+        )
+    except BaseException:
+        stderr_handle.close()
+        raise
+    reader: BoundedPipeReader | None = None
+    try:
+        stderr_handle.close()
+        if process.stdin is None or process.stdout is None:
             raise AssertionError("bridge pipes were not created")
-        process.stdin.write(request)
-        process.stdin.flush()
-
-        executor = ThreadPoolExecutor(max_workers=1)
-        reply_future = executor.submit(process.stdout.readline)
+        reader = BoundedPipeReader(process.stdout)
+        previous = custody_defer
+        custody_defer = None
+        restore_termination_signals(previous)
+        reply_deadline = time.monotonic() + reply_timeout
         try:
-            try:
-                first_line = reply_future.result(timeout=15)
-            except FutureTimeoutError as error:
-                process.kill()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    pass
-                failure_stderr = process.stderr.read()
-                debug_path = root / "debug.log"
-                failure_debug = (
-                    debug_path.read_text(encoding="utf-8", errors="replace")
-                    if debug_path.exists()
-                    else ""
-                )
-                raise AssertionError(
-                    "bridge did not return a bounded reply: "
-                    f"rc={process.poll()} stderr={failure_stderr!r} "
-                    f"debug={failure_debug!r}"
-                ) from error
-        finally:
-            executor.shutdown(wait=True)
+            write_all(process.stdin, request.encode("utf-8"), reply_deadline)
+        except (BrokenPipeError, OSError, TimeoutError) as error:
+            orphan_group_observed = terminate_bridge(
+                process, active_child, term_grace=shutdown_timeout
+            )
+            raise AssertionError(
+                "bridge did not accept a bounded request: "
+                f"rc={process.poll()} "
+                f"orphanGroupObserved={orphan_group_observed} "
+                f"stderr={bounded_text(stderr_path)!r} "
+                f"debug={bounded_text(root / 'debug.log')!r}"
+            ) from error
 
-        if not first_line:
-            returncode = process.poll()
-            failure_stderr = (
-                process.stderr.read() if returncode is not None else ""
-            )
-            debug_path = root / "debug.log"
-            failure_debug = (
-                debug_path.read_text(encoding="utf-8", errors="replace")
-                if debug_path.exists()
-                else ""
-            )
+        try:
+            first_bytes = reader.line(reply_deadline)
+        except EOFError as error:
+            terminate_bridge(process, active_child, term_grace=shutdown_timeout)
             raise AssertionError(
                 "bridge exited before replying with "
-                f"rc={returncode} stderr={failure_stderr!r} "
-                f"debug={failure_debug!r}"
-            )
-        if not expect_exit_after_reply and process.poll() is not None:
-            failure_stderr = process.stderr.read()
-            debug_path = root / "debug.log"
-            failure_debug = (
-                debug_path.read_text(encoding="utf-8", errors="replace")
-                if debug_path.exists()
-                else ""
+                f"rc={process.poll()} stderr={bounded_text(stderr_path)!r} "
+                f"debug={bounded_text(root / 'debug.log')!r}"
+            ) from error
+        except TimeoutError as error:
+            orphan_group_observed = terminate_bridge(
+                process, active_child, term_grace=shutdown_timeout
             )
             raise AssertionError(
+                "bridge did not return a bounded reply: "
+                f"rc={process.poll()} "
+                f"orphanGroupObserved={orphan_group_observed} "
+                f"stderr={bounded_text(stderr_path)!r} "
+                f"debug={bounded_text(root / 'debug.log')!r}"
+            ) from error
+        try:
+            first_line = first_bytes.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as error:
+            raise AssertionError("bridge reply was not valid UTF-8") from error
+        if not expect_exit_after_reply and process_exited_without_reaping(process):
+            terminate_bridge(process, active_child, term_grace=shutdown_timeout)
+            raise AssertionError(
                 "bridge did not remain available after one request: "
-                f"rc={process.returncode} stderr={failure_stderr!r} "
-                f"debug={failure_debug!r}"
+                f"rc={process.returncode} stderr={bounded_text(stderr_path)!r} "
+                f"debug={bounded_text(root / 'debug.log')!r}"
             )
-        if expect_exit_after_reply and process.poll() is None:
-            try:
-                process.wait(timeout=15)
-            except subprocess.TimeoutExpired as error:
-                process.kill()
+        if expect_exit_after_reply:
+            if not wait_process_exit_unreaped(process, shutdown_timeout):
+                terminate_bridge(
+                    process, active_child, term_grace=shutdown_timeout
+                )
                 raise AssertionError(
                     "ambiguous dispatch did not close the bridge"
-                ) from error
+                )
         transaction_paths = list(root.glob("anvil-mcp.*"))
         staged = {
             path.name: (
@@ -565,26 +1220,13 @@ def run_bridge_while_open(
                     )
                 transaction_ok = transaction_ok and child_ok
         if transaction_paths and not transaction_ok:
-            debug_log = root / "debug.log"
-            debug = (
-                debug_log.read_text(encoding="utf-8")
-                if debug_log.exists()
-                else "<no debug log>"
-            )
+            debug = bounded_text(root / "debug.log") or "<no debug log>"
             expression_file = root / "expression"
-            expression = (
-                expression_file.read_text(encoding="utf-8")
-                if expression_file.exists()
-                else "<no expression>"
-            )
+            expression = bounded_text(expression_file, 4096) or "<no expression>"
             guard_file = root / "guard-observed"
             early_file = root / "early-dispatch"
-            guard = (
-                guard_file.read_text(encoding="utf-8") if guard_file.exists() else ""
-            )
-            early = (
-                early_file.read_text(encoding="utf-8") if early_file.exists() else ""
-            )
+            guard = bounded_text(guard_file, 4096)
+            early = bounded_text(early_file, 4096)
             raise AssertionError(
                 "bridge retained unsafe generation custody after replying: "
                 f"{staged!r}; response={first_line!r}; "
@@ -595,29 +1237,41 @@ def run_bridge_while_open(
 
         try:
             process.stdin.close()
-        except BrokenPipeError:
+        except (BrokenPipeError, OSError):
             pass
         process.stdin = None
+        if not wait_process_exit_unreaped(process, shutdown_timeout):
+            terminate_bridge(process, active_child, term_grace=shutdown_timeout)
+            raise AssertionError("bridge did not exit after stdin EOF")
         try:
-            process.wait(timeout=8)
-        except subprocess.TimeoutExpired as error:
-            process.kill()
-            raise AssertionError("bridge did not exit after stdin EOF") from error
-        remainder = process.stdout.read()
-        stderr = process.stderr.read()
+            retained_processes = session_processes(process.pid)
+        except AssertionError as error:
+            terminate_bridge(process, active_child, term_grace=0)
+            raise AssertionError(
+                "bridge session could not be validated before reaping"
+            ) from error
+        retained_processes.pop(process.pid, None)
+        if retained_processes:
+            retained = sorted(retained_processes)
+            terminate_bridge(process, active_child, term_grace=0)
+            raise AssertionError(
+                f"bridge exit retained session children {retained!r}"
+            )
+        process.wait(timeout=HARNESS_KILL_GRACE_SECONDS)
+        try:
+            remainder_bytes = reader.remainder(time.monotonic() + 2)
+            remainder = remainder_bytes.decode("utf-8", errors="strict")
+        except (TimeoutError, UnicodeDecodeError) as error:
+            terminate_bridge(process, active_child, term_grace=shutdown_timeout)
+            raise AssertionError("bridge output did not close cleanly") from error
+        stderr = bounded_text(stderr_path)
         stdout = first_line + remainder
         expected_returncode = 74 if expect_exit_after_reply else 0
         if process.returncode != expected_returncode:
-            debug_path = root / "debug.log"
-            failure_debug = (
-                debug_path.read_text(encoding="utf-8", errors="replace")
-                if debug_path.exists()
-                else ""
-            )
             raise AssertionError(
                 f"bridge exited {process.returncode}, expected "
                 f"{expected_returncode}: stdout={stdout!r} stderr={stderr!r} "
-                f"debug={failure_debug!r}"
+                f"debug={bounded_text(root / 'debug.log')!r}"
             )
         remaining_transactions = list(root.glob("anvil-mcp.*"))
         if remaining_transactions:
@@ -627,9 +1281,16 @@ def run_bridge_while_open(
             )
         return stdout, stderr
     finally:
-        if process.poll() is None:
-            process.kill()
-            process.wait(timeout=2)
+        if not stderr_handle.closed:
+            stderr_handle.close()
+        cleanup_fixture_process(
+            process,
+            term_grace=shutdown_timeout,
+            active_child=active_child,
+            reader=reader,
+        )
+        if custody_defer is not None:
+            restore_termination_signals(custody_defer)
 
 
 def run_case(
@@ -700,6 +1361,7 @@ os.execv({real_python!r}, [{real_python!r}, *sys.argv[1:]])
         if large_request:
             request["params"] = {"payload": "x" * 20000}
         environment = os.environ.copy()
+        kill_after_timeout = 1
         environment.pop("ANVIL_MCP_PARENT_GUARD", None)
         environment.pop("ANVIL_MCP_PARENT_GUARD_PYTHON", None)
         environment.update(
@@ -736,6 +1398,7 @@ os.execv({real_python!r}, [{real_python!r}, *sys.argv[1:]])
                 ),
                 "FAKE_IGNORE_TERM": "0",
                 "FAKE_HANG_PID": str(root / "hang-pid"),
+                "FAKE_ACTIVE_CHILD": str(root / "active-child"),
                 "FAKE_DESCENDANT_PID": str(root / "descendant-pid"),
                 "FAKE_EXIT_DESCENDANT": "1" if exit_descendant else "0",
                 "FAKE_INVALID_OUTPUT": "1" if invalid_output else "0",
@@ -745,7 +1408,7 @@ os.execv({real_python!r}, [{real_python!r}, *sys.argv[1:]])
                 "ANVIL_EMACSCLIENT_READINESS_TIMEOUT": str(readiness_timeout),
                 "ANVIL_EMACSCLIENT_STARTUP_DISPATCH_TIMEOUT": "10",
                 "ANVIL_EMACSCLIENT_DISPATCH_TIMEOUT": str(dispatch_timeout),
-                "ANVIL_EMACSCLIENT_KILL_AFTER_TIMEOUT": "1",
+                "ANVIL_EMACSCLIENT_KILL_AFTER_TIMEOUT": str(kill_after_timeout),
                 "ANVIL_EMACSCLIENT_RETRY_MAX": str(retry_max),
                 "ANVIL_EMACSCLIENT_RETRY_DELAY_MS": str(retry_delay_ms),
                 "ANVIL_MCP_REQUEST_PARSE_TIMEOUT": str(request_parse_timeout),
@@ -764,6 +1427,17 @@ os.execv({real_python!r}, [{real_python!r}, *sys.argv[1:]])
             environment,
             root,
             expect_exit_after_reply=hang_prepare_response,
+            reply_timeout=reply_observer_budget(
+                frame_timeout=frame_read_timeout,
+                parse_timeout=request_parse_timeout,
+                readiness_timeout=readiness_timeout,
+                dispatch_timeout=dispatch_timeout,
+                kill_after=kill_after_timeout,
+                large_request=large_request,
+            ),
+            shutdown_timeout=shutdown_observer_budget(
+                request_parse_timeout, kill_after_timeout
+            ),
         )
         if exit_descendant:
             descendant_path = root / "descendant-pid"
@@ -773,8 +1447,6 @@ os.execv({real_python!r}, [{real_python!r}, *sys.argv[1:]])
                 )
             descendant_pid = int(descendant_path.read_text(encoding="utf-8"))
             if not wait_process_dead(descendant_pid):
-                os.kill(descendant_pid, signal.SIGKILL)
-                wait_process_dead(descendant_pid)
                 raise AssertionError(
                     "successful direct child left a same-group descendant alive"
                 )
@@ -792,8 +1464,7 @@ os.execv({real_python!r}, [{real_python!r}, *sys.argv[1:]])
             if guard_observed.exists()
             else ""
         )
-        debug_log = root / "debug.log"
-        debug = debug_log.read_text(encoding="utf-8") if debug_log.exists() else ""
+        debug = bounded_text(root / "debug.log")
         diagnostics = stderr + ("\n" + debug if debug else "")
         probes = read_count(probe_count)
         if not always_nil and probes != read_count(fast_probe_count):
@@ -809,6 +1480,116 @@ os.execv({real_python!r}, [{real_python!r}, *sys.argv[1:]])
             diagnostics,
             guard,
         )
+
+
+def assert_harness_timeout_reaps_separate_child(bash: str) -> None:
+    """A reply timeout must not strand a separate child-group writer."""
+    with tempfile.TemporaryDirectory(prefix="anvil-stdio-harness-timeout-") as raw:
+        root = Path(raw)
+        active_child = root / "active-child"
+        descendant_child = root / "descendant-child"
+        leader_reaped = root / "leader-reaped"
+        bridge = root / "bridge.sh"
+        slow_bin = root / "slow-bin"
+        slow_bin.mkdir()
+        real_ps = shutil.which("ps")
+        if real_ps is None:
+            raise AssertionError("process-table fixture requires ps")
+        make_executable(
+            slow_bin / "ps",
+            (
+                f"#!{sys.executable}\n"
+                "import os\n"
+                "import sys\n"
+                "import time\n"
+                "time.sleep(1.2)\n"
+                f"os.execv({real_ps!r}, [{real_ps!r}, *sys.argv[1:]])\n"
+            ),
+        )
+        make_executable(
+            bridge,
+            f"""#!{bash}
+set -eu
+set -m
+{json.dumps(sys.executable)} -I -S -c '
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+
+descendant = os.fork()
+if descendant == 0:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    while True:
+        time.sleep(1)
+Path(os.environ["FAKE_DESCENDANT_CHILD"]).write_text(str(descendant))
+signal.signal(signal.SIGTERM, lambda *_arguments: sys.exit(0))
+while True:
+    time.sleep(1)
+' &
+child=$!
+printf '%s %s\n' "$child" "$child" > "$FAKE_ACTIVE_CHILD"
+trap 'kill -TERM "$child" 2>/dev/null || :; wait "$child" 2>/dev/null || :; : > "$FAKE_LEADER_REAPED"; exit 143' TERM
+while :; do sleep 1; done
+""",
+        )
+        environment = os.environ.copy()
+        environment["FAKE_ACTIVE_CHILD"] = str(active_child)
+        environment["FAKE_DESCENDANT_CHILD"] = str(descendant_child)
+        environment["FAKE_LEADER_REAPED"] = str(leader_reaped)
+        started = time.monotonic()
+        failure = ""
+        original_path = os.environ.get("PATH")
+        try:
+            os.environ["PATH"] = str(slow_bin) + os.pathsep + (original_path or "")
+            run_bridge_while_open(
+                [bash, str(bridge)],
+                "request\n",
+                environment,
+                root,
+                reply_timeout=2,
+                shutdown_timeout=HARNESS_TERM_GRACE_SECONDS,
+            )
+        except AssertionError as error:
+            failure = str(error)
+        else:
+            raise AssertionError("silent fixture unexpectedly returned a reply")
+        finally:
+            if original_path is None:
+                os.environ.pop("PATH", None)
+            else:
+                os.environ["PATH"] = original_path
+        elapsed = time.monotonic() - started
+        if "bridge did not return a bounded reply" not in failure:
+            raise AssertionError(f"wrong timeout diagnostic: {failure!r}")
+        if "orphanGroupObserved=True" not in failure:
+            raise AssertionError(f"orphan group was not observed: {failure!r}")
+        if not leader_reaped.exists():
+            raise AssertionError("timeout fixture did not reap its child-group leader")
+        if not active_child.exists():
+            raise AssertionError("timeout fixture never published its child group")
+        child_pid = int(active_child.read_text(encoding="ascii").split()[0])
+        if not descendant_child.exists():
+            raise AssertionError("timeout fixture never published its descendant")
+        descendant_pid = int(descendant_child.read_text(encoding="ascii"))
+        if not wait_process_dead(child_pid) or not wait_process_dead(descendant_pid):
+            raise AssertionError(
+                f"timeout retained child group {child_pid}/{descendant_pid}"
+            )
+        maximum_elapsed = (
+            2
+            + HARNESS_TERM_GRACE_SECONDS
+            + 3 * HARNESS_KILL_GRACE_SECONDS
+            + HARNESS_FINAL_VERIFY_SECONDS
+            + 1
+        )
+        if elapsed >= maximum_elapsed:
+            raise AssertionError(
+                f"harness timeout cleanup exceeded its bound: {elapsed:.3f}s"
+            )
 
 
 def assert_reaped_pid_alias_does_not_extend_wait(
@@ -1047,8 +1828,7 @@ def assert_lifecycle_guard(
             if guard_observed.exists()
             else ""
         )
-        debug_log = root / "debug.log"
-        debug = debug_log.read_text(encoding="utf-8") if debug_log.exists() else ""
+        debug = bounded_text(root / "debug.log")
         expected_count = 1 if malformed or split_sentinel else 0
         expected_debug = f"MCP-{kind.upper()}-RC: 70"
         if (
@@ -1196,6 +1976,8 @@ read() {
         hang_pid_path = root / "hang-pid"
         descendant_pid_path = root / "descendant-pid"
         runner_pid_path = root / "runner-pid"
+        bridge_pid_path = root / "bridge-pid"
+        bridge_reaped_path = root / "bridge-reaped"
         term_count_path = root / "term-count"
         probe_count_path = root / "probe-count"
         fast_probe_count_path = root / "fast-probe-count"
@@ -1241,6 +2023,8 @@ read() {
                 "FAKE_HANG_PID": str(hang_pid_path),
                 "FAKE_RUNNER_PID": str(runner_pid_path),
                 "FAKE_DESCENDANT_PID": str(descendant_pid_path),
+                "FAKE_BRIDGE_PID": str(bridge_pid_path),
+                "FAKE_BRIDGE_REAPED": str(bridge_reaped_path),
                 "FAKE_EXIT_DESCENDANT": "0",
                 "FAKE_INVALID_OUTPUT": "0",
                 "FAKE_CRLF": "0",
@@ -1256,23 +2040,58 @@ read() {
                 "ANVIL_MCP_FRAME_READ_TIMEOUT": "2",
             }
         )
-        process = subprocess.Popen(
-            [
-                bash,
-                str(bridge),
-                "--socket=/tmp/anvil-readiness-test",
-                "--server-id=anvil",
-            ],
+        launch_command = [
+            bash,
+            str(bridge),
+            "--socket=/tmp/anvil-readiness-test",
+            "--server-id=anvil",
+        ]
+        if owner_death_after_hold:
+            supervisor = root / "bridge-supervisor.py"
+            make_executable(
+                supervisor,
+                f"""#!{sys.executable}
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+
+
+def publish(name, value):
+    path = Path(os.environ[name])
+    temporary = path.with_name(path.name + f".{{os.getpid()}}.tmp")
+    temporary.write_text(str(value), encoding="ascii")
+    os.replace(temporary, path)
+
+
+bridge = subprocess.Popen(sys.argv[1:])
+publish("FAKE_BRIDGE_PID", bridge.pid)
+returncode = bridge.wait()
+publish("FAKE_BRIDGE_REAPED", returncode)
+os.kill(os.getpid(), signal.SIGKILL)
+""",
+            )
+            launch_command = [
+                sys.executable,
+                "-I",
+                "-S",
+                str(supervisor),
+                *launch_command,
+            ]
+        process, custody_defer = popen_with_termination_deferred(
+            launch_command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=environment,
-            text=True,
+            bufsize=0,
             start_new_session=True,
         )
         fake_pid: int | None = None
         runner_pid: int | None = None
         descendant_pid: int | None = None
+        bridge_pid = process.pid
         bridge_stopped = False
         try:
             if (
@@ -1281,15 +2100,46 @@ read() {
                 or process.stderr is None
             ):
                 raise AssertionError("signal regression pipes were not created")
-            process.stdin.write(json.dumps(request, separators=(",", ":")) + "\n")
-            process.stdin.flush()
-
+            previous = custody_defer
+            custody_defer = None
+            restore_termination_signals(previous)
+            if owner_death_after_hold:
+                bridge_deadline = time.monotonic() + 2
+                while (
+                    not bridge_pid_path.exists()
+                    and time.monotonic() < bridge_deadline
+                ):
+                    if process_exited_without_reaping(process):
+                        break
+                    time.sleep(0.01)
+                bridge_pid_text = bounded_text(bridge_pid_path, 128).strip()
+                if (
+                    not bridge_pid_text.isascii()
+                    or not bridge_pid_text.isdecimal()
+                ):
+                    raise AssertionError(
+                        "owner-death supervisor did not publish its bridge"
+                    )
+                bridge_pid = int(bridge_pid_text)
+                try:
+                    bridge_owned = os.getsid(bridge_pid) == process.pid
+                except OSError:
+                    bridge_owned = False
+                if not bridge_owned:
+                    raise AssertionError(
+                        "owner-death bridge did not remain in its supervisor session"
+                    )
             # Allow the existing 10-second dispatch deadline plus both one-
             # second convergence phases and normal bridge unwinding to settle.
             # This observation window does not change any production deadline.
             deadline = time.monotonic() + 15
+            write_all(
+                process.stdin,
+                (json.dumps(request, separators=(",", ":")) + "\n").encode(),
+                deadline,
+            )
             while time.monotonic() < deadline:
-                if process.poll() is not None:
+                if process_exited_without_reaping(process):
                     break
                 if (
                     hang_pid_path.exists()
@@ -1305,20 +2155,11 @@ read() {
                     break
                 time.sleep(0.02)
             if fake_pid is None or runner_pid is None or descendant_pid is None:
-                returncode = process.poll()
-                failure_stderr = (
-                    process.stderr.read() if returncode is not None else ""
-                )
-                debug_path = root / "debug.log"
-                failure_debug = (
-                    debug_path.read_text(encoding="utf-8", errors="replace")
-                    if debug_path.exists()
-                    else ""
-                )
+                failure_debug = bounded_text(root / "debug.log")
                 details = (
                     "large request did not reach its staged hanging dispatch "
                     "with a same-group descendant: "
-                    f"rc={returncode} stderr={failure_stderr!r} "
+                    f"exited={process_exited_without_reaping(process)} "
                     f"debug={failure_debug!r}"
                 )
                 raise AssertionError(details)
@@ -1341,9 +2182,17 @@ read() {
                     raise AssertionError(
                         "forged child NUL/status suppressed runner escalation"
                     )
-                process.terminate()
+                if not signal_owned_process(
+                    bridge_pid, process.pid, signal.SIGTERM
+                ) and not process_exited_without_reaping(process):
+                    raise AssertionError(
+                        "bridge lost session ownership before forged-record TERM"
+                    )
             elif repeat:
-                os.kill(runner_pid, signal.SIGTERM)
+                if not signal_owned_process(
+                    runner_pid, process.pid, signal.SIGTERM
+                ):
+                    raise AssertionError("runner lost session ownership before TERM")
                 term_deadline = time.monotonic() + 1
                 while (
                     read_count(term_count_path) != 1
@@ -1356,7 +2205,7 @@ read() {
                     )
                 time.sleep(0.1)
                 if (
-                    process.poll() is not None
+                    process_exited_without_reaping(process)
                     or not process_alive(runner_pid)
                     or not process_alive(fake_pid)
                     or not process_alive(descendant_pid)
@@ -1367,10 +2216,16 @@ read() {
 
                 # Freeze the reader so the status pipe remains open while the
                 # exact runner reaps its child and enters the held-writer path.
-                os.kill(process.pid, signal.SIGSTOP)
+                if not signal_owned_process(
+                    bridge_pid, process.pid, signal.SIGSTOP
+                ):
+                    raise AssertionError("bridge lost session ownership before STOP")
                 bridge_stopped = True
                 time.sleep(0.05)
-                os.kill(runner_pid, signal.SIGUSR1)
+                if not signal_owned_process(
+                    runner_pid, process.pid, signal.SIGUSR1
+                ):
+                    raise AssertionError("runner lost session ownership before USR1")
                 kill_deadline = time.monotonic() + 1
                 while (
                     (
@@ -1392,13 +2247,23 @@ read() {
                 if owner_death_after_hold:
                     # Kill only the frozen bridge leader.  Its reader vanishes,
                     # and the already-closed runner writer must not spin forever.
-                    os.kill(process.pid, signal.SIGKILL)
+                    if not signal_owned_process(
+                        bridge_pid, process.pid, signal.SIGKILL
+                    ):
+                        raise AssertionError(
+                            "bridge lost session ownership before owner death"
+                        )
                     bridge_stopped = False
                 else:
                     # Signals that interrupt the held pipe write must not let the
                     # runner escape before the parent closes its reader.
                     for repeated_signal in (signal.SIGTERM, signal.SIGUSR1):
-                        os.kill(runner_pid, repeated_signal)
+                        if not signal_owned_process(
+                            runner_pid, process.pid, repeated_signal
+                        ):
+                            raise AssertionError(
+                                "runner lost session ownership during held write"
+                            )
                         time.sleep(0.05)
                         if not process_alive(runner_pid):
                             raise AssertionError(
@@ -1407,56 +2272,59 @@ read() {
 
                     # Queue bridge termination while its reader is still frozen;
                     # SIGCONT delivers it before normal response processing resumes.
-                    process.terminate()
-                    os.kill(process.pid, signal.SIGCONT)
+                    if not signal_owned_process(
+                        bridge_pid, process.pid, signal.SIGTERM
+                    ) and not process_exited_without_reaping(process):
+                        raise AssertionError(
+                            "bridge lost session ownership before queued TERM"
+                        )
+                    if not signal_owned_process(
+                        bridge_pid, process.pid, signal.SIGCONT
+                    ):
+                        raise AssertionError(
+                            "bridge lost session ownership before CONT"
+                        )
                     bridge_stopped = False
             else:
-                process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired as error:
-                debug_path = root / "debug.log"
-                debug = (
-                    debug_path.read_text(encoding="utf-8", errors="replace")
-                    if debug_path.exists()
-                    else ""
-                )
+                if not signal_owned_process(
+                    bridge_pid, process.pid, signal.SIGTERM
+                ) and not process_exited_without_reaping(process):
+                    raise AssertionError(
+                        "bridge lost session ownership before direct TERM"
+                    )
+            if not wait_process_exit_unreaped(process, 5):
+                debug = bounded_text(root / "debug.log")
                 raise AssertionError(
                     "direct bridge SIGTERM did not produce a bounded exit: "
                     f"child_alive={process_alive(fake_pid)} "
                     f"runner_alive={process_alive(runner_pid)} "
                     f"descendant_alive={process_alive(descendant_pid)} "
                     f"debug={debug!r}"
-                ) from error
+                )
+            if owner_death_after_hold:
+                bridge_returncode = bounded_text(
+                    bridge_reaped_path, 128
+                ).strip()
+                if bridge_returncode != str(-signal.SIGKILL):
+                    raise AssertionError(
+                        "owner-death supervisor did not reap the killed bridge"
+                    )
 
-            stdout = process.stdout.read()
-            stderr = process.stderr.read()
             stage_retained = cleanup_failure or owner_death_after_hold
             deadline = time.monotonic() + 2
             child_alive = True
             runner_alive = True
             descendant_alive = True
             group_alive = True
+            session_children: dict[int, int] = {}
             staged = list(root.glob("anvil-mcp.*"))
             while time.monotonic() < deadline:
-                try:
-                    os.kill(fake_pid, 0)
-                except ProcessLookupError:
-                    child_alive = False
-                except PermissionError:
-                    child_alive = True
-                else:
-                    child_alive = True
-                runner_alive = process_alive(runner_pid)
-                descendant_alive = process_alive(descendant_pid)
-                try:
-                    os.killpg(process.pid, 0)
-                except ProcessLookupError:
-                    group_alive = False
-                except PermissionError:
-                    group_alive = True
-                else:
-                    group_alive = True
+                session_children = session_processes(process.pid)
+                session_children.pop(process.pid, None)
+                child_alive = fake_pid in session_children
+                runner_alive = runner_pid in session_children
+                descendant_alive = descendant_pid in session_children
+                group_alive = bool(session_children)
                 staged = list(root.glob("anvil-mcp.*"))
                 if (
                     not child_alive
@@ -1473,27 +2341,25 @@ read() {
             expected_returncode = (
                 -signal.SIGKILL if owner_death_after_hold else 143
             )
-            debug_path = root / "debug.log"
-            debug = (
-                debug_path.read_text(encoding="utf-8", errors="replace")
-                if debug_path.exists()
-                else ""
-            )
-            group_snapshot = ""
-            if group_alive:
-                snapshot = subprocess.run(
-                    ["ps", "-axo", "pid=,ppid=,pgid=,stat=,command="],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                    text=True,
-                    check=False,
-                ).stdout
-                group_snapshot = "\n".join(
-                    line
-                    for line in snapshot.splitlines()
-                    if len(line.split(None, 4)) >= 3
-                    and line.split(None, 4)[2] == str(process.pid)
+            debug = bounded_text(root / "debug.log")
+            group_snapshot = repr(sorted(session_children.items()))
+            if (
+                child_alive
+                or runner_alive
+                or descendant_alive
+                or group_alive
+                or (not staged if stage_retained else bool(staged))
+            ):
+                raise AssertionError(
+                    f"{label} bridge retained custody before reap: "
+                    f"child_alive={child_alive} runner_alive={runner_alive} "
+                    f"descendant_alive={descendant_alive} group_alive={group_alive} "
+                    f"staged={[path.name for path in staged]!r} "
+                    f"debug={debug!r} group_snapshot={group_snapshot!r}"
                 )
+            process.wait(timeout=HARNESS_KILL_GRACE_SECONDS)
+            stdout = bounded_stream_text(process.stdout)
+            stderr = bounded_stream_text(process.stderr)
             if (
                 process.returncode != expected_returncode
                 or read_count(term_count_path) != 1
@@ -1525,46 +2391,16 @@ read() {
                     f"debug={debug!r} group_snapshot={group_snapshot!r}"
                 )
         finally:
-            if bridge_stopped and process.poll() is None:
-                try:
-                    os.kill(process.pid, signal.SIGCONT)
-                except ProcessLookupError:
-                    pass
-            if process.stdin is not None:
-                try:
-                    process.stdin.close()
-                except BrokenPipeError:
-                    pass
-            if process.poll() is None:
-                # Preserve the bridge's runner custody even on assertion paths.
-                # A hard group kill here can orphan an as-yet-unpublished child
-                # in the runner's separate process group.
-                process.terminate()
-                try:
-                    process.wait(timeout=7)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait(timeout=2)
-            else:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            if fake_pid is not None:
-                try:
-                    os.kill(fake_pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            if runner_pid is not None:
-                try:
-                    os.kill(runner_pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            if descendant_pid is not None:
-                try:
-                    os.kill(descendant_pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+            if bridge_stopped and bridge_pid != process.pid:
+                signal_owned_process(bridge_pid, process.pid, signal.SIGCONT)
+                bridge_stopped = False
+            cleanup_fixture_process(
+                process,
+                term_grace=shutdown_observer_budget(5, 1),
+                resume=bridge_stopped and bridge_pid == process.pid,
+            )
+            if custody_defer is not None:
+                restore_termination_signals(custody_defer)
 
 
 def assert_signal_publication(
@@ -1692,13 +2528,13 @@ exec "$FAKE_PUBLICATION_REAL_PYTHON" "$@"
                 "ANVIL_MCP_FRAME_READ_TIMEOUT": "2",
             }
         )
-        process = subprocess.Popen(
+        process, custody_defer = popen_with_termination_deferred(
             [bash, str(bridge), "--server-id=anvil"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=environment,
-            text=True,
+            bufsize=0,
             start_new_session=True,
         )
         runner_pid: int | None = None
@@ -1706,17 +2542,22 @@ exec "$FAKE_PUBLICATION_REAL_PYTHON" "$@"
         try:
             if process.stdin is None:
                 raise AssertionError("publication regression stdin is unavailable")
-            process.stdin.write('{"jsonrpc":"2.0","id":41,"method":"tools/call"}\n')
-            process.stdin.flush()
-
+            previous = custody_defer
+            custody_defer = None
+            restore_termination_signals(previous)
             deadline = time.monotonic() + 5
+            write_all(
+                process.stdin,
+                b'{"jsonrpc":"2.0","id":41,"method":"tools/call"}\n',
+                deadline,
+            )
             while time.monotonic() < deadline:
                 if runner_ready_path.exists():
                     runner_pid = int(
                         runner_ready_path.read_text(encoding="utf-8")
                     )
                     break
-                if process.poll() is not None:
+                if process_exited_without_reaping(process):
                     break
                 time.sleep(0.02)
             if runner_pid is None:
@@ -1725,39 +2566,27 @@ exec "$FAKE_PUBLICATION_REAL_PYTHON" "$@"
                 )
             deadline = time.monotonic() + 8
             while time.monotonic() < deadline:
-                if signal_sent_path.exists() or process.poll() is not None:
+                if signal_sent_path.exists() or process_exited_without_reaping(
+                    process
+                ):
                     break
                 time.sleep(0.01)
             if not signal_sent_path.exists():
-                returncode = process.poll()
-                failure_stderr = (
-                    process.stderr.read()
-                    if returncode is not None and process.stderr is not None
-                    else ""
-                )
-                debug_path = root / "debug.log"
-                failure_debug = (
-                    debug_path.read_text(encoding="utf-8", errors="replace")
-                    if debug_path.exists()
-                    else ""
-                )
+                failure_debug = bounded_text(root / "debug.log")
                 raise AssertionError(
                     f"{label} publication regression never reached its "
-                    f"injected signal: rc={returncode} "
-                    f"stderr={failure_stderr!r} debug={failure_debug!r}"
+                    "injected signal: "
+                    f"exited={process_exited_without_reaping(process)} "
+                    f"debug={failure_debug!r}"
                 )
             convergence_started = time.monotonic()
-            try:
-                process.wait(timeout=8)
-            except subprocess.TimeoutExpired as error:
+            if not wait_process_exit_unreaped(process, 8):
                 raise AssertionError(
                     "signal during runner publication did not converge "
                     "independently of the 150-second command deadline"
-                ) from error
+                )
             convergence_elapsed = time.monotonic() - convergence_started
 
-            stdout = process.stdout.read() if process.stdout is not None else ""
-            stderr = process.stderr.read() if process.stderr is not None else ""
             helper_started = ready_path.exists()
             if helper_started:
                 helper_pid = int(ready_path.read_text(encoding="utf-8"))
@@ -1765,45 +2594,29 @@ exec "$FAKE_PUBLICATION_REAL_PYTHON" "$@"
             runner_alive = True
             group_alive = True
             helper_alive = helper_pid is not None
+            session_children: dict[int, int] = {}
             while time.monotonic() < deadline:
-                try:
-                    os.kill(runner_pid, 0)
-                except ProcessLookupError:
-                    runner_alive = False
-                except PermissionError:
-                    runner_alive = True
-                else:
-                    runner_alive = True
-                try:
-                    os.killpg(process.pid, 0)
-                except ProcessLookupError:
-                    group_alive = False
-                except PermissionError:
-                    group_alive = True
-                else:
-                    group_alive = True
-                helper_alive = (
-                    helper_pid is not None and process_alive(helper_pid)
-                )
+                session_children = session_processes(process.pid)
+                session_children.pop(process.pid, None)
+                runner_alive = runner_pid in session_children
+                group_alive = bool(session_children)
+                helper_alive = helper_pid in session_children
                 if not runner_alive and not group_alive and not helper_alive:
                     break
                 time.sleep(0.02)
             staged = list(root.glob("anvil-mcp.*"))
-            group_snapshot = ""
-            if group_alive:
-                snapshot = subprocess.run(
-                    ["ps", "-axo", "pid=,ppid=,pgid=,stat=,command="],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                    text=True,
-                    check=False,
-                ).stdout
-                group_snapshot = "\n".join(
-                    line
-                    for line in snapshot.splitlines()
-                    if len(line.split(None, 4)) >= 3
-                    and line.split(None, 4)[2] == str(process.pid)
+            group_snapshot = repr(sorted(session_children.items()))
+            if runner_alive or group_alive or helper_alive or staged:
+                raise AssertionError(
+                    f"{label} publication retained custody before reap: "
+                    f"runner_alive={runner_alive} group_alive={group_alive} "
+                    f"helper_alive={helper_alive} "
+                    f"staged={[path.name for path in staged]!r} "
+                    f"group_snapshot={group_snapshot!r}"
                 )
+            process.wait(timeout=HARNESS_KILL_GRACE_SECONDS)
+            stdout = bounded_stream_text(process.stdout)
+            stderr = bounded_stream_text(process.stderr)
             if (
                 process.returncode != 143
                 or runner_alive
@@ -1826,27 +2639,12 @@ exec "$FAKE_PUBLICATION_REAL_PYTHON" "$@"
                     f"group_snapshot={group_snapshot!r}"
                 )
         finally:
-            if process.stdin is not None:
-                try:
-                    process.stdin.close()
-                except BrokenPipeError:
-                    pass
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            if runner_pid is not None:
-                try:
-                    os.kill(runner_pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            if helper_pid is not None:
-                try:
-                    os.kill(helper_pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            if process.poll() is None:
-                process.wait(timeout=2)
+            cleanup_fixture_process(
+                process,
+                term_grace=shutdown_observer_budget(2, 1),
+            )
+            if custody_defer is not None:
+                restore_termination_signals(custody_defer)
 
 
 def assert_delayed_ack_preserves_runner(
@@ -1978,34 +2776,43 @@ printf 'DONE %s\\n' "$runner"
                     stdout=subprocess.PIPE,
                     text=True,
                     check=True,
+                    timeout=2,
                 ).stdout.strip(),
             }
         )
-        process = subprocess.Popen(
-            [bash, str(harness)],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=environment,
-            text=True,
-            start_new_session=True,
-        )
-        runner_pid: int | None = None
+        stderr_path = root / "heartbeat.stderr"
+        stderr_handle = stderr_path.open("wb")
         try:
-            if (
-                process.stdin is None
-                or process.stdout is None
-                or process.stderr is None
-            ):
+            process, custody_defer = popen_with_termination_deferred(
+                [bash, str(harness)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=stderr_handle,
+                env=environment,
+                bufsize=0,
+                start_new_session=True,
+            )
+        except BaseException:
+            stderr_handle.close()
+            raise
+        runner_pid: int | None = None
+        reader: BoundedPipeReader | None = None
+        try:
+            stderr_handle.close()
+            if process.stdin is None or process.stdout is None:
                 raise AssertionError("heartbeat regression pipes were not created")
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                ready_future = executor.submit(process.stdout.readline)
-                try:
-                    ready_line = ready_future.result(timeout=5)
-                except FutureTimeoutError as error:
-                    raise AssertionError(
-                        "saturated heartbeat runner never published READY"
-                    ) from error
+            reader = BoundedPipeReader(process.stdout)
+            previous = custody_defer
+            custody_defer = None
+            restore_termination_signals(previous)
+            try:
+                ready_line = reader.line(time.monotonic() + 5).decode(
+                    "ascii", errors="strict"
+                )
+            except (EOFError, TimeoutError, UnicodeDecodeError) as error:
+                raise AssertionError(
+                    "saturated heartbeat runner never published READY"
+                ) from error
             pieces = ready_line.strip().split()
             if len(pieces) != 2 or pieces[0] != "READY":
                 raise AssertionError(
@@ -2019,7 +2826,7 @@ printf 'DONE %s\\n' "$runner"
             before_size = 0
             after_size = 0
             while time.monotonic() < saturation_deadline:
-                if process.poll() is not None:
+                if process_exited_without_reaping(process):
                     break
                 before_size = (
                     before_path.stat().st_size if before_path.exists() else 0
@@ -2036,26 +2843,8 @@ printf 'DONE %s\\n' "$runner"
                 time.sleep(0.01)
             if not saturated:
                 runner_alive = process_alive(runner_pid)
-                snapshot = subprocess.run(
-                    ["ps", "-axo", "pid=,ppid=,pgid=,stat=,command="],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                    text=True,
-                    check=False,
-                ).stdout
-                group_snapshot = "\n".join(
-                    line
-                    for line in snapshot.splitlines()
-                    if len(line.split(None, 4)) >= 3
-                    and line.split(None, 4)[2] == str(process.pid)
-                )
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                if process.poll() is None:
-                    process.wait(timeout=2)
-                stderr = process.stderr.read()
+                group_snapshot = repr(sorted(session_process_groups(process.pid)))
+                stderr = bounded_text(stderr_path)
                 raise AssertionError(
                     "heartbeat pipe did not reach a blocked write: "
                     f"rc={process.returncode} runner_alive={runner_alive} "
@@ -2063,37 +2852,46 @@ printf 'DONE %s\\n' "$runner"
                     f"stderr={stderr!r} group_snapshot={group_snapshot!r}"
                 )
 
-            process.stdin.write("go\n")
-            process.stdin.flush()
+            write_all(process.stdin, b"go\n", time.monotonic() + 2)
             process.stdin.close()
             process.stdin = None
-            try:
-                stdout, stderr = process.communicate(timeout=8)
-            except subprocess.TimeoutExpired as error:
+            reader.close()
+            reader = None
+            if not wait_process_exit_unreaped(process, 8):
                 raise AssertionError(
                     "signal-interrupted saturated heartbeat did not converge"
-                ) from error
+                )
+            deadline = time.monotonic() + 2
+            session_children: dict[int, int] = {}
+            while time.monotonic() < deadline:
+                session_children = session_processes(process.pid)
+                session_children.pop(process.pid, None)
+                if not session_children:
+                    break
+                time.sleep(0.02)
+            if session_children:
+                raise AssertionError(
+                    "saturated heartbeat retained custody before reap: "
+                    f"runner={runner_pid} children={sorted(session_children)!r}"
+                )
+            process.wait(timeout=HARNESS_KILL_GRACE_SECONDS)
+            stdout = bounded_stream_text(process.stdout)
+            stderr = bounded_text(stderr_path)
             if process.returncode != 0 or not stdout.startswith("DONE "):
                 raise AssertionError(
                     "signal-interrupted saturated heartbeat lost ACK/status: "
                     f"rc={process.returncode} stdout={stdout!r} stderr={stderr!r}"
                 )
-            if not wait_process_dead(runner_pid):
-                raise AssertionError(
-                    f"saturated heartbeat runner survived FD7 close: {runner_pid}"
-                )
         finally:
-            if process.stdin is not None:
-                try:
-                    process.stdin.close()
-                except BrokenPipeError:
-                    pass
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            if process.poll() is None:
-                process.wait(timeout=2)
+            if not stderr_handle.closed:
+                stderr_handle.close()
+            cleanup_fixture_process(
+                process,
+                term_grace=2,
+                reader=reader,
+            )
+            if custody_defer is not None:
+                restore_termination_signals(custody_defer)
 
 
 def assert_drain_phase_budget(stdio: Path, bash: str) -> None:
@@ -2277,6 +3075,7 @@ def main() -> int:
         raise AssertionError(f"real Emacs is not executable: {real_emacs}")
     os.environ["ANVIL_TEST_REAL_EMACS"] = real_emacs
     expected = {"jsonrpc": "2.0", "id": 17, "result": {"ready": True}}
+    assert_harness_timeout_reaps_separate_child(bash)
     assert_reaped_pid_alias_does_not_extend_wait(stdio, bash, expected)
 
     success, probes, dispatches, _elapsed, stderr, _guard = run_case(
@@ -2513,5 +3312,14 @@ def main() -> int:
     return 0
 
 
+def exit_on_termination(signum: int, _frame: object) -> None:
+    """Raise through active fixture cleanup when an outer timeout terminates us."""
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    raise SystemExit(128 + signum)
+
+
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, exit_on_termination)
+    signal.signal(signal.SIGINT, exit_on_termination)
     raise SystemExit(main())
