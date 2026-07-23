@@ -103,6 +103,33 @@
   correctness or scope blocker; definitive evidence still waits on the new
   upstream source pin.
 
+## 2026-07-23 load-resilience continuation
+
+- Fork CI is green through signed tip `c5b2274`; the stacked PR remains
+  intentionally unopened until the final Nix package is deployed and proved on
+  Hera.
+- A real concurrent dedicated smoke reproduced an ambiguous one-shot dispatch
+  while every worker candidate used an independent spawn wait. With the
+  deployed 2/1/1 roster, the old selector could spend seven complete waits
+  before the tool body and approach the root watchdog deadline.
+- Worker selection now uses one aggregate spawn deadline, starts candidates
+  only in the highest-priority usable lane, introduces at most one cold worker,
+  restarts previously demanded dead peers at most once, clamps full probes to
+  the remaining time, and preserves round-robin and cached live fallbacks.
+  Deterministic dead-pool, hanging-probe, lazy-lane, busy-fallback,
+  lane-priority, and no-redemand regressions pass with the complete worker
+  suite.
+- Stdio runner READY/ACK control now has its own configured five-second budget
+  rather than inheriting a 240-second dispatch deadline before receiving a
+  fresh execution deadline. Bash 3.2 whole-second accounting can add at most
+  one second to that control phase, which the Nix outer envelope counts.
+  Generic operation defaults remain unchanged; the Nix deployment widens only
+  the guarded helper budgets and binds the complete outer client envelope.
+- Final upstream and Nix gates, the Hera switch, deployed fresh-client proof,
+  and the dependent PR are still required. The observed `rc=70` is consistent
+  with the repaired startup defects but is not treated as unique incident
+  attribution because several fail-closed post-dispatch paths share that code.
+
 ## Current state
 
 - The isolated upstream branch is `fix/anvil-root-resilience`; its signed
