@@ -390,11 +390,19 @@ def strict_equal(actual: object, expected: object) -> bool:
 
 HARNESS_MAX_CAPTURE_BYTES = 1_048_576
 HARNESS_CHILD_RECORD_MAX_BYTES = 128
+HARNESS_SESSION_COLLECT_SECONDS = 4.0
 HARNESS_SESSION_REAP_SECONDS = 0.5
 HARNESS_SESSION_VALIDATE_SECONDS = 2.0
+HARNESS_SESSION_SCHEDULING_GRACE_SECONDS = 0.5
+HARNESS_SESSION_SCAN_SECONDS = (
+    HARNESS_SESSION_COLLECT_SECONDS
+    + HARNESS_SESSION_REAP_SECONDS
+    + HARNESS_SESSION_VALIDATE_SECONDS
+    + HARNESS_SESSION_SCHEDULING_GRACE_SECONDS
+)
 HARNESS_TERM_GRACE_SECONDS = 4.0
 HARNESS_KILL_GRACE_SECONDS = 2.0
-HARNESS_FINAL_VERIFY_SECONDS = 2 * HARNESS_KILL_GRACE_SECONDS
+HARNESS_FINAL_VERIFY_SECONDS = 3 * HARNESS_SESSION_SCAN_SECONDS
 HARNESS_OBSERVER_MARGIN_SECONDS = 10.0
 
 
@@ -520,7 +528,7 @@ def session_processes(
     When DEADLINE is non-nil, process launch, collection, reaping, and row
     validation all remain inside that caller-owned absolute deadline.
     """
-    natural_wait_deadline = time.monotonic() + 2
+    natural_wait_deadline = time.monotonic() + HARNESS_SESSION_COLLECT_SECONDS
     if deadline is None:
         wait_deadline = natural_wait_deadline
     else:
@@ -835,6 +843,7 @@ def _terminate_bridge(
 
     session_id = process.pid
     orphan_group_observed = False
+    phase_discovery_errors: list[str] = []
     discovery_errors: list[str] = []
 
     def discover_groups(
@@ -917,8 +926,8 @@ def _terminate_bridge(
             )
         except SessionDiscoveryDeadline as error:
             message = str(error)
-            if message not in discovery_errors:
-                discovery_errors.append(message)
+            if message not in phase_discovery_errors:
+                phase_discovery_errors.append(message)
             break
         except AssertionError as error:
             message = str(error)
@@ -986,6 +995,9 @@ def _terminate_bridge(
             f"{sorted(retained_processes)!r}"
         )
     if discovery_errors:
+        for message in phase_discovery_errors:
+            if message not in discovery_errors:
+                discovery_errors.append(message)
         raise AssertionError(
             "harness cleanup session discovery failed: "
             + "; ".join(discovery_errors)
@@ -1484,6 +1496,11 @@ os.execv({real_python!r}, [{real_python!r}, *sys.argv[1:]])
 
 def assert_harness_timeout_reaps_separate_child(bash: str) -> None:
     """A reply timeout must not strand a separate child-group writer."""
+    minimum_final_verify = 3 * HARNESS_SESSION_SCAN_SECONDS
+    if HARNESS_FINAL_VERIFY_SECONDS < minimum_final_verify:
+        raise AssertionError(
+            "final verification must fund one cleanup scan and two quiet scans"
+        )
     with tempfile.TemporaryDirectory(prefix="anvil-stdio-harness-timeout-") as raw:
         root = Path(raw)
         active_child = root / "active-child"
@@ -1502,7 +1519,7 @@ def assert_harness_timeout_reaps_separate_child(bash: str) -> None:
                 "import os\n"
                 "import sys\n"
                 "import time\n"
-                "time.sleep(1.2)\n"
+                "time.sleep(1.6)\n"
                 f"os.execv({real_ps!r}, [{real_ps!r}, *sys.argv[1:]])\n"
             ),
         )
