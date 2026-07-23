@@ -166,7 +166,8 @@ probing daemon indefinitely."
   :group 'anvil-worker)
 
 (defcustom anvil-worker-spawn-wait 5
-  "Max seconds to wait for a freshly spawned worker."
+  "Max aggregate seconds to start workers for one dispatch.
+Startup waits and their liveness probes share this single deadline."
   :type 'integer
   :group 'anvil-worker)
 
@@ -592,40 +593,48 @@ file\" (issue #16)."
       (list "-a" "false" "-f" server-file)
     (list "-a" "false" "-s" server-file)))
 
-(defun anvil-worker--probe-emacsclient (server-file)
+(defun anvil-worker--probe-emacsclient (server-file &optional caller-deadline)
   "Return non-nil if `emacsclient' liveness probe on SERVER-FILE exits 0 in time.
 The probe is run asynchronously via `make-process' and hard-killed
 after `anvil-worker-alive-check-timeout' seconds.  This prevents a
 stale SERVER-FILE pointing at a reused TCP port from blocking the
-caller indefinitely."
-  (let* ((buf (generate-new-buffer " *anvil-worker-probe*"))
-         (proc (make-process
-                :name "anvil-worker-probe"
-                :buffer buf
-                :command (append (list "emacsclient")
-                                 (anvil-worker--emacsclient-server-args
-                                  server-file)
-                                 (list "-e" "t"))
-                :noquery t
-                :connection-type 'pipe))
-         (deadline (+ (float-time) anvil-worker-alive-check-timeout))
-         (alive nil))
-    (unwind-protect
-        (progn
-          (while (and (process-live-p proc)
-                      (< (float-time) deadline))
-            (accept-process-output proc 0.1 nil t))
-          (if (process-live-p proc)
-              (progn
-                (delete-process proc)
-                (anvil-worker--log
-                 'probe-timeout
-                 (format "%s >%.1fs"
-                         (file-name-nondirectory server-file)
-                         anvil-worker-alive-check-timeout)))
-            (setq alive (= 0 (process-exit-status proc)))))
-      (when (buffer-live-p buf) (kill-buffer buf)))
-    alive))
+caller indefinitely.  When CALLER-DEADLINE is non-nil, it is an
+absolute `float-time' deadline that also bounds this probe."
+  (let ((started (float-time)))
+    (when (or (null caller-deadline) (< started caller-deadline))
+      (let* ((buf (generate-new-buffer " *anvil-worker-probe*"))
+             (proc (make-process
+                    :name "anvil-worker-probe"
+                    :buffer buf
+                    :command (append (list "emacsclient")
+                                     (anvil-worker--emacsclient-server-args
+                                      server-file)
+                                     (list "-e" "t"))
+                    :noquery t
+                    :connection-type 'pipe))
+             (deadline (let ((local-deadline
+                              (+ started anvil-worker-alive-check-timeout)))
+                         (if caller-deadline
+                             (min local-deadline caller-deadline)
+                           local-deadline)))
+             (alive nil))
+        (unwind-protect
+            (progn
+              (while (and (process-live-p proc)
+                          (< (float-time) deadline))
+                (accept-process-output
+                 proc (min 0.1 (max 0.0 (- deadline (float-time)))) nil t))
+              (if (process-live-p proc)
+                  (progn
+                    (delete-process proc)
+                    (anvil-worker--log
+                     'probe-timeout
+                     (format "%s >%.1fs"
+                             (file-name-nondirectory server-file)
+                             (max 0.0 (- deadline started)))))
+                (setq alive (= 0 (process-exit-status proc)))))
+          (when (buffer-live-p buf) (kill-buffer buf)))
+        alive))))
 
 (defun anvil-worker--server-file-pid (server-file)
   "Return the PID recorded on the first line of SERVER-FILE.
@@ -662,21 +671,23 @@ deleting live sockets and orphaning the daemons behind them."
           nil)
       (file-error t))))
 
-(defun anvil-worker--worker-alive-p (worker)
+(defun anvil-worker--worker-alive-p (worker &optional deadline)
   "Return non-nil if WORKER plist is reachable.
 Performs the same cheap checks as `anvil-worker--quick-alive-p'
 followed by a bounded `emacsclient' probe, and deletes a stale
-server file as a side-effect."
-  (let ((server-file (plist-get worker :server-file)))
-    (cond
-     ((not (file-exists-p server-file)) nil)
-     ((anvil-worker--server-file-stale-p server-file)
-      (ignore-errors (delete-file server-file))
-      (anvil-worker--log
-       'stale-server-file
-       (file-name-nondirectory server-file))
-      nil)
-     (t (anvil-worker--probe-emacsclient server-file)))))
+server file as a side-effect.  Optional DEADLINE is an absolute
+`float-time' deadline shared with the caller."
+  (when (or (null deadline) (< (float-time) deadline))
+    (let ((server-file (plist-get worker :server-file)))
+      (cond
+       ((not (file-exists-p server-file)) nil)
+       ((anvil-worker--server-file-stale-p server-file)
+        (ignore-errors (delete-file server-file))
+        (anvil-worker--log
+         'stale-server-file
+         (file-name-nondirectory server-file))
+        nil)
+       (t (anvil-worker--probe-emacsclient server-file deadline))))))
 
 (defun anvil-worker-alive-p (&optional index lane)
   "Return non-nil if worker at INDEX (default 0) of LANE (default :read) is alive.
@@ -994,63 +1005,41 @@ Return non-nil only after PROC is confirmed dead."
 
 ;;; Dispatch — pick a worker
 
-(defun anvil-worker--pick-in-lane (lane)
-  "Pick the next available worker in LANE, or nil if nothing alive.
-Round-robin within LANE, preferring non-busy.  Falls back to a
-busy-but-alive worker when every lane member is occupied."
+(defun anvil-worker--lane-workers-in-order (lane)
+  "Return LANE workers in current round-robin order."
   (let* ((vec (anvil-worker--lane-pool lane))
          (size (and vec (length vec)))
          (start (or (plist-get anvil-worker--dispatch-index lane) 0))
-         (chosen nil))
+         workers)
     (when (and vec (> size 0))
-      ;; Prefer non-busy + alive.
       (dotimes (off size)
-        (let* ((idx (% (+ start off) size))
-               (worker (aref vec idx)))
-          (when (and (not chosen)
-                     (not (plist-get worker :busy))
-                     (anvil-worker--worker-alive-p worker))
-            (setq chosen worker))))
-      ;; Recover or grow an idle slot before reusing an already-busy worker.
-      ;; The liveness pass above proved every candidate considered here dead;
-      ;; demanded peers need immediate recovery just as unused peers need their
-      ;; first spawn.
-      (unless chosen
-        (dotimes (off size)
-          (let* ((idx (% (+ start off) size))
-                 (worker (aref vec idx)))
-            (when (and (not chosen)
-                       (not (plist-get worker :busy)))
-              (setq chosen (anvil-worker--demand-worker worker))))))
-      ;; Fallback: any alive worker (even busy).
-      (unless chosen
-        (dotimes (off size)
-          (let* ((idx (% (+ start off) size))
-                 (worker (aref vec idx)))
-            (when (and (not chosen)
-                       (anvil-worker--worker-alive-p worker))
-              (setq chosen worker)))))
-      (when chosen
-        (plist-put chosen :demanded t)
-        (setq anvil-worker--dispatch-index
-              (plist-put anvil-worker--dispatch-index lane
-                         (% (1+ (plist-get chosen :index)) size)))))
-    chosen))
+        (push (aref vec (% (+ start off) size)) workers)))
+    (nreverse workers)))
 
-(defun anvil-worker--demand-worker (worker)
-  "Mark WORKER demanded, spawn it, and return it once reachable."
+(defun anvil-worker--first-alive-worker (workers busy-p &optional deadline)
+  "Return the first live member of WORKERS whose busy state is BUSY-P.
+Optional DEADLINE is an absolute `float-time' deadline for all probes."
+  (cl-find-if
+   (lambda (worker)
+     (and (if busy-p
+              (plist-get worker :busy)
+            (not (plist-get worker :busy)))
+          (or (null deadline) (< (float-time) deadline))
+          (anvil-worker--worker-alive-p worker deadline)))
+   workers))
+
+(defun anvil-worker--select-worker (worker)
+  "Mark WORKER selected and advance its lane's round-robin cursor."
   (when worker
     (plist-put worker :demanded t)
-    (anvil-worker--spawn-worker worker)
-    (let ((deadline (+ (float-time) anvil-worker-spawn-wait)))
-      (while (and (not (anvil-worker--worker-alive-p worker))
-                  (< (float-time) deadline))
-        (sit-for 0.1)))
-    (and (anvil-worker--worker-alive-p worker) worker)))
-
-(defun anvil-worker--pick-fallback-in-lane (lane)
-  "Demand the first worker in LANE, returning it once reachable."
-  (anvil-worker--demand-worker (anvil-worker--worker lane 0)))
+    (let* ((lane (plist-get worker :lane))
+           (vec (anvil-worker--lane-pool lane))
+           (size (and vec (length vec))))
+      (when (and size (> size 0))
+        (setq anvil-worker--dispatch-index
+              (plist-put anvil-worker--dispatch-index lane
+                         (% (1+ (plist-get worker :index)) size)))))
+    worker))
 
 (defun anvil-worker--pick-worker (&optional kind expression)
   "Pick a worker for a tool call.
@@ -1066,9 +1055,111 @@ lane is tried first and the remaining lanes act as fallbacks."
                       kind))
          ;; Try effective lane first, then the rest in canonical order.
          (try-order (cons effective
-                          (cl-remove effective anvil-worker--lanes))))
-    (or (cl-some #'anvil-worker--pick-in-lane try-order)
-        (cl-some #'anvil-worker--pick-fallback-in-lane try-order))))
+                          (cl-remove effective anvil-worker--lanes)))
+         (ordered-lanes
+          (mapcar (lambda (lane)
+                    (cons lane (anvil-worker--lane-workers-in-order lane)))
+                  try-order))
+         ;; One absolute deadline covers every candidate and every lane.
+         (deadline (+ (float-time) (max 0.0 anvil-worker-spawn-wait)))
+         initially-checked
+         initially-alive
+         priority-workers
+         fallbacks
+         selected)
+    (cl-labels
+        ((initially-alive-p
+          (worker)
+          (if (memq worker initially-checked)
+              (memq worker initially-alive)
+            (push worker initially-checked)
+            (when (anvil-worker--worker-alive-p worker deadline)
+              (push worker initially-alive)
+              t)))
+         (spawn-candidates
+          (workers)
+          ;; Preserve lazy startup: restart every previously-demanded dead
+          ;; peer, but introduce at most one never-demanded worker.
+          (let (cold-chosen candidates)
+            (dolist (worker workers (nreverse candidates))
+              (when (and (not (plist-get worker :busy))
+                         (not (initially-alive-p worker))
+                         (or (plist-get worker :demanded)
+                             (not cold-chosen)))
+                (unless (plist-get worker :demanded)
+                  (setq cold-chosen t))
+                (push worker candidates))))))
+      ;; Find the highest-priority lane that has a live worker or a worker it
+      ;; may start.  Preserve the idle preference; if no idle worker is live,
+      ;; cache a live busy worker before attempting startup.
+      (let ((lanes ordered-lanes))
+        (while (and lanes (not selected) (not priority-workers))
+          (let* ((entry (car lanes))
+                 (workers (cdr entry))
+                 (idle (cl-remove-if
+                        (lambda (worker) (plist-get worker :busy))
+                        workers))
+                 (busy (cl-remove-if-not
+                        (lambda (worker) (plist-get worker :busy))
+                        workers))
+                 (idle-ready (cl-find-if #'initially-alive-p idle))
+                 (busy-ready (and (not idle-ready)
+                                  (cl-find-if #'initially-alive-p busy)))
+                 (candidates (and (not idle-ready)
+                                  (spawn-candidates idle))))
+            (cond
+             (idle-ready
+              (setq selected idle-ready))
+             (candidates
+              (setq priority-workers candidates)
+              (when busy-ready
+                (setq fallbacks (list busy-ready)))
+              ;; Cache lower-lane fallbacks before the startup wait consumes
+              ;; the remaining deadline.  Never spawn those lanes here.
+              (dolist (lower (cdr lanes))
+                (let* ((lower-workers (cdr lower))
+                       (lower-idle
+                        (cl-remove-if
+                         (lambda (worker) (plist-get worker :busy))
+                         lower-workers))
+                       (lower-busy
+                        (cl-remove-if-not
+                         (lambda (worker) (plist-get worker :busy))
+                         lower-workers))
+                       (idle-fallback
+                        (cl-find-if #'initially-alive-p lower-idle))
+                       (busy-fallback
+                        (and (not idle-fallback)
+                             (cl-find-if #'initially-alive-p lower-busy))))
+                  (when idle-fallback
+                    (setq fallbacks
+                          (append fallbacks (list idle-fallback))))
+                  (when busy-fallback
+                    (setq fallbacks
+                          (append fallbacks (list busy-fallback)))))))
+             (busy-ready
+              (setq selected busy-ready))))
+          (setq lanes (cdr lanes))))
+      (when (and priority-workers (not selected))
+        (dolist (worker priority-workers)
+          (plist-put worker :demanded t)
+          (anvil-worker--spawn-worker worker))
+        ;; Readiness in the priority lane ends the wait early.  Cached busy
+        ;; and lower-lane workers are used only if every startup misses the
+        ;; shared deadline.
+        (while (and priority-workers
+                    (not selected)
+                    (< (float-time) deadline))
+          (setq selected
+                (anvil-worker--first-alive-worker
+                 priority-workers nil deadline))
+          (unless selected
+            (let ((remaining (- deadline (float-time))))
+              (when (> remaining 0)
+                (sit-for (min 0.1 remaining))))))
+        (unless selected
+          (setq selected (car fallbacks))))
+    (anvil-worker--select-worker selected))))
 
 ;;; Heavy-op detection
 
