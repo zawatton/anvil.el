@@ -119,10 +119,12 @@
   Deterministic dead-pool, hanging-probe, lazy-lane, busy-fallback,
   lane-priority, and no-redemand regressions pass with the complete worker
   suite.
-- Stdio runner READY/ACK control now has its own configured five-second budget
+- Stdio runner READY/ACK control now has its own configured ten-second budget
   rather than inheriting a 240-second dispatch deadline before receiving a
   fresh execution deadline. Bash 3.2 whole-second accounting can add at most
-  one second to that control phase, which the Nix outer envelope counts.
+  one second to that control phase, which the Nix outer envelope counts.  The
+  ten-second cap preserves the established regression where parent scheduling
+  delays ACK publication by more than five seconds.
   Generic operation defaults remain unchanged; the Nix deployment widens only
   the guarded helper budgets and binds the complete outer client envelope.
 - Final upstream and Nix gates, the Hera switch, deployed fresh-client proof,

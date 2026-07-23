@@ -37,11 +37,11 @@
     (should
      (string-match-p
       (regexp-quote
-       "ANVIL_MCP_RUNNER_CONTROL_TIMEOUT=${ANVIL_MCP_RUNNER_CONTROL_TIMEOUT:-5}")
+       "ANVIL_MCP_RUNNER_CONTROL_TIMEOUT=${ANVIL_MCP_RUNNER_CONTROL_TIMEOUT:-10}")
       source))
     (should
      (string-match-p
-      (regexp-quote "\"$ANVIL_MCP_RUNNER_CONTROL_TIMEOUT\" 5")
+      (regexp-quote "\"$ANVIL_MCP_RUNNER_CONTROL_TIMEOUT\" 10")
       source))
     (should
      (string-match-p
@@ -137,11 +137,11 @@
         (should
          (string-match-p
           (regexp-quote
-           "ANVIL_MCP_RUNNER_CONTROL_TIMEOUT=${ANVIL_MCP_RUNNER_CONTROL_TIMEOUT:-5}")
+           "ANVIL_MCP_RUNNER_CONTROL_TIMEOUT=${ANVIL_MCP_RUNNER_CONTROL_TIMEOUT:-10}")
           source))
         (should
          (string-match-p
-          (regexp-quote "\"$ANVIL_MCP_RUNNER_CONTROL_TIMEOUT\" 5")
+          (regexp-quote "\"$ANVIL_MCP_RUNNER_CONTROL_TIMEOUT\" 10")
           source))
         (should
          (string-match-p
