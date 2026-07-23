@@ -79,50 +79,57 @@
   are sanitized, and every exposed fallback value is fresh. Audit repair
   `72b44aa` rejects malformed cap types on every path, and `2ec574f` documents
   the enabled, disabled, and invalid cases explicitly.
-- Package lint compatibility is committed as `de735e3`. The latest exact file
-  suite passed 68/68 before the added race case, which then passed focused;
-  the latest core run passed all 51 functional cases except the inherited
-  two-second offload checkpoint under scheduler starvation, and that exact
-  checkpoint passed immediately in isolation.
-- The inherited stdio race was fixed in signed commit `49246b0`. Runner
-  publication now uses an atomic bounded heartbeat and explicit ACK custody,
-  with no arbitrary acknowledgement deadline or pre-publication PID signal.
-  Full Bash 3.2 readiness and postdispatch suites pass; targeted custody,
-  saturation, delayed-ACK, publication, and cleanup-backlog regressions pass
-  on Bash 3.2 and Bash 5.3. A final full Bash 5.3 run was scheduler-starved
-  before its shell-only probe received CPU and left no child behind; no
-  deadline was weakened or retry added.
-- Nix Task 5 closes the five independent audit findings: enum inputs are
-  type-checked, the real clean-wrapper through real-Emacs capability chain is
-  proven, duplicate boundary calls emit one transition, all eleven telemetry
-  ERTs are gated, and capability keys are absent from every descendant class.
-  A second audit added a scalar-params telemetry guard and exact-runtime
-  activity-socket preflight. The realized focused supervisor set passes 5/5,
-  and a generated-init unit probe accepts object alists while rejecting scalar,
-  vector, improper, and dotted inputs without changing request results.
+- The broad package-lint compatibility commit was removed from this stacked
+  branch to keep the resilience PR scoped. Fresh parent/child package-lint
+  diagnostics normalize to the same 439 lines and SHA-256; upstream issue #57
+  tracks that inherited repair separately.
+- The gate-discovered stdio custody and readiness repairs are committed through
+  `56fe0d1`. Runner publication uses an atomic bounded heartbeat and explicit
+  ACK custody; readiness cleanup shares caller deadlines, validates ownership,
+  and requires two bounded quiet observations. The standalone Bash 3.2 and
+  Bash 5.3 suites, delayed-`ps` oracle, timeout-budget audit, and independent
+  final readiness audit all pass without weakening a production deadline.
+- Emacs 28 file identity fallback is committed as `b8159c0`; authenticated
+  inline overflow handling is committed as `a2e3ec3`; and deadline-safe stdio
+  cleanup is committed as `56fe0d1`. The inline boundary rejects malformed and
+  spoofed conditions while preserving exact genuine 80/34 and 84/34 counts.
+- Nix Task 5 now closes every independent audit finding: enum inputs and
+  coherent optional deadline pairs are checked, the real clean-wrapper through
+  real-Emacs capability chain is proven, duplicate boundary calls emit one
+  transition, all eleven telemetry ERTs are gated, and capability keys are
+  absent from every descendant class. The focused watchdog set passes 33/33;
+  the supervisor capability set passes 5/5, including write-only descriptor
+  mode and fresh deterministic run IDs. An independent final review reports no
+  correctness or scope blocker; definitive evidence still waits on the new
+  upstream source pin.
 
 ## Current state
 
 - The isolated upstream branch is `fix/anvil-root-resilience`; its signed
-  implementation tip is `2a4ebbf`, followed by signed handoff-only commits,
-  above the pushed PR #55 planning head `41a0145`. It has not been pushed or
-  opened as a PR yet.
-- All implementation code paths and this handoff are committed. Generated
-  Python bytecode was removed. Dedicated Anvil reported no modified file
-  buffers before both final code commits.
-- The independent whole-branch review found only the immediate-overflow and
-  malformed-limit issues above. Both repairs and their follow-up review
-  findings are closed. The one planned rebase onto the fetched, unchanged
-  `fix/issue-53-interrupted-hangs` parent remains before the clean upstream gate
-  and definitive push.
+  implementation tip is `56fe0d1`, followed by this handoff-only commit, above
+  the pushed PR #55 planning head `41a0145`. All 20 implementation commits have
+  good signatures, the merge base is exactly `41a0145`, and the 14-path diff is
+  scoped to Tasks 1-3 plus the required stdio custody/readiness prerequisite.
+  The branch has not been pushed or opened as a PR yet.
+- An additional nox CI-shaped ERT run passed all 2,715 tests with exit status
+  zero, including both Bash variants of the postdispatch and readiness suites.
+  The 52-test smoke suite, warning-fatal five-file core compilation, release
+  audit, Eask full compilation, Ruff, Python source compilation, shell syntax,
+  and diff hygiene also pass. Eask reports inherited warnings, and literal
+  `make lint` remains inherited-red only at package-lint; issue #57 and the
+  byte-identical parent/child diagnostic proof are the scoped exception.
+- The frozen plan's packaged Emacs runtime gates remain the final pre-push
+  step. Generated bytecode is absent. Dedicated Anvil reported no modified
+  file buffers before Nix edit batches; its root session stayed responsive even
+  while every worker lane was dead, reproducing the production failure mode.
 - The Nix implementation worktree is `fix/anvil-root-resilience` from
   `facb6353740253d76e15d300c65b136f06a675b9`. Task 5 changes are deliberately
   uncommitted until the definitive upstream pin lands.
-- The current realized Nix Anvil pin is `01eecf6`. Its focused package build
-  passes clean-env 13/13 and watchdog 33/33, then expectedly stops at telemetry
-  7/10 because that revision predates the three Task 3 result boundaries.
-  The prior ten-test generated fixture is 10/10 against local upstream HEAD;
-  the new scalar-params case will join the authoritative run after pinning.
+- The current realized Nix Anvil pin is still `01eecf6`. The Task 5 source
+  delta is deliberately uncommitted until the definitive upstream revision is
+  pushed and pinned in a separate source-only commit. Its fresh local generated
+  fixtures pass watchdog 33/33 and supervisor capability 5/5; the package and
+  full-system gates must be rerun after pinning.
 - `/Users/johnw/src/nix` remains synchronized with `origin/main` at `facb635`;
   its untracked fractal design document is unrelated user work and must remain
   untouched.
@@ -147,9 +154,10 @@
 1. Re-read the Wiggum skill, frozen design, plan, and this handoff.
 2. Verify live Anvil, Nix, and ai-nix state; live artifacts override this
    snapshot.
-3. Commit this handoff, rebase exactly once onto the already-fetched PR #55
-   head, and rerun the clean upstream test, lint, byte-compile, and `test-all`
-   gates.
+3. Commit this handoff, perform the required no-op rebase/pull against the
+   already-fetched PR #55 head, resolve the exact packaged Emacs runtime, and
+   run the frozen readiness, postdispatch, smoke, full, release, compile, and
+   no-delta lint gates without any later history mutation.
 4. Push `fix/anvil-root-resilience` to the fork without opening the PR. Pin that
    exact revision, archive hash, committer date, and package header version in
    the Nix worktree as the first Nix commit.
