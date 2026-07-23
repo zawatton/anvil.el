@@ -383,6 +383,20 @@ BINDINGS is a `let' binding list for delta-cache defcustoms."
   (should (= 65536 anvil-file--stream-chunk-bytes))
   (should (= 16 anvil-file--stream-yield-chunks))
   (should (= 0.001 anvil-file--stream-yield-seconds))
+  (let ((path (make-temp-file "anvil-file-identity-")))
+    (unwind-protect
+        (let* ((attributes (file-attributes path 'integer))
+               (fallback
+                (list (file-attribute-inode-number attributes)
+                      (file-attribute-device-number attributes))))
+          (should (equal fallback
+                         (anvil-file--attribute-identity attributes)))
+          (cl-letf (((symbol-function
+                      'file-attribute-file-identifier)
+                     nil))
+            (should (equal fallback
+                           (anvil-file--attribute-identity attributes)))))
+      (delete-file path)))
   ;; Exact-cap and small UTF-8 bodies survive; cap-plus-one does not.
   (dolist (body '("0123456789abcdef" "hé🙂\n"))
     (anvil-file-test--with-tmp

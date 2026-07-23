@@ -144,12 +144,19 @@ When POSITIVE is non-nil, reject zero as well as malformed values."
    (t
     (error "anvil-file-max-inline-read-bytes must be nil or an integer"))))
 
+(defun anvil-file--attribute-identity (attributes)
+  "Return a stable file identity from ATTRIBUTES on Emacs 28 and later."
+  (if (fboundp 'file-attribute-file-identifier)
+      (file-attribute-file-identifier attributes)
+    (list (file-attribute-inode-number attributes)
+          (file-attribute-device-number attributes))))
+
 (defun anvil-file--file-generation (target)
   "Return TARGET's regular-file identity, size, and modification generation."
   (let ((attributes (file-attributes target 'integer)))
     (when (and attributes
                (null (file-attribute-type attributes)))
-      (list :identity (file-attribute-file-identifier attributes)
+      (list :identity (anvil-file--attribute-identity attributes)
             :size (file-attribute-size attributes)
             :mtime (file-attribute-modification-time attributes)))))
 
