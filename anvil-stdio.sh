@@ -408,8 +408,10 @@ anvil_mcp_run_bounded() {
 	local runner status="" runner_ready=""
 	local runner_ack="" ack_error=0 ack_attempted=0 ack_sent=0
 	local runner_owned=0
+	local control_deadline=$ANVIL_MCP_RUNNER_CONTROL_TIMEOUT
 	local started_seconds=$SECONDS elapsed remaining
 	shift 5
+	[ "$control_deadline" -le "$deadline" ] || control_deadline=$deadline
 	case "$operation" in
 	emacsclient|probe-delay|dispatch|frame-line|frame-body|request-metadata|prepare-response|validate-response-fd|stage-request|cleanup-staged)
 		;;
@@ -426,7 +428,7 @@ anvil_mcp_run_bounded() {
 		"$$" "$deadline" "$stderr_mode" "$input_mode" "$input" "$@")
 	runner=$!
 	anvil_mcp_finish_bounded_termination "$runner" 0
-	if ! IFS= read -r -t "$deadline" runner_ready <&7 \
+	if ! IFS= read -r -t "$control_deadline" runner_ready <&7 \
 		|| [ "$runner_ready" != "ANVIL-MCP-RUNNER-READY" ]; then
 		mcp_debug_log "RUNNER-TIMEOUT" \
 			"phase=ready operation=$operation"
@@ -462,7 +464,7 @@ anvil_mcp_run_bounded() {
 	# one second for the unknown fractional remainder instead of timing out
 	# immediately after a wall-second boundary.
 	elapsed=$((SECONDS - started_seconds))
-	remaining=$((deadline - elapsed))
+	remaining=$((control_deadline - elapsed))
 	[ "$elapsed" -eq 0 ] || remaining=$((remaining + 1))
 	if [ "$remaining" -le 0 ]; then
 		ack_error=124
@@ -491,7 +493,7 @@ anvil_mcp_run_bounded() {
 			anvil_mcp_finish_bounded_termination \
 				"$runner" 1 "$runner_owned"
 			elapsed=$((SECONDS - started_seconds))
-			remaining=$((deadline - elapsed))
+			remaining=$((control_deadline - elapsed))
 			[ "$elapsed" -eq 0 ] || remaining=$((remaining + 1))
 			runner_ack=
 			if [ "$remaining" -le 0 ] \
@@ -710,6 +712,7 @@ ANVIL_EMACSCLIENT_DISPATCH_TIMEOUT=${ANVIL_EMACSCLIENT_DISPATCH_TIMEOUT:-150}
 ANVIL_EMACSCLIENT_KILL_AFTER_TIMEOUT=${ANVIL_EMACSCLIENT_KILL_AFTER_TIMEOUT:-1}
 ANVIL_MCP_REQUEST_PARSE_TIMEOUT=${ANVIL_MCP_REQUEST_PARSE_TIMEOUT:-10}
 ANVIL_MCP_FRAME_READ_TIMEOUT=${ANVIL_MCP_FRAME_READ_TIMEOUT:-10}
+ANVIL_MCP_RUNNER_CONTROL_TIMEOUT=${ANVIL_MCP_RUNNER_CONTROL_TIMEOUT:-5}
 readonly ANVIL_MCP_MAX_REQUEST_BYTES=16777216
 # Tool results are staged on disk before they cross emacsclient.  This limit is
 # large enough for the worst-case JSON escaping of the 4 MiB shell tee while
@@ -784,6 +787,8 @@ anvil_mcp_validate_timeout ANVIL_MCP_REQUEST_PARSE_TIMEOUT \
 	"$ANVIL_MCP_REQUEST_PARSE_TIMEOUT" 10
 anvil_mcp_validate_timeout ANVIL_MCP_FRAME_READ_TIMEOUT \
 	"$ANVIL_MCP_FRAME_READ_TIMEOUT" 10
+anvil_mcp_validate_timeout ANVIL_MCP_RUNNER_CONTROL_TIMEOUT \
+	"$ANVIL_MCP_RUNNER_CONTROL_TIMEOUT" 5
 
 ANVIL_MCP_PYTHON=$(type -P python3 || :)
 ANVIL_MCP_EMACSCLIENT=$(type -P emacsclient || :)

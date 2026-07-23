@@ -25,6 +25,29 @@
   (file-name-directory (or load-file-name buffer-file-name))
   "Directory containing the stdio post-dispatch regression helper.")
 
+(ert-deftest anvil-stdio-runner-control-budget-is-bounded ()
+  "READY and ACK control must not inherit a long operation deadline."
+  (let* ((root
+          (file-name-directory
+           (directory-file-name anvil-stdio-postdispatch-test--directory)))
+         (source
+          (with-temp-buffer
+            (insert-file-contents (expand-file-name "anvil-stdio.sh" root))
+            (buffer-string))))
+    (should
+     (string-match-p
+      (regexp-quote
+       "ANVIL_MCP_RUNNER_CONTROL_TIMEOUT=${ANVIL_MCP_RUNNER_CONTROL_TIMEOUT:-5}")
+      source))
+    (should
+     (string-match-p
+      (regexp-quote "\"$ANVIL_MCP_RUNNER_CONTROL_TIMEOUT\" 5")
+      source))
+    (should
+     (string-match-p
+      (regexp-quote "control_deadline=$ANVIL_MCP_RUNNER_CONTROL_TIMEOUT")
+      source))))
+
 (ert-deftest anvil-stdio-postdispatch-response-path-is-process-free ()
   "A completed dispatch must not depend on another executable starting."
   (let* ((root
@@ -110,6 +133,20 @@
          (string-match-p
           (regexp-quote
            "ANVIL_MCP_REQUEST_PARSE_TIMEOUT=${ANVIL_MCP_REQUEST_PARSE_TIMEOUT:-10}")
+          source))
+        (should
+         (string-match-p
+          (regexp-quote
+           "ANVIL_MCP_RUNNER_CONTROL_TIMEOUT=${ANVIL_MCP_RUNNER_CONTROL_TIMEOUT:-5}")
+          source))
+        (should
+         (string-match-p
+          (regexp-quote "\"$ANVIL_MCP_RUNNER_CONTROL_TIMEOUT\" 5")
+          source))
+        (should
+         (string-match-p
+          (regexp-quote
+           "control_deadline=$ANVIL_MCP_RUNNER_CONTROL_TIMEOUT")
           source))
         (should
          (string-match-p
