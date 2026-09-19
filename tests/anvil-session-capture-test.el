@@ -74,6 +74,39 @@
     (should (eq (plist-get status :category) 'tool-use))
     (should (= (plist-get status :priority) 3))))
 
+(ert-deftest anvil-session-capture-test-mentioning-git-is-not-running-git ()
+  "A command that merely contains a git invocation is not a git op.
+
+Found on live data the day the hook was wired: an `echo' of a JSON
+payload whose text included \"git commit -m wired\" was recorded as
+a P1 git row. The old matcher scanned the whole command string, so
+anything quoting a git command — an echo, a grep, a heredoc — was
+filed as one. P1 survives the snapshot budget, so a false positive
+there displaces a real commit."
+  (dolist (cmd '("echo '{\"command\":\"git commit -m wired\"}' | ./hook"
+                 "grep -rn 'git push' scripts/"
+                 "cat <<EOF\ngit rebase -i main\nEOF"))
+    (let ((ev (anvil-session-capture-classify
+               (anvil-session-capture-test--payload
+                "tool_name" "Bash" "tool_input" `(("command" . ,cmd))))))
+      (should (eq (plist-get ev :category) 'tool-use))))
+  ;; ...while a real invocation in any segment still counts, including
+  ;; the pre-subcommand flag forms. `--no-pager' is the case that broke
+  ;; the first fix: a rule of "a flag may take the next token" swallowed
+  ;; the subcommand, so the value-taking flags are enumerated instead.
+  (dolist (cmd '("git commit -m x"
+                 "  cd /repo && git push origin main"
+                 "GIT_AUTHOR_NAME=x git commit -m y"
+                 "/usr/bin/git -C /repo checkout develop"
+                 "git -c user.name=x commit -m z"
+                 "git --no-pager merge develop"
+                 "sudo git reset --hard"))
+    (let ((ev (anvil-session-capture-classify
+               (anvil-session-capture-test--payload
+                "tool_name" "Bash" "tool_input" `(("command" . ,cmd))))))
+      (should (eq (plist-get ev :category) 'git))
+      (should (= (plist-get ev :priority) 1)))))
+
 (ert-deftest anvil-session-capture-test-git-word-must-be-the-command ()
   "`git' must be a whole word followed by a real subcommand.
 

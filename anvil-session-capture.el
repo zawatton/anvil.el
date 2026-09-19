@@ -100,12 +100,69 @@ Read-only git (`status', `log', `diff') is left out on purpose: it
 is the most frequent command in a session and carries no state
 change, so indexing it would bury the commits under noise.")
 
+(defun anvil-session-capture--segments (command)
+  "Split COMMAND into the individual commands a shell would run.
+
+Splitting on `;', `&&', `||', `|' and newlines is deliberately
+approximate — it does not parse quoting — but it is enough to tell
+\"this segment invokes git\" from \"this segment mentions git\".
+
+Everything from the first heredoc operator onward is dropped: its
+body is data, and the lines inside it look exactly like commands
+once you split on newlines.  Erring toward \"not a command\" is the
+right direction here, because the categories this feeds are P1."
+  (let ((head (if (string-match "<<" command)
+                  (substring command 0 (match-beginning 0))
+                command)))
+    (split-string head "\\(?:&&\\|||\\||\\|;\\|\n\\)" t)))
+
 (defun anvil-session-capture--git-subcommand (command)
-  "Return the state-changing git subcommand in COMMAND, or nil."
-  (when (and (stringp command)
-             (string-match "\\_<git\\_>[ \t]+\\([a-z-]+\\)" command))
-    (let ((sub (match-string 1 command)))
-      (car (member sub anvil-session-capture--git-subcommands)))))
+  "Return the state-changing git subcommand COMMAND runs, or nil.
+
+Only a segment that *starts* with git counts.  Scanning the whole
+string for `git <word>' anywhere files every command that merely
+mentions one as a git operation: an echo of a JSON payload
+containing \"git commit\", a grep for a git invocation, a heredoc
+quoting one.  Observed on live data the day this shipped — an
+`echo ... | anvil-capture-hook' round-trip was recorded as a P1
+git row.  P1 is the tier that survives the snapshot budget, so a
+false positive there costs a real commit its place."
+  (when (stringp command)
+    (catch 'hit
+      (dolist (seg (anvil-session-capture--segments command))
+        (let ((sub (anvil-session-capture--segment-git-subcommand seg)))
+          (when (member sub anvil-session-capture--git-subcommands)
+            (throw 'hit sub))))
+      nil)))
+
+(defconst anvil-session-capture--git-flags-with-value
+  '("-C" "-c" "--git-dir" "--work-tree" "--namespace" "--exec-path")
+  "Pre-subcommand git flags that consume the token after them.
+
+Enumerated rather than guessed: a rule like \"a flag may take the
+next token\" is ambiguous, and it swallows the subcommand itself in
+`git --no-pager merge develop'.")
+
+(defun anvil-session-capture--segment-git-subcommand (seg)
+  "Return the git subcommand SEG invokes, or nil if it does not run git."
+  (let ((tokens (split-string (string-trim seg) "[ \t]+" t)))
+    ;; Skip `sudo' and any VAR=value prefixes; they leave git as the
+    ;; command actually being run.
+    (while (and tokens
+                (or (equal (car tokens) "sudo")
+                    (string-match-p "\\`[A-Za-z_][A-Za-z0-9_]*=" (car tokens))))
+      (setq tokens (cdr tokens)))
+    (when (and tokens
+               (equal (file-name-nondirectory (car tokens)) "git"))
+      (setq tokens (cdr tokens))
+      ;; Walk past pre-subcommand flags to the first bare word.
+      (while (and tokens (string-prefix-p "-" (car tokens)))
+        (let ((flag (car tokens)))
+          (setq tokens (cdr tokens))
+          (when (and tokens (member flag
+                                    anvil-session-capture--git-flags-with-value))
+            (setq tokens (cdr tokens)))))
+      (car tokens))))
 
 (defun anvil-session-capture--response-error (response)
   "Return an error string from RESPONSE, or nil when it looks fine."
