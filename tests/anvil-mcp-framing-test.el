@@ -254,6 +254,19 @@
                        (string-match-p "tools array is empty" line))
                      warnings)))
       (delete-file cache-file))))
+;;;; --- Response encoding ------------------------------------------------
+
+(ert-deftest anvil-mcp-framing-test-line-response-forces-utf8 ()
+  "Legacy line-mode responses bind stdout encoding to UTF-8."
+  (let (written observed-coding-system)
+    (cl-letf (((symbol-function 'anvil-server--batch-write-stdout)
+               (lambda (string)
+                 (setq written string
+                       observed-coding-system coding-system-for-write))))
+      (let ((coding-system-for-write 'cp932))
+        (anvil-server--batch-emit-response "{\"text\":\"→\"}" nil)))
+    (should (eq observed-coding-system 'utf-8))
+    (should (equal written "{\"text\":\"→\"}\n"))))
 
 ;;;; --- Sanity: define-error symbol present -----------------------------
 

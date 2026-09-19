@@ -396,6 +396,7 @@ empty), so the cache round-trips purely through string ops + `load'
           (make-directory dir t))
         (write-region
          (concat
+          ";;; -*- lexical-binding: t; no-byte-compile: t -*-\n"
           "(setq anvil-server--schema-cache-file-data '"
           (anvil-server--prin1-to-string
            (list :version anvil-server--schema-cache-version
@@ -762,7 +763,7 @@ symbol properties) keep the original handler as the source of truth for
 schema extraction and argument binding while transport encoding happens
 after execution."
   (let* ((raw-handler
-          (if-let ((wrapped (and (symbolp handler)
+          (if-let* ((wrapped (and (symbolp handler)
                                  (get handler 'anvil-server-raw-handler))))
               wrapped
             handler))
@@ -2467,7 +2468,7 @@ Supports RFC 6570 simple variables {var} and reserved expansion {+var}."
         (len (length template)))
     ;; Process template character by character
     (while (< pos len)
-      (if-let ((var-start (string-match "{" template pos)))
+      (if-let* ((var-start (string-match "{" template pos)))
         ;; Found variable start
         (progn
           ;; Add literal segment before variable if any

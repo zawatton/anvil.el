@@ -33,9 +33,27 @@
 diagnostic trace lines via `nelisp--write-stderr-line'.  Default
 nil for production (silent).")
 
+;; NeLisp v1.2.0: restore anvil's documented standalone marker (see
+;; shell-loop.el for the rationale).
+(when (and (fboundp 'read-stdin-bytes) (not (featurep 'nelisp)))
+  (provide 'nelisp))
+
 (defun anvil-runtime-server--env (name default)
   (let ((val (and (fboundp 'getenv) (getenv name))))
     (if (and val (> (length val) 0)) val default)))
+
+(defvar anvil-mcp--server-id "emacs-eval"
+  "Server id the connection filter dispatches to.
+
+A GLOBAL, deliberately.  Every `defun' below is written inside one big
+`let*', so each is a closure over that `let*''s bindings -- and on the
+NeLisp v1.2.x reader a closure invoked from the process pump does not
+reliably see or write those captured bindings: measured 2026-09-04, a
+`:filter' closure recording through a captured variable lost every
+write, and mutating a captured cons took the process down, while the
+same filter recording into a global hash table worked.  That is why the
+daemon accepted connections and answered nothing.  Anything the filter
+or sentinel needs at dispatch time is therefore read from a global.")
 
 (defvar anvil-runtime-server--primitive-load nil
   "Standalone `load' function saved before stdlib-misc replaces it.")
@@ -46,11 +64,28 @@ nil for production (silent).")
 (defvar anvil-runtime-server--skip-load-files nil
   "Absolute source files intentionally skipped by the runtime loader.")
 
+(defun anvil-runtime-server--absolute-file-name-p (file)
+  "Return non-nil when FILE is an absolute name on this platform.
+`file-name-absolute-p' is missing from some standalone images, and a
+leading-slash test alone rejects the Windows reader's own paths: the
+launcher hands the bootstrap `C:/...' names, so every absolute load fell
+through to `locate-library' and failed (measured 2026-09-04, the daemon
+died on emacs-init.el)."
+  (and (stringp file)
+       (> (length file) 0)
+       (if (fboundp 'file-name-absolute-p)
+           (file-name-absolute-p file)
+         (or (eq (aref file 0) ?/)
+             (eq (aref file 0) 92)
+             (and (> (length file) 2)
+                  (eq (aref file 1) ?:)
+                  (or (eq (aref file 2) ?/) (eq (aref file 2) 92)))))))
+
 (defun anvil-runtime-server--compat-load
     (file &optional noerror nomessage _nosuffix _must-suffix)
   "Load FILE with Emacs load context and the standalone native reader."
   (let ((resolved
-         (if (and (> (length file) 0) (eq (aref file 0) ?/))
+         (if (anvil-runtime-server--absolute-file-name-p file)
              (cond
               ((file-exists-p file) file)
               ((file-exists-p (concat file ".el")) (concat file ".el"))
@@ -111,6 +146,8 @@ nil for production (silent).")
                     "nelisp/lisp")))
        (server-id
         (anvil-runtime-server--env "ANVIL_SERVER_ID" "emacs-eval"))
+       ;; Publish it before any filter/sentinel closure can be called.
+       (_srvid (setq anvil-mcp--server-id server-id))
        (socket-path
         ;; The launcher (`bin/anvil-runtime server PATH') writes a
         ;; bootstrap.el that `setq's `anvil-runtime-bootstrap-socket-path'
@@ -121,6 +158,39 @@ nil for production (silent).")
             (anvil-runtime-server--env
              "ANVIL_RUNTIME_SOCKET"
              "/tmp/anvil-runtime.sock")))
+       ;; State dir (bin/anvil-runtime creates it); same role as in
+       ;; shell-loop.el: temporary files and anvil-server's schema cache.
+       (state-dir
+        (or (and (boundp 'anvil-runtime-bootstrap-state-dir)
+                 anvil-runtime-bootstrap-state-dir)
+            (anvil-runtime-server--env "ANVIL_RUNTIME_DAEMON_DIR"
+                                       "/tmp/anvil-runtime")))
+       ;; NeLisp v1.2.0 (2026-09-04): the daemon listens on TCP loopback
+       ;; through nelisp's own process adapter (`packages/nelisp-process-
+       ;; adapter', Doc 194: `make-network-process :server t' over the
+       ;; native `nelisp-socket-*' family, Linux and Windows alike).  The
+       ;; K1 UNIX-socket stack (emacs-network-ffi / -process-events /
+       ;; -eventloop) spoke the Rust-era `nl-ffi-call LIB FUNC SIG' contract
+       ;; and cannot open a socket on this reader ("socket() failed:
+       ;; errno=0", measured on WSL).  `bin/anvil-runtime server PORT'
+       ;; sets `anvil-runtime-bootstrap-port'; a non-numeric argument keeps
+       ;; the legacy socket-path + K1 path for readers that still have it.
+       (port
+        (or (and (boundp 'anvil-runtime-bootstrap-port)
+                 anvil-runtime-bootstrap-port)
+            (let ((env (anvil-runtime-server--env "ANVIL_RUNTIME_PORT" nil)))
+              (and env (string-to-number env)))))
+       (nelisp-home-dir
+        (let ((lisp (and (boundp 'anvil-runtime-bootstrap-nelisp-lisp-dir)
+                         anvil-runtime-bootstrap-nelisp-lisp-dir)))
+          (and (stringp lisp) (> (length lisp) 0)
+               (directory-file-name (file-name-directory (directory-file-name lisp))))))
+       (adapter-core-el (and nelisp-home-dir
+                             (concat nelisp-home-dir
+                                     "/packages/nelisp-eventloop/src/nelisp-async-core.el")))
+       (adapter-el (and nelisp-home-dir
+                        (concat nelisp-home-dir
+                                "/packages/nelisp-process-adapter/src/nelisp-process-adapter.el")))
        (init-el (concat nelisp-emacs-dir "/src/emacs-init.el"))
        (stub-el (concat nelisp-emacs-dir "/src/emacs-stub.el"))
        (network-ffi-el (concat nelisp-emacs-dir "/src/emacs-network-ffi.el"))
@@ -130,6 +200,14 @@ nil for production (silent).")
        (metrics-el (concat anvil-el-dir "/anvil-server-metrics.el"))
        (server-el (concat anvil-el-dir "/anvil-server.el"))
        (server-commands-el (concat anvil-el-dir "/anvil-server-commands.el"))
+       ;; Resolved HERE, in the binding list, so it is read while `getenv' is
+       ;; still the reader's own.  Read after `(load init-el)' it came back
+       ;; nil and the daemon silently served the three-module default even
+       ;; when ANVIL_TOOL_MODULES asked for six (measured 2026-09-04).
+       ;; shell-loop.el resolves its copy pre-init for the same reason.
+       (modules-env (anvil-runtime-server--env
+                     "ANVIL_TOOL_MODULES"
+                     "anvil-discovery,anvil-sqlite,anvil-bench"))
        (stdlib-misc (concat nelisp-lisp-dir "/nelisp-stdlib-misc.el"))
        (bootstrap-skip-features '(nelisp-coding-jis-tables calendar)))
 
@@ -146,32 +224,95 @@ nil for production (silent).")
   ;; UTF-8 only and never exercises JIS codec paths, so the tables are
   ;; deadweight for the server-loop.  Remove once the nelisp regression
   ;; is fixed upstream.
-  (dolist (feature bootstrap-skip-features)
-    (provide feature))
+  (provide 'nelisp-coding-jis-tables)
+  ;; Same headless pre-provides as shell-loop.el (NeLisp v1.2.0): the
+  ;; vendor libs the polyfills would otherwise walk, and the editor / UI
+  ;; substrate a socket MCP server never opens.
+  (dolist (lib '(subr-x seq cl-extra cl-seq benchmark profiler))
+    (provide lib))
+  (dolist (f '(emacs-syntax-table emacs-elisp-mode emacs-mode emacs-mode-builtins
+               emacs-font-lock-builtins emacs-faces-builtins emacs-textmodes-stub
+               emacs-redisplay-builtins emacs-tui-event emacs-tui-backend
+               emacs-frame-builtins emacs-window-builtins emacs-keymap-builtins
+               emacs-command-loop-builtins
+               emacs-frame emacs-window keymap emacs-faces emacs-font-lock))
+    (provide f))
   (setq load-prefer-newer t)
+  (unless (boundp 'temporary-file-directory)
+    (defvar temporary-file-directory (concat state-dir "/tmp/")))
+  ;; The v1.2.0 reader's `load' never binds `load-file-name', so
+  ;; emacs-init.el cannot put its own src/ on load-path; do it here.
+  (let ((src-dir (concat nelisp-emacs-dir "/src")))
+    (unless (and (boundp 'load-path) (member src-dir load-path))
+      (setq load-path (cons src-dir (and (boundp 'load-path) load-path)))))
   ;; Load before emacs-init for the measured `load-file-name' behavior.
   ;; See shell-loop.el for the 2026-08-28 JSON timing and call-count data.
-  (setq anvil-runtime-server--primitive-load (symbol-function 'load))
-  (setq anvil-runtime-server--primitive-hash-functions
-        (mapcar (lambda (name) (cons name (symbol-function name)))
-                '(maphash hash-table-keys hash-table-values hash-table-count)))
-  (load stdlib-misc nil t)
-  ;; Retain the working native hash traversal functions; see shell-loop.el
-  ;; for the measured missing-`nelisp--hash-pairs' failure.
-  (let ((saved anvil-runtime-server--primitive-hash-functions))
-    (while saved
-      (fset (car (car saved)) (cdr (car saved)))
-      (setq saved (cdr saved))))
-  ;; Install the same 2026-08-29 measured native-reader compatibility
-  ;; layer and exact vendor-calendar skip documented in shell-loop.el.
-  (setq anvil-runtime-server--skip-load-files
-        (list (concat nelisp-emacs-dir
-                      "/vendor/emacs-lisp/calendar/calendar.el")))
-  (fset 'load #'anvil-runtime-server--compat-load)
+  ;; The stdlib-misc chain below is OPT-IN, default off.
+  ;;
+  ;; It was written for the pre-v1.2 runtime, where `load' left
+  ;; `load-file-name' nil and stdlib-misc supplied the coding-system and
+  ;; hash-traversal fixes.  NeLisp v1.2.1's prelude carries those fixes
+  ;; itself, and loading stdlib-misc on top of it is not free: measured
+  ;; 2026-09-04 on the windows-x86_64 reader, `(load init-el)' never
+  ;; returned -- a 600 s stdio run stalled after `[STEP] pre-init' with
+  ;; no output, where the same tree without this chain answered
+  ;; `tools/list' normally.  Set ANVIL_RUNTIME_STDLIB_MISC=1 to restore
+  ;; it for a runtime that still needs it.
+  (when (and (boundp 'anvil-runtime-bootstrap-stdlib-misc)
+             anvil-runtime-bootstrap-stdlib-misc
+             (file-exists-p stdlib-misc))
+    (setq anvil-runtime-server--primitive-load (symbol-function 'load))
+    (setq anvil-runtime-server--primitive-hash-functions
+          (mapcar (lambda (name) (cons name (symbol-function name)))
+                  '(maphash hash-table-keys hash-table-values hash-table-count)))
+    (load stdlib-misc nil t)
+    ;; Retain the working native hash traversal functions; see shell-loop.el
+    ;; for the measured missing-`nelisp--hash-pairs' failure.
+    (let ((saved anvil-runtime-server--primitive-hash-functions))
+      (while saved
+        (fset (car (car saved)) (cdr (car saved)))
+        (setq saved (cdr saved))))
+    ;; Install the same 2026-08-29 measured native-reader compatibility
+    ;; layer and exact vendor-calendar skip documented in shell-loop.el.
+    (setq anvil-runtime-server--skip-load-files
+          (list (concat nelisp-emacs-dir
+                        "/vendor/emacs-lisp/calendar/calendar.el")))
+    (fset 'load #'anvil-runtime-server--compat-load)
+    )
   (dolist (feature bootstrap-skip-features)
     (provide feature))
+
   (load init-el nil t)
   (load stub-el nil t)
+
+  ;; --- alist-get override (= Doc 98 §98.2 workaround), probe-gated ---
+  ;; The old code loaded the whole nelisp-stdlib-misc.el for this, which
+  ;; shell-loop.el measured as a ~300x json-read slowdown; inline the one
+  ;; defun instead, and only when the running `alist-get' is wrong (the
+  ;; v1.2.0 prelude's is correct).
+  (unless (and (fboundp 'alist-get)
+               (condition-case nil
+                   (and (equal (alist-get 'b '((a . 1) (b . 2))) 2)
+                        (eq (alist-get 'z '((a . 1)) 'dflt) 'dflt)
+                        (equal (alist-get "k" '(("k" . 3)) nil nil #'equal) 3))
+                 (error nil)))
+    (defun alist-get (key alist &optional default _remove testfn)
+      (let ((cur alist) (found nil) (result default))
+        (while (and cur (not found))
+          (let ((pair (car cur)))
+            (cond
+             ((not (consp pair)) (setq cur (cdr cur)))
+             ((cond
+               ((null testfn) (equal (car pair) key))
+               ((eq testfn 'eq) (eq (car pair) key))
+               ((eq testfn 'equal) (equal (car pair) key))
+               ((or (eq testfn 'string=) (eq testfn 'string-equal))
+                (and (stringp (car pair)) (stringp key) (equal (car pair) key)))
+               (t (funcall testfn (car pair) key)))
+              (setq result (cdr pair))
+              (setq found t))
+             (t (setq cur (cdr cur))))))
+        result)))
 
   ;; Put `anvil-el-dir' on `load-path' so any `(require 'anvil-orchestrator-routing)'
   ;; / `(require 'anvil-orchestrator-presets)' / etc. inside the
@@ -182,12 +323,67 @@ nil for production (silent).")
 
   (load metrics-el nil t)
   (load server-el nil t)
+  (when (boundp 'anvil-server-schema-cache-file)
+    (setq anvil-server-schema-cache-file
+          (concat state-dir "/anvil-schema-cache.el")))
   (load server-commands-el nil t)
+  ;; User config, as in shell-loop.el (machine-specific DB pins).
+  (condition-case err
+      (require 'anvil-config nil t)
+    (error
+     (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+       (nelisp--write-stderr-line
+        (concat "[server-loop] anvil-config load ERR: " (format "%S" err))))))
 
   ;; --- network stack ---
-  (load network-ffi-el nil t)
-  (load process-events-el nil t)
-  (load eventloop-el nil t)
+  ;; TCP (v1.2.0): nelisp's process adapter.  Legacy (no port, or no
+  ;; adapter on disk): the K1 UNIX-socket stack.
+  (defvar anvil-runtime-server--tcp-p
+    (and (integerp port) adapter-el (file-exists-p adapter-el))
+    "Non-nil when the daemon listens on TCP through nelisp's adapter.")
+  (if anvil-runtime-server--tcp-p
+      (progn
+        (load adapter-core-el nil t)
+        (load adapter-el nil t)
+        (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+          (nelisp--write-stderr-line
+           (format "[server-loop] network stack: nelisp-process-adapter (TCP 127.0.0.1:%d)" port))))
+    (load network-ffi-el nil t)
+    (load process-events-el nil t)
+    (load eventloop-el nil t))
+
+  (defun anvil-mcp--conn-fd (proc)
+    "Return the connection key (fd) for PROC on either network stack.
+The adapter's process is a vector `[network-process NAME STATUS FD ...]'
+and is recognised first: Layer 2's `process-id-fd' exists after
+emacs-init and signals `processp' on it (measured on both hosts; it
+killed the daemon right after bind)."
+    (cond
+     ((and (vectorp proc) (> (length proc) 3)
+           (eq (aref proc 0) 'network-process)
+           (integerp (aref proc 3)))
+      (aref proc 3))
+     ((fboundp 'process-id-fd)
+      (condition-case nil (process-id-fd proc) (error nil)))
+     (t nil)))
+
+  (defun anvil-mcp--decode (s)
+    "Return the wire bytes S as a decoded (multibyte) string for dispatch.
+The parser above slices by byte counts, so only the extracted body is
+decoded; see shell-loop.el's `anvil-runtime-shell--multibyte'."
+    (cond
+     ((not (stringp s)) s)
+     ;; Prefer anvil-server's validating decoder (it also covers host
+     ;; Emacs); fall back to the lenient path when it rejects the bytes,
+     ;; so one malformed frame cannot take the daemon down.
+     ((fboundp 'anvil-server--utf8-bytes-to-string)
+      (condition-case nil
+          (anvil-server--utf8-bytes-to-string s)
+        (error (if (fboundp 'string-as-multibyte)
+                   (funcall 'string-as-multibyte s)
+                 s))))
+     ((fboundp 'string-as-multibyte) (funcall 'string-as-multibyte s))
+     (t s)))
 
   ;; --- shared polyfills (cl-loop / to-json-value / register-tools etc) ---
   ;; (migrated from nelisp-emacs/scripts/ to anvil.el/scripts/ 2026-05-14)
@@ -295,17 +491,8 @@ helper instead of `frame-send' for those clients."
     (process-send-string proc "\n"))
 
   ;; --- tool-module load chain (same as shell-loop default) ---
-  (let* ((modules-env (anvil-runtime-server--env
-                       "ANVIL_TOOL_MODULES"
-                       ;; Default trimmed 2026-05-24 from 8 → 3 modules.
-                       ;; anvil-{state,memory,worklog,org-index,
-                       ;; orchestrator} all fail at *-enable with
-                       ;; "sqlite not available" under post-2026-05-17
-                       ;; nelisp standalone (no sqlite primitive yet),
-                       ;; burning 63 % of cold-load time before failing.
-                       ;; Set ANVIL_TOOL_MODULES explicitly to re-enable
-                       ;; any of them once nelisp ships sqlite.
-                       "anvil-discovery,anvil-sqlite,anvil-bench")))
+  (progn
+
     (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
       (nelisp--write-stderr-line
        (concat "[server-loop] ANVIL_TOOL_MODULES=" modules-env)))
@@ -440,6 +627,18 @@ LF-only line endings to match the separator dialects handled by
       (anvil-server-mcp-frame-send proc response))))
 
   (defun anvil-mcp-filter (proc chunk)
+    "Per-connection entry: `anvil-mcp--filter-1' behind a guard.
+A per-connection error (a bad frame, a handler that signals past
+anvil-server's own wrapper) must never unwind the event loop and take
+the whole daemon down with every other client."
+    (condition-case err
+        (anvil-mcp--filter-1 proc chunk)
+      (error
+       (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+         (nelisp--write-stderr-line
+          (format "[mcp-filter] fd=%S ERR %S" (anvil-mcp--conn-fd proc) err))))))
+
+  (defun anvil-mcp--filter-1 (proc chunk)
     "Per-connection MCP frame parser.  Accumulates CHUNK, extracts
 zero or more complete frames, dispatches each via
 `anvil-server-process-jsonrpc', and writes the response back via
@@ -452,7 +651,7 @@ Wire-format detection (= per-connection, latched on first chunk):
 The first non-empty buffer's leading byte picks the dialect:
 `{' -> `:mode ndjson', anything else -> `:mode framed'.
 Responses go back in the matching wire format."
-    (let* ((fd (process-id-fd proc))
+    (let* ((fd (anvil-mcp--conn-fd proc))
            (state (or (gethash fd anvil-mcp--state-by-fd)
                       (puthash fd
                                (list :buffer ""
@@ -502,7 +701,7 @@ Responses go back in the matching wire format."
                                (substring body 0 (min 120 (length body))))))
                     (let ((response
                            (condition-case err
-                               (anvil-server-process-jsonrpc body server-id)
+                               (anvil-server-process-jsonrpc (anvil-mcp--decode body) anvil-mcp--server-id)
                              (error
                               (format
                                "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32603,\"message\":\"Internal error: %s\"}}"
@@ -556,7 +755,7 @@ Responses go back in the matching wire format."
                              (substring body 0 (min 120 (length body))))))
                   (let ((response
                          (condition-case err
-                             (anvil-server-process-jsonrpc body server-id)
+                             (anvil-server-process-jsonrpc (anvil-mcp--decode body) anvil-mcp--server-id)
                            (error
                             (format
                              "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32603,\"message\":\"Internal error: %s\"}}"
@@ -574,16 +773,25 @@ Responses go back in the matching wire format."
            (t nil))))))
 
   (defun anvil-mcp-sentinel (proc msg)
-    "Clean up per-connection state when a child closes."
-    (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
-      (nelisp--write-stderr-line
-       (format "[server-loop] sentinel %s: %s"
-               (process-name proc)
-               (replace-regexp-in-string "\n" "" msg))))
-    ;; Drop the parser state when the connection ends.
-    (let ((fd (process-id-fd proc)))
-      (when (and fd (integerp fd))
-        (remhash fd anvil-mcp--state-by-fd))))
+    "Clean up per-connection state when a child closes.
+`process-name' is deliberately not called: the reader's own one
+signals `processp' on the adapter's network-process vector (measured on
+WSL, and it took the daemon down at the first disconnect)."
+    (condition-case err
+        (progn
+          (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+            (nelisp--write-stderr-line
+             (format "[server-loop] sentinel fd=%S: %s"
+                     (anvil-mcp--conn-fd proc)
+                     (if (stringp msg) (replace-regexp-in-string "\n" "" msg) msg))))
+          ;; Drop the parser state when the connection ends.
+          (let ((fd (anvil-mcp--conn-fd proc)))
+            (when (and fd (integerp fd))
+              (remhash fd anvil-mcp--state-by-fd))))
+      (error
+       (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+         (nelisp--write-stderr-line
+          (format "[server-loop] sentinel ERR %S" err))))))
 
   ;; `anvil-server-process-jsonrpc' rejects requests when no MCP
   ;; server is active; `anvil-server-run-batch-stdio' (= the legacy
@@ -645,25 +853,39 @@ Responses go back in the matching wire format."
 
   (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
     (nelisp--write-stderr-line
-     (concat "[server-loop] binding socket " socket-path)))
+     (if anvil-runtime-server--tcp-p
+         (format "[server-loop] binding TCP 127.0.0.1:%d" port)
+       (concat "[server-loop] binding socket " socket-path))))
 
-  ;; Ensure parent dir exists for the socket file.
-  (let ((dir (file-name-directory socket-path)))
-    (when (and dir (not (file-directory-p dir)))
-      (make-directory dir t)))
+  ;; Ensure parent dir exists for the socket file (legacy UNIX-socket path).
+  (unless anvil-runtime-server--tcp-p
+    (let ((dir (file-name-directory socket-path)))
+      (when (and dir (not (file-directory-p dir)))
+        (make-directory dir t))))
 
   (let ((server
-         (make-network-process
-          :name "anvil-runtime-server"
-          :family 'local
-          :service socket-path
-          :server t
-          :filter #'anvil-mcp-filter
-          :sentinel #'anvil-mcp-sentinel)))
+         (if anvil-runtime-server--tcp-p
+             (make-network-process
+              :name "anvil-runtime-server"
+              :host "127.0.0.1"
+              :service port
+              :server t
+              :filter #'anvil-mcp-filter
+              :sentinel #'anvil-mcp-sentinel)
+           (make-network-process
+            :name "anvil-runtime-server"
+            :family 'local
+            :service socket-path
+            :server t
+            :filter #'anvil-mcp-filter
+            :sentinel #'anvil-mcp-sentinel))))
     (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
       (nelisp--write-stderr-line
-       (format "[server-loop] listening on %s fd=%d"
-               socket-path (process-id-fd server)))))
+       (format "[server-loop] listening on %s fd=%S"
+               (if anvil-runtime-server--tcp-p
+                   (format "127.0.0.1:%d" port)
+                 socket-path)
+               (anvil-mcp--conn-fd server)))))
 
   ;; Main loop — block in poll for up to 1 second per iteration so
   ;; SIGINT / SIGTERM can interrupt promptly.

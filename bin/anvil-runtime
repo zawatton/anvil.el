@@ -1,24 +1,72 @@
 #!/usr/bin/env bash
 # anvil-runtime — standalone-NeLisp MCP launcher for anvil.el.
 #
-# Loads anvil-server.el modules under a standalone NeLisp interpreter
-# and enters the MCP Content-Length stdio loop via the elisp driver in
+# Loads anvil-server.el modules under the standalone NeLisp reader and
+# enters the MCP Content-Length stdio loop via the elisp driver in
 # `scripts/anvil-runtime-shell-loop.el'.  Migrated 2026-05-14 from
 # `nelisp/bin/anvil-runtime' + `nelisp-emacs-lib/scripts/anvil-runtime-*'
 # so the entire deployment surface lives in this repo; `nelisp' and
 # `nelisp-emacs-lib' supply only the language runtime and Emacs C → elisp
 # substrate respectively.
 #
+# NeLisp v1.2.0 (2026-09-04) update.  The Rust-era binary
+# (`target/release/nelisp', invoked as `nelisp exec FILE') is gone since
+# the 2026-06-02 pure-elisp self-host.  The standalone reader now lives
+# at `target/nelisp' (`target/nelisp.exe' on windows-x86_64, a full
+# standalone target as of v1.2.0) and is started as `nelisp FILE'.
+# Discovery below prefers the new layout and keeps the legacy one as a
+# fallback; `NELISP_LOAD_MODE' forces one invocation style when
+# auto-detection guesses wrong.  `anvil-runtime doctor' prints what was
+# resolved.
+#
+# Why the bare `nelisp FILE' form and not `--load FILE': the reader
+# prints the value of FILE's last top-level form to stdout under
+# `--load', which would leave a stray `t' behind the final MCP frame,
+# whereas the bare form uses that value as the process exit status
+# instead (measured 2026-09-04).  The bootstrap therefore ends with a
+# literal `0' so a loop that returns exits cleanly.
+#
 # Required env / paths:
 #   ANVIL_EL_DIR        — anvil.el checkout root (default: this script's
 #                         repo root, i.e. `$script_dir/..').
-#   NELISP_BIN          — nelisp standalone binary.  Default: walks the
-#                         sibling-checkout convention
-#                         `$ANVIL_EL_DIR/../nelisp/target/nelisp'.
-#   NELISP_EMACS_DIR    — nelisp-emacs-lib checkout root.  Default: walks
-#                         the sibling-checkout convention
-#                         `$ANVIL_EL_DIR/../nelisp-emacs-lib'.
-#   ANVIL_SERVER_ID     — server-id (default: "default")
+#   NELISP_BIN          — nelisp standalone binary.  Default: walks
+#                         `$NELISP_HOME', the sibling-checkout convention
+#                         `$ANVIL_EL_DIR/../nelisp', the `~/Cowork/Notes/dev'
+#                         and `~/Notes/dev' mirrors, then PATH.
+#   NELISP_HOME         — nelisp checkout root (optional; first discovery
+#                         candidate when set).
+#   ANVIL_RUNTIME_STDLIB_MISC
+#                       — set to load nelisp-stdlib-misc.el over the
+#                         runtime's own definitions.  Off by default;
+#                         see the loop scripts for why.
+#   NELISP_EMACS_DIR    — nelisp-emacs checkout root.  Default: same walk
+#                         as NELISP_BIN, for the sibling `nelisp-emacs'
+#                         or `nelisp-emacs-lib' (the repository is being
+#                         renamed to the latter).
+#   NELISP_LISP_DIR     — nelisp `lisp/' dir (derived from NELISP_BIN).
+#   NELISP_LOAD_MODE    — auto (default) | file | load | exec.  `file'
+#                         runs `nelisp BOOTSTRAP' (v1.x pure-elisp
+#                         reader, exit status = last value); `load' runs
+#                         `nelisp --load BOOTSTRAP' (same reader, but it
+#                         prints the last value); `exec' runs `nelisp
+#                         exec BOOTSTRAP' (legacy Rust binary).  auto =
+#                         exec iff the binary sits under
+#                         `target/release/', else file.
+#   ANVIL_RUNTIME_DAEMON_DIR
+#                       — state dir for bootstrap files, the driver's
+#                         fast-handshake + schema caches and the K2
+#                         socket (default: ~/.anvil-runtime).
+#   ANVIL_RUNTIME_DEBUG — non-empty turns on the driver's [STEP] /
+#                         [shell-loop] stderr trace.
+#   ANVIL_RUNTIME_FAST_HANDSHAKE
+#                       — 0/no/off/false disables the pre-load MCP fast
+#                         handshake (default on).  Reach for it against a
+#                         NeLisp older than v1.1.1, which crashes on that
+#                         path.
+#   ANVIL_SERVER_ID     — server-id (read by the driver through `getenv';
+#                         default "emacs-eval").
+#   ANVIL_TOOL_MODULES  — comma-separated module list (driver default
+#                         "anvil-discovery,anvil-sqlite,anvil-bench").
 #
 # Sibling-checkout convention assumed at default:
 #   <parent>/
@@ -26,49 +74,93 @@
 #     ├── nelisp            (Layer 1 NeLisp runtime)
 #     └── nelisp-emacs-lib  (Layer 2 Emacs C → elisp port)
 # Set the env vars above to override when the layout differs.
+#
+# Windows (MSYS2 / Git Bash): the reader is a native PE binary, so every
+# path embedded in the bootstrap file is converted with `cygpath -m'
+# (`C:/Users/...'); an MSYS-style `/c/Users/...' never reaches nelisp.exe.
 
 set -euo pipefail
 
-ANVIL_RUNTIME_VERSION="0.7.0-anvil-el"
+ANVIL_RUNTIME_VERSION="0.8.0-anvil-el"
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ANVIL_EL_DIR="${ANVIL_EL_DIR:-$(cd "$script_dir/.." && pwd)}"
 
-# Path discovery: try (1) sibling-checkout convention, (2) the user's
-# standard `Cowork/Notes/dev/' dev mirror, (3) PATH lookup.  First hit
-# wins.  `NELISP_BIN' / `NELISP_EMACS_DIR' env vars short-circuit
-# discovery when set.
+case "$(uname -s 2>/dev/null || echo)" in
+    MINGW*|MSYS*|CYGWIN*) ANVIL_RUNTIME_OS="windows-msys" ;;
+    Darwin*)              ANVIL_RUNTIME_OS="macos" ;;
+    *)                    ANVIL_RUNTIME_OS="linux" ;;
+esac
+
+# Print PATH in the form the nelisp binary understands.  On MSYS the
+# reader is a native Windows executable: hand it `C:/...' via `cygpath -m'
+# (forward slashes, so the string survives elisp "..." quoting as-is).
+native_path() {
+    if [ -z "${1:-}" ]; then
+        printf '\n'
+    elif [ "$ANVIL_RUNTIME_OS" = "windows-msys" ] && command -v cygpath >/dev/null 2>&1; then
+        cygpath -m "$1"
+    else
+        printf '%s\n' "$1"
+    fi
+}
+
+# Candidate nelisp checkout roots, first hit wins.
+nelisp_home_candidates() {
+    if [ -n "${NELISP_HOME:-}" ]; then
+        printf '%s\n' "$NELISP_HOME"
+    fi
+    printf '%s\n' \
+        "$ANVIL_EL_DIR/../nelisp" \
+        "$HOME/Cowork/Notes/dev/nelisp" \
+        "$HOME/Notes/dev/nelisp"
+}
+
+# Per checkout, the binary candidates in preference order:
+#   target/nelisp.exe        v1.2.0+ windows-x86_64 reader (MSYS hosts)
+#   target/nelisp            v1.x linux / macos reader
+#   target/release/nelisp    pre-2026-06-02 Rust binary (legacy)
+nelisp_bin_candidates_in() {
+    local home="$1"
+    if [ "$ANVIL_RUNTIME_OS" = "windows-msys" ]; then
+        printf '%s\n' "$home/target/nelisp.exe" "$home/target/nelisp"
+    else
+        printf '%s\n' "$home/target/nelisp"
+    fi
+    printf '%s\n' "$home/target/release/nelisp"
+}
+
 discover_nelisp_bin() {
-    local candidates=(
-        "$ANVIL_EL_DIR/../nelisp/target/nelisp"
-        "$ANVIL_EL_DIR/../nelisp/target/release/nelisp"
-        "$HOME/Cowork/Notes/dev/nelisp/target/nelisp"
-        "$HOME/Cowork/Notes/dev/nelisp/target/release/nelisp"
-        "$HOME/Notes/dev/nelisp/target/nelisp"
-        "$HOME/Notes/dev/nelisp/target/release/nelisp"
-    )
-    local p resolved_dir
-    for p in "${candidates[@]}"; do
-        if [ -x "$p" ]; then
-            resolved_dir="$(cd "$(dirname "$p")" && pwd -P)"
-            echo "$resolved_dir/$(basename "$p")"
-            return 0
-        fi
-    done
+    local home p
+    while IFS= read -r home; do
+        [ -n "$home" ] && [ -d "$home" ] || continue
+        while IFS= read -r p; do
+            if [ -x "$p" ]; then
+                printf '%s/%s\n' "$(cd "$(dirname "$p")" && pwd -P)" "$(basename "$p")"
+                return 0
+            fi
+        done < <(nelisp_bin_candidates_in "$home")
+    done < <(nelisp_home_candidates)
     command -v nelisp 2>/dev/null && return 0
     return 1
 }
 
 discover_nelisp_emacs_dir() {
-    local candidates=(
-        "$ANVIL_EL_DIR/../nelisp-emacs-lib"
+    local candidates=() p
+    if [ -n "${NELISP_HOME:-}" ]; then
+        candidates+=("$NELISP_HOME/../nelisp-emacs"
+                     "$NELISP_HOME/../nelisp-emacs-lib")
+    fi
+    # The repository is being renamed `nelisp-emacs' -> `nelisp-emacs-lib';
+    # accept both so a checkout on either side of that rename resolves.
+    candidates+=(
         "$ANVIL_EL_DIR/../nelisp-emacs"
+        "$ANVIL_EL_DIR/../nelisp-emacs-lib"
         "$HOME/Cowork/Notes/dev/nelisp-emacs-lib"
         "$HOME/Cowork/Notes/dev/nelisp-emacs"
         "$HOME/Notes/dev/nelisp-emacs-lib"
         "$HOME/Notes/dev/nelisp-emacs"
     )
-    local p
     for p in "${candidates[@]}"; do
         if [ -d "$p/src" ]; then
             (cd "$p" && pwd -P)
@@ -105,14 +197,118 @@ fi
 NELISP_LISP_DIR="${NELISP_LISP_DIR:-}"
 LOOP_EL="${LOOP_EL:-$ANVIL_EL_DIR/scripts/anvil-runtime-shell-loop.el}"
 SERVER_LOOP_EL="${SERVER_LOOP_EL:-$ANVIL_EL_DIR/scripts/anvil-runtime-server-loop.el}"
+STATE_DIR="${ANVIL_RUNTIME_DAEMON_DIR:-$HOME/.anvil-runtime}"
+NELISP_LOAD_MODE="${NELISP_LOAD_MODE:-auto}"
 
 export ANVIL_EL_DIR NELISP_EMACS_DIR NELISP_LISP_DIR
+
+resolve_load_mode() {
+    case "$NELISP_LOAD_MODE" in
+        file|load|exec) printf '%s\n' "$NELISP_LOAD_MODE" ;;
+        *)
+            case "$NELISP_BIN" in
+                */target/release/*) printf 'exec\n' ;;
+                *)                  printf 'file\n' ;;
+            esac
+            ;;
+    esac
+}
+
+# Bootstrap file: embeds the path env vars via `setq' so the loop driver
+# can read them before `emacs-init.el' polyfills `getenv'.  (The retired
+# Rust binary's `getenv' was nil until `emacs-callproc.el' loaded; the
+# v1.2.0 reader has a native `getenv', but the setq channel stays the
+# primary one so both binaries see identical values.)
+write_bootstrap() {  # $1 = file, $2.. = extra elisp lines
+    local file="$1"
+    shift
+    {
+        echo ";; anvil-runtime bootstrap (auto-generated by bin/anvil-runtime; do not edit)"
+        printf '(setq anvil-runtime-bootstrap-anvil-el-dir "%s")\n' "$(native_path "$ANVIL_EL_DIR")"
+        printf '(setq anvil-runtime-bootstrap-nelisp-emacs-dir "%s")\n' "$(native_path "$NELISP_EMACS_DIR")"
+        printf '(setq anvil-runtime-bootstrap-nelisp-lisp-dir "%s")\n' "$(native_path "$NELISP_LISP_DIR")"
+        printf '(setq anvil-runtime-bootstrap-state-dir "%s")\n' "$(native_path "$STATE_DIR")"
+        if [ -n "${ANVIL_RUNTIME_DEBUG:-}" ]; then
+            echo "(setq anvil-server--debug-trace t)"
+        fi
+        # Opt-in: load nelisp-stdlib-misc.el over the runtime's own
+        # definitions.  Needed by pre-v1.2 runtimes, harmful on v1.2.1
+        # (see the loop scripts for the 2026-09-04 measurement).
+        if [ -n "${ANVIL_RUNTIME_STDLIB_MISC:-}" ]; then
+            echo "(setq anvil-runtime-bootstrap-stdlib-misc t)"
+        fi
+        local line
+        for line in "$@"; do
+            printf '%s\n' "$line"
+        done
+        # Last form = process exit status under the bare `nelisp FILE'
+        # invocation (ignored by `--load' / `exec').
+        echo "0"
+    } > "$file"
+}
+
+run_nelisp() {  # $1 = bootstrap file (never returns)
+    local mode
+    mode="$(resolve_load_mode)"
+    case "$mode" in
+        exec) exec "$NELISP_BIN" exec "$1" ;;
+        load) exec "$NELISP_BIN" --load "$(native_path "$1")" ;;
+        *)    exec "$NELISP_BIN" "$(native_path "$1")" ;;
+    esac
+}
+
+require_runtime() {  # $1 = driver file that must exist
+    if [ ! -x "$NELISP_BIN" ]; then
+        echo "anvil-runtime: nelisp binary not found at $NELISP_BIN" >&2
+        echo "  (set NELISP_BIN, or NELISP_HOME to the nelisp checkout; build with \`make standalone-reader')" >&2
+        exit 1
+    fi
+    if [ ! -f "$1" ]; then
+        echo "anvil-runtime: driver not found at $1" >&2
+        exit 1
+    fi
+}
+
+doctor() {
+    local mode probe rc
+    mode="$(resolve_load_mode)"
+    echo "anvil-runtime $ANVIL_RUNTIME_VERSION"
+    echo "  os:               $ANVIL_RUNTIME_OS"
+    echo "  anvil-el-dir:     $ANVIL_EL_DIR"
+    if [ -x "$NELISP_BIN" ]; then
+        echo "  nelisp-bin:       $NELISP_BIN (ok)"
+    else
+        echo "  nelisp-bin:       $NELISP_BIN (MISSING)"
+    fi
+    echo "  load-mode:        $mode"
+    echo "  nelisp-emacs-dir: ${NELISP_EMACS_DIR:-<not found>}"
+    echo "  nelisp-lisp-dir:  ${NELISP_LISP_DIR:-<not found>}"
+    echo "  state-dir:        $STATE_DIR"
+    echo "  loop-el:          $LOOP_EL"
+    if [ -x "$NELISP_BIN" ] && [ "$mode" != exec ]; then
+        set +e
+        probe="$("$NELISP_BIN" --eval '(+ 40 2)' 2>&1)"
+        rc=$?
+        set -e
+        if [ "$rc" -eq 0 ] && [ "$(printf '%s' "$probe" | tr -d '[:space:]')" = 42 ]; then
+            echo "  nelisp-eval:      ok"
+        else
+            echo "  nelisp-eval:      FAIL (rc=$rc: $probe)"
+            return 1
+        fi
+    fi
+}
 
 usage() {
     cat >&2 <<EOF
 usage: anvil-runtime --version
+       anvil-runtime doctor                 (print resolved paths + probe the reader)
+       anvil-runtime prewarm                (load the modules once, write the caches, exit)
        anvil-runtime mcp serve              (Phase B5 stdio loop, single-client)
-       anvil-runtime server [SOCKET_PATH]   (K2 UNIX-socket loop, multi-client)
+       anvil-runtime server [PORT]          (multi-client daemon on TCP 127.0.0.1:PORT,
+                                             default \$ANVIL_RUNTIME_PORT or 47171;
+                                             a non-numeric argument is a legacy
+                                             UNIX-socket path)
 EOF
     exit 2
 }
@@ -126,76 +322,76 @@ case "$1" in
         echo "anvil-runtime $ANVIL_RUNTIME_VERSION"
         exit 0
         ;;
+    doctor)
+        doctor
+        ;;
+    prewarm)
+        # Same driver as `mcp serve', but the loop returns after the module
+        # chain instead of serving: generates the schema cache, the module
+        # -> tool map and the fast-handshake file under the state dir.  A
+        # first-ever start of the DB-backed module set otherwise spends ~9
+        # minutes of schema generation inside the first MCP session.
+        require_runtime "$LOOP_EL"
+        mkdir -p "$STATE_DIR/tmp"
+        BOOTSTRAP="$STATE_DIR/prewarm-bootstrap.el"
+        write_bootstrap "$BOOTSTRAP" \
+            "(setq anvil-runtime-bootstrap-prewarm t)" \
+            "(load \"$(native_path "$LOOP_EL")\" nil t)"
+        echo "anvil-runtime: prewarming $STATE_DIR (modules: ${ANVIL_TOOL_MODULES:-<driver default>})" >&2
+        run_nelisp "$BOOTSTRAP" </dev/null
+        ;;
     mcp)
         if [ "$#" -ge 2 ] && [ "$2" = "serve" ]; then
-            if [ ! -x "$NELISP_BIN" ]; then
-                echo "anvil-runtime: nelisp binary not found at $NELISP_BIN" >&2
-                exit 1
-            fi
-            if [ ! -f "$LOOP_EL" ]; then
-                echo "anvil-runtime: loop driver not found at $LOOP_EL" >&2
-                exit 1
-            fi
-            # Bootstrap embeds the path env vars via `setq' so the loop
-            # driver can read them before `emacs-init.el' polyfills
-            # `getenv'.  (Standalone NeLisp's `getenv' is nil until
-            # `emacs-callproc.el' loads — chicken-and-egg with init load.)
+            require_runtime "$LOOP_EL"
+            mkdir -p "$STATE_DIR/tmp"
             # Fast handshake is ON by default as of NeLisp v1.1.1.  It was
             # gated off because every fast-path run died after 2-20 s; the
             # cause was fourteen precise-root defects in the standalone GC,
             # fixed there, and with a NeLisp carrying those fixes the path
-            # returns all 5,208 bytes and exits 0 -- 3/3 with address
-            # randomisation disabled and 3/3 with it on.  Without it every
-            # `mcp serve' pays the ~100 s cold start before answering
-            # `initialize'.
-            #
-            # It DOES depend on the runtime underneath: an older NeLisp will
-            # crash on this path.  `ANVIL_RUNTIME_FAST_HANDSHAKE=0' turns it
-            # back off for exactly that case.
+            # returns all of its output and exits 0.  Without it every
+            # `mcp serve' pays the full cold start before answering
+            # `initialize'.  It DOES depend on the runtime underneath: an
+            # older NeLisp will crash on this path, and
+            # `ANVIL_RUNTIME_FAST_HANDSHAKE=0' turns it back off for exactly
+            # that case.  The env var has to travel through the generated
+            # bootstrap: the driver's own `defvar' runs before
+            # `emacs-callproc.el' provides `getenv'.
             case "${ANVIL_RUNTIME_FAST_HANDSHAKE:-1}" in
                 0|no|off|false) anvil_fast_handshake_elisp=nil ;;
-                *) anvil_fast_handshake_elisp=t ;;
+                *)              anvil_fast_handshake_elisp=t ;;
             esac
-            BOOTSTRAP_DIR="${ANVIL_RUNTIME_DAEMON_DIR:-$HOME/.anvil-runtime}"
-            mkdir -p "$BOOTSTRAP_DIR"
-            BOOTSTRAP="$BOOTSTRAP_DIR/mcp-bootstrap.el"
-            cat > "$BOOTSTRAP" <<EOF
-;; anvil-runtime mcp-serve bootstrap (auto-generated by bin/anvil-runtime)
-(setq anvil-runtime-bootstrap-anvil-el-dir "$ANVIL_EL_DIR")
-(setq anvil-runtime-bootstrap-nelisp-emacs-dir "$NELISP_EMACS_DIR")
-(setq anvil-runtime-bootstrap-nelisp-lisp-dir "$NELISP_LISP_DIR")
-(setq anvil-runtime-bootstrap-fast-handshake-enabled $anvil_fast_handshake_elisp)
-(load "$LOOP_EL" nil t)
-EOF
-            exec "$NELISP_BIN" "$BOOTSTRAP"
+            BOOTSTRAP="$STATE_DIR/mcp-bootstrap.el"
+            write_bootstrap "$BOOTSTRAP"                 "(setq anvil-runtime-bootstrap-fast-handshake-enabled $anvil_fast_handshake_elisp)"                 "(load \"$(native_path "$LOOP_EL")\" nil t)"
+            run_nelisp "$BOOTSTRAP"
         fi
         usage
         ;;
     server)
-        if [ ! -x "$NELISP_BIN" ]; then
-            echo "anvil-runtime: nelisp binary not found at $NELISP_BIN" >&2
-            exit 1
-        fi
-        if [ ! -f "$SERVER_LOOP_EL" ]; then
-            echo "anvil-runtime: server loop not found at $SERVER_LOOP_EL" >&2
-            exit 1
-        fi
-        # Bootstrap embeds path env vars + socket via `setq' (NeLisp
-        # standalone's `getenv' is nil until `emacs-callproc.el' loads,
-        # which `server-loop.el' itself does — chicken-and-egg).
-        SOCKET_PATH="${2:-$HOME/.anvil-runtime/sock}"
-        SOCKET_DIR="$(dirname "$SOCKET_PATH")"
-        mkdir -p "$SOCKET_DIR"
-        BOOTSTRAP="$SOCKET_DIR/bootstrap.el"
-        cat > "$BOOTSTRAP" <<EOF
-;; anvil-runtime server bootstrap (auto-generated by bin/anvil-runtime)
-(setq anvil-runtime-bootstrap-socket-path "$SOCKET_PATH")
-(setq anvil-runtime-bootstrap-anvil-el-dir "$ANVIL_EL_DIR")
-(setq anvil-runtime-bootstrap-nelisp-emacs-dir "$NELISP_EMACS_DIR")
-(setq anvil-runtime-bootstrap-nelisp-lisp-dir "$NELISP_LISP_DIR")
-(load "$SERVER_LOOP_EL" nil t)
-EOF
-        exec "$NELISP_BIN" "$BOOTSTRAP"
+        require_runtime "$SERVER_LOOP_EL"
+        mkdir -p "$STATE_DIR/tmp"
+        TARGET="${2:-${ANVIL_RUNTIME_PORT:-47171}}"
+        case "$TARGET" in
+            ''|*[!0-9]*)
+                # Legacy: a UNIX-socket path, served by the K1 stack where
+                # the reader still supports it.
+                SOCKET_DIR="$(dirname "$TARGET")"
+                mkdir -p "$SOCKET_DIR"
+                BOOTSTRAP="$SOCKET_DIR/bootstrap.el"
+                write_bootstrap "$BOOTSTRAP" \
+                    "(setq anvil-runtime-bootstrap-socket-path \"$(native_path "$TARGET")\")" \
+                    "(load \"$(native_path "$SERVER_LOOP_EL")\" nil t)"
+                ;;
+            *)
+                # TCP loopback through nelisp's process adapter (NeLisp
+                # v1.2.0): the same daemon on Linux and Windows, bridged by
+                # `anvil-runtime-stdio'.
+                BOOTSTRAP="$STATE_DIR/server-bootstrap.el"
+                write_bootstrap "$BOOTSTRAP" \
+                    "(setq anvil-runtime-bootstrap-port $TARGET)" \
+                    "(load \"$(native_path "$SERVER_LOOP_EL")\" nil t)"
+                ;;
+        esac
+        run_nelisp "$BOOTSTRAP"
         ;;
     *)
         usage

@@ -5,6 +5,123 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **`bin/anvil-runtime` follows NeLisp v1.2.0** — the standalone
+  launcher now discovers the pure-elisp reader at `target/nelisp` /
+  `target/nelisp.exe` (windows-x86_64 is a full standalone target as of
+  NeLisp v1.2.0) and starts it as bare `nelisp BOOTSTRAP`, whose last
+  form's value is the exit status (the `--load` form prints it, which
+  left a stray `t` behind the final MCP frame).  The retired Rust-era
+  `target/release/nelisp exec` path stays as a fallback
+  (`NELISP_LOAD_MODE=exec`).  Under MSYS2 every path embedded in the
+  bootstrap is converted with `cygpath -m` so the native `nelisp.exe`
+  can read it; the driver's fast-handshake and schema caches move from
+  `/tmp/anvil-runtime` to `$ANVIL_RUNTIME_DAEMON_DIR` (default
+  `~/.anvil-runtime`); `ANVIL_RUNTIME_DEBUG=1` turns on the `[STEP]`
+  trace; `anvil-runtime doctor` reports the resolved layout and probes
+  the reader.  Measured on windows-x86_64: initialize → tools/list →
+  tools/call round-trip in 36 s cold (no schema cache), 23 s warm; the
+  May-2026 daemon needed 35-40 min.
+- **`scripts/anvil-runtime-shell-loop.el`** puts `nelisp-emacs/src` on
+  `load-path` itself (the v1.2.0 reader's `load` never binds
+  `load-file-name`, so emacs-init.el's own-directory step was a no-op),
+  re-provides the `nelisp` feature (anvil's documented standalone
+  marker, no longer supplied by the runtime), gates the `alist-get`
+  override on a functional probe now that the prelude ships a correct
+  one, and binds `temporary-file-directory` under the state dir when
+  the substrate leaves it unbound.
+- Requires the matching nelisp-emacs fixes (2026-09-04): `locate-library`
+  and the `file-exists-p` / `file-readable-p` / `file-directory-p` ports
+  no longer override a runtime definition that verifiably works,
+  `write-region` accepts a string START, the `backquote-*-symbol`
+  constants are defined, and the `src/cl-lib.el` shim is loaded by path
+  when the reader provides `cl-lib` natively but lacks `cl-member-if`.
+- **DB-backed tools on the standalone reader** — with NeLisp's SQLite
+  arm (Doc 138: `sqlite3_*` rows over the inbox `winsqlite3.dll` /
+  `libsqlite3.so.0`, plus `ptr-read-bytes` / `ptr-write-bytes`) and the
+  rewritten nelisp-emacs `emacs-sqlite-ffi.el`, `sqlite-query`,
+  `memory-*` and `worklog-*` now run under `bin/anvil-runtime`.  The
+  driver learns which tool ids each module registers
+  (`<state>/anvil-module-tools.el`) so modules beyond the original three
+  are served lazily from the schema cache on later starts, and modules
+  without a learned map are loaded eagerly instead of being skipped; the
+  fast-handshake file is rebuilt from the live registry so it advertises
+  every tool.  `anvil-config` (`$ANVIL_CONFIG_DIR/config.el`, XDG
+  fallback) is loaded by the driver, which is where machine-specific
+  pins such as `anvil-worklog-db-path` belong.  The legacy list-backed
+  sqlite cursor polyfill now steps aside when the substrate provides
+  `sqlite-more-p`.  Measured on windows-x86_64 with six modules: first
+  ever start 534 s (schema generation for ~40 tools), warm start 26 s,
+  fast handshake 1.2 s to the initialize response.
+
+- **Linux verified (WSL Debian 13, dynamic reader)** — the same launcher
+  and driver serve the DB-backed set on the Linux reader: framed and
+  NDJSON dialects, worklog-search with a Japanese query, 37 tools; warm
+  start 25 s, initialize answered in 0.36 s on the fast handshake,
+  `prewarm` cold 339 s.
+- **Fast handshake speaks NDJSON** — Claude Code 2.1.138+ sends one JSON
+  object per line without Content-Length; the pre-init fast path now
+  detects the dialect from the first byte and answers initialize /
+  tools/list in kind (1.2–2.4 s on windows-x86_64) instead of falling
+  through to the full load.  Request bodies and lines are decoded with
+  `string-as-multibyte` before dispatch so non-ASCII arguments arrive
+  as text.
+- **Fast-tools cache keyed by module set** — the file records the
+  `ANVIL_TOOL_MODULES` it was written for and is ignored for another
+  set (a default-module run used to shrink it to 6 tools for the next
+  six-module run).  The eager (first-ever) path writes it too.
+- **`anvil-runtime prewarm`** — loads the modules once, writes the schema
+  cache, the module→tool map and the fast-tools file, and exits, so the
+  first-ever schema generation no longer happens inside an MCP session.
+- **Daemon on TCP loopback, working end to end** — `anvil-runtime server
+  [PORT]`, `anvil-runtime-daemon` and `anvil-runtime-stdio` now use
+  127.0.0.1:PORT (default 47171, `ANVIL_RUNTIME_PORT`) through nelisp's
+  own process adapter (`make-network-process :server t` over the native
+  socket family), the same on Linux and Windows.  The K2 UNIX-socket
+  stack spoke the Rust-era FFI contract and could not open a socket on
+  the v1.2.x reader; it remains reachable by passing a socket path.  The
+  bridge gained a python fallback (socat → python → nc).  Measured on
+  Linux with the six-module set: the daemon is listening 17 s after
+  start with warm caches, and serves 38 tools over both dialects, DB
+  tools included, across successive client connections.
+
+  Three things had to be right for that, each of which had failed
+  silently:
+
+  - The **bridge must not read its relay program from stdin.**  Handing
+    python the program on stdin left `sys.stdin` at EOF, so every
+    connection opened, sent nothing, and closed -- which read exactly
+    like a server that never answers.  The program is passed with `-c`.
+  - **The filter and sentinel read what they need from globals.**  Every
+    `defun` in the server loop sits inside one `let*`, and on the v1.2.x
+    reader a closure invoked from the process pump does not reliably
+    see or write those captured bindings (measured: a filter recording
+    through a captured variable lost every write; mutating a captured
+    cons took the process down).  `anvil-mcp--server-id` is a global for
+    that reason.
+  - **`ANVIL_TOOL_MODULES` is resolved before Layer 2 loads**, as the
+    shell loop already did.  Read afterwards it came back nil and the
+    daemon quietly served the three-module default while asked for six.
+
+  On Linux the DB-backed tools need the DYNAMIC reader
+  (`NELISP_READER_DYNAMIC=1 make standalone-reader`): that is the build
+  carrying nelisp's sqlite3 FFI rows.  The static reader serves the
+  discovery and bench tools and reports sqlite as unavailable.
+- `bin/anvil-runtime doctor` and the server loop share the shell loop's
+  v1.2.0 pre-init (src/ on load-path, `nelisp` feature marker, state-dir
+  temporary directory, probe-gated `alist-get`, anvil-config).
+
+### Changed (standalone driver defaults)
+
+- `ANVIL_TOOL_MODULES` still defaults to the three original modules;
+  set it to
+  `anvil-discovery,anvil-sqlite,anvil-bench,anvil-state,anvil-memory,anvil-worklog`
+  to expose the DB-backed tools (the canonical DB paths come from
+  `config.el` or `ANVIL_WORKLOG_DB` / `ANVIL_MEMORY_DB`).
+
 ## [1.3.0] - 2026-06-26
 
 Develop-line release focused on broader AI maintainer workflows: codebase
