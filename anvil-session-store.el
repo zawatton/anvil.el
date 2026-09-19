@@ -672,7 +672,12 @@ the whole story.  MAX-ITEMS caps the lines shown per section
 ;;;; --- MCP tools ----------------------------------------------------------
 
 (defun anvil-session-store--tool-search (query &optional session-id limit)
-  "MCP wrapper for `anvil-session-store-search'."
+  "Ranked search over the indexed session event log.
+
+MCP Parameters:
+  query       - Search text; terms are OR-ed.  Empty falls back to recent.
+  session-id  - Optional Claude session id to scope the search to.
+  limit       - Optional maximum rows to return (default 20)."
   (anvil-session-store-search
    query
    :session-id (and (stringp session-id) (not (string-empty-p session-id))
@@ -680,14 +685,22 @@ the whole story.  MAX-ITEMS caps the lines shown per section
    :limit (and limit (anvil-session-store--as-number limit))))
 
 (defun anvil-session-store--tool-recent (&optional session-id limit)
-  "MCP wrapper for `anvil-session-store-recent'."
+  "Return the most recent indexed session events, newest last.
+
+MCP Parameters:
+  session-id  - Optional Claude session id to scope the result to.
+  limit       - Optional maximum rows to return (default 20)."
   (anvil-session-store-recent
    :session-id (and (stringp session-id) (not (string-empty-p session-id))
                     session-id)
    :limit (and limit (anvil-session-store--as-number limit))))
 
 (defun anvil-session-store--tool-snapshot (session-id &optional max-bytes)
-  "MCP wrapper for `anvil-session-store-snapshot-ref'."
+  "Build a reference snapshot of one session's event log.
+
+MCP Parameters:
+  session-id  - Claude session id to summarise.
+  max-bytes   - Optional byte budget for the output (default 2048)."
   (anvil-session-store-snapshot-ref
    session-id
    :max-bytes (and max-bytes (anvil-session-store--as-number max-bytes))))
