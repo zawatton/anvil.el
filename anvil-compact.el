@@ -474,13 +474,57 @@ Returns the stored snapshot plist."
   "Fetch the latest snapshot plist for SESSION-ID, or nil."
   (anvil-compact--state-get session-id "snapshot"))
 
-(defun anvil-compact-snapshot-format (snap)
+(defcustom anvil-compact-append-session-ref nil
+  "When non-nil, append a Doc 63 reference snapshot to the preamble.
+
+The reference snapshot (`anvil-session-store-snapshot-ref') is a
+table of contents over the indexed event log: it names the event
+categories, lists recent identifiers, and embeds a runnable search
+call so the model can pull full rows on demand.  It complements the
+count-capped digest above rather than replacing it.
+
+Default nil — Doc 17 Phase 4 made hook behaviour explicit opt-in,
+and this inherits that stance.  Turning it on is only useful once
+the capture hook is installed; without it the event log has nothing
+structured to summarise."
+  :type 'boolean
+  :group 'anvil-compact)
+
+;; anvil-session-store is loaded on demand below, not required at the
+;; top of this file: anvil-compact must keep working on a build where
+;; the Doc 63 store is absent or has no SQLite behind it.
+(declare-function anvil-session-store-snapshot-ref "anvil-session-store"
+                  (session-id &rest keys))
+(declare-function anvil-session-store-available-p "anvil-session-store" ())
+
+(defun anvil-compact--session-ref (session-id)
+  "Return the Doc 63 reference snapshot for SESSION-ID, or nil.
+
+Returns nil — never signals — when the feature is off, the store
+module is absent, or this runtime has no SQLite.  A restore
+preamble that fails to render is worse than one without the extra
+section, because it is emitted on the path where the model has
+just lost its history."
+  (when (and anvil-compact-append-session-ref
+             (stringp session-id) (not (string-empty-p session-id)))
+    (condition-case nil
+        (when (and (require 'anvil-session-store nil t)
+                   (fboundp 'anvil-session-store-available-p)
+                   (anvil-session-store-available-p))
+          (let ((ref (anvil-session-store-snapshot-ref session-id)))
+            (and (stringp ref) (not (string-empty-p ref)) ref)))
+      (error nil))))
+
+(defun anvil-compact-snapshot-format (snap &optional session-id)
   "Render SNAP as a human-readable continuation string.
 The returned string is designed to be pasted into the model's
 context directly — it reads as an `[anvil-compact restore]'
 preamble that the model can use to pick up where /compact left
 off.  Missing / empty fields are skipped rather than rendered as
-blank labels."
+blank labels.
+
+With SESSION-ID and `anvil-compact-append-session-ref' non-nil, a
+Doc 63 reference snapshot for that session is appended."
   (when (and snap (listp snap))
     (let* ((ts     (plist-get snap :captured-at))
            (pct    (plist-get snap :percent))
@@ -518,6 +562,8 @@ blank labels."
                             (or kind "?")
                             (or summary ""))
                     parts)))))
+      (let ((ref (anvil-compact--session-ref session-id)))
+        (when ref (push ref parts)))
       (mapconcat #'identity (nreverse parts) "\n"))))
 
 
@@ -666,7 +712,7 @@ Priority (highest first):
      (flag
       (anvil-compact--state-clear-flag session-id)
       (let* ((snap (anvil-compact-snapshot-get session-id))
-             (preamble (or (anvil-compact-snapshot-format snap)
+             (preamble (or (anvil-compact-snapshot-format snap session-id)
                            "[anvil-compact restore]"))
              (pct (if (listp snap) (or (plist-get snap :percent) 0) 0))
              (body
@@ -689,7 +735,7 @@ Priority (highest first):
       (let ((queued (anvil-compact--queue-pop session-id)))
         (if (not queued)
             ""
-          (let ((preamble (or (anvil-compact-snapshot-format queued)
+          (let ((preamble (or (anvil-compact-snapshot-format queued session-id)
                               "[anvil-compact restore]")))
             (if (string-empty-p preamble)
                 ""
@@ -709,7 +755,7 @@ present.  Returns JSON additionalContext or an empty string."
          (snap   (or queued (anvil-compact-snapshot-get session-id))))
     (if (not snap)
         ""
-      (let ((preamble (anvil-compact-snapshot-format snap)))
+      (let ((preamble (anvil-compact-snapshot-format snap session-id)))
         (if (or (null preamble) (string-empty-p preamble))
             ""
           (anvil-compact--log-event
@@ -901,7 +947,7 @@ MCP Parameters:
   session_id - Claude Code session identifier"
   (anvil-server-with-error-handling
     (or (anvil-compact-snapshot-format
-         (anvil-compact-snapshot-get session_id))
+         (anvil-compact-snapshot-get session_id) session_id)
         "")))
 
 (defun anvil-compact--tool-stats (session_id since_ts)

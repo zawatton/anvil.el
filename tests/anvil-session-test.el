@@ -280,7 +280,11 @@ action as `add'."
   (anvil-session-test--with-tmp-settings path
     ;; Seed with an empty JSON object so the parser has something to read.
     (with-temp-file path (insert "{}"))
-    (let* ((r (anvil-hook-install-settings
+    ;; Scope to the Doc 17 set: with the Doc 63 capture hook enabled a
+    ;; key can legitimately carry two matcher objects, which is what
+    ;; `anvil-session-test-install-settings-adds-capture-hook' covers.
+    (let* ((anvil-session-install-capture-hook nil)
+           (r (anvil-hook-install-settings
                :path path :script "/opt/anvil-hook" :dry-run nil))
            (diff (plist-get r :diff))
            (written (with-temp-buffer

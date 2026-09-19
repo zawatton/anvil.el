@@ -1,0 +1,69 @@
+#!/bin/sh
+# anvil-capture-hook — structured Claude Code hook capture (Doc 63 Phase 2).
+#
+# Usage (from ~/.claude/settings.json):
+#   PostToolUse / UserPromptSubmit:
+#     .../scripts/anvil-capture-hook
+#   SessionEnd:
+#     .../scripts/anvil-capture-hook --prune
+#
+# Takes no arguments in capture mode.  Claude Code delivers the payload
+# on stdin as JSON — session_id, cwd, tool_name, tool_input,
+# tool_response — and that payload is the point of this script.
+#
+# Why a separate script from `anvil-hook':
+#
+#   `anvil-hook' forwards argv, which is how the shipped wiring ends
+#   up passing only $CLAUDE_TOOL_NAME.  Changing its contract would
+#   break every existing settings.json that calls it with positional
+#   arguments, so capture ships alongside instead of inside it.  Run
+#   both on PostToolUse: `anvil-hook' keeps the anvil-state event
+#   row, this one adds the indexed, structured row.
+#
+# Why stdin is spooled to a file rather than interpolated into the
+# elisp form: a `tool_input' can carry a whole file's contents, well
+# past ARG_MAX, and an over-long emacsclient argument fails in a way
+# that looks like a hook bug rather than a size limit.
+#
+# This script must never fail the tool call it observes.  Every exit
+# path returns 0: a PostToolUse hook that exits non-zero surfaces an
+# error on every single tool use, which costs the user far more than
+# a dropped event.
+#
+# Environment:
+#   ANVIL_EMACSCLIENT   emacsclient binary (default `emacsclient')
+#   ANVIL_CAPTURE_SOCKET  Emacs server socket name (default `server')
+
+set -u
+
+emacsclient="${ANVIL_EMACSCLIENT:-emacsclient}"
+socket="${ANVIL_CAPTURE_SOCKET:-server}"
+
+# --prune: drop rows past the TTL. Wired to SessionEnd, where stdin
+# carries no tool payload worth classifying.
+if [ "${1:-}" = "--prune" ]; then
+	"$emacsclient" -s "$socket" -e \
+		'(progn (require (quote anvil-session-store)) (anvil-session-store-prune))' \
+		>/dev/null 2>&1
+	exit 0
+fi
+
+tmp=$(mktemp "${TMPDIR:-/tmp}/anvil-capture.XXXXXX" 2>/dev/null) || exit 0
+# shellcheck disable=SC2064
+trap "rm -f '$tmp'" EXIT INT TERM
+
+cat >"$tmp" 2>/dev/null || exit 0
+[ -s "$tmp" ] || exit 0
+
+# session_id comes from the payload itself, so the caller needs no
+# arguments and cannot pass a stale id. Fall back to the env var
+# Claude Code also sets, then to "unknown" so the row is still kept.
+session=$(sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+	"$tmp" | head -n 1)
+[ -n "$session" ] || session="${CLAUDE_SESSION_ID:-unknown}"
+
+"$emacsclient" -s "$socket" -e \
+	"(anvil-session-capture-record-file \"$session\" \"$tmp\")" \
+	>/dev/null 2>&1
+
+exit 0

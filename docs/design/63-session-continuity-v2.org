@@ -1,0 +1,260 @@
+#+title: anvil-session-store — Indexed Session Continuity
+#+date: 2026-09-19
+#+author: zawatton
+#+property: status PHASE-1-2-3-SHIPPED
+#+property: scope GENERIC
+
+* STATUS
+
+~PHASE-1-2-3-SHIPPED~ (2026-09-19).  Phase 3's PreCompact handover is
+in; its settings.json wiring is documented as a manual step, for the
+reasons under Phase 3.
+
+Successor to Doc 17 Phase 3, which shipped the hook lifecycle but
+settled for a linear scan where its own design called for FTS5.
+
+* Motivation
+
+Doc 17 was written against context-mode (=github.com/mksglu/context-
+mode=), and says so: its STATUS line reads "Week-3 Ship 5, 競合
+context-mode 由来".  Phases 1, 3 and 4 shipped on 2026-04-22.  Two
+gaps stayed open, and a re-read of context-mode in 2026-09 makes
+both of them concrete.
+
+** Gap 1 — the hooks capture a tool name and nothing else
+
+The installed PostToolUse wiring is
+
+: scripts/anvil-hook post-tool-use $CLAUDE_SESSION_ID $CLAUDE_TOOL_NAME
+
+Claude Code delivers the full payload — =tool_input=,
+=tool_response=, =cwd= — on the hook's *stdin*, as JSON.  =anvil-
+hook= reads argv and never touches stdin, so every row in the event
+log records that a tool ran and not what it did.  The log can answer
+"did I use Bash?" but not "when did I last touch anvil-worker.el?",
+which is the question a resuming session actually has.
+
+** Gap 2 — the event log was never indexed
+
+=anvil-session-events-search= documents its own shortfall:
+
+#+begin_quote
+Doc 17 design used FTS5 but the anvil-state simple-LIKE path is
+adequate for the <=500-event/session volume anticipated; swap in a
+dedicated FTS5 DB later if hot.
+#+end_quote
+
+The consequence is not speed.  A linear substring scan has no
+ranking, so there is no way to ask for the *most relevant* twenty
+events — only the most recent twenty that contain a substring.  A
+snapshot builder on top of it can cap by count and nothing else,
+which is exactly what =anvil-compact.el= does today.
+
+* Non-goals
+
+Four context-mode features are deliberately *not* ported.
+
+- *porter stemming.*  It does nothing for Japanese, and anvil
+  already auto-selects the trigram tokenizer, which is what makes
+  CJK searchable at all.  Adding a porter table would cost a second
+  index for no recall on this corpus.
+
+- *A general sandboxed executor* (=ctx_execute=).  =anvil-shell-
+  filter= (Doc 27) already runs commands, compresses output through
+  ~60 per-command filters, and tees the raw bytes to anvil-state
+  under a TTL.  It is further along than =ctx_execute=, not behind
+  it.  Exposing Python and Node runtimes as MCP tools would add
+  attack surface to replace something anvil already has.
+
+- *Re-injecting events into the compact payload.*  Doc 17 already
+  chose against this: "don't dump it back, index it".  Phase 3 keeps
+  that stance — see the snapshot format below.
+
+- *A 25-category taxonomy.*  Only categories anvil's hooks actually
+  emit are defined.  An unemitted category renders an empty snapshot
+  section every time, which teaches the reader to skim past sections
+  that sometimes do matter.
+
+* Phase 1 — the indexed store (~SHIPPED~ 2026-09-19)
+
+=anvil-session-store.el=.  A single FTS5 table, columns ordered so
+=bm25()= weights apply positionally:
+
+#+begin_src sql
+CREATE VIRTUAL TABLE session_events USING fts5(
+  session_id UNINDEXED, seq UNINDEXED, ts UNINDEXED,
+  kind UNINDEXED, category UNINDEXED, priority UNINDEXED,
+  tool, data, summary,
+  tokenize = trigram)         -- unicode61 when the build lacks trigram
+#+end_src
+
+Retrieval runs two passes and fuses them:
+
+1. FTS5 MATCH on terms of 3+ characters, ordered by =bm25(…, 2.0,
+   5.0, 1.0)=.  =data= — the path, command or ref — carries the 5x
+   weight, playing the role context-mode gives markdown headings.
+2. A LIKE scan over every term.  This is the *only* pass that can
+   match a 1-2 character CJK query, because neither trigram nor
+   unicode61 emits a token that short.
+
+Reciprocal Rank Fusion (K=60) merges the two, then a proximity
+rerank applies: identifier hits, the tightest window covering all
+terms (=--min-span=, so repetition cannot inflate the score), and
+adjacent-term pairs saturating at four.
+
+** Reference snapshots
+
+=anvil-session-store-snapshot-ref= builds a table of contents, not a
+digest.  Each section names a category, lists recent identifiers,
+and embeds a runnable retrieval call:
+
+#+begin_example
+<session_resume id="abc123" events="47">
+  <error count="2">
+    anvil-worker.el:441
+    full rows: session-events-search(query: "anvil-worker.el:441", session_id: "abc123")
+  </error>
+  <omitted categories="mcp,file">retrieve with session-events-search(…)</omitted>
+</session_resume>
+#+end_example
+
+Event bodies stay in the database.  When the byte budget binds,
+whole sections are dropped lowest-priority-first and *named* in an
+=<omitted>= line — a record is either intact or absent.  The
+=<omitted>= line is the one element allowed to exceed the budget: a
+snapshot that silently forgets a category is worse than one a few
+bytes over that says what it left out.
+
+* Phase 2 — structured capture (~SHIPPED~ 2026-09-19)
+
+=anvil-session-capture.el= plus =scripts/anvil-capture-hook=.
+
+The script takes no arguments and consumes the hook's stdin, which
+is where the payload has been all along.  It spools stdin to a file
+before calling Emacs, because a =tool_input= can carry a whole
+file's contents and an argv-sized payload would be cut off by
+ARG_MAX in a way that looks like a hook bug.  Every exit path
+returns 0: a PostToolUse hook that fails surfaces an error on every
+tool call, which costs more than a dropped event.
+
+=anvil-session-capture-classify= is pure, so the taxonomy is tested
+without a hook, a daemon or a database.  Two classification rules
+are worth stating because they are judgement calls, not mechanics:
+
+- *A failed tool call is an error row first.*  A failed =Edit= is
+  filed under =error= at P1, not under =file=.  "What went wrong
+  last time" is the first question on resume.
+- *Read-only git is demoted.*  =git status= and =git log= are the
+  most frequent commands in a session and change nothing, so only
+  state-changing subcommands earn a P1 =git= row.  Otherwise the
+  commits drown in status calls.
+
+* Phase 3 — PreCompact handover (~SHIPPED~) + wiring (manual)
+
+** PreCompact handover (shipped)
+
+=anvil-compact-snapshot-format= takes an optional SESSION-ID and, when
+=anvil-compact-append-session-ref= is non-nil, appends the reference
+snapshot after the existing digest.  The old one-argument call is
+unchanged, so every existing caller and the 56 shipped anvil-compact
+tests keep passing.
+
+The defcustom defaults to nil, inheriting Doc 17 Phase 4's opt-in
+stance.  =anvil-compact--session-ref= returns nil rather than
+signalling when the feature is off, the store module is absent, the
+runtime has no SQLite, or the store throws.  That path runs straight
+after =/compact= has wiped the model's history, so an error there
+costs the whole session's continuity — degrading to the plain
+preamble is always the better failure.
+
+** Wiring (manual, by design)
+
+=SessionEnd= gains =anvil-capture-hook --prune=; =PostToolUse= and
+=UserPromptSubmit= gain the capture hook as an *additional* entry
+beside the existing =anvil-hook= call:
+
+#+begin_src json
+{ "type": "command",
+  "command": "/path/to/anvil.el/scripts/anvil-capture-hook" }
+#+end_src
+
+*** Why this is not automated
+
+=anvil-hook-install-settings= cannot be extended to do it.  Its
+planner calls =(puthash claude-key desired new)= — it *replaces* the
+whole value for each hook key rather than appending to the array.  On
+the author's own machine =Stop= currently holds two entries, anvil's
+and an unrelated Discord notifier; running the installer today would
+silently drop the second.  Teaching it to append is a separate change
+to a shipped code path with its own blast radius, and bundling it
+here would hide a destructive fix inside a feature commit.
+
+A second reason is narrower: until this branch merges, the script
+lives at a worktree path.  Wiring the live settings.json to a path
+that disappears when the worktree is removed trades a missing feature
+for a broken hook.
+
+* Dual-target
+
+* Dual-target
+
+Every database call goes through the plain =sqlite-*= surface.
+=nelisp-emacs/src/emacs-sqlite.el= forwards those to =nelisp-sqlite-
+*= under NeLisp standalone, so both modules run on either runtime
+with no =fboundp= branch — the same arrangement =anvil-semantic.el=
+already relies on.  No Rust was added.
+
+*Measured on 2026-09-19.*  The pure ranking functions were run on the
+standalone runtime and return results identical to Emacs (min-span,
+positions, term splitting, priority lookup).  The SQL path was *not*
+verified there, and the reason is worth recording because it is not an
+anvil defect:
+
+1. The default static build has =nl-ffi-call= =fboundp= but raising
+   =nelisp-unsupported-primitive= — dynamic FFI is opt-in via
+   =NELISP_READER_DYNAMIC=1=.
+2. On a build with FFI actually working (control: =(nl-ffi-call
+   "toupper" 97)= → 65), =nl_sqlite_open= still returned nil even
+   though the symbol is exported by the runtime library, because
+   =nl-ffi-call= resolves against a build-time fixed extern table
+   rather than dlopen'ing an arbitrary path.
+
+So the store reaches =anvil-session-store-available-p= → nil on
+NeLisp today and refuses with a clear error instead of crashing.
+Exercising the SQL path there needs a NeLisp build whose extern table
+carries the =nl_sqlite_*= arm — a NeLisp build-configuration matter.
+
+Per Doc "module categorization": this is *(a) portable 機能系* —
+pure data and SQL, no Emacs-specific workaround — so dual-target is
+required rather than optional.
+
+* Verification
+
+27 new ERT tests (11 store + 10 capture + 6 compact wiring), plus the
+56 shipped anvil-compact tests still green after the signature change.
+All byte-compiled with =byte-compile-error-on-warn=.
+
+The tests were mutation-checked: each mechanism was disabled in turn
+and the test that claims to cover it had to go red.  Two did not,
+and were rewritten:
+
+| Mechanism disabled            | First result | After rewrite |
+|-------------------------------+--------------+---------------|
+| LIKE pass removed             | killed       | killed        |
+| bm25 identifier weight flat   | *survived*   | killed        |
+| proximity rerank removed      | *survived*   | killed        |
+| snapshot truncates records    | killed       | killed        |
+| is_error :json-false guard    | killed       | killed        |
+| git word-boundary loosened    | *survived*   | killed        |
+
+The two ranking tests survived because the expected winner was also
+the most recently inserted row, and the LIKE pass orders by =ts
+DESC= — so recency alone produced the expected order and the
+ranking was never exercised.  Both now insert the expected winner
+*first*, so recency works against it.
+
+The git test survived because its input, "no digital content here",
+gives the same answer with or without the word-boundary anchor.  It
+now uses "legit push to prod": the letters =git= sit immediately
+before a real subcommand, so only the anchor prevents the
+misclassification.

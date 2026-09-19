@@ -115,6 +115,28 @@ the `.bat' sibling."
   :type 'file
   :group 'anvil-session)
 
+(defcustom anvil-session-capture-hook-script
+  (expand-file-name "scripts/anvil-capture-hook"
+                    (or (and load-file-name
+                             (file-name-directory load-file-name))
+                        default-directory))
+  "Absolute path to the `anvil-capture-hook' shell wrapper (Doc 63).
+Unlike `anvil-session-hook-script' this one reads the hook payload
+from stdin, so it binds with no argv of its own."
+  :type 'file
+  :group 'anvil-session)
+
+(defcustom anvil-session-install-capture-hook t
+  "When non-nil, `anvil-hook-install-settings' also binds the Doc 63
+capture hook alongside the Doc 17 hooks.
+
+Both run on PostToolUse and UserPromptSubmit: `anvil-hook' keeps
+writing the anvil-state row that `anvil-compact' reads, and
+`anvil-capture-hook' adds the structured, indexed row.  Set to nil
+to install only the Doc 17 set."
+  :type 'boolean
+  :group 'anvil-session)
+
 (defcustom anvil-session-claude-settings-path
   (expand-file-name "~/.claude/settings.json")
   "Path to the Claude Code user-settings JSON file.
@@ -624,39 +646,193 @@ truncated."
     (when (fboundp 'json-pretty-print-buffer)
       (ignore-errors (json-pretty-print-buffer)))))
 
-(defun anvil-session--settings-plan (existing-hooks script op)
+(defconst anvil-session--managed-script-basenames
+  '("anvil-hook" "anvil-hook.bat" "anvil-hook.cmd"
+    "anvil-capture-hook" "anvil-capture-hook.bat")
+  "Wrapper basenames whose hook commands anvil considers its own.
+
+Matching on the basename as well as on the configured script path
+means a checkout that moved (a worktree, a reinstall under a new
+prefix) is recognised as the same binding and updated in place,
+rather than appended a second time.")
+
+(defun anvil-session--command-wrapper (cmd)
+  "Return the wrapper basename CMD invokes, or nil."
+  (when (stringp cmd)
+    (let ((first (car (split-string (string-trim cmd) "[ \t]+" t))))
+      (and first (file-name-nondirectory first)))))
+
+(defun anvil-session--anvil-managed-command-p (cmd script)
+  "Return non-nil when CMD is the binding for wrapper SCRIPT.
+
+Matching is per-wrapper, not \"any anvil script\".  PostToolUse
+carries both `anvil-hook' and `anvil-capture-hook' bindings, so a
+looser test would let the capture binding overwrite the Doc 17 one
+while installing.  Anything matching neither SCRIPT's path nor its
+basename belongs to the user and survives untouched."
+  (and (stringp cmd) (stringp script) (not (string-empty-p script))
+       (let ((trimmed (string-trim cmd)))
+         (or (string-prefix-p script trimmed)
+             (equal (anvil-session--command-wrapper cmd)
+                    (file-name-nondirectory script))))))
+
+(defun anvil-session--any-anvil-command-p (cmd script)
+  "Return non-nil when CMD is any anvil-owned hook binding.
+
+Used by uninstall, which must take out every anvil wrapper under a
+key regardless of which path it was installed from."
+  (or (anvil-session--anvil-managed-command-p cmd script)
+      (let ((w (anvil-session--command-wrapper cmd)))
+        (and w (member w anvil-session--managed-script-basenames) t))))
+
+(defun anvil-session--hook-value->list (value)
+  "Return Claude hook VALUE as a list of outer matcher hash-tables.
+
+Accepts the current vector-of-matchers schema and the legacy plain
+string earlier anvil versions wrote, so a settings file written by
+either generation merges rather than being overwritten."
+  (cond
+   ((null value) nil)
+   ((vectorp value) (append value nil))
+   ((listp value) value)
+   ((stringp value)
+    ;; Legacy plain string: lift it into the modern shape so it can be
+    ;; merged with, instead of silently replaced.
+    (append (anvil-session--claude-hook-entry value) nil))
+   (t nil)))
+
+(defun anvil-session--outer-commands (outer)
+  "Return the list of command strings inside matcher object OUTER."
+  (let ((inner (and (hash-table-p outer) (gethash "hooks" outer))))
+    (when inner
+      (mapcar (lambda (h) (and (hash-table-p h) (gethash "command" h)))
+              (append inner nil)))))
+
+(defun anvil-session--merge-hook-value (existing desired-cmd script)
+  "Merge anvil's DESIRED-CMD into EXISTING, preserving foreign entries.
+
+Returns `(VALUE . ACTION)' where ACTION is `add', `update' or
+`keep'.  An anvil-managed command already present is rewritten in
+place; otherwise anvil's entry is appended.  Commands anvil does
+not own are never touched — that is the whole point of this
+function, and the reason the old planner could not simply
+`puthash' a fresh value over the key."
+  (let ((outers (anvil-session--hook-value->list existing))
+        (found nil)
+        (changed nil)
+        (result nil))
+    (dolist (outer outers)
+      (let ((inner-vec (and (hash-table-p outer) (gethash "hooks" outer))))
+        (if (not inner-vec)
+            (push outer result)
+          (let ((new-inner nil))
+            (dolist (h (append inner-vec nil))
+              (let ((cmd (and (hash-table-p h) (gethash "command" h))))
+                (cond
+                 ((and (not found)
+                       (anvil-session--anvil-managed-command-p cmd script))
+                  (setq found t)
+                  (unless (equal cmd desired-cmd) (setq changed t))
+                  (let ((copy (copy-hash-table h)))
+                    (puthash "command" desired-cmd copy)
+                    (puthash "type" "command" copy)
+                    (push copy new-inner)))
+                 (t (push h new-inner)))))
+            (let ((copy (copy-hash-table outer)))
+              (puthash "hooks" (vconcat (nreverse new-inner)) copy)
+              (push copy result))))))
+    (setq result (nreverse result))
+    (cond
+     (found
+      (cons (vconcat result) (if changed 'update 'keep)))
+     (t
+      (cons (vconcat (append result
+                             (append (anvil-session--claude-hook-entry
+                                      desired-cmd)
+                                     nil)))
+            'add)))))
+
+(defun anvil-session--strip-hook-value (existing script)
+  "Remove anvil-managed commands from EXISTING, keeping the rest.
+
+Returns `(VALUE . REMOVED)' where VALUE is nil when nothing anvil
+does not own remains — the caller then drops the key entirely —
+and REMOVED is the list of command strings taken out."
+  (let ((outers (anvil-session--hook-value->list existing))
+        (removed nil)
+        (result nil))
+    (dolist (outer outers)
+      (let ((inner-vec (and (hash-table-p outer) (gethash "hooks" outer))))
+        (if (not inner-vec)
+            (push outer result)
+          (let ((kept nil))
+            (dolist (h (append inner-vec nil))
+              (let ((cmd (and (hash-table-p h) (gethash "command" h))))
+                (if (anvil-session--any-anvil-command-p cmd script)
+                    (push cmd removed)
+                  (push h kept))))
+            (when kept
+              (let ((copy (copy-hash-table outer)))
+                (puthash "hooks" (vconcat (nreverse kept)) copy)
+                (push copy result)))))))
+    (setq result (nreverse result))
+    (cons (and result (vconcat result)) (nreverse removed))))
+
+(defun anvil-session--planned-bindings (script capture-script)
+  "Return the list of (CLAUDE-KEY . COMMAND-STRING) anvil installs."
+  (append
+   (mapcar (lambda (pair)
+             (cons (car pair)
+                   (anvil-session--hook-command-for (cdr pair) script)))
+           anvil-session--hook-events)
+   (when anvil-session-install-capture-hook
+     (list (cons "PostToolUse" capture-script)
+           (cons "UserPromptSubmit" capture-script)
+           (cons "SessionEnd" (concat capture-script " --prune"))))))
+
+(defun anvil-session--settings-plan (existing-hooks script op
+                                                    &optional capture-script)
   "Return `(NEW-HOOKS . DIFF)' describing OP applied to EXISTING-HOOKS.
-OP is `install' or `uninstall'.  SCRIPT is the anvil-hook path.
-DIFF is a list of (ACTION KEY VALUE) tuples for the dry-run
-printout: ACTION ∈ {`add', `update', `remove', `keep'}."
+OP is `install' or `uninstall'.  SCRIPT is the anvil-hook path,
+CAPTURE-SCRIPT the Doc 63 capture wrapper.  DIFF is a list of
+\(ACTION KEY VALUE) tuples for the dry-run printout: ACTION ∈
+{`add', `update', `remove', `keep'}.
+
+Install merges: an existing anvil binding under a key is rewritten
+in place and every other command under that key is preserved.  A
+key anvil does not bind is never read or written."
   (let ((new (copy-hash-table existing-hooks))
+        (capture (or capture-script anvil-session-capture-hook-script))
         (diff nil))
     (pcase op
       ('install
-       (dolist (pair anvil-session--hook-events)
-         (let* ((claude-key (car pair))
-                (sub-cmd (cdr pair))
-                (cmd-str (anvil-session--hook-command-for sub-cmd script))
-                (desired (anvil-session--claude-hook-entry cmd-str))
-                (existing (gethash claude-key existing-hooks)))
-           (cond
-            ((null existing)
-             (puthash claude-key desired new)
-             (push (list 'add claude-key cmd-str) diff))
-            ((anvil-session--hook-value-equal existing desired)
-             (push (list 'keep claude-key cmd-str) diff))
-            (t
-             (puthash claude-key desired new)
-             (push (list 'update claude-key cmd-str) diff))))))
+       (dolist (binding (anvil-session--planned-bindings script capture))
+         (let* ((claude-key (car binding))
+                (cmd-str (cdr binding))
+                ;; Match against the wrapper THIS binding uses, so the
+                ;; capture binding cannot overwrite the Doc 17 one on a
+                ;; key that carries both.
+                (own-script (if (string-prefix-p capture cmd-str)
+                                capture script))
+                (merged (anvil-session--merge-hook-value
+                         (gethash claude-key new) cmd-str own-script)))
+           (puthash claude-key (car merged) new)
+           (push (list (cdr merged) claude-key cmd-str) diff))))
       ('uninstall
-       (dolist (pair anvil-session--hook-events)
-         (let* ((claude-key (car pair))
-                (existing (gethash claude-key existing-hooks)))
+       (dolist (claude-key (delete-dups
+                            (mapcar #'car (anvil-session--planned-bindings
+                                           script capture))))
+         (let ((existing (gethash claude-key new)))
            (when existing
-             (remhash claude-key new)
-             (push (list 'remove claude-key
-                         (anvil-session--hook-value-command existing))
-                   diff))))))
+             (let* ((stripped (anvil-session--strip-hook-value
+                               existing script))
+                    (kept (car stripped))
+                    (removed (cdr stripped)))
+               (if kept
+                   (puthash claude-key kept new)
+                 (remhash claude-key new))
+               (dolist (cmd removed)
+                 (push (list 'remove claude-key cmd) diff))))))))
     (cons new (nreverse diff))))
 
 (defun anvil-session--format-diff (diff)
