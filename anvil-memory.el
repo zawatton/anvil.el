@@ -547,35 +547,61 @@ sharing a symlinked directory are indexed once."
 preserved on conflict (so access_count / validity_prior are never
 reset).  The FTS body index is always refreshed per file so
 re-scanning a changed .md reflects immediately in `memory-search'.
-Returns the number of .md files seen."
+Returns the number of .md files seen.
+
+The whole walk runs inside one `BEGIN IMMEDIATE' transaction.  Three
+statements per file without a transaction means three implicit
+transactions — and three fsyncs — per file: measured on a 1010-file
+tree that is 29.4s, against 4.4s batched, while the same walk with no
+DB writes at all costs 0.19s.  The cost was never the file reading.
+
+`IMMEDIATE' rather than deferred because several Emacs processes share
+one database (see docs/design/08-state.org): a deferred lock is taken
+lazily and can fail when upgrading mid-walk, discarding the whole scan,
+whereas immediate fails at the start when it fails at all.
+
+`unwind-protect' rather than `condition-case' so a `C-g' during a
+multi-second scan cannot leave the transaction open — `condition-case'
+catches `error' but not a quit or throw.
+
+Consequence worth knowing: a scan that fails partway now leaves the
+index untouched instead of partially updated."
   (let* ((roots (or roots (anvil-memory--effective-roots)))
          (db (anvil-memory--db))
+         (committed nil)
          (n 0))
-    (dolist (root roots)
-      (when (file-directory-p root)
-        (dolist (path (directory-files root t "\\.md\\'"))
-          (let ((base (file-name-nondirectory path)))
-            (unless (equal base "MEMORY.md")
-              (let* ((type (anvil-memory--infer-type base))
-                     (mtime (truncate (float-time
-                                       (nth 5 (file-attributes path)))))
-                     (body (ignore-errors
-                             (anvil-memory--read-body-utf8 path))))
-                (sqlite-execute
-                 db
-                 "INSERT INTO memory_meta(file, type, created, ttl_policy)
-                    VALUES (?1, ?2, ?3, ?2)
-                    ON CONFLICT(file) DO NOTHING"
-                 (list path (symbol-name type) mtime))
-                (sqlite-execute
-                 db
-                 "DELETE FROM memory_body_fts WHERE file = ?1"
-                 (list path))
-                (sqlite-execute
-                 db
-                 "INSERT INTO memory_body_fts(file, body) VALUES (?1, ?2)"
-                 (list path (or body "")))
-                (cl-incf n)))))))
+    (sqlite-execute db "BEGIN IMMEDIATE")
+    (unwind-protect
+        (progn
+          (dolist (root roots)
+            (when (file-directory-p root)
+              (dolist (path (directory-files root t "\\.md\\'"))
+                (let ((base (file-name-nondirectory path)))
+                  (unless (equal base "MEMORY.md")
+                    (let* ((type (anvil-memory--infer-type base))
+                           (mtime (truncate (float-time
+                                             (nth 5 (file-attributes path)))))
+                           (body (ignore-errors
+                                   (anvil-memory--read-body-utf8 path))))
+                      (sqlite-execute
+                       db
+                       "INSERT INTO memory_meta(file, type, created, ttl_policy)
+                          VALUES (?1, ?2, ?3, ?2)
+                          ON CONFLICT(file) DO NOTHING"
+                       (list path (symbol-name type) mtime))
+                      (sqlite-execute
+                       db
+                       "DELETE FROM memory_body_fts WHERE file = ?1"
+                       (list path))
+                      (sqlite-execute
+                       db
+                       "INSERT INTO memory_body_fts(file, body) VALUES (?1, ?2)"
+                       (list path (or body "")))
+                      (cl-incf n)))))))
+          (sqlite-execute db "COMMIT")
+          (setq committed t))
+      (unless committed
+        (ignore-errors (sqlite-execute db "ROLLBACK"))))
     n))
 
 ;;;###autoload
