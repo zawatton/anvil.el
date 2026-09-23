@@ -214,7 +214,7 @@
          (prompt (anvil-orw-option args "--prompt-file"))
          (work (anvil-orw-option args "--work-dir"))
          (timeout (string-to-number (anvil-orw-option args "--timeout" "300")))
-         (turns (string-to-number (anvil-orw-option args "--max-turns" "8")))
+         (turns (string-to-number (anvil-orw-option args "--max-turns" "20")))
          (mcp-path (anvil-orw-option args "--anvil-config"))
          (context-only (member "--context-only" args)))
     (unless (and model (string-suffix-p ":free" model)
