@@ -1514,37 +1514,43 @@ MCP Parameters:
         (when tag-list
           (org-set-tags tag-list))
 
-        ;; Add body if provided
-        (if body
-            (progn
-              (end-of-line)
-              ;; Child headings have a trailing \n; top-level ones don't.
-              ;; Skip past it so the drawer (inserted at the heading line
-              ;; by org-id-get-create) ends up before our blank line.
-              (let* ((has-nl (looking-at "\n"))
-                     (before (if has-nl "\n" "\n\n")))
-                (when has-nl (forward-char 1))
-                ;; Remove any blank lines already at insertion point so
-                ;; existing spacing doesn't stack with ours.
-                (delete-region
-                 (point)
-                 (progn (skip-chars-forward "\n") (point)))
-                ;; Normalise body: strip boundary newlines, collapse
-                ;; internal runs of 3+ \n so the result never exceeds \n\n.
-                (let* ((trimmed (string-trim body "\n+" "\n+"))
-                       (clean (replace-regexp-in-string
-                               "\n\n\n+" "\n\n" trimmed)))
-                  (insert before clean "\n\n")))
-              ;; Step back inside the new entry: the insert can leave
-              ;; point at the beginning of the next heading, where
-              ;; org-back-to-heading stays put and org-id-get-create
-              ;; would return (or mint) the neighbouring heading's ID.
-              (skip-chars-backward "\n")
-              (org-back-to-heading t))
-          ;; No body - ensure newline after heading
-          (end-of-line)
-          (unless (looking-at "\n")
-            (insert "\n")))))))
+        ;; Remember the new heading itself.  A backward search cannot recover
+        ;; it once the body is in place: a body may legitimately contain
+        ;; deeper sub-headings, and the nearest preceding heading is then the
+        ;; LAST of those, not the task.  The marker tracks the insertions.
+        (let ((heading (copy-marker (line-beginning-position))))
+          (unwind-protect
+              ;; Add body if provided
+              (if body
+                  (progn
+                    (end-of-line)
+                    ;; Child headings have a trailing \n; top-level ones don't.
+                    ;; Skip past it so the drawer (inserted at the heading line
+                    ;; by org-id-get-create) ends up before our blank line.
+                    (let* ((has-nl (looking-at "\n"))
+                           (before (if has-nl "\n" "\n\n")))
+                      (when has-nl (forward-char 1))
+                      ;; Remove any blank lines already at insertion point so
+                      ;; existing spacing doesn't stack with ours.
+                      (delete-region
+                       (point)
+                       (progn (skip-chars-forward "\n") (point)))
+                      ;; Normalise body: strip boundary newlines, collapse
+                      ;; internal runs of 3+ \n so the result never exceeds \n\n.
+                      (let* ((trimmed (string-trim body "\n+" "\n+"))
+                             (clean (replace-regexp-in-string
+                                     "\n\n\n+" "\n\n" trimmed)))
+                        (insert before clean "\n\n")))
+                    ;; Back to the task, so the completion step's
+                    ;; org-id-get-create stamps it and not a body sub-heading
+                    ;; (nor, when the subtree is followed by a sibling, the
+                    ;; neighbouring heading).
+                    (goto-char heading))
+                ;; No body - ensure newline after heading
+                (end-of-line)
+                (unless (looking-at "\n")
+                  (insert "\n")))
+            (set-marker heading nil)))))))
 
 (defun anvil-org--handle-outline-resource (params)
   "Handler for org://{filename}/outline template.
