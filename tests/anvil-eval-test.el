@@ -109,6 +109,66 @@
         (should (string-match-p "^runtime: [0-9.]+s" out))))))
 
 
+;;;; --- result bounding ----------------------------------------------------
+
+(defun anvil-eval-test--run-async (expression)
+  "Run EXPRESSION through `anvil-eval--async' and return the settled job."
+  (let* ((started (anvil-eval--async expression))
+         (job-id (replace-regexp-in-string "\\`Job started: " "" started))
+         (deadline (+ (float-time) 2.0)))
+    (while (and (< (float-time) deadline)
+                (eq 'running
+                    (plist-get (gethash job-id anvil-eval--async-jobs)
+                               :status)))
+      (accept-process-output nil 0.01))
+    (gethash job-id anvil-eval--async-jobs)))
+
+(ert-deftest anvil-eval-test-sync-result-within-cap-unchanged ()
+  "Results under the cap are returned verbatim."
+  (let ((anvil-eval-result-max-chars 100))
+    (should (equal (anvil-eval--sync "(make-string 5 ?a)") "\"aaaaa\""))))
+
+(ert-deftest anvil-eval-test-sync-result-capped ()
+  "An oversized sync result is cut with a trailer naming its length."
+  (let* ((anvil-eval-result-max-chars 1000)
+         (out (anvil-eval--sync "(make-string 50000 ?a)")))
+    (should (string-prefix-p "\"aaa" out))
+    (should (string-match-p "showing 1000 of 50002 chars" out))
+    (should (string-match-p "return a smaller value" out))
+    (should (< (length out) 1200))))
+
+(ert-deftest anvil-eval-test-sync-result-cap-disabled ()
+  "A nil cap returns the full result."
+  (let ((anvil-eval-result-max-chars nil))
+    (should (= (length (anvil-eval--sync "(make-string 50000 ?a)")) 50002))))
+
+(ert-deftest anvil-eval-test-sync-error-with-huge-data-capped ()
+  "An error whose data prints huge is reported within the error cap."
+  (let* ((anvil-server-tool-error-max-chars 2000)
+         (err (should-error
+               (anvil-eval--sync
+                "(let ((h (make-hash-table))) (dotimes (i 20000) (puthash i (make-string 30 ?x) h)) (signal 'wrong-type-argument (list 'sequencep h)))")
+               :type 'anvil-server-tool-error)))
+    (should (string-prefix-p "Error: (wrong-type-argument sequencep" (cadr err)))
+    (should (< (length (cadr err)) 2200))))
+
+(ert-deftest anvil-eval-test-async-result-and-error-capped ()
+  "Async results and async errors are bounded like sync ones."
+  (let ((anvil-eval--async-jobs (make-hash-table :test 'equal))
+        (anvil-eval--async-counter 0)
+        (anvil-eval-result-max-chars 1000)
+        (anvil-server-tool-error-max-chars 2000))
+    (let ((job (anvil-eval-test--run-async "(make-string 50000 ?a)")))
+      (should (eq 'done (plist-get job :status)))
+      (should (string-match-p "showing 1000 of 50002 chars"
+                              (plist-get job :result))))
+    (let ((job (anvil-eval-test--run-async
+                "(signal 'error (list (make-string 50000 ?b)))")))
+      (should (eq 'error (plist-get job :status)))
+      (should (string-prefix-p "Error: (error" (plist-get job :result)))
+      (should (< (length (plist-get job :result)) 2200)))))
+
+
 ;;;; --- guards -------------------------------------------------------------
 
 (defun anvil-eval-test--nelisp-source-or-skip ()

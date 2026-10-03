@@ -38,6 +38,17 @@ Tools exceeding this are killed.  Use async variant for longer ops."
   :type 'integer
   :group 'anvil-eval)
 
+(defcustom anvil-eval-result-max-chars 51200
+  "Maximum characters of an evaluation result returned to the client.
+An expression can evaluate to an arbitrarily large object, and the
+MCP client feeds the printed result into the model's context, so an
+unbounded result can exceed the context window on its own.  Applies
+to `emacs-eval', `emacs-eval-async' results and `nelisp-eval'.
+Longer results are cut and end with a trailer stating the original
+length.  Nil disables the cap."
+  :type '(choice (const :tag "Unlimited" nil) integer)
+  :group 'anvil-eval)
+
 (defcustom anvil-eval-org-fast-mode t
   "When non-nil, minimize `org-mode' setup during MCP tool calls.
 Skips mode hooks, disables font-lock and org-element-cache.
@@ -127,6 +138,14 @@ Only available in Emacs with thread support.")
         (apply orig-fn args))
     (apply orig-fn args)))
 
+;;; Result bounding
+
+(defun anvil-eval--bound-result (text)
+  "Cap evaluation result TEXT at `anvil-eval-result-max-chars'."
+  (anvil-server-truncate-text
+   text anvil-eval-result-max-chars
+   "return a smaller value, e.g. a count, a slice or specific fields"))
+
 ;;; Sync eval tool
 
 (defun anvil-eval--sync (expression)
@@ -142,7 +161,7 @@ Only available in Emacs with thread support.")
   (anvil-server-with-error-handling
    (let* ((form (car (read-from-string expression)))
           (result (eval form t)))
-     (format "%S" result))))
+     (anvil-eval--bound-result (format "%S" result)))))
 
 ;;; NeLisp eval tool (pure Elisp REPL)
 
@@ -211,7 +230,8 @@ Only available in Emacs with thread support.")
   (when (and anvil-eval-nelisp-reset-before-eval
              (fboundp 'nelisp--reset))
     (nelisp--reset))
-  (prin1-to-string (nelisp-eval-string expression)))
+  (anvil-eval--bound-result
+   (prin1-to-string (nelisp-eval-string expression))))
 
 (defun anvil-eval--reset-nelisp-host ()
   "Reset the pure Elisp NeLisp evaluator and keep it loaded."
@@ -292,10 +312,11 @@ MCP Parameters:
                     status result)
                 (setq job (plist-put job :run-start-time run-start))
                 (condition-case err
-                    (setq result (format "%S" (eval form t))
+                    (setq result (anvil-eval--bound-result
+                                  (format "%S" (eval form t)))
                           status 'done)
                   (error
-                   (setq result (format "Error: %S" err)
+                   (setq result (anvil-server-format-tool-error err)
                          status 'error)))
                 (let ((finish (current-time)))
                   (setq job (plist-put job :status status))

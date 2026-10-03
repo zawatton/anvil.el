@@ -120,6 +120,17 @@ tight non-yielding loop.  Nil (default) imposes no limit."
   :type '(choice (const :tag "No timeout" nil) number)
   :group 'anvil-server)
 
+(defcustom anvil-server-tool-error-max-chars 4096
+  "Maximum characters of tool error text sent to the client.
+Tool errors are read by LLM clients, and the client typically feeds
+the whole message back into the model's context.  The signal data of
+an unexpected error can carry arbitrarily large objects (a buffer's
+text, a populated hash table), so unbounded error text can exceed the
+model's context window on its own.  Longer messages are cut and end
+with a trailer stating the original length.  Nil disables the cap."
+  :type '(choice (const :tag "Unlimited" nil) integer)
+  :group 'anvil-server)
+
 ;;; Public Constants
 
 (defconst anvil-server-name "anvil"
@@ -1798,7 +1809,10 @@ virtual server-ids share the same handler pool."
                     `((content
                        .
                        ,(vector
-                         `((type . "text") (text . ,(cadr err)))))
+                         `((type . "text")
+                           (text . ,(anvil-server-truncate-text
+                                     (cadr err)
+                                     anvil-server-tool-error-max-chars)))))
                       (isError . t))))
                (anvil-server--respond-with-result
                 context formatted-error)))
@@ -1816,8 +1830,12 @@ virtual server-ids share the same handler pool."
               err tool-name 'tool-body)
              (anvil-server--jsonrpc-error
               id anvil-server-jsonrpc-error-internal
-              (format "Internal error executing tool: %s"
-                      (error-message-string err))))))
+              (anvil-server-truncate-text
+               (format "Internal error executing tool: %s"
+                       (let ((print-length 64)
+                             (print-level 8))
+                         (error-message-string err)))
+               anvil-server-tool-error-max-chars)))))
       (anvil-server-metrics--track-tool-call tool-name t)
       (anvil-server--metrics-bump (anvil-server-metrics-errors method-metrics))
       (anvil-server--jsonrpc-error
@@ -1910,12 +1928,40 @@ Signals `anvil-server-tool-error' on timeout or remote error."
 
 ;;; Error handling helpers
 
+(defun anvil-server-truncate-text (text max-chars &optional hint)
+  "Return TEXT cut to at most MAX-CHARS characters plus a trailer.
+TEXT is returned unchanged when it is not a string, MAX-CHARS is nil,
+or TEXT fits.  The trailer states how much was kept out of the
+original length; HINT, when non-nil, is appended to it to tell the
+reader how to get a smaller result."
+  (if (or (not (stringp text))
+          (null max-chars)
+          (<= (length text) max-chars))
+      text
+    (concat (substring text 0 (max 0 max-chars))
+            (format "\n…[truncated: showing %d of %d chars%s]"
+                    (max 0 max-chars) (length text)
+                    (if hint (concat "; " hint) "")))))
+
+(defun anvil-server-format-tool-error (err)
+  "Return the \"Error: ...\" tool message for condition ERR.
+The signal data is printed with bounded `print-length' and
+`print-level' so a huge object carried by ERR is elided while it is
+printed rather than after, then the text is capped at
+`anvil-server-tool-error-max-chars'."
+  (anvil-server-truncate-text
+   (let ((print-length 64)
+         (print-level 8))
+     (format "Error: %S" err))
+   anvil-server-tool-error-max-chars))
+
 (defmacro anvil-server-with-error-handling (&rest body)
   "Execute BODY with automatic error handling for MCP tools.
 
 Any error that occurs during BODY execution is caught and converted to
 an MCP tool error using `anvil-server-tool-throw'.  This ensures
-consistent error reporting to LLM clients.
+consistent error reporting to LLM clients.  The message is bounded by
+`anvil-server-format-tool-error'.
 
 Arguments:
   BODY  Forms to execute with error handling
@@ -1941,7 +1987,7 @@ See also: `anvil-server-tool-throw'"
      (error
       (anvil-server--run-tool-error-hook
        err anvil-server--current-tool-name 'tool-body)
-      (anvil-server-tool-throw (format "Error: %S" err)))))
+      (anvil-server-tool-throw (anvil-server-format-tool-error err)))))
 
 ;;; Tool helpers
 

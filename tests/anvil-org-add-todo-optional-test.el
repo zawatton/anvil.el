@@ -139,5 +139,36 @@
              "\\*\\* Middle\n[^*]*\\*\\* TODO Newcomer"
              (anvil-org-add-todo-optional-test--read path)))))
 
+(ert-deftest anvil-org-add-todo-optional-test-id-on-heading-not-body-subheading ()
+  "A body containing sub-headings still leaves the ID on the new task.
+The completion step searched backwards for a heading, which lands on the
+LAST sub-heading the body itself introduced -- so the task got no ID and a
+sub-heading was silently given one (plus a :CREATED: describing the task's
+capture)."
+  (anvil-org-add-todo-optional-test--with-org
+      "* Parent\n:PROPERTIES:\n:ID:       44444444-aaaa-bbbb-cccc-000000000005\n:END:\nText.\n"
+    (let* ((response
+            (json-parse-string
+             (anvil-org--tool-add-todo
+              "Structured" "TODO"
+              "org-id://44444444-aaaa-bbbb-cccc-000000000005"
+              "Intro paragraph.\n\n*** First section\nContent.\n\n*** Decide\nMore.")
+             :object-type 'alist))
+           (uri (alist-get 'uri response))
+           (content (anvil-org-add-todo-optional-test--read path))
+           (id (and (string-match "org-id://\\(.*\\)" uri)
+                    (match-string 1 uri))))
+      (should (eq t (alist-get 'success response)))
+      ;; The drawer belongs to the task, immediately under its heading.
+      (should (string-match-p
+               "\\*\\* TODO Structured\n:PROPERTIES:\n:ID:" content))
+      ;; ...and NOT to a sub-heading the body introduced.
+      (should-not (string-match-p "\\*\\*\\* Decide\n:PROPERTIES:" content))
+      (should-not (string-match-p "\\*\\*\\* First section\n:PROPERTIES:" content))
+      ;; The returned URI identifies the task, not a sub-heading.
+      (should (string-match-p (concat "\\*\\* TODO Structured\n:PROPERTIES:\n:ID: +"
+                                      (regexp-quote id))
+                              content)))))
+
 (provide 'anvil-org-add-todo-optional-test)
 ;;; anvil-org-add-todo-optional-test.el ends here
