@@ -142,6 +142,11 @@ died on emacs-init.el)."
 (defvar anvil-runtime-shell--fast-trace nil
   "When non-nil, trace the pre-init fast MCP handshake path.")
 
+(defvar anvil-runtime-shell--fast-tools-json nil
+  "Precomputed `tools/list' result JSON.
+Set by loading the fast-tools file; must be special so the `let' in
+`anvil-runtime-shell--fast-tools-result' sees the loaded value.")
+
 (defvar anvil-runtime-shell--fast-tools-modules nil
   "Module list the fast-tools file was written for.
 Set by loading the file; compared against the current
@@ -710,6 +715,16 @@ MODULES is the current `ANVIL_TOOL_MODULES' value the file must match."
                           ",\"result\":" tools-json "}")))
                 (setq served t)
                 (setq keep-going nil))
+               ;; Pre-initialize probes from newer clients (Claude Code
+               ;; 2.1.289 sends `server/discover' first) get Method not
+               ;; found right away so the client falls back to
+               ;; `initialize' instead of waiting out the full load.
+               ((and (not served) method (not (equal id "null")))
+                (anvil-runtime-shell--stdout
+                 (anvil-runtime-shell--frame
+                  (concat "{\"jsonrpc\":\"2.0\",\"id\":" id
+                          ",\"error\":{\"code\":-32601,"
+                          "\"message\":\"Method not found\"}}"))))
                (t
                 (setq anvil-runtime-shell--fast-pending-body body)
                 (setq keep-going nil))))))))
