@@ -1519,12 +1519,46 @@ the cached placeholders AND whatever was eagerly registered."
   ;; return without serving.  A first-ever start of the DB-backed module
   ;; set costs ~9 minutes of schema generation on the reader; this moves
   ;; that out of the first MCP session.
-  (if (and (boundp 'anvil-runtime-bootstrap-prewarm)
-           anvil-runtime-bootstrap-prewarm)
-      (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
-        (nelisp--write-stderr-line
-         (format "[shell-loop] prewarm done: %d tools registered"
-                 (length (anvil-runtime-shell--registered-tool-ids)))))
-    (anvil-server-run-batch-stdio server-id)))
+  ;;
+  ;; `anvil-runtime mcp daemon' sets `anvil-runtime-bootstrap-service-dir':
+  ;; instead of one stdio session, serve every session through one
+  ;; nelisp-service daemon (NeLisp Doc 213).  Each `mcp shared' proxy
+  ;; forwards its JSON-RPC text; the reply is the same string
+  ;; `anvil-server-process-jsonrpc' would have written to stdout, or "" for
+  ;; a notification.  Requests from all sessions run one at a time.
+  (cond
+   ((and (boundp 'anvil-runtime-bootstrap-prewarm)
+         anvil-runtime-bootstrap-prewarm)
+    (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+      (nelisp--write-stderr-line
+       (format "[shell-loop] prewarm done: %d tools registered"
+               (length (anvil-runtime-shell--registered-tool-ids))))))
+   ((and (boundp 'anvil-runtime-bootstrap-service-dir)
+         anvil-runtime-bootstrap-service-dir)
+    ;; The bootstrap already loaded nelisp-service-daemon, pointed it at
+    ;; the state dir and took the lock before this file loaded, so a
+    ;; second daemon started in the same window exits without paying for
+    ;; the module chain.
+    (anvil-server-start)
+    (let ((daemon
+           (nelisp-service-daemon-start
+            "anvil"
+            :lock-held t
+            :version anvil-runtime-bootstrap-service-version
+            :idle-timeout anvil-runtime-bootstrap-service-idle
+            :handler
+            (lambda (_conn payload reply)
+              (funcall reply
+                       (or (anvil-server-process-jsonrpc
+                            (anvil-runtime-shell--multibyte payload)
+                            server-id)
+                           ""))))))
+      (if daemon
+          (nelisp-service-daemon-run daemon)
+        ;; Another daemon won the lock; its clients will find it.
+        (when (fboundp 'nelisp--write-stderr-line)
+          (nelisp--write-stderr-line
+           "[shell-loop] shared daemon already running; exiting")))))
+   (t (anvil-server-run-batch-stdio server-id))))
 
 ;;; anvil-runtime-shell-loop.el ends here
