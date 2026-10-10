@@ -12,8 +12,10 @@
 ;; `anvil-eval--server-execute-cleanup-advice' wraps `server-execute'
 ;; in `unwind-protect': on abnormal unwind of a wait-for-reply client
 ;; (dontkill nil, connection still open) it sends an `-error' reply
-;; and deletes the connection.  These tests pin that contract using a
-;; real localhost socket pair so `process-status' is genuinely `open'.
+;; and deletes the connection.  A normal return is left alone, even
+;; when the connection stays open.  These tests pin that contract
+;; using a real localhost socket pair so `process-status' is genuinely
+;; `open'.
 
 ;;; Code:
 
@@ -92,6 +94,23 @@ On Emacs 30+, EVALEXPRS occupies index 4 while DONTKILL is at index 5."
                (lambda (&rest _) (delete-process proc) 'done)
                (anvil-eval-server-execute-test--server-args proc nil nil)))
       (should-not sent))))
+
+(ert-deftest anvil-eval-server-execute-test-normal-exit-open-untouched ()
+  "A normal return that leaves the connection open is not torn down.
+`server-execute' returns normally for a waiting file client
+\(`emacsclient FILE', also how with-editor runs $EDITOR) and keeps
+the connection open until the user finishes with the buffer."
+  (anvil-eval-server-execute-test--with-open-process proc
+    (let (sent deleted)
+      (cl-letf (((symbol-function 'process-send-string)
+                 (lambda (_p s) (setq sent s)))
+                ((symbol-function 'delete-process)
+                 (lambda (p) (setq deleted p))))
+        (apply #'anvil-eval--server-execute-cleanup-advice
+               (lambda (&rest _) 'done)
+               (anvil-eval-server-execute-test--server-args proc nil nil)))
+      (should-not sent)
+      (should-not deleted))))
 
 (provide 'anvil-eval-server-execute-test)
 ;;; anvil-eval-server-execute-test.el ends here

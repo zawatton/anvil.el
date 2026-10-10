@@ -438,15 +438,23 @@ the connection down so emacsclient can exit cleanly.  When
 `-suspend' clients — we leave the connection alone, matching
 upstream `server-execute' behaviour.
 
+A normal return is never cleaned up, even with the connection
+still open: that is how `server-execute' leaves a waiting file
+client (`emacsclient FILE', and with-editor's $EDITOR), which
+holds the connection until the user finishes with the buffer.
+
 `dontkill' sits at a different ARGS index depending on the Emacs
 version: Emacs 30 inserted `evalexprs' ahead of it (Bug#65902,
 commit 683efb8de5), shifting `dontkill' from index 4 to index 5."
   (let* ((proc (nth 0 args))
          (dontkill-index (if (>= emacs-major-version 30) 5 4))
-         (dontkill (nth dontkill-index args)))
+         (dontkill (nth dontkill-index args))
+         (finished nil))
     (unwind-protect
-        (apply orig-fn args)
-      (when (and (null dontkill)
+        (prog1 (apply orig-fn args)
+          (setq finished t))
+      (when (and (not finished)
+                 (null dontkill)
                  (processp proc)
                  (process-live-p proc)
                  (eq (process-status proc) 'open))

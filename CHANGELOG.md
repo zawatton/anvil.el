@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Leave `server-execute` connections alone when the call returns normally.
+  The emacsclient cleanup advice ran on every exit, so a waiting file client
+  (`emacsclient FILE`, and with-editor's `$EDITOR`), whose connection stays
+  open by design until the user finishes with the buffer, got a spurious
+  `-error` reply and was disconnected. Magit commits then silently created
+  nothing. Cleanup now happens only on a non-local exit, as documented.
+
 ## [1.4.1] - 2026-10-04
 
 ### Fixed
