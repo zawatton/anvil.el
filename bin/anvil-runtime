@@ -383,7 +383,8 @@ case "$1" in
             # the anvil.el commit, the reader binary, or the module set.
             anvil_rev="$(git -C "$ANVIL_EL_DIR" rev-parse --short HEAD 2>/dev/null || echo none)"
             nelisp_stamp="$(stat -c %Y "$NELISP_BIN" 2>/dev/null || echo 0)"
-            SERVICE_VERSION="$ANVIL_RUNTIME_VERSION/$anvil_rev/$nelisp_stamp/${ANVIL_TOOL_MODULES:-default}"
+            service_stamp="$(cat "$SERVICE_DIR"/*.el 2>/dev/null | cksum | cut -d' ' -f1)"
+            SERVICE_VERSION="$ANVIL_RUNTIME_VERSION/$anvil_rev/$nelisp_stamp/$service_stamp/${ANVIL_TOOL_MODULES:-default}"
             service_common=(
                 "(add-to-list 'load-path \"$(native_path "$SERVICE_DIR")\")"
                 "(setq anvil-runtime-bootstrap-service-dir \"$(native_path "$SERVICE_DIR")\")"
