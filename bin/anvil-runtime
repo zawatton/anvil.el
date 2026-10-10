@@ -228,6 +228,13 @@ write_bootstrap() {  # $1 = file, $2.. = extra elisp lines
         printf '(setq anvil-runtime-bootstrap-nelisp-emacs-dir "%s")\n' "$(native_path "$NELISP_EMACS_DIR")"
         printf '(setq anvil-runtime-bootstrap-nelisp-lisp-dir "%s")\n' "$(native_path "$NELISP_LISP_DIR")"
         printf '(setq anvil-runtime-bootstrap-state-dir "%s")\n' "$(native_path "$STATE_DIR")"
+        # The standalone reader defaults `temporary-file-directory' to "/tmp",
+        # which on Windows is not the directory MSYS helpers resolve "/tmp" to:
+        # `secure-hash' writes its input there and Git's sha1sum.exe then fails
+        # with rc 1 (measured 2026-10-10), breaking every memory/worklog write.
+        if [ "$ANVIL_RUNTIME_OS" = "windows-msys" ] && [ -n "${TEMP:-}" ]; then
+            printf '(setq temporary-file-directory "%s/")\n' "$(native_path "$TEMP")"
+        fi
         if [ -n "${ANVIL_RUNTIME_DEBUG:-}" ]; then
             echo "(setq anvil-server--debug-trace t)"
         fi
