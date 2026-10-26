@@ -1,0 +1,13 @@
+#+TITLE: Anvil 1.4.2 commit and documentation
+
+* S1 Prepare and commit the patch version
+
+** S1.1 Package metadata and current-version documentation agree
+cmd: python -c "import pathlib,re; p=pathlib.Path('.'); assert re.search(r'^;; Version: 1[.]4[.]2$', (p/'anvil.el').read_text(encoding='utf-8'), re.M); assert re.search(r'\(package \"anvil\"\s+\"1[.]4[.]2\"', (p/'Eask').read_text(encoding='utf-8')); assert all('v1.4.2 (2026-10-26)' in (p/f).read_text(encoding='utf-8') for f in ['README.org','README.ja.org']); assert '## [1.4.2] - 2026-10-26' in (p/'CHANGELOG.md').read_text(encoding='utf-8')"
+
+** S1.2 Native Emacs release audit passes
+cmd: emacs -Q --batch -L . --eval '(require (quote anvil-dev))' --eval '(let ((r (anvil-dev-release-audit default-directory))) (when (or (plist-get r :arglist-strip) (plist-get r :missing-params) (plist-get r :plist-return)) (kill-emacs 1)))'
+
+** S1.3 Commit the scoped release update on top of the verified worker fix
+cmd: git merge-base --is-ancestor 5c9072d9564dac325d0756f57403f5a35049a45c HEAD
+cmd: git log -1 --format=%s | grep -Fx 'Prepare Anvil 1.4.2 with nonblocking worker monitoring'

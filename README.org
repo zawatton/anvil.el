@@ -23,7 +23,16 @@ run elisp, query SQLite, and more *through Emacs primitives* instead
 of generic =sed= / =grep= / =read-whole-file= round-trips.  That
 swap is where the token savings come from.
 
-v1.4.1 (2026-10-04) adds bounded handling for
+v1.4.2 (2026-10-26) makes periodic worker health monitoring asynchronous:
+unresponsive workers no longer impose a two-second synchronous wait on the
+hosting Emacs for every probe. Sweeps share a deadline, run at most two probes
+concurrently, and cancel obsolete callbacks safely. Windows PID-reuse checks
+and nonblocking Unix socket recovery protect worker identity and ownership.
+See [[file:docs/worker-health-monitoring.md][worker health monitoring]] for behavior and verification.
+The latest published stable tag remains =v1.4.1= until v1.4.2 is published;
+the installation examples below keep that published tag.
+
+v1.4.1 (2026-10-04) added bounded handling for
 selected file reads and successful inline results, bounded diagnostic and
 telemetry traversal, and safer worker cleanup after successful termination.
 These changes build on the v1.4.0 feature set: searchable Claude Code session
@@ -45,7 +54,26 @@ the Emacs daemon remains the full-featured path.
 
 * Current Release Highlights
 
-Release v1.4.1 (2026-10-04) adds bounded handling for file reads, successful inline results,
+Version v1.4.2 (2026-10-26) includes:
+
+- Nonblocking periodic worker monitoring with a shared deadline, bounded
+  concurrency, fair scheduling, and cancellation on stop, restart, pool reset,
+  and worker shutdown. Explicit synchronous dispatch probes keep their API.
+- Windows auth-file identity checks and asynchronous Unix socket classification;
+  busy workers and full socket backlogs do not authorize speculative termination.
+- Preserved normal waiting =server-execute= clients and clean worker replies,
+  plus bounded interrupted-request, async-result, and stdio recovery behavior.
+- Verified Emacs 28.2 core and Emacs 29.1 optional-module profiles, with no
+  package-lint diagnostics across the 103 profiled modules.
+
+On a private Windows server with three unresponsive workers, the monitor
+callback fell from 6.180 seconds to 0.109 seconds; a concurrent client improved
+from 6.526 seconds to 0.112 seconds. These measurements describe that fixture,
+not a latency guarantee for arbitrary synchronous Lisp or OS scheduling.
+Standalone isolation remains a separate deployment choice and is not required
+to obtain the worker-monitoring fix. Windows validation can run natively.
+
+Previous release v1.4.1 (2026-10-04) added bounded handling for file reads, successful inline results,
 diagnostic snapshots, and telemetry rendering, plus safer worker cleanup.
 The byte limits apply at their documented boundaries; they do not bound
 arbitrary execution or complete transport frames. The v1.4.0 feature baseline

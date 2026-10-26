@@ -78,7 +78,16 @@ Anvil の背景 - 何故開発するに至ったのか — [[file:STORY.ja.org][
 
 * 現在のリリースハイライト
 
-v1.4.1 (2026-10-04) adds bounded handling for
+v1.4.2 (2026-10-26) makes periodic worker monitoring asynchronous, with at most
+two concurrent probes, one shared deadline, fair scheduling, and safe callback
+cancellation. Windows PID-reuse checks and nonblocking Unix socket recovery
+preserve worker ownership. Standalone isolation is a separate deployment choice;
+Windows validation can run natively. See
+[[file:docs/worker-health-monitoring.md][worker health monitoring]] for details and measured results.
+The latest published stable tag remains =v1.4.1= until v1.4.2 is published;
+the installation examples below retain that published tag.
+
+Previous release v1.4.1 (2026-10-04) added bounded handling for
 selected file reads and successful inline results, bounded diagnostic and
 telemetry traversal, and safer worker cleanup after successful termination.
 The byte limits apply at their documented boundaries; they do not bound

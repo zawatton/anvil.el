@@ -7,8 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.2] - 2026-10-26
+
 ### Fixed
 
+- Run periodic worker health checks as bounded asynchronous sweeps instead of
+  synchronously waiting up to two seconds per worker inside the hosting Emacs.
+  Limit concurrency, share the sweep deadline, rotate queued workers, and cancel
+  probe children, buffers, timers, and obsolete callbacks on lifecycle changes.
+- Preserve exact worker, endpoint, pool, and owned-process identity during
+  recovery. Keep busy workers under dispatch ownership, reject Windows PID reuse
+  when metadata proves it, and classify Unix sockets without blocking or
+  unlinking live endpoints with a full backlog.
+- Preserve clean worker output and bound interrupted-request, asynchronous
+  result, diagnostic, and stdio recovery behavior. Retain explicit synchronous
+  dispatch probe APIs and the existing standalone deployment choice.
+- Verify separate Emacs 28.2 core and Emacs 29.1 optional-module compatibility
+  profiles without raising the core requirement. Align Eask package metadata
+  with the package header version.
 - Leave `server-execute` connections alone when the call returns normally.
   The emacsclient cleanup advice ran on every exit, so a waiting file client
   (`emacsclient FILE`, and with-editor's `$EDITOR`), whose connection stays
