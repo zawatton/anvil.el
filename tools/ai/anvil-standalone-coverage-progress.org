@@ -1,0 +1,38 @@
+#+TITLE: anvil modules on the standalone NeLisp server
+
+* S1 Coverage census
+
+** S1.1 Census driver runs end to end on the standalone runtime
+cmd: d=$(mktemp -d) && tools/ai/standalone-coverage-census.sh "$d" anvil-git >/dev/null 2>&1 && grep -q 'anvil-git	pass' "$d/results.tsv"
+
+** S1.2 Every anvil-*.el module has exactly one row in the coverage table
+cmd: ls anvil-*.el | sed 's/\.el$//' | sort > /tmp/.cov-a.$$ && grep -oE '^[|] anvil-[a-z0-9-]+ ' docs/standalone-module-coverage.md | sed 's/^| //; s/ $//' | sort > /tmp/.cov-b.$$ && cmp -s /tmp/.cov-a.$$ /tmp/.cov-b.$$; r=$?; rm -f /tmp/.cov-a.$$ /tmp/.cov-b.$$; exit $r
+
+** S1.3 Negative control: known module passes, missing module reports file-missing
+cmd: d=$(mktemp -d) && tools/ai/standalone-coverage-census.sh "$d" anvil-memory anvil-nonexistent-xyz >/dev/null 2>&1 && grep -q 'anvil-memory	pass' "$d/results.tsv" && grep -q 'anvil-nonexistent-xyz	fail	(file-missing' "$d/results.tsv"
+
+* S2 Port lint and cron (user chose option 3 on 2026-11-01)
+
+** S2.1 Standalone loader registers anvil-lint and anvil-cron outside the context worker
+cmd: grep -q "(anvil-lint-enable)" tools/anvil-standalone-mcp.el && grep -q "(anvil-cron-enable)" tools/anvil-standalone-mcp.el
+
+** S2.2 Real launcher (image build + smoke) serves lint/cron and every call succeeds
+cmd: out=$(timeout 280 python3 tools/ai/standalone-mcp-call.py tools/ai/standalone-port-calls.json) && echo "$out" | grep -q '"count\\":1'
+
+** S2.3 The shared anvil-standalone daemon answers lint-scanners after its next restart
+#+NOTE: needs a new Claude Code session; record the MCP response as evidence
+pending
+
+* S3 git tools on standalone
+
+** S3.1 git-head-sha on standalone returns HEAD of the requested repo, not of the server cwd
+#+NOTE: known red: NeLisp make-process ignores default-directory; also needs process-coding-system-alist and process-list
+cmd: out=$(timeout 280 python3 tools/ai/standalone-mcp-call.py tools/ai/standalone-git-calls.json) && echo "$out" | grep -q "$(git rev-parse HEAD)"
+
+** S3.2 NeLisp make-process honors default-directory and binds process-coding-system-alist (branch fix/make-process-cwd-20261101)
+#+REQUIRES: NELISP_MPC_WT
+#+NOTE: NELISP_MPC_WT = the nelisp worktree whose target/nelisp is built from that branch
+cmd: ulimit -v 8388608; out=$(cd /tmp && ANVIL_EL_DIR="$OLDPWD" ANVIL_STANDALONE_TEST_NO_SERVER=1 timeout 120 "$NELISP_MPC_WT/target/nelisp" --load "$OLDPWD/tools/anvil-standalone-mcp.el" --load "$NELISP_MPC_WT/tools/ai/make-process-cwd-probe.el" 2>&1) && echo "$out" | grep -q "PROBE coding-alist-bound PASS" && echo "$out" | grep -q "PROBE make-process-cwd PASS"
+
+** S3.3 anvil-shell returns complete stdout on the installed standalone runtime
+cmd: ulimit -v 8388608; cd /tmp && ANVIL_EL_DIR="$OLDPWD" ANVIL_STANDALONE_TEST_NO_SERVER=1 timeout 120 nelisp --load "$OLDPWD/tools/anvil-standalone-mcp.el" --load "$OLDPWD/tools/ai/standalone-shell-drain-probe.el" 2>&1 | grep -q "DRAIN PASS"
