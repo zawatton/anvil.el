@@ -139,6 +139,14 @@ for other reasons should invoke `setsid --fork' explicitly."
                   (delete-process stderr-proc))
                 (error "anvil-host: shell timeout after %ss: %s"
                        timeout command)))
+            ;; Bounded drain for stdout still buffered after exit.  The
+            ;; NeLisp runtime reports the process dead before its last
+            ;; chunk is read, so without this the tail of the output is
+            ;; lost; on Emacs it returns nil at once.
+            (let ((drain-deadline
+                   (+ (float-time) anvil-host--stderr-drain-budget-sec)))
+              (while (and (accept-process-output proc 0.02)
+                          (< (float-time) drain-deadline))))
             ;; Brief bounded drain for late stderr after proc exit.
             ;; The stderr pipe-proc is independent: when proc dies the
             ;; kernel pipe may still hold bytes the proc just wrote,

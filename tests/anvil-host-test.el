@@ -99,5 +99,18 @@ post-exit drain captures those late bytes."
       (should (string-match-p "line1" err))
       (should (string-match-p "line5" err)))))
 
+(ert-deftest anvil-host-test-shell-captures-stdout-tail ()
+  "Stdout must be complete up to its last byte.
+Regression for runtimes (NeLisp standalone) whose `process-live-p'
+turns nil before the last output chunk is read: without the
+post-exit stdout drain, `seq 1 20000' stopped at a 4096-byte
+boundary (last line \"19\")."
+  (skip-unless (memq system-type '(gnu/linux darwin)))
+  (let* ((res (anvil-shell "seq 1 20000" '(:timeout 10 :max-output 1000000)))
+         (out (plist-get res :stdout)))
+    (should (eql 0 (plist-get res :exit)))
+    (should (= 108894 (length out)))
+    (should (equal "20000" (car (last (split-string out "\n" t)))))))
+
 (provide 'anvil-host-test)
 ;;; anvil-host-test.el ends here
