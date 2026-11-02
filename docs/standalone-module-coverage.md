@@ -108,13 +108,14 @@ harness-telemetry, session-store) were added to the loader the same day.
 Loader defect found by this screening: `tools/anvil-standalone-mcp.el` at
 56bb67f requires `anvil-context-batch`, `anvil-context-dependencies` and
 `anvil-context-project`, which are untracked working files, so the server does
-not start from a clean checkout of the branch (the screening stubbed them).
+not start from a clean checkout of the branch (the screening stubbed them).  Fixed 2026-11-03: those three requires are optional and their tools
+register only when the feature loaded; a clean checkout serves 94 tools.
 
 anvil-lint and anvil-cron were added to the loader on 2026-11-01 (image tool count 40 -> 46; the sixth is `metrics-token-report`, pulled in by their requires).  anvil-file followed on 2026-11-02 (46 -> 61) and anvil-compact, anvil-session and anvil-shell-filter after it (61 -> 79), and agent, data, dev, discovery, harness-telemetry and session-store after the second screening (79 -> 98; their databases go to the XDG cache).
 
 Note: NeLisp origin/main (66561c85e) cannot run the standalone loader at all (`nl-ffi-memory` is missing there); the installed runtime's line is ~2200 commits ahead of origin/main.
 
-Adding modules also requires updating the tool-count check (now 98) in
+Adding modules also requires updating the tool-count check (a lower bound: 94 plus one per optional context module that loaded; 98 in a full working tree) in
 `tools/anvil-standalone-image.py` `smoke`.
 
 <!-- TABLE -->

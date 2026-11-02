@@ -301,8 +301,13 @@ class Launcher:
 
     def smoke(self, path):
         """Never publish an image that this exact runtime cannot restore."""
+        # Tool count: 94 committed tools plus each optional context module that
+        # loaded; a lower bound, so tools added by work in progress pass.
         form = ('(unless (and (fboundp \'anvil-standalone-start) '
-                '(= (hash-table-count (gethash "emacs-eval" anvil-server--tools)) 98) '
+                '(>= (hash-table-count (gethash "emacs-eval" anvil-server--tools)) '
+                '(+ 94 (if (featurep \'anvil-context-batch) 1 0) '
+                '(if (featurep \'anvil-context-dependencies) 1 0) '
+                '(if (featurep \'anvil-context-project) 1 0))) '
                 '(null anvil-memory--db) (null anvil-worklog--db) '
                 '(null anvil-standalone--encoding-cache) '
                 '(null anvil-standalone--response-cache) '

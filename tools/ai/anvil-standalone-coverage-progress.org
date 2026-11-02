@@ -19,9 +19,9 @@ cmd: d=$(mktemp -d) && tools/ai/standalone-coverage-census.sh "$d" anvil-org-ind
 #+NOTE: added 2026-11-02 with the second screening; context-range and dashboard are untracked, so they stay unscreened ports
 cmd: for m in agent bisect buffer cad data dev discovery eval fusion-longrun-mcp fusion-mcp harness-telemetry manifest mu4e orchestrator-routing semantic session-store; do grep -qE "^[|] anvil-$m [|].*(screened|already loaded)" docs/standalone-module-coverage.md || exit 1; done
 
-** S1.6 A clean archive of HEAD contains every anvil module the standalone loader requires
-#+NOTE: added 2026-11-02; known red: the loader requires anvil-context-batch, -dependencies and -project, which are untracked
-cmd: files=$(git archive HEAD | tar -t) && for m in $(grep -oE "^\(require 'anvil[a-z0-9-]*\)" tools/anvil-standalone-mcp.el | sed "s/(require '//; s/)//" | sort -u); do printf '%s\n' "$files" | grep -qx "$m.el" || exit 1; done
+** S1.6 A clean archive of HEAD has every module the loader hard-requires and its loader registers the 94 committed tools
+#+NOTE: added 2026-11-02 (known red: hard requires of untracked anvil-context-batch/-dependencies/-project); 2026-11-03 those requires became optional and this check became end to end
+cmd: ulimit -v 8388608; d=$(mktemp -d) && git archive HEAD | tar -x -C "$d" && for m in $(grep -oE "^\(require 'anvil[a-z0-9-]*\)" "$d/tools/anvil-standalone-mcp.el" | sed "s/(require '//; s/)//" | sort -u); do test -f "$d/$m.el" || exit 1; done && n=$(cd /tmp && ANVIL_NOTES_DIR="${ANVIL_NOTES_DIR:-$HOME/Cowork/Notes}" ANVIL_EL_DIR="$d" ANVIL_STANDALONE_TEST_NO_SERVER=1 timeout 180 nelisp --load "$d/tools/anvil-standalone-mcp.el" --load "$OLDPWD/tools/ai/standalone-tool-count-probe.el" 2>/dev/null | sed -n 's/^TOOLCOUNT //p') && test "${n:-0}" -ge 94
 
 * S2 Port lint and cron (user chose option 3 on 2026-11-01)
 

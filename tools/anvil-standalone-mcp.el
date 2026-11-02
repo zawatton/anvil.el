@@ -278,8 +278,11 @@ non-positive SECS cannot spin."
 (require 'anvil)
 (require 'anvil-server-commands)
 (require 'anvil-context)
-(require 'anvil-context-batch)
-(require 'anvil-context-dependencies)
+;; The batch, dependency and project context modules are optional: a checkout
+;; without them still serves every other tool.  Their tools register below
+;; only when the feature loaded.
+(require 'anvil-context-batch nil t)
+(require 'anvil-context-dependencies nil t)
 
 (let ((compat-dir (or (getenv "NELISP_EMACS_LIB_DIR")
                       (and (getenv "ANVIL_NOTES_DIR")
@@ -301,7 +304,7 @@ non-positive SECS cannot spin."
       db)))
 
 (require 'anvil-defs)
-(require 'anvil-context-project)
+(require 'anvil-context-project nil t)
 (require 'anvil-disclosure)
 (require 'anvil-memory)
 (require 'anvil-worklog)
@@ -413,40 +416,43 @@ non-positive SECS cannot spin."
                           ("diagnostic-limit" . ((description . "Optional omitted-range detail limit, 0..128, default 20.") (type . "string")))))
            (required . ["path" "query"]))
  :description "Retrieve matching code excerpts within a character budget. Local lexical baseline through nelisp-system-one; reports omitted counts and ranges with optional diagnostic-limit. Use for targeted source inspection, not complete review or instructions.")
-(anvil-server-register-tool
- #'anvil-standalone-context-batch-handler :id "code-context-batch" :server-id "emacs-eval"
- :intent '(file-read) :layer 'core :read-only t
- :schema '((type . "object")
-           (properties . (("requests" . ((description . "JSON array string of 1..16 bounded context requests.") (type . "string")))
-                          ("encoding" . ((description . "Optional standard or shared-excerpts encoding.") (type . "string")))))
-           (required . ["requests"]))
- :description "Retrieve bounded code contexts in one call; identical requests share results through NSO. Optional shared-excerpts encoding pools exact overlapping excerpts. Little overlap can increase size. Local lexical scorer only; file-attribute checks are not a snapshot.")
-(anvil-server-register-tool
- #'anvil-standalone-context-dependencies-handler :id "code-context-dependencies"
- :server-id "emacs-eval" :intent '(file-read) :layer 'core :read-only t
- :schema '((type . "object")
-           (properties . (("path" . ((description . "Local Elisp source file.") (type . "string")))
-                          ("symbol" . ((description . "Exact function name.") (type . "string")))
-                          ("budget-chars" . ((description . "Optional excerpt budget, default 6000, maximum 32000.") (type . "string")))
-                          ("depth" . ((description . "Optional dependency depth, default 1, maximum 3.") (type . "string")))
-                          ("additional-paths" . ((description . "Optional JSON array string of up to seven local Elisp paths.") (type . "string")))
-                          ("direction" . ((description . "Optional callees or callers direction.") (type . "string")))))
-           (required . ["path" "symbol"]))
- :description "Retrieve an exact Elisp function and bounded callees or callers from up to eight explicit files, each at most 64 MiB. Large files use bounded top-level definition scanning. All reached definitions must fit. No implicit directory search or dynamic call resolution.")
-(anvil-server-register-tool
- #'anvil-standalone-context-project-handler :id "code-context-project"
- :server-id "emacs-eval" :intent '(file-read) :layer 'core :read-only t
- :schema '((type . "object")
-           (properties . (("path" . ((description . "Local primary Elisp file defining the symbol.") (type . "string")))
-                          ("symbol" . ((description . "Exact function name.") (type . "string")))
-                          ("root" . ((description . "Explicit local project directory restricting discovered files.") (type . "string")))
-                          ("budget-chars" . ((description . "Optional excerpt budget, default 6000, maximum 32000.") (type . "string")))
-                          ("depth" . ((description . "Optional graph depth, default 1, maximum 3.") (type . "string")))
-                          ("direction" . ((description . "Optional callees or callers direction.") (type . "string")))
-                          ("diagnostic-limit" . ((description . "Optional maximum detailed discovery issues, 0..128.") (type . "string")))
-                          ("discovery-mode" . ((description . "Optional indexed or source discovery mode.") (type . "string")))))
-           (required . ["path" "symbol" "root"]))
- :description "Retrieve dependencies through NSO within an explicit root. Default indexed discovery uses indexed locations and reverse edges; optional source mode scans at most eight Elisp files without the DB to find new callers and unindexed files. Bounded, partial, no index rebuild.")
+(when (featurep 'anvil-context-batch)
+  (anvil-server-register-tool
+   #'anvil-standalone-context-batch-handler :id "code-context-batch" :server-id "emacs-eval"
+   :intent '(file-read) :layer 'core :read-only t
+   :schema '((type . "object")
+             (properties . (("requests" . ((description . "JSON array string of 1..16 bounded context requests.") (type . "string")))
+                            ("encoding" . ((description . "Optional standard or shared-excerpts encoding.") (type . "string")))))
+             (required . ["requests"]))
+   :description "Retrieve bounded code contexts in one call; identical requests share results through NSO. Optional shared-excerpts encoding pools exact overlapping excerpts. Little overlap can increase size. Local lexical scorer only; file-attribute checks are not a snapshot."))
+(when (featurep 'anvil-context-dependencies)
+  (anvil-server-register-tool
+   #'anvil-standalone-context-dependencies-handler :id "code-context-dependencies"
+   :server-id "emacs-eval" :intent '(file-read) :layer 'core :read-only t
+   :schema '((type . "object")
+             (properties . (("path" . ((description . "Local Elisp source file.") (type . "string")))
+                            ("symbol" . ((description . "Exact function name.") (type . "string")))
+                            ("budget-chars" . ((description . "Optional excerpt budget, default 6000, maximum 32000.") (type . "string")))
+                            ("depth" . ((description . "Optional dependency depth, default 1, maximum 3.") (type . "string")))
+                            ("additional-paths" . ((description . "Optional JSON array string of up to seven local Elisp paths.") (type . "string")))
+                            ("direction" . ((description . "Optional callees or callers direction.") (type . "string")))))
+             (required . ["path" "symbol"]))
+   :description "Retrieve an exact Elisp function and bounded callees or callers from up to eight explicit files, each at most 64 MiB. Large files use bounded top-level definition scanning. All reached definitions must fit. No implicit directory search or dynamic call resolution."))
+(when (featurep 'anvil-context-project)
+  (anvil-server-register-tool
+   #'anvil-standalone-context-project-handler :id "code-context-project"
+   :server-id "emacs-eval" :intent '(file-read) :layer 'core :read-only t
+   :schema '((type . "object")
+             (properties . (("path" . ((description . "Local primary Elisp file defining the symbol.") (type . "string")))
+                            ("symbol" . ((description . "Exact function name.") (type . "string")))
+                            ("root" . ((description . "Explicit local project directory restricting discovered files.") (type . "string")))
+                            ("budget-chars" . ((description . "Optional excerpt budget, default 6000, maximum 32000.") (type . "string")))
+                            ("depth" . ((description . "Optional graph depth, default 1, maximum 3.") (type . "string")))
+                            ("direction" . ((description . "Optional callees or callers direction.") (type . "string")))
+                            ("diagnostic-limit" . ((description . "Optional maximum detailed discovery issues, 0..128.") (type . "string")))
+                            ("discovery-mode" . ((description . "Optional indexed or source discovery mode.") (type . "string")))))
+             (required . ["path" "symbol" "root"]))
+   :description "Retrieve dependencies through NSO within an explicit root. Default indexed discovery uses indexed locations and reverse edges; optional source mode scans at most eight Elisp files without the DB to find new callers and unindexed files. Bounded, partial, no index rebuild."))
 (anvil-server-register-tool
  #'anvil-standalone-defs-index-handler :id "defs-index"
  :server-id "emacs-eval" :intent '(elisp-read structure) :layer 'core :read-only t
