@@ -36,3 +36,41 @@ cmd: ulimit -v 8388608; out=$(cd /tmp && ANVIL_EL_DIR="$OLDPWD" ANVIL_STANDALONE
 
 ** S3.3 anvil-shell returns complete stdout on the installed standalone runtime
 cmd: ulimit -v 8388608; cd /tmp && ANVIL_EL_DIR="$OLDPWD" ANVIL_STANDALONE_TEST_NO_SERVER=1 timeout 120 nelisp --load "$OLDPWD/tools/anvil-standalone-mcp.el" --load "$OLDPWD/tools/ai/standalone-shell-drain-probe.el" 2>&1 | grep -q "DRAIN PASS"
+
+* S4 (require 'org) on standalone (user request 2026-11-02)
+
+# Root cause (2026-11-02): nelisp-emacs-compat.el / nelisp-text-buffer.el
+# replace their cl-defstruct with alist objects under standalone, while
+# host-compiled .elc of their users inline the record accessors (aref).
+
+** S4.1 Fixed nelisp-emacs-lib branch, overlaid on the live checkout: require org, an org buffer round trip and require anvil-file pass under the loader
+#+REQUIRES: NELISP_EMACS_LIB_WT
+#+NOTE: NELISP_EMACS_LIB_WT = worktree of nelisp-emacs-lib branch fix/standalone-struct-records-20261102; overlaid because the live checkout carries another session's uncommitted json/stdio/sqlite changes the loader needs
+cmd: ulimit -v 8388608; d=$(mktemp -d); tools/ai/elib-overlay.sh "${ANVIL_NOTES_DIR:-$HOME/Cowork/Notes}/dev/nelisp-emacs-lib" "$NELISP_EMACS_LIB_WT" "$d" || exit 1; out=$(cd "$d" && NELISP_EMACS_LIB_DIR="$d/src" ANVIL_EL_DIR="$OLDPWD" ANVIL_NOTES_DIR="${ANVIL_NOTES_DIR:-$HOME/Cowork/Notes}" ANVIL_MEMORY_DB="$d/m.db" ANVIL_WORKLOG_DB="$d/w.db" TMPDIR="$d" ANVIL_STANDALONE_TEST_NO_SERVER=1 timeout 280 nelisp --load "$OLDPWD/tools/anvil-standalone-mcp.el" --load "$OLDPWD/tools/ai/standalone-org-timer-probe.el" 2>&1); echo "$out" | grep -q "ORGTIMER require-org PASS" && echo "$out" | grep -q "ORGTIMER org-buffer-roundtrip PASS" && echo "$out" | grep -q "ORGTIMER require-anvil-file PASS"
+
+** S4.2 Same checks pass with the default nelisp-emacs-lib checkout (what the shared daemon loads)
+cmd: ulimit -v 8388608; d=$(mktemp -d); out=$(cd "$d" && ANVIL_EL_DIR="$OLDPWD" ANVIL_NOTES_DIR="${ANVIL_NOTES_DIR:-$HOME/Cowork/Notes}" ANVIL_MEMORY_DB="$d/m.db" ANVIL_WORKLOG_DB="$d/w.db" TMPDIR="$d" ANVIL_STANDALONE_TEST_NO_SERVER=1 timeout 280 nelisp --load "$OLDPWD/tools/anvil-standalone-mcp.el" --load "$OLDPWD/tools/ai/standalone-org-timer-probe.el" 2>&1); echo "$out" | grep -q "ORGTIMER require-org PASS" && echo "$out" | grep -q "ORGTIMER require-anvil-file PASS"
+
+** S4.3 Real MCP call: anvil-file tools (read, outline, create, replace, read back) answer through the real launcher
+#+NOTE: user chose to port anvil-file on 2026-11-02; anvil-org still blocked (org-id.el missing)
+cmd: out=$(timeout 400 python3 tools/ai/standalone-mcp-call.py tools/ai/standalone-file-calls.json) && echo "$out" | grep -q 'FILE-ROUNDTRIP-OK'
+
+** S4.4 Standalone loader registers anvil-file outside the context worker
+cmd: grep -q "(anvil-file-enable)" tools/anvil-standalone-mcp.el
+
+* S5 Timers on standalone (user request 2026-11-02)
+
+# run-at-time / cancel-timer / timerp are real async timers (nelisp-async-core);
+# run-with-timer and run-with-idle-timer are unbound.
+
+** S5.1 Fixed NeLisp binary: run-with-timer (deferred, repeat, cancel) and run-with-idle-timer fire
+#+REQUIRES: NELISP_TIMER_WT
+#+NOTE: NELISP_TIMER_WT = nelisp worktree of branch feat/run-with-timer-20261102 with target/nelisp built
+cmd: ulimit -v 8388608; d=$(mktemp -d); out=$(cd "$d" && ANVIL_EL_DIR="$OLDPWD" ANVIL_NOTES_DIR="${ANVIL_NOTES_DIR:-$HOME/Cowork/Notes}" ANVIL_MEMORY_DB="$d/m.db" ANVIL_WORKLOG_DB="$d/w.db" TMPDIR="$d" ANVIL_STANDALONE_TEST_NO_SERVER=1 timeout 280 "$NELISP_TIMER_WT/target/nelisp" --load "$OLDPWD/tools/anvil-standalone-mcp.el" --load "$OLDPWD/tools/ai/standalone-org-timer-probe.el" 2>&1); echo "$out" | grep -q "ORGTIMER run-with-timer-deferred PASS" && echo "$out" | grep -q "ORGTIMER run-with-timer-repeat-cancel PASS" && echo "$out" | grep -q "ORGTIMER run-with-idle-timer PASS"
+
+** S5.2 Installed runtime + default checkout: timer checks pass and the seven blocked modules enable
+cmd: ulimit -v 8388608; d=$(mktemp -d); out=$(cd "$d" && ANVIL_EL_DIR="$OLDPWD" ANVIL_NOTES_DIR="${ANVIL_NOTES_DIR:-$HOME/Cowork/Notes}" ANVIL_MEMORY_DB="$d/m.db" ANVIL_WORKLOG_DB="$d/w.db" TMPDIR="$d" ANVIL_STANDALONE_TEST_NO_SERVER=1 timeout 280 nelisp --load "$OLDPWD/tools/anvil-standalone-mcp.el" --load "$OLDPWD/tools/ai/standalone-org-timer-probe.el" 2>&1); echo "$out" | grep -q "ORGTIMER run-with-timer-repeat-cancel PASS" && echo "$out" | grep -q "ORGTIMER run-with-idle-timer PASS" && test "$(echo "$out" | grep -c 'ORGTIMER enable-anvil-.* PASS')" = 7
+
+** S5.3 Real MCP call: a tool from a timer-dependent module answers through the real launcher
+#+NOTE: needs the module added to the loader after S5.2
+pending

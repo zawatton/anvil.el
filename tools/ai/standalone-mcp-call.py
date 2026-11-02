@@ -10,8 +10,9 @@ exits 0 only when every call succeeds.
 import json, os, resource, subprocess, sys, tempfile
 
 repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-calls = json.loads(open(sys.argv[1]).read().replace("@REPO@", repo))  # @REPO@ -> repo root
 work = tempfile.mkdtemp(prefix="anvil-mcp-call-")
+# @REPO@ -> repo root, @TMP@ -> private work dir
+calls = json.loads(open(sys.argv[1]).read().replace("@REPO@", repo).replace("@TMP@", work))
 cache = os.environ.get("ANVIL_MCP_CALL_CACHE") or os.path.join(work, "xdg")
 env = dict(os.environ, ANVIL_EL_DIR=repo, XDG_CACHE_HOME=cache, TMPDIR=work,
            ANVIL_MEMORY_DB=os.path.join(work, "m.db"), ANVIL_WORKLOG_DB=os.path.join(work, "w.db"),

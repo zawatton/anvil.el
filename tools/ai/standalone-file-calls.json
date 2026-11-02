@@ -1,0 +1,5 @@
+[["file-read", {"path": "@REPO@/tools/ai/fixtures/lint-conflict/t.org"}],
+ ["file-outline", {"path": "@REPO@/tools/ai/fixtures/lint-conflict/t.org"}],
+ ["file-create", {"path": "@TMP@/rt.org", "content": "* A\nfoo FILE-ROUNDTRIP-\n"}],
+ ["file-replace-string", {"path": "@TMP@/rt.org", "old-string": "foo FILE-ROUNDTRIP-", "new-string": "bar FILE-ROUNDTRIP-OK"}],
+ ["file-read", {"path": "@TMP@/rt.org"}]]

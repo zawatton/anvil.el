@@ -245,6 +245,27 @@
       (defalias 'advice-remove 'nelisp-advice-remove)
       (defalias 'advice-member-p 'nelisp-advice-member-p))))
 
+;; Timer fallbacks.  Older standalone runtimes provide `run-at-time',
+;; `cancel-timer' and `timerp' (nelisp-async-core) but not the
+;; `run-with-*' wrappers that several anvil modules call when enabled.
+;; Newer NeLisp defines both natively, so these guards step aside there.
+(unless (fboundp 'run-with-timer)
+  (defun run-with-timer (secs repeat function &rest args)
+    "Run FUNCTION with ARGS after SECS seconds, repeating every REPEAT.
+Fallback for runtimes that lack a native `run-with-timer'."
+    (apply #'run-at-time secs repeat function args)))
+
+(unless (fboundp 'run-with-idle-timer)
+  (defun run-with-idle-timer (secs repeat function &rest args)
+    "Run FUNCTION with ARGS once idle for SECS seconds.
+The standalone server has no user input and is therefore always idle, so
+this approximates idleness with a plain timer.  When REPEAT is non-nil the
+function runs every SECS seconds, with a 1.0 second floor so a missing or
+non-positive SECS cannot spin."
+    (let ((interval (and repeat
+                         (if (and (numberp secs) (> secs 0)) secs 1.0))))
+      (apply #'run-at-time secs interval function args))))
+
 ;; Load the current provider before Anvil can select a stale .elc.  NeLisp's
 ;; library lookup prefers bytecode independently of load-suffixes.
 (let ((compat-dir (or (getenv "NELISP_EMACS_LIB_DIR")
@@ -461,7 +482,33 @@
   (require 'anvil-lint)
   (require 'anvil-cron)
   (anvil-lint-enable)
-  (anvil-cron-enable))
+  (anvil-cron-enable)
+  ;; File tools; `anvil-file-enable' also re-enables the context tools, which
+  ;; are already registered above with worker-split handlers, so stub those out.
+  (defvar anvil-standalone--file-tools-error nil
+    "Error that kept the file tools from loading, or nil.")
+  ;; anvil-file needs Org, which loads only with the nelisp-emacs-lib
+  ;; provider (ANVIL_NOTES_DIR / NELISP_EMACS_LIB_DIR).  Without it, skip the
+  ;; file tools: a failed attempt half-installs the runtime's own buffer
+  ;; layer and breaks other tools (anvil-shell), so do not even try.
+  (condition-case err
+      (when (or (getenv "NELISP_EMACS_LIB_DIR") (getenv "ANVIL_NOTES_DIR"))
+        (require 'anvil-file)
+        (let ((saved (mapcar (lambda (f) (cons f (symbol-function f)))
+                             '(anvil-context-enable anvil-context-batch-enable
+                               anvil-context-dependencies-enable
+                               anvil-context-project-enable))))
+          (dolist (c saved) (fset (car c) (lambda () nil)))
+          (unwind-protect (anvil-file-enable)
+            (dolist (c saved) (fset (car c) (cdr c)))))
+        ;; Offload children do not load anvil-file here; run these
+        ;; tools in-process.
+        (let ((tools (gethash "emacs-eval" anvil-server--tools)))
+          (dolist (id '("file-outline" "code-extract-pattern"
+                        "code-add-field-by-map"))
+            (puthash id (plist-put (gethash id tools) :offload nil) tools))))
+    ;; No `message': on NeLisp it writes to stdout, the MCP channel.
+    (error (setq anvil-standalone--file-tools-error err))))
 
 (defun anvil-standalone-start ()
   "Serve the prepared registry, opening databases on first use."
