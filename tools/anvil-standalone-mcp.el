@@ -510,6 +510,30 @@ non-positive SECS cannot spin."
     ;; No `message': on NeLisp it writes to stdout, the MCP channel.
     (error (setq anvil-standalone--file-tools-error err))))
 
+;; Modules whose enable step needs the anvil-state KV store.  The enable
+;; functions open the DB handle and install a daily idle vacuum timer; a
+;; native DB handle cannot live in the image and the daemon should not run
+;; a vacuum, so stub `anvil-state-enable' while registering.  The state DB
+;; then opens lazily on the first tool call (see `anvil-standalone-start').
+(defvar anvil-standalone--state-tools-errors nil
+  "Alist of (MODULE . ERROR) for state-backed modules that failed to load.")
+(unless (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
+  (condition-case err
+      (require 'anvil-state)
+    (error (push (cons 'anvil-state err) anvil-standalone--state-tools-errors)))
+  (when (fboundp 'anvil-state-enable)
+    (let ((saved (symbol-function 'anvil-state-enable)))
+      (fset 'anvil-state-enable (lambda () nil))
+      (unwind-protect
+          (dolist (module '(anvil-compact anvil-session anvil-shell-filter))
+            (condition-case err
+                (progn (require module)
+                       (funcall (intern (format "%s-enable" module))))
+              ;; No `message': on NeLisp it writes to stdout, the MCP channel.
+              (error (push (cons module err)
+                           anvil-standalone--state-tools-errors))))
+        (fset 'anvil-state-enable saved)))))
+
 (defun anvil-standalone-start ()
   "Serve the prepared registry, opening databases on first use."
   (setq default-directory
@@ -517,6 +541,14 @@ non-positive SECS cannot spin."
                                     default-directory)))
   (setq temporary-file-directory
         (file-name-as-directory (or (getenv "TMPDIR") temporary-file-directory)))
+  ;; `user-emacs-directory' is the host Emacs directory, whose
+  ;; anvil-state.db the host daemon owns.  Keep the standalone KV store apart.
+  (setq anvil-state-db-path
+        (or (getenv "ANVIL_STATE_DB")
+            (expand-file-name
+             "anvil-standalone/anvil-state.db"
+             (or (getenv "XDG_CACHE_HOME")
+                 (expand-file-name ".cache" (or (getenv "HOME") "~"))))))
   (setq anvil-server--debug-trace (and (getenv "ANVIL_STANDALONE_DEBUG") t))
   (anvil-standalone--call-with-stdio-reader
    (lambda () (anvil-server-run-batch-stdio "emacs-eval")))

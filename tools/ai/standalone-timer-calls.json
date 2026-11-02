@@ -1,0 +1,5 @@
+[["compact-estimate", {"transcript_path": ""}],
+ ["compact-stats", {"session_id": "", "since_ts": ""}],
+ ["session-list", {}],
+ ["shell-filter", {"filter": "git-status", "raw": "On branch main\nnothing to commit, working tree clean\n"}],
+ ["shell-gain", {"days": "7"}]]

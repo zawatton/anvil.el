@@ -71,6 +71,6 @@ cmd: ulimit -v 8388608; d=$(mktemp -d); out=$(cd "$d" && ANVIL_EL_DIR="$OLDPWD" 
 ** S5.2 Installed runtime + default checkout: timer checks pass and the seven blocked modules enable
 cmd: ulimit -v 8388608; d=$(mktemp -d); out=$(cd "$d" && ANVIL_EL_DIR="$OLDPWD" ANVIL_NOTES_DIR="${ANVIL_NOTES_DIR:-$HOME/Cowork/Notes}" ANVIL_MEMORY_DB="$d/m.db" ANVIL_WORKLOG_DB="$d/w.db" TMPDIR="$d" ANVIL_STANDALONE_TEST_NO_SERVER=1 timeout 280 nelisp --load "$OLDPWD/tools/anvil-standalone-mcp.el" --load "$OLDPWD/tools/ai/standalone-org-timer-probe.el" 2>&1); echo "$out" | grep -q "ORGTIMER run-with-timer-repeat-cancel PASS" && echo "$out" | grep -q "ORGTIMER run-with-idle-timer PASS" && test "$(echo "$out" | grep -c 'ORGTIMER enable-anvil-.* PASS')" = 7
 
-** S5.3 Real MCP call: a tool from a timer-dependent module answers through the real launcher
-#+NOTE: needs the module added to the loader after S5.2
-pending
+** S5.3 Real MCP calls: tools of the ported timer-dependent modules answer through the real launcher
+#+NOTE: user chose to port the timer modules on 2026-11-02; the calls file lists one call per ported module; harness exits 0 only when every call succeeds
+cmd: test -s tools/ai/standalone-timer-calls.json && timeout 400 python3 tools/ai/standalone-mcp-call.py tools/ai/standalone-timer-calls.json >/dev/null

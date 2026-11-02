@@ -302,7 +302,7 @@ class Launcher:
     def smoke(self, path):
         """Never publish an image that this exact runtime cannot restore."""
         form = ('(unless (and (fboundp \'anvil-standalone-start) '
-                '(= (hash-table-count (gethash "emacs-eval" anvil-server--tools)) 61) '
+                '(= (hash-table-count (gethash "emacs-eval" anvil-server--tools)) 79) '
                 '(null anvil-memory--db) (null anvil-worklog--db) '
                 '(null anvil-standalone--encoding-cache) '
                 '(null anvil-standalone--response-cache) '
