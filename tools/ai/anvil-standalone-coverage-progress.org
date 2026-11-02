@@ -11,6 +11,10 @@ cmd: ls anvil-*.el | sed 's/\.el$//' | sort > /tmp/.cov-a.$$ && grep -oE '^[|] a
 ** S1.3 Negative control: known module passes, missing module reports file-missing
 cmd: d=$(mktemp -d) && tools/ai/standalone-coverage-census.sh "$d" anvil-memory anvil-nonexistent-xyz >/dev/null 2>&1 && grep -q 'anvil-memory	pass' "$d/results.tsv" && grep -q 'anvil-nonexistent-xyz	fail	(file-missing' "$d/results.tsv"
 
+** S1.4 Census probes keep module databases out of the real home (anvil-org-index DB lands in the scratch HOME)
+#+NOTE: added 2026-11-02 after a census run opened ~/.emacs.d/anvil-org-index.db
+cmd: d=$(mktemp -d) && tools/ai/standalone-coverage-census.sh "$d" anvil-org-index anvil-state >/dev/null 2>&1 && grep -q 'anvil-org-index	pass		pass' "$d/results.tsv" && test -e "$d/work/home/.emacs.d/anvil-org-index.db"
+
 * S2 Port lint and cron (user chose option 3 on 2026-11-01)
 
 ** S2.1 Standalone loader registers anvil-lint and anvil-cron outside the context worker

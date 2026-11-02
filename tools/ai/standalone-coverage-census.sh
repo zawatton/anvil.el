@@ -11,11 +11,19 @@ if [[ $# -gt 0 ]]; then mods=("$@"); else
   mods=($(cd "$repo" && ls anvil-*.el | sed 's/\.el$//'))
 fi
 nelisp_bin="${NELISP_BIN:-$(command -v nelisp)}"
+notes_dir="${ANVIL_NOTES_DIR:-$HOME/Cowork/Notes}"
+# Enabling a module may open databases under `user-emacs-directory' (for
+# example anvil-org-index.db), so each probe gets a scratch HOME and XDG
+# directories instead of the real ones.
+mkdir -p "$out/work/home/.emacs.d" || exit 1
 probe_one() {
   local m="$1" log="$out/logs/$1.log" line
   ( ulimit -v 8388608
     cd "$out/work" || exit 1
-    ANVIL_EL_DIR="$repo" ANVIL_NOTES_DIR="${ANVIL_NOTES_DIR:-$HOME/Cowork/Notes}" \
+    HOME="$out/work/home" XDG_CACHE_HOME="$out/work/home/.cache" \
+    XDG_CONFIG_HOME="$out/work/home/.config" XDG_DATA_HOME="$out/work/home/.local/share" \
+    XDG_STATE_HOME="$out/work/home/.local/state" \
+    ANVIL_EL_DIR="$repo" ANVIL_NOTES_DIR="$notes_dir" \
     ANVIL_MEMORY_DB="$out/work/memory.db" ANVIL_WORKLOG_DB="$out/work/worklog.db" \
     TMPDIR="$out/work" ANVIL_STANDALONE_TEST_NO_SERVER=1 ANVIL_COVERAGE_MODULE="$m" \
     timeout 120 "$nelisp_bin" --load "$repo/tools/anvil-standalone-mcp.el" \
@@ -29,7 +37,7 @@ probe_one() {
     printf '%s\n' "$line"
   fi
 }
-export -f probe_one; export out repo nelisp_bin
+export -f probe_one; export out repo nelisp_bin notes_dir
 printf '%s\n' "${mods[@]}" | xargs -P "${CENSUS_JOBS:-4}" -I{} bash -c 'probe_one {}' \
   | sort > "$out/results.tsv"
 wc -l < "$out/results.tsv"
