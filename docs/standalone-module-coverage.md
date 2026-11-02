@@ -1,7 +1,9 @@
 # anvil modules on the standalone (NeLisp) server — coverage census
 
-Measured 2026-11-01 on anvil.el 531b5b1 (with the working tree's uncommitted
-changes) and `nelisp` from `~/.local/bin/nelisp`.  Reproduce with:
+Measured 2026-11-02 on anvil.el 8a9202f (with other sessions' uncommitted
+module edits in the working tree), `nelisp` from `~/.local/bin/nelisp`, and the
+nelisp-emacs-lib checkout at `0d0536a2` (plus its uncommitted json/stdio/sqlite
+edits).  First census: 2026-11-01 on anvil.el 531b5b1.  Reproduce with:
 
 ```
 tools/ai/standalone-coverage-census.sh OUT_DIR          # all anvil-*.el
@@ -11,7 +13,8 @@ tools/ai/standalone-coverage-table.py OUT_DIR/results.tsv docs/standalone-module
 Method: for each module, a fresh process loads `tools/anvil-standalone-mcp.el`
 with `ANVIL_STANDALONE_TEST_NO_SERVER=1`, then `(require 'MODULE)`, then calls
 `MODULE-enable` if it exists and counts tools added to `anvil-server--tools`.
-Databases, cwd and TMPDIR point at a scratch directory.
+Databases, cwd, TMPDIR, HOME and the XDG directories point at a scratch
+directory, so modules cannot open the real `~/.emacs.d` databases.
 
 Limits: "tools register" means the tool specs were accepted, not that the
 tools work.  Modules such as `anvil-buffer`, `anvil-eval`, `anvil-dashboard`
@@ -31,10 +34,20 @@ a real MCP call.  Only the first blocker is recorded; fixing it may reveal more.
 - `c`: inherently host- or environment-bound.
 - `d`: anvil code bug.
 
-Shared root causes: `(require 'org)` failing blocks anvil-file, and through it
-anvil-org, anvil-text, anvil-data, anvil-elisp and anvil-workspace-sync.
-Missing `run-with-timer`/`run-with-idle-timer` blocks the enable step of seven
-modules.  Missing `tabulated-list` blocks the orchestrator family.
+Shared root causes: missing `tabulated-list` blocks the orchestrator family;
+the url/mailcap stack blocks the web and mail modules; compile.el without
+`define-compilation-mode` blocks anvil-elisp and anvil-sexp.
+
+Fixed on 2026-11-02 (were the largest blockers on 2026-11-01):
+- `(require 'org)` failed (`wrong-type-argument arrayp`): nelisp-emacs-lib
+  swapped its buffer structs for alist objects on standalone while host-built
+  .elc inline the record accessors.  Fixed on nelisp-emacs-lib branch
+  `fix/standalone-struct-records-20261102` (records everywhere; vendored Org
+  parser load made best-effort).  anvil-file, anvil-data and anvil-text now
+  load; anvil-org next needs org-id.el.
+- `run-with-timer` / `run-with-idle-timer` were unbound.  The loader now
+  supplies them on top of `run-at-time`; NeLisp branch
+  `feat/run-with-timer-20261102` adds them natively.
 
 ## Real-call screening of port candidates (2026-11-01)
 
@@ -50,12 +63,17 @@ of a codex branch commit (2026-10-24) that is not an ancestor of NeLisp main.
 | `anvil-git`, `anvil-git-msg` | not ported | (1) `process-coding-system-alist` unbound (anvil-host.el let-binds it); (2) `get-buffer-process` calls `process-list`, which standalone lacks (still true on the newest NeLisp branch 0e250a877, 2026-10-28); (3) with both shimmed, 9/10 calls return, but NeLisp `make-process` ignores `default-directory`, so results describe the server cwd's repo, not `path` (silent wrong answers); (4) `git-pr-body` needs `shell-quote-argument` |
 | `anvil-sqlite` | fails | runtime `sqlite-select` rejects return type `set` |
 | `anvil-ts`, `anvil-py`, `anvil-js` | fail | treesit subprocess backend `with-root` not implemented (Doc 38 Phase G TODO) |
+| `anvil-file` | `file-read`, `file-outline`, `file-create`, `file-replace-string` OK | ported 2026-11-02 |
+| `anvil-compact`, `anvil-session`, `anvil-shell-filter` | `compact-estimate`, `compact-stats`, `session-list`, `shell-filter`, `shell-gain` OK | ported 2026-11-02 (state DB under the XDG cache, not the host's) |
+| `anvil-browser` | fails | `browser-fetch`: `process-coding-system-alist` unbound on this runtime |
+| `anvil-org-index` | not called | uses the host's `~/.emacs.d` DB, calls `message` (stdout is the MCP channel), needs `anvil-org-index-paths` |
+| `anvil-claude-watchdog` | not called | 30 s timer watching the host's Claude processes; would duplicate host events |
 
-anvil-lint and anvil-cron were added to the loader on 2026-11-01 (image tool count 40 -> 46; the sixth is `metrics-token-report`, pulled in by their requires).
+anvil-lint and anvil-cron were added to the loader on 2026-11-01 (image tool count 40 -> 46; the sixth is `metrics-token-report`, pulled in by their requires).  anvil-file followed on 2026-11-02 (46 -> 61) and anvil-compact, anvil-session and anvil-shell-filter after it (61 -> 79).
 
 Note: NeLisp origin/main (66561c85e) cannot run the standalone loader at all (`nl-ffi-memory` is missing there); the installed runtime's line is ~2200 commits ahead of origin/main.
 
-Adding modules also requires updating the tool-count check (40) in
+Adding modules also requires updating the tool-count check (now 79) in
 `tools/anvil-standalone-image.py` `smoke`.
 
 <!-- TABLE -->
@@ -66,13 +84,13 @@ Adding modules also requires updating the tool-count check (40) in
 | anvil-autoresearch | no | - | b | tabulated-list.el missing | S |
 | anvil-bench | no | - | b | profiler.el missing | S |
 | anvil-bisect | yes | yes (3) | port | not in loader | S |
-| anvil-browser | yes | enable fails | a | `run-with-idle-timer` not bound | S |
+| anvil-browser | yes | yes (5) | a | registers; `browser-fetch` fails (process coding support) | - |
 | anvil-buffer | yes | yes (3) | port | not in loader | S |
 | anvil-cad | yes | yes (5) | port | not in loader | S |
-| anvil-claude-watchdog | yes | enable fails | a | `run-with-timer` not bound | S |
+| anvil-claude-watchdog | yes | yes (1) | c | registers; watches the host's Claude processes | - |
 | anvil-cli | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-clipboard | yes | no `-enable` | lib | library or registered by a parent | - |
-| anvil-compact | yes | enable fails | a | `run-with-idle-timer` not bound | S |
+| anvil-compact | yes | already loaded | ok | in standalone loader | - |
 | anvil-config | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-context-batch | yes | already loaded | ok | in standalone loader | - |
 | anvil-context-dependencies | yes | already loaded | ok | in standalone loader | - |
@@ -83,18 +101,18 @@ Adding modules also requires updating the tool-count check (40) in
 | anvil-crypto | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-daemon-guard | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-dashboard | yes | yes (3) | port | not in loader | S |
-| anvil-data | no | - | a | `(require 'org)` fails on NeLisp (buffer object used as array) | L |
+| anvil-data | yes | yes (4) | port | not in loader | S |
 | anvil-defs-context | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-defs | yes | already loaded | ok | in standalone loader | - |
 | anvil-dev | yes | yes (6) | port | not in loader | S |
 | anvil-disclosure | yes | already loaded | ok | in standalone loader | - |
 | anvil-discovery | yes | yes (2) | port | not in loader | S |
 | anvil-disk | yes | no `-enable` | lib | library or registered by a parent | - |
-| anvil-elisp | no | - | a | `(require 'org)` fails on NeLisp (buffer object used as array) | L |
+| anvil-elisp | no | - | a | compile.el loads but `define-compilation-mode` is not bound | S |
 | anvil-emacs | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-eval | yes | yes (6) | port | not in loader | S |
 | anvil-extend | no | - | a | vendored filenotify.el `cl-defun` destructuring arglist | M |
-| anvil-file | no | - | a | `(require 'org)` fails on NeLisp (buffer object used as array) | L |
+| anvil-file | yes | already loaded | ok | in standalone loader | - |
 | anvil-fs | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-fusion-ask | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-fusion-async | yes | no `-enable` | lib | library or registered by a parent | - |
@@ -112,12 +130,12 @@ Adding modules also requires updating the tool-count check (40) in
 | anvil-fusion-route | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-fusion-traj | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-fusion-verify | yes | no `-enable` | lib | library or registered by a parent | - |
-| anvil-git-msg | yes | yes (2) | port | not in loader | S |
-| anvil-git | yes | yes (8) | port | not in loader | S |
+| anvil-git-msg | yes | yes (2) | a | registers; real calls blocked (see screening) | - |
+| anvil-git | yes | yes (8) | a | registers; real calls blocked (see screening) | - |
 | anvil-harness-telemetry | yes | yes (3) | port | not in loader | S |
 | anvil-host | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-http | no | - | b | mailcap.el missing (url stack) | M |
-| anvil-js | yes | yes (12) | port | not in loader | S |
+| anvil-js | yes | yes (12) | a | registers; treesit subprocess `with-root` not implemented | - |
 | anvil-lint | yes | already loaded | ok | in standalone loader | - |
 | anvil-manifest | yes | yes (4) | port | not in loader | S |
 | anvil-memory-batch | yes | no `-enable` | lib | library or registered by a parent | - |
@@ -136,30 +154,30 @@ Adding modules also requires updating the tool-count check (40) in
 | anvil-orchestrator-presets | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-orchestrator-routing | yes | yes (1) | port | not in loader | S |
 | anvil-orchestrator-workflow | no | - | b | tabulated-list.el missing | S |
-| anvil-org | no | - | a | `(require 'org)` fails on NeLisp (buffer object used as array) | L |
-| anvil-org-index | yes | enable fails | a | `run-with-idle-timer` not bound | S |
+| anvil-org | no | - | b | org-id.el missing (only the lightweight Org subset loads) | M |
+| anvil-org-index | yes | yes (2) | c | registers; uses the host DB and `message`, needs paths | - |
 | anvil-org-watch | no | - | b | url-util.el missing (url stack) | M |
 | anvil-pdf | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-proc | yes | no `-enable` | lib | library or registered by a parent | - |
-| anvil-pty-broker | yes | enable fails | c | needs node-pty broker process | - |
-| anvil-py | yes | yes (12) | port | not in loader | S |
+| anvil-pty-broker | yes | enable fails | c | needs the node-pty broker process | - |
+| anvil-py | yes | yes (12) | a | registers; treesit subprocess `with-root` not implemented | - |
 | anvil-semantic | yes | yes (5) | port | not in loader | S |
 | anvil-server-commands | yes | already loaded | ok | in standalone loader | - |
 | anvil-server-ert | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-server-metrics | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-server | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-session-capture | yes | no `-enable` | lib | library or registered by a parent | - |
-| anvil-session | yes | enable fails | a | `run-with-idle-timer` not bound | S |
+| anvil-session | yes | already loaded | ok | in standalone loader | - |
 | anvil-session-store | yes | yes (3) | port | not in loader | S |
 | anvil-sexp-cst | yes | enable fails | c | needs tree-sitter C runtime | - |
 | anvil-sexp | no | - | a | compile.el loads but `define-compilation-mode` is not bound | S |
 | anvil-shell-filter-builtin | yes | no `-enable` | lib | library or registered by a parent | - |
-| anvil-shell-filter | yes | enable fails | a | `run-with-idle-timer` not bound | S |
-| anvil-sqlite | yes | yes (1) | port | not in loader | S |
-| anvil-state | yes | enable fails | a | `run-with-idle-timer` not bound | S |
-| anvil-text | no | - | a | `(require 'org)` fails on NeLisp (buffer object used as array) | L |
+| anvil-shell-filter | yes | already loaded | ok | in standalone loader | - |
+| anvil-sqlite | yes | yes (1) | a | registers; `sqlite-select` lacks return type `set` | - |
+| anvil-state | yes | already loaded | ok | in standalone loader | - |
+| anvil-text | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-treesit-backend | yes | 0 tools | lib | `-enable` runs but registers no MCP tools | - |
-| anvil-ts | yes | yes (14) | port | not in loader | S |
+| anvil-ts | yes | yes (14) | a | registers; treesit subprocess `with-root` not implemented | - |
 | anvil-uri | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-web | no | - | b | mailcap.el missing (url stack) | M |
 | anvil-wl | no | - | c | Wanderlust/mail stack | L |
@@ -173,5 +191,5 @@ Adding modules also requires updating the tool-count check (40) in
 | anvil-wl-wanderlust | yes | 0 tools | lib | `-enable` runs but registers no MCP tools | - |
 | anvil-worker | no | - | c | needs a running Emacs daemon | - |
 | anvil-worklog | yes | already loaded | ok | in standalone loader | - |
-| anvil-workspace-sync | no | - | a | `(require 'org)` fails on NeLisp (buffer object used as array) | L |
+| anvil-workspace-sync | no | - | a | `coding-system-p` not bound | S |
 | anvil-xlsx | yes | no `-enable` | lib | library or registered by a parent | - |

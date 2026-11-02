@@ -12,13 +12,29 @@ from pathlib import Path
 
 LOADED = {"anvil", "anvil-server-commands", "anvil-context", "anvil-context-batch",
           "anvil-context-dependencies", "anvil-defs", "anvil-context-project",
-          "anvil-disclosure", "anvil-memory", "anvil-worklog", "anvil-lint", "anvil-cron"}
+          "anvil-disclosure", "anvil-memory", "anvil-worklog", "anvil-lint", "anvil-cron",
+          "anvil-file", "anvil-compact", "anvil-session", "anvil-shell-filter",
+          "anvil-state"}
+
+# Port candidates (tools register) that a real-call screening rejected:
+# module -> (class, note).  See the doc's "Real-call screening" section.
+SCREENED = {
+    "anvil-git": ("a", "registers; real calls blocked (see screening)"),
+    "anvil-git-msg": ("a", "registers; real calls blocked (see screening)"),
+    "anvil-sqlite": ("a", "registers; `sqlite-select` lacks return type `set`"),
+    "anvil-ts": ("a", "registers; treesit subprocess `with-root` not implemented"),
+    "anvil-py": ("a", "registers; treesit subprocess `with-root` not implemented"),
+    "anvil-js": ("a", "registers; treesit subprocess `with-root` not implemented"),
+    "anvil-browser": ("a", "registers; `browser-fetch` fails (process coding support)"),
+    "anvil-org-index": ("c", "registers; uses the host DB and `message`, needs paths"),
+    "anvil-claude-watchdog": ("c", "registers; watches the host's Claude processes"),
+}
 
 # Substring of the first blocker -> (class, root cause, effort)
 RULES = [
-    ("nelisp-ec-buffer", "a", "`(require 'org)` fails on NeLisp (buffer object used as array)", "L"),
-    ("run-with-idle-timer", "a", "`run-with-idle-timer` not bound", "S"),
-    ("run-with-timer", "a", "`run-with-timer` not bound", "S"),
+    ("\"org-id\"", "b", "org-id.el missing (only the lightweight Org subset loads)", "M"),
+    ("coding-system-p", "a", "`coding-system-p` not bound", "S"),
+    ("broker did not become ready", "c", "needs the node-pty broker process", "-"),
     ("Malformed arglist", "a", "vendored filenotify.el `cl-defun` destructuring arglist", "M"),
     ("define-compilation-mode", "a", "compile.el loads but `define-compilation-mode` is not bound", "S"),
     ("tabulated-list-mode-map", "b", "tabulated-list.el missing", "S"),
@@ -59,6 +75,9 @@ def main():
         elif reg == "fail":
             cls, cause, effort = classify(rerr)
             status, tools = "yes", "enable fails"
+        elif reg == "pass" and mod in SCREENED:
+            cls, cause = SCREENED[mod]
+            status, tools, effort = "yes", f"yes ({added})", "-"
         elif reg == "pass":
             status, tools, cls, cause, effort = "yes", f"yes ({added})", "port", "not in loader", "S"
         elif reg == "no-enable":
