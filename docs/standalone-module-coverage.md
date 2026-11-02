@@ -21,6 +21,8 @@ tools work.  Modules such as `anvil-buffer`, `anvil-eval`, `anvil-dashboard`
 and `anvil-mu4e` register but act on host Emacs buffers/UI, so their calls are
 expected to fail or be meaningless on standalone; each port must be verified by
 a real MCP call.  Only the first blocker is recorded; fixing it may reveal more.
+Rows marked "screened" take their class from the real-call screenings below
+(2026-11-01 and 2026-11-02), not from the census.
 
 ## Classes
 
@@ -69,24 +71,63 @@ of a codex branch commit (2026-10-24) that is not an ancestor of NeLisp main.
 | `anvil-org-index` | not called | uses the host's `~/.emacs.d` DB, calls `message` (stdout is the MCP channel), needs `anvil-org-index-paths` |
 | `anvil-claude-watchdog` | not called | 30 s timer watching the host's Claude processes; would duplicate host events |
 
-anvil-lint and anvil-cron were added to the loader on 2026-11-01 (image tool count 40 -> 46; the sixth is `metrics-token-report`, pulled in by their requires).  anvil-file followed on 2026-11-02 (46 -> 61) and anvil-compact, anvil-session and anvil-shell-filter after it (61 -> 79).
+### Second screening (2026-11-02): the remaining 18 port candidates
+
+Same method, on a `git archive` of 56bb67f with per-module HOME/XDG/TMPDIR
+and databases under a scratch directory (the real `~/.emacs.d` was checked
+untouched).  Calls were limited to read-only tools or writes inside the scratch
+directory; tools that call an LLM or remote API (`fusion-ask`,
+`longrun-start`/`-resume`, `semantic-embed-index`), spawn Emacs
+(`bisect-test`, `test-run-all`) or scaffold modules were not called.
+
+| module | real call | blocker |
+|---|---|---|
+| `anvil-agent` | `agent-spec-loader` OK | - |
+| `anvil-data` | `list-keys`, `get-path`, `set-path` (preview + apply, re-read shows the new value) OK | - |
+| `anvil-dev` | `self-sync-check`, `claude-limits-analyze`, `codex-efficiency-check`, `release-audit` OK | `self-sync-check` reports nil git info |
+| `anvil-discovery` | `tools-by-intent`, `tools-usage-report` OK | - |
+| `anvil-harness-telemetry` | `record`, then `stats` (1 entry), `recent` OK | - |
+| `anvil-session-store` | `recent`, `search-ranked`, `snapshot-ref` OK | empty DB only; content not verified |
+| `anvil-bisect` | `bisect-last-result` OK, `bisect-cancel` fails | (d) `bisect-cancel` returns a symbol the server rejects |
+| `anvil-cad` | `cad-read-outline`, `cad-extract` OK; `cad-generate`, `cad-annotate` fail | (d) compares the `write-region` result with `t`; the file is written, then "cannot write" is signalled |
+| `anvil-manifest` | `manifest-cost` OK only | (d) registers on server-id `"default"`, so the loader would not serve it; `attention`/`recovery-suggest` hit `(wrong-type-argument symbolp 'dev)` (doubly quoted spec, not compared with GNU Emacs); `docstring-candidates` needs tabulated-list |
+| `anvil-orchestrator-routing` | `orchestrator-routing-select` fails | (d) `anvil-orchestrator-stats` void: missing require; preloading anvil-orchestrator then needs tabulated-list |
+| `anvil-buffer` | `buffer-list-modified`, `buffer-read` fail | (a) after the module loads, `buffer-live-p` returns nil and `buffer-file-name` rejects its argument; the same calls work without the module |
+| `anvil-eval` | all three fail | (a) `with-timeout` void; with a shim `emacs-eval`/`emacs-eval-jobs` work and `nelisp-eval` needs `NELISP_ELISP_DIR`; registers on server-id `"anvil"` |
+| `anvil-semantic` | `status`, `notes-lexical-search`, `semantic-search` (lexical) return; `reindex` fails | (a) `directory-files-recursively` void; the searches ran on an empty index, so their `[]` proves nothing |
+| `anvil-fusion-mcp` | `fusion-result` fails | (b) tabulated-list.el missing |
+| `anvil-fusion-longrun-mcp` | `longrun-status` fails | (b) tabulated-list.el missing |
+| `anvil-mu4e` | not called | (c) touches mail |
+| `anvil-context-range`, `anvil-dashboard` | not called | untracked in the working tree, absent from the archive |
+
+Shared gaps found: tabulated-list.el (fusion, fusion-longrun, manifest,
+orchestrator-routing), `with-timeout` (eval), `directory-files-recursively`
+(semantic).  The six modules that passed (agent, data, dev, discovery,
+harness-telemetry, session-store) were added to the loader the same day.
+
+Loader defect found by this screening: `tools/anvil-standalone-mcp.el` at
+56bb67f requires `anvil-context-batch`, `anvil-context-dependencies` and
+`anvil-context-project`, which are untracked working files, so the server does
+not start from a clean checkout of the branch (the screening stubbed them).
+
+anvil-lint and anvil-cron were added to the loader on 2026-11-01 (image tool count 40 -> 46; the sixth is `metrics-token-report`, pulled in by their requires).  anvil-file followed on 2026-11-02 (46 -> 61) and anvil-compact, anvil-session and anvil-shell-filter after it (61 -> 79), and agent, data, dev, discovery, harness-telemetry and session-store after the second screening (79 -> 98; their databases go to the XDG cache).
 
 Note: NeLisp origin/main (66561c85e) cannot run the standalone loader at all (`nl-ffi-memory` is missing there); the installed runtime's line is ~2200 commits ahead of origin/main.
 
-Adding modules also requires updating the tool-count check (now 79) in
+Adding modules also requires updating the tool-count check (now 98) in
 `tools/anvil-standalone-image.py` `smoke`.
 
 <!-- TABLE -->
 
 | module | loads? | tools register? | class | first blocker / note | effort |
 |---|---|---|---|---|---|
-| anvil-agent | yes | yes (1) | port | not in loader | S |
+| anvil-agent | yes | already loaded | ok | in standalone loader | - |
 | anvil-autoresearch | no | - | b | tabulated-list.el missing | S |
 | anvil-bench | no | - | b | profiler.el missing | S |
-| anvil-bisect | yes | yes (3) | port | not in loader | S |
+| anvil-bisect | yes | yes (3) | d | screened: `bisect-cancel` returns a symbol the server rejects | - |
 | anvil-browser | yes | yes (5) | a | registers; `browser-fetch` fails (process coding support) | - |
-| anvil-buffer | yes | yes (3) | port | not in loader | S |
-| anvil-cad | yes | yes (5) | port | not in loader | S |
+| anvil-buffer | yes | yes (3) | a | screened: buffer primitives misbehave after the module loads | - |
+| anvil-cad | yes | yes (5) | d | screened: write tools compare `write-region` result with `t` | - |
 | anvil-claude-watchdog | yes | yes (1) | c | registers; watches the host's Claude processes | - |
 | anvil-cli | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-clipboard | yes | no `-enable` | lib | library or registered by a parent | - |
@@ -101,16 +142,16 @@ Adding modules also requires updating the tool-count check (now 79) in
 | anvil-crypto | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-daemon-guard | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-dashboard | yes | yes (3) | port | not in loader | S |
-| anvil-data | yes | yes (4) | port | not in loader | S |
+| anvil-data | yes | already loaded | ok | in standalone loader | - |
 | anvil-defs-context | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-defs | yes | already loaded | ok | in standalone loader | - |
-| anvil-dev | yes | yes (6) | port | not in loader | S |
+| anvil-dev | yes | already loaded | ok | in standalone loader | - |
 | anvil-disclosure | yes | already loaded | ok | in standalone loader | - |
-| anvil-discovery | yes | yes (2) | port | not in loader | S |
+| anvil-discovery | yes | already loaded | ok | in standalone loader | - |
 | anvil-disk | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-elisp | no | - | a | compile.el loads but `define-compilation-mode` is not bound | S |
 | anvil-emacs | yes | no `-enable` | lib | library or registered by a parent | - |
-| anvil-eval | yes | yes (6) | port | not in loader | S |
+| anvil-eval | yes | yes (6) | a | screened: `with-timeout` void; registers on server-id "anvil" | - |
 | anvil-extend | no | - | a | vendored filenotify.el `cl-defun` destructuring arglist | M |
 | anvil-file | yes | already loaded | ok | in standalone loader | - |
 | anvil-fs | yes | no `-enable` | lib | library or registered by a parent | - |
@@ -120,10 +161,10 @@ Adding modules also requires updating the tool-count check (now 79) in
 | anvil-fusion-exec | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-fusion-lens | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-fusion-longrun-async | yes | no `-enable` | lib | library or registered by a parent | - |
-| anvil-fusion-longrun-mcp | yes | yes (3) | port | not in loader | S |
+| anvil-fusion-longrun-mcp | yes | yes (3) | b | screened: tabulated-list.el missing | - |
 | anvil-fusion-longrun | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-fusion-longrun-store | yes | no `-enable` | lib | library or registered by a parent | - |
-| anvil-fusion-mcp | yes | yes (2) | port | not in loader | S |
+| anvil-fusion-mcp | yes | yes (2) | b | screened: tabulated-list.el missing | - |
 | anvil-fusion-panels | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-fusion | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-fusion-plan | yes | no `-enable` | lib | library or registered by a parent | - |
@@ -132,18 +173,18 @@ Adding modules also requires updating the tool-count check (now 79) in
 | anvil-fusion-verify | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-git-msg | yes | yes (2) | a | registers; real calls blocked (see screening) | - |
 | anvil-git | yes | yes (8) | a | registers; real calls blocked (see screening) | - |
-| anvil-harness-telemetry | yes | yes (3) | port | not in loader | S |
+| anvil-harness-telemetry | yes | already loaded | ok | in standalone loader | - |
 | anvil-host | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-http | no | - | b | mailcap.el missing (url stack) | M |
 | anvil-js | yes | yes (12) | a | registers; treesit subprocess `with-root` not implemented | - |
 | anvil-lint | yes | already loaded | ok | in standalone loader | - |
-| anvil-manifest | yes | yes (4) | port | not in loader | S |
+| anvil-manifest | yes | yes (4) | d | screened: registers on server-id "default"; quoted spec symbols | - |
 | anvil-memory-batch | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-memory-bridge | no | - | b | url-util.el missing (url stack) | M |
 | anvil-memory-context | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-memory-obs | no | - | b | tabulated-list.el missing | S |
 | anvil-memory | yes | already loaded | ok | in standalone loader | - |
-| anvil-mu4e | yes | yes (5) | port | not in loader | S |
+| anvil-mu4e | yes | yes (5) | c | screened: not called (touches mail) | - |
 | anvil-nelisp-shims-demo | no | - | d | demo spec shape rejected by real anvil-server | S |
 | anvil-nelisp-shims | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-net | yes | no `-enable` | lib | library or registered by a parent | - |
@@ -152,7 +193,7 @@ Adding modules also requires updating the tool-count check (now 79) in
 | anvil-orchestrator | no | - | b | tabulated-list.el missing | S |
 | anvil-orchestrator-openrouter | no | - | b | tabulated-list.el missing | S |
 | anvil-orchestrator-presets | yes | no `-enable` | lib | library or registered by a parent | - |
-| anvil-orchestrator-routing | yes | yes (1) | port | not in loader | S |
+| anvil-orchestrator-routing | yes | yes (1) | d | screened: `anvil-orchestrator-stats` void (missing require) | - |
 | anvil-orchestrator-workflow | no | - | b | tabulated-list.el missing | S |
 | anvil-org | no | - | b | org-id.el missing (only the lightweight Org subset loads) | M |
 | anvil-org-index | yes | yes (2) | c | registers; uses the host DB and `message`, needs paths | - |
@@ -161,14 +202,14 @@ Adding modules also requires updating the tool-count check (now 79) in
 | anvil-proc | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-pty-broker | yes | enable fails | c | needs the node-pty broker process | - |
 | anvil-py | yes | yes (12) | a | registers; treesit subprocess `with-root` not implemented | - |
-| anvil-semantic | yes | yes (5) | port | not in loader | S |
+| anvil-semantic | yes | yes (5) | a | screened: reindex needs `directory-files-recursively` | - |
 | anvil-server-commands | yes | already loaded | ok | in standalone loader | - |
 | anvil-server-ert | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-server-metrics | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-server | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-session-capture | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-session | yes | already loaded | ok | in standalone loader | - |
-| anvil-session-store | yes | yes (3) | port | not in loader | S |
+| anvil-session-store | yes | already loaded | ok | in standalone loader | - |
 | anvil-sexp-cst | yes | enable fails | c | needs tree-sitter C runtime | - |
 | anvil-sexp | no | - | a | compile.el loads but `define-compilation-mode` is not bound | S |
 | anvil-shell-filter-builtin | yes | no `-enable` | lib | library or registered by a parent | - |

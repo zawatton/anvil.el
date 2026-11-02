@@ -14,7 +14,9 @@ LOADED = {"anvil", "anvil-server-commands", "anvil-context", "anvil-context-batc
           "anvil-context-dependencies", "anvil-defs", "anvil-context-project",
           "anvil-disclosure", "anvil-memory", "anvil-worklog", "anvil-lint", "anvil-cron",
           "anvil-file", "anvil-compact", "anvil-session", "anvil-shell-filter",
-          "anvil-state"}
+          "anvil-state",
+          "anvil-agent", "anvil-data", "anvil-dev", "anvil-discovery",
+          "anvil-harness-telemetry", "anvil-session-store"}
 
 # Port candidates (tools register) that a real-call screening rejected:
 # module -> (class, note).  See the doc's "Real-call screening" section.
@@ -28,6 +30,17 @@ SCREENED = {
     "anvil-browser": ("a", "registers; `browser-fetch` fails (process coding support)"),
     "anvil-org-index": ("c", "registers; uses the host DB and `message`, needs paths"),
     "anvil-claude-watchdog": ("c", "registers; watches the host's Claude processes"),
+    # 2026-11-02 screening
+    "anvil-bisect": ("d", "screened: `bisect-cancel` returns a symbol the server rejects"),
+    "anvil-cad": ("d", "screened: write tools compare `write-region` result with `t`"),
+    "anvil-manifest": ("d", "screened: registers on server-id \"default\"; quoted spec symbols"),
+    "anvil-orchestrator-routing": ("d", "screened: `anvil-orchestrator-stats` void (missing require)"),
+    "anvil-buffer": ("a", "screened: buffer primitives misbehave after the module loads"),
+    "anvil-eval": ("a", "screened: `with-timeout` void; registers on server-id \"anvil\""),
+    "anvil-semantic": ("a", "screened: reindex needs `directory-files-recursively`"),
+    "anvil-fusion-mcp": ("b", "screened: tabulated-list.el missing"),
+    "anvil-fusion-longrun-mcp": ("b", "screened: tabulated-list.el missing"),
+    "anvil-mu4e": ("c", "screened: not called (touches mail)"),
 }
 
 # Substring of the first blocker -> (class, root cause, effort)
@@ -77,7 +90,8 @@ def main():
             status, tools = "yes", "enable fails"
         elif reg == "pass" and mod in SCREENED:
             cls, cause = SCREENED[mod]
-            status, tools, effort = "yes", f"yes ({added})", "-"
+            status, tools = "yes", f"yes ({added})"
+            effort = "S" if cls == "port" else "-"
         elif reg == "pass":
             status, tools, cls, cause, effort = "yes", f"yes ({added})", "port", "not in loader", "S"
         elif reg == "no-enable":

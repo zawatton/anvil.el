@@ -1,0 +1,22 @@
+[
+ ["agent-spec-loader", {"spec_path": "@REPO@/anvil.el", "goal": "port6", "acceptance": "a, b"}],
+ ["file-create", {"path": "@TMP@/port6-data.json", "content": "{\"name\": \"orig\", \"n\": 1}"}],
+ ["data-list-keys", {"file": "@TMP@/port6-data.json"}],
+ ["data-get-path", {"file": "@TMP@/port6-data.json", "path": "name"}],
+ ["data-set-path", {"file": "@TMP@/port6-data.json", "path": "name", "value-json": "\"renamed\""}],
+ ["data-set-path", {"file": "@TMP@/port6-data.json", "path": "name", "value-json": "\"renamed\"", "apply": "t"}],
+ ["data-get-path", {"file": "@TMP@/port6-data.json", "path": "name"}],
+ ["file-read", {"path": "@TMP@/port6-data.json"}],
+ ["anvil-self-sync-check", {}],
+ ["anvil-claude-limits-analyze", {"report": "Weekly limit: 40% used"}],
+ ["anvil-codex-efficiency-check", {"codex-home": "@TMP@", "project-root": "@REPO@"}],
+ ["anvil-release-audit", {}],
+ ["anvil-tools-by-intent", {"query": "file", "intent": "", "layer": "", "include-experimental": ""}],
+ ["anvil-tools-usage-report", {"days": "30"}],
+ ["harness-telemetry-record", {"class": "stall", "tool": "port6-probe", "provider": "claude"}],
+ ["harness-telemetry-stats", {}],
+ ["harness-telemetry-recent", {"limit": "5"}],
+ ["session-events-recent-indexed", {"limit": "5"}],
+ ["session-events-search-ranked", {"query": "x"}],
+ ["session-snapshot-ref", {"session-id": "none"}]
+]

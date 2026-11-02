@@ -534,6 +534,34 @@ non-positive SECS cannot spin."
                            anvil-standalone--state-tools-errors))))
         (fset 'anvil-state-enable saved)))))
 
+;; Port 6: agent, data, dev, discovery, harness-telemetry, session-store.
+;; Registered under the same "emacs-eval" server id the loader serves.  The
+;; telemetry enable step opens its SQLite handle eagerly; a native handle
+;; cannot live in the image, so stub the opener while registering (it opens
+;; lazily on the first tool call, see `anvil-standalone-start').
+(defvar anvil-standalone--port6-errors nil
+  "Alist of (MODULE . ERROR) for port-6 modules that failed to load.")
+(unless (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
+  ;; anvil-data needs the nelisp-emacs-lib checkout, like anvil-file: with the
+  ;; runtime's bundled buffer layer its require half-loads and breaks
+  ;; anvil-shell (`before-change-functions' void).
+  (dolist (module (append '(anvil-agent anvil-dev anvil-discovery
+                            anvil-harness-telemetry anvil-session-store)
+                          (and (or (getenv "NELISP_EMACS_LIB_DIR")
+                                   (getenv "ANVIL_NOTES_DIR"))
+                               '(anvil-data))))
+    (condition-case err
+        (progn
+          (require module)
+          (if (eq module 'anvil-harness-telemetry)
+              (let ((saved (symbol-function 'anvil-harness-telemetry--open)))
+                (fset 'anvil-harness-telemetry--open (lambda () nil))
+                (unwind-protect (anvil-harness-telemetry-enable)
+                  (fset 'anvil-harness-telemetry--open saved)))
+            (funcall (intern (format "%s-enable" module)))))
+      ;; No `message': on NeLisp it writes to stdout, the MCP channel.
+      (error (push (cons module err) anvil-standalone--port6-errors)))))
+
 (defun anvil-standalone-start ()
   "Serve the prepared registry, opening databases on first use."
   (setq default-directory
@@ -549,6 +577,18 @@ non-positive SECS cannot spin."
              "anvil-standalone/anvil-state.db"
              (or (getenv "XDG_CACHE_HOME")
                  (expand-file-name ".cache" (or (getenv "HOME") "~"))))))
+  ;; Same isolation for the databases the port-6 modules write by default
+  ;; (session-store under `user-emacs-directory'; telemetry in the worklog DB).
+  (let ((cache (expand-file-name
+                "anvil-standalone"
+                (or (getenv "XDG_CACHE_HOME")
+                    (expand-file-name ".cache" (or (getenv "HOME") "~"))))))
+    (setq anvil-session-store-db-path
+          (or (getenv "ANVIL_SESSION_STORE_DB")
+              (expand-file-name "anvil-session-events.db" cache)))
+    (setq anvil-harness-telemetry-db-path
+          (or (getenv "ANVIL_HARNESS_TELEMETRY_DB")
+              (expand-file-name "anvil-harness-telemetry.db" cache))))
   (setq anvil-server--debug-trace (and (getenv "ANVIL_STANDALONE_DEBUG") t))
   (anvil-standalone--call-with-stdio-reader
    (lambda () (anvil-server-run-batch-stdio "emacs-eval")))

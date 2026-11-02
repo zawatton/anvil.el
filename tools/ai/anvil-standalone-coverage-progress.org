@@ -15,6 +15,14 @@ cmd: d=$(mktemp -d) && tools/ai/standalone-coverage-census.sh "$d" anvil-memory 
 #+NOTE: added 2026-11-02 after a census run opened ~/.emacs.d/anvil-org-index.db
 cmd: d=$(mktemp -d) && tools/ai/standalone-coverage-census.sh "$d" anvil-org-index anvil-state >/dev/null 2>&1 && grep -q 'anvil-org-index	pass		pass' "$d/results.tsv" && test -e "$d/work/home/.emacs.d/anvil-org-index.db"
 
+** S1.5 Every port candidate that registers tools has a real-call screening verdict
+#+NOTE: added 2026-11-02 with the second screening; context-range and dashboard are untracked, so they stay unscreened ports
+cmd: for m in agent bisect buffer cad data dev discovery eval fusion-longrun-mcp fusion-mcp harness-telemetry manifest mu4e orchestrator-routing semantic session-store; do grep -qE "^[|] anvil-$m [|].*(screened|already loaded)" docs/standalone-module-coverage.md || exit 1; done
+
+** S1.6 A clean archive of HEAD contains every anvil module the standalone loader requires
+#+NOTE: added 2026-11-02; known red: the loader requires anvil-context-batch, -dependencies and -project, which are untracked
+cmd: files=$(git archive HEAD | tar -t) && for m in $(grep -oE "^\(require 'anvil[a-z0-9-]*\)" tools/anvil-standalone-mcp.el | sed "s/(require '//; s/)//" | sort -u); do printf '%s\n' "$files" | grep -qx "$m.el" || exit 1; done
+
 * S2 Port lint and cron (user chose option 3 on 2026-11-01)
 
 ** S2.1 Standalone loader registers anvil-lint and anvil-cron outside the context worker
@@ -78,3 +86,17 @@ cmd: ulimit -v 8388608; d=$(mktemp -d); out=$(cd "$d" && ANVIL_EL_DIR="$OLDPWD" 
 ** S5.3 Real MCP calls: tools of the ported timer-dependent modules answer through the real launcher
 #+NOTE: user chose to port the timer modules on 2026-11-02; the calls file lists one call per ported module; harness exits 0 only when every call succeeds
 cmd: test -s tools/ai/standalone-timer-calls.json && timeout 400 python3 tools/ai/standalone-mcp-call.py tools/ai/standalone-timer-calls.json >/dev/null
+
+* S6 Port agent, data, dev, discovery, harness-telemetry, session-store (user request 2026-11-02)
+
+# Databases: session-store and harness-telemetry default to $XDG_CACHE_HOME/anvil-standalone/
+# (env overrides ANVIL_SESSION_STORE_DB, ANVIL_HARNESS_TELEMETRY_DB); anvil-data writes only under @TMP@.
+
+** S6.1 Loader (ANVIL_STANDALONE_TEST_NO_SERVER=1) registers one named tool from each of the six modules outside the context worker
+cmd: ulimit -v 8388608; d=$(mktemp -d); printf '%s\n' '(let ((tools (gethash "emacs-eval" anvil-server--tools)) (miss nil)) (dolist (id (quote ("agent-spec-loader" "data-list-keys" "anvil-self-sync-check" "anvil-tools-by-intent" "harness-telemetry-record" "session-events-recent-indexed"))) (unless (gethash id tools) (push id miss))) (princ (if miss (format "PORT6 MISSING %S\n" miss) "PORT6 ALL-REGISTERED\n")))' > "$d/probe.el"; out=$(cd "$d" && ANVIL_EL_DIR="$OLDPWD" ANVIL_NOTES_DIR="${ANVIL_NOTES_DIR:-$HOME/Cowork/Notes}" ANVIL_MEMORY_DB="$d/m.db" ANVIL_WORKLOG_DB="$d/w.db" TMPDIR="$d" ANVIL_STANDALONE_TEST_NO_SERVER=1 timeout 280 nelisp --load "$OLDPWD/tools/anvil-standalone-mcp.el" --load "$d/probe.el" 2>&1); echo "$out" | grep -q "PORT6 ALL-REGISTERED"
+
+** S6.2 Real MCP calls through the real launcher: all six modules answer; data set-path then get-path shows the new value; telemetry stats count is at least 1
+cmd: test -s tools/ai/standalone-port6-calls.json && out=$(timeout 500 python3 tools/ai/standalone-mcp-call.py tools/ai/standalone-port6-calls.json) && echo "$out" | grep -q "tools/list: 98" && echo "$out" | grep '^OK   data-get-path ' | grep -Eq 'value[^a-z]+renamed' && echo "$out" | grep '^OK   harness-telemetry-stats ' | grep -Eq '"total[^a-z0-9-]+[1-9]'
+
+** S6.3 Isolated cache dir receives the session-store and telemetry DBs; nothing created or modified under the real ~/.emacs.d
+cmd: c=$(mktemp -d); s=$(mktemp); sleep 1; ANVIL_MCP_CALL_CACHE="$c" timeout 500 python3 tools/ai/standalone-mcp-call.py tools/ai/standalone-port6-calls.json >/dev/null && test -s "$c/anvil-standalone/anvil-session-events.db" && test -s "$c/anvil-standalone/anvil-harness-telemetry.db" && test -z "$(find "$HOME/.emacs.d" -maxdepth 1 \( -name 'anvil-session-events.db*' -o -name 'anvil-harness-telemetry.db*' \) -newer "$s")"
