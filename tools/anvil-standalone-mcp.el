@@ -568,6 +568,19 @@ non-positive SECS cannot spin."
       ;; No `message': on NeLisp it writes to stdout, the MCP channel.
       (error (push (cons module err) anvil-standalone--port6-errors)))))
 
+;; Port 7: bisect and cad.  Each module loads in its own condition-case so a
+;; failure in one cannot hide the other.  Both register on "emacs-eval".
+(defvar anvil-standalone--port7-errors nil
+  "Alist of (MODULE . ERROR) for port-7 modules that failed to load.")
+(unless (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
+  (dolist (module '(anvil-bisect anvil-cad))
+    (condition-case err
+        (progn
+          (require module)
+          (funcall (intern (format "%s-enable" module))))
+      ;; No `message': on NeLisp it writes to stdout, the MCP channel.
+      (error (push (cons module err) anvil-standalone--port7-errors)))))
+
 (defun anvil-standalone-start ()
   "Serve the prepared registry, opening databases on first use."
   (setq default-directory

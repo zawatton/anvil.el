@@ -319,5 +319,18 @@ compiled cache sits next to it."
     (should (not (string-suffix-p ".elc" p)))))
 
 
+;; The server rejects a bare `t' ("Tool handler must return a JSON-serialisable
+;; value"); the cancel tool must hand back a string or a list instead.
+(ert-deftest anvil-bisect-test-cancel-tool-returns-serialisable ()
+  "`anvil-bisect--tool-cancel' returns a value anvil-server accepts."
+  (let ((anvil-bisect--active-process nil)
+        (anvil-bisect--cancelled nil))
+    (let ((r (anvil-bisect--tool-cancel)))
+      (should-not (eq r t))
+      (should (or (stringp r) (consp r)))
+      (should (stringp (anvil-server-encode-for-mcp r)))
+      (should (string-match-p ":interrupted nil" (format "%s" r)))
+      (should anvil-bisect--cancelled))))
+
 (provide 'anvil-bisect-test)
 ;;; anvil-bisect-test.el ends here

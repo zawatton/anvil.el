@@ -16,7 +16,8 @@ LOADED = {"anvil", "anvil-server-commands", "anvil-context", "anvil-context-batc
           "anvil-file", "anvil-compact", "anvil-session", "anvil-shell-filter",
           "anvil-state",
           "anvil-agent", "anvil-data", "anvil-dev", "anvil-discovery",
-          "anvil-harness-telemetry", "anvil-session-store"}
+          "anvil-harness-telemetry", "anvil-session-store",
+          "anvil-bisect", "anvil-cad"}
 
 # Port candidates (tools register) that a real-call screening rejected:
 # module -> (class, note).  See the doc's "Real-call screening" section.
@@ -31,8 +32,6 @@ SCREENED = {
     "anvil-org-index": ("c", "registers; uses the host DB and `message`, needs paths"),
     "anvil-claude-watchdog": ("c", "registers; watches the host's Claude processes"),
     # 2026-11-02 screening
-    "anvil-bisect": ("d", "screened: `bisect-cancel` returns a symbol the server rejects"),
-    "anvil-cad": ("d", "screened: write tools compare `write-region` result with `t`"),
     "anvil-manifest": ("d", "screened: registers on server-id \"default\"; quoted spec symbols"),
     "anvil-orchestrator-routing": ("d", "screened: `anvil-orchestrator-stats` void (missing require)"),
     "anvil-buffer": ("a", "screened: buffer primitives misbehave after the module loads"),

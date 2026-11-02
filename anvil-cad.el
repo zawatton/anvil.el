@@ -553,10 +553,11 @@ Returns (CHANGED-P . NEW-PAIRS)."
 (defun anvil-cad--write (path content)
   "Write CONTENT to PATH as UTF-8/LF; return the number of bytes written."
   (if (fboundp 'wrf)
-      (progn
-        (unless (eq (wrf path content) t)
+      ;; Older `wrf' builds return t; current NeLisp returns the byte count.
+      (let ((r (wrf path content)))
+        (unless (or (eq r t) (integerp r))
           (user-error "anvil-cad: cannot write %s" path))
-        (length content))
+        (if (integerp r) r (length content)))
     (let ((coding-system-for-write 'utf-8-unix))
       (write-region content nil path nil 'no-message))
     (length (encode-coding-string content 'utf-8))))

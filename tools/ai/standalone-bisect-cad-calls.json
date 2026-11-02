@@ -1,0 +1,11 @@
+[["bisect-last-result", {}],
+ ["bisect-cancel", {}],
+ ["file-create", {"path": "@TMP@/d.svg", "content": "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"100\"><line x1=\"0\" y1=\"0\" x2=\"10\" y2=\"10\"/><text x=\"1\" y=\"2\">ORIG</text></svg>"}],
+ ["cad-read-outline", {"path": "@TMP@/d.svg"}],
+ ["cad-extract", {"path": "@TMP@/d.svg"}],
+ ["cad-generate", {"out-path": "@TMP@/g.dxf", "entities-json": "[{\"type\":\"line\",\"layer\":\"L1\",\"p1\":[0,0],\"p2\":[10,0]},{\"type\":\"circle\",\"layer\":\"L2\",\"center\":[5,5],\"radius\":3}]"}],
+ ["cad-annotate", {"path": "@TMP@/d.svg", "text": "S7ANNOTATION", "x": "5", "y": "6", "out-path": "@TMP@/d2.svg"}],
+ ["file-read", {"path": "@TMP@/d2.svg"}],
+ ["cad-extract", {"path": "@TMP@/d2.svg"}],
+ ["cad-annotate", {"path": "@TMP@/g.dxf", "text": "DXFNOTE", "x": "2", "y": "3", "out-path": "@TMP@/g2.dxf"}],
+ ["cad-extract", {"path": "@TMP@/g2.dxf", "type": "text"}]]

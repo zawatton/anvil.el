@@ -513,7 +513,13 @@ Returns a Doc 13 result plist — :status is one of `found', `timeout',
 
 MCP Parameters: (none)"
   (anvil-server-with-error-handling
-   (anvil-bisect-cancel)))
+   ;; `anvil-bisect-cancel' returns t, which the server rejects as a handler
+   ;; result; report whether a step process was live instead.
+   (let ((interrupted (and anvil-bisect--active-process
+                           (process-live-p anvil-bisect--active-process)
+                           t)))
+     (anvil-bisect-cancel)
+     (format "%S" (list :ok t :cancelled t :interrupted interrupted)))))
 
 (defun anvil-bisect--tool-last-result ()
   "Return the most recent bisect plist, or nil.

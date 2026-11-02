@@ -88,8 +88,8 @@ directory; tools that call an LLM or remote API (`fusion-ask`,
 | `anvil-discovery` | `tools-by-intent`, `tools-usage-report` OK | - |
 | `anvil-harness-telemetry` | `record`, then `stats` (1 entry), `recent` OK | - |
 | `anvil-session-store` | `recent`, `search-ranked`, `snapshot-ref` OK | empty DB only; content not verified |
-| `anvil-bisect` | `bisect-last-result` OK, `bisect-cancel` fails | (d) `bisect-cancel` returns a symbol the server rejects |
-| `anvil-cad` | `cad-read-outline`, `cad-extract` OK; `cad-generate`, `cad-annotate` fail | (d) compares the `write-region` result with `t`; the file is written, then "cannot write" is signalled |
+| `anvil-bisect` | `bisect-last-result` OK, `bisect-cancel` fails | (d) `bisect-cancel` returns a symbol the server rejects; fixed and ported 2026-11-03 (tool now returns `(:ok t :cancelled t :interrupted BOOL)`) |
+| `anvil-cad` | `cad-read-outline`, `cad-extract` OK; `cad-generate`, `cad-annotate` fail | (d) compares the `write-region` result with `t`; the file is written, then "cannot write" is signalled; fixed and ported 2026-11-03 (`wrf` returns the byte count on NeLisp, now accepted) |
 | `anvil-manifest` | `manifest-cost` OK only | (d) registers on server-id `"default"`, so the loader would not serve it; `attention`/`recovery-suggest` hit `(wrong-type-argument symbolp 'dev)` (doubly quoted spec, not compared with GNU Emacs); `docstring-candidates` needs tabulated-list |
 | `anvil-orchestrator-routing` | `orchestrator-routing-select` fails | (d) `anvil-orchestrator-stats` void: missing require; preloading anvil-orchestrator then needs tabulated-list |
 | `anvil-buffer` | `buffer-list-modified`, `buffer-read` fail | (a) after the module loads, `buffer-live-p` returns nil and `buffer-file-name` rejects its argument; the same calls work without the module |
@@ -125,10 +125,10 @@ Adding modules also requires updating the tool-count check (a lower bound: 94 pl
 | anvil-agent | yes | already loaded | ok | in standalone loader | - |
 | anvil-autoresearch | no | - | b | tabulated-list.el missing | S |
 | anvil-bench | no | - | b | profiler.el missing | S |
-| anvil-bisect | yes | yes (3) | d | screened: `bisect-cancel` returns a symbol the server rejects | - |
+| anvil-bisect | yes | already loaded | ok | in standalone loader | - |
 | anvil-browser | yes | yes (5) | a | registers; `browser-fetch` fails (process coding support) | - |
 | anvil-buffer | yes | yes (3) | a | screened: buffer primitives misbehave after the module loads | - |
-| anvil-cad | yes | yes (5) | d | screened: write tools compare `write-region` result with `t` | - |
+| anvil-cad | yes | already loaded | ok | in standalone loader | - |
 | anvil-claude-watchdog | yes | yes (1) | c | registers; watches the host's Claude processes | - |
 | anvil-cli | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-clipboard | yes | no `-enable` | lib | library or registered by a parent | - |

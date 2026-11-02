@@ -96,7 +96,24 @@ cmd: test -s tools/ai/standalone-timer-calls.json && timeout 400 python3 tools/a
 cmd: ulimit -v 8388608; d=$(mktemp -d); printf '%s\n' '(let ((tools (gethash "emacs-eval" anvil-server--tools)) (miss nil)) (dolist (id (quote ("agent-spec-loader" "data-list-keys" "anvil-self-sync-check" "anvil-tools-by-intent" "harness-telemetry-record" "session-events-recent-indexed"))) (unless (gethash id tools) (push id miss))) (princ (if miss (format "PORT6 MISSING %S\n" miss) "PORT6 ALL-REGISTERED\n")))' > "$d/probe.el"; out=$(cd "$d" && ANVIL_EL_DIR="$OLDPWD" ANVIL_NOTES_DIR="${ANVIL_NOTES_DIR:-$HOME/Cowork/Notes}" ANVIL_MEMORY_DB="$d/m.db" ANVIL_WORKLOG_DB="$d/w.db" TMPDIR="$d" ANVIL_STANDALONE_TEST_NO_SERVER=1 timeout 280 nelisp --load "$OLDPWD/tools/anvil-standalone-mcp.el" --load "$d/probe.el" 2>&1); echo "$out" | grep -q "PORT6 ALL-REGISTERED"
 
 ** S6.2 Real MCP calls through the real launcher: all six modules answer; data set-path then get-path shows the new value; telemetry stats count is at least 1
-cmd: test -s tools/ai/standalone-port6-calls.json && out=$(timeout 500 python3 tools/ai/standalone-mcp-call.py tools/ai/standalone-port6-calls.json) && echo "$out" | grep -q "tools/list: 98" && echo "$out" | grep '^OK   data-get-path ' | grep -Eq 'value[^a-z]+renamed' && echo "$out" | grep '^OK   harness-telemetry-stats ' | grep -Eq '"total[^a-z0-9-]+[1-9]'
+cmd: test -s tools/ai/standalone-port6-calls.json && out=$(timeout 500 python3 tools/ai/standalone-mcp-call.py tools/ai/standalone-port6-calls.json) && n=$(echo "$out" | sed -n 's|^tools/list: ||p') && test "${n:-0}" -ge 98 && echo "$out" | grep '^OK   data-get-path ' | grep -Eq 'value[^a-z]+renamed' && echo "$out" | grep '^OK   harness-telemetry-stats ' | grep -Eq '"total[^a-z0-9-]+[1-9]'
 
 ** S6.3 Isolated cache dir receives the session-store and telemetry DBs; nothing created or modified under the real ~/.emacs.d
 cmd: c=$(mktemp -d); s=$(mktemp); sleep 1; ANVIL_MCP_CALL_CACHE="$c" timeout 500 python3 tools/ai/standalone-mcp-call.py tools/ai/standalone-port6-calls.json >/dev/null && test -s "$c/anvil-standalone/anvil-session-events.db" && test -s "$c/anvil-standalone/anvil-harness-telemetry.db" && test -z "$(find "$HOME/.emacs.d" -maxdepth 1 \( -name 'anvil-session-events.db*' -o -name 'anvil-harness-telemetry.db*' \) -newer "$s")"
+
+* S7 Fix and port bisect and cad (user request 2026-11-03)
+
+# Fixes: `bisect-cancel' returned t (rejected by the server); `anvil-cad--write' required `wrf' to return t,
+# but NeLisp's returns the byte count.  Both modules load outside the context worker, each in its own condition-case.
+
+** S7.1 Host ERT for anvil-bisect and anvil-cad passes (includes the new regression tests)
+#+NOTE: red before the fix: the cancel-tool and integer-wrf tests fail against the unfixed functions; -L tests is needed for anvil-bisect-entry.el
+cmd: ulimit -v 8388608; for x in bisect cad; do timeout 600 emacs --batch -Q -L . -L tests -l ert -l tests/anvil-$x-test.el -f ert-run-tests-batch-and-exit >/dev/null 2>&1 || exit 1; done
+
+** S7.2 Loader (ANVIL_STANDALONE_TEST_NO_SERVER=1) registers bisect-cancel and cad-annotate outside the context worker
+#+NOTE: red before the change: the same probe against a git archive of the pre-S7 HEAD reports MISSING
+cmd: ulimit -v 8388608; d=$(mktemp -d); printf '%s\n' '(let ((tools (gethash "emacs-eval" anvil-server--tools)) (miss nil)) (dolist (id (quote ("bisect-cancel" "cad-annotate"))) (unless (gethash id tools) (push id miss))) (princ (if miss (format "PORT7 MISSING %S\n" miss) "PORT7 ALL-REGISTERED\n")))' > "$d/probe.el"; out=$(cd "$d" && ANVIL_EL_DIR="$OLDPWD" ANVIL_NOTES_DIR="${ANVIL_NOTES_DIR:-$HOME/Cowork/Notes}" ANVIL_MEMORY_DB="$d/m.db" ANVIL_WORKLOG_DB="$d/w.db" TMPDIR="$d" ANVIL_STANDALONE_TEST_NO_SERVER=1 timeout 280 nelisp --load "$OLDPWD/tools/anvil-standalone-mcp.el" --load "$d/probe.el" 2>&1); echo "$out" | grep -q "PORT7 ALL-REGISTERED"
+
+** S7.3 Real MCP calls through the real launcher: all succeed and the re-read SVG (the cad-extract line with :count 2 only) contains the annotation text
+#+NOTE: red before the change: the call file fails on the pre-S7 HEAD archive; the grep is proven to fail on an output whose file-read line lost the text
+cmd: test -s tools/ai/standalone-bisect-cad-calls.json && out=$(timeout 500 python3 tools/ai/standalone-mcp-call.py tools/ai/standalone-bisect-cad-calls.json) && echo "$out" | grep '^OK   cad-extract .*:count 2 ' | grep -q 'S7ANNOTATION' && ! { echo "$out" | sed '/^OK   cad-extract .*:count 2 /s/S7ANNOTATION/x/g' | grep '^OK   cad-extract .*:count 2 ' | grep -q 'S7ANNOTATION'; }

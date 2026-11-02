@@ -1,6 +1,7 @@
 ;;; anvil-cad-test.el --- Tests for anvil-cad -*- lexical-binding: t; -*-
 
 (require 'ert)
+(require 'cl-lib)
 (require 'anvil-cad)
 
 ;;;; --- fixtures -----------------------------------------------------------
@@ -470,6 +471,22 @@ with a line + entity-bearing text, and a top-level circle.")
           out "[{\"type\":\"text\",\"text\":\"x\",\"p1\":[0,0]}]" base "1"))
       (delete-file base)
       (delete-file out))))
+
+;; NeLisp's `wrf' returns the byte count, GNU-style callers expect `t'.
+(ert-deftest anvil-cad-test-write-accepts-integer-wrf ()
+  "`anvil-cad--write' succeeds when `wrf' returns a byte count."
+  (cl-letf (((symbol-function 'wrf) (lambda (_p _c) 42)))
+    (should (= 42 (anvil-cad--write "/nonexistent/x" "abc")))))
+
+(ert-deftest anvil-cad-test-write-accepts-t-wrf ()
+  "`anvil-cad--write' still accepts `t' and returns the content length."
+  (cl-letf (((symbol-function 'wrf) (lambda (_p _c) t)))
+    (should (= 3 (anvil-cad--write "/nonexistent/x" "abc")))))
+
+(ert-deftest anvil-cad-test-write-nil-wrf-signals ()
+  "`anvil-cad--write' signals when `wrf' reports failure."
+  (cl-letf (((symbol-function 'wrf) (lambda (_p _c) nil)))
+    (should-error (anvil-cad--write "/nonexistent/x" "abc") :type 'user-error)))
 
 (provide 'anvil-cad-test)
 ;;; anvil-cad-test.el ends here
