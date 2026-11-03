@@ -36,7 +36,7 @@ Rows marked "screened" take their class from the real-call screenings below
 - `c`: inherently host- or environment-bound.
 - `d`: anvil code bug.
 
-Shared root causes: missing `tabulated-list` blocks the orchestrator family;
+Shared root causes: missing `tabulated-list` blocked the orchestrator family (fixed in S8);
 the url/mailcap stack blocks the web and mail modules; compile.el without
 `define-compilation-mode` blocked anvil-elisp and anvil-sexp (loading fixed in step S10, below).
 
@@ -46,7 +46,7 @@ Fixed on 2026-11-02 (were the largest blockers on 2026-11-01):
   .elc inline the record accessors.  Fixed on nelisp-emacs-lib branch
   `fix/standalone-struct-records-20261102` (records everywhere; vendored Org
   parser load made best-effort).  anvil-file, anvil-data and anvil-text now
-  load; anvil-org next needs org-id.el.
+  load; anvil-org loads after step S11.
 - `run-with-timer` / `run-with-idle-timer` were unbound.  The loader now
   supplies them on top of `run-at-time`; NeLisp branch
   `feat/run-with-timer-20261102` adds them natively.
@@ -63,7 +63,7 @@ of a codex branch commit (2026-10-24) that is not an ancestor of NeLisp main.
 | `anvil-lint` | `lint-scanners`, `lint` (scoped) OK | - |
 | `anvil-cron` | `cron-list`, `cron-status` OK | - |
 | `anvil-git`, `anvil-git-msg` | not ported | (1) `process-coding-system-alist` unbound (anvil-host.el let-binds it); (2) `get-buffer-process` calls `process-list`, which standalone lacks (still true on the newest NeLisp branch 0e250a877, 2026-10-28); (3) with both shimmed, 9/10 calls return, but NeLisp `make-process` ignores `default-directory`, so results describe the server cwd's repo, not `path` (silent wrong answers); (4) `git-pr-body` needs `shell-quote-argument` |
-| `anvil-sqlite` | fails | runtime `sqlite-select` rejects return type `set` |
+| `anvil-sqlite` | `sqlite-query` OK | S12.5: guarded `sqlite-select` `set` cursor shim |
 | `anvil-ts`, `anvil-py`, `anvil-js` | fail | treesit subprocess backend `with-root` not implemented (Doc 38 Phase G TODO) |
 | `anvil-file` | `file-read`, `file-outline`, `file-create`, `file-replace-string` OK | ported 2026-11-02 |
 | `anvil-compact`, `anvil-session`, `anvil-shell-filter` | `compact-estimate`, `compact-stats`, `session-list`, `shell-filter`, `shell-gain` OK | ported 2026-11-02 (state DB under the XDG cache, not the host's) |
@@ -91,14 +91,14 @@ directory; tools that call an LLM or remote API (`fusion-ask`,
 | `anvil-bisect` | `bisect-last-result` OK, `bisect-cancel` fails | (d) `bisect-cancel` returns a symbol the server rejects; fixed and ported 2026-11-03 (tool now returns `(:ok t :cancelled t :interrupted BOOL)`) |
 | `anvil-cad` | `cad-read-outline`, `cad-extract` OK; `cad-generate`, `cad-annotate` fail | (d) compares the `write-region` result with `t`; the file is written, then "cannot write" is signalled; fixed and ported 2026-11-03 (`wrf` returns the byte count on NeLisp, now accepted) |
 | `anvil-manifest` | `manifest-cost` OK only | (d) registers on server-id `"default"`, so the loader would not serve it; `attention`/`recovery-suggest` hit `(wrong-type-argument symbolp 'dev)` (doubly quoted spec, not compared with GNU Emacs); `docstring-candidates` needs tabulated-list |
-| `anvil-orchestrator-routing` | `orchestrator-routing-select` fails | (d) `anvil-orchestrator-stats` void: missing require; preloading anvil-orchestrator then needs tabulated-list |
+| `anvil-orchestrator-routing` | `orchestrator-routing-select` OK | S8/S12: tabulated-list loads and anvil-orchestrator is preloaded |
 | `anvil-buffer` | `buffer-list-modified`, `buffer-read` fail | (a) after the module loads, `buffer-live-p` returns nil and `buffer-file-name` rejects its argument; the same calls work without the module |
 | `anvil-eval` | `emacs-eval` (3), `emacs-eval-async` + `emacs-eval-jobs` (job done after a wait point) OK; `nelisp-eval` not ported | (a) `with-timeout` void: shimmed 2026-11-03; registers on server-id `"anvil"`: the four tools are registered on `"emacs-eval"` without `anvil-eval-enable` (global advice); `nelisp-eval`/`-reset` need the pure-Elisp NeLisp sources (`NELISP_ELISP_DIR`) and are left out; `time-subtract` also shimmed |
 | `anvil-semantic` | `status`, `reindex` (2 files, 2 chunks), `semantic-search` (lexical) hit the seeded word | (a) `directory-files-recursively` void: shimmed 2026-11-03; `file-name-base` also shimmed; DB under `$XDG_CACHE_HOME/anvil-standalone/anvil-semantic-index.db`; `semantic-embed-index` (HTTP embedding provider) not registered; the default exclude pattern `/\.cache/` skips corpora under `~/.cache` |
 | `anvil-fusion-mcp` | `fusion-result` fails | (b) tabulated-list.el missing |
 | `anvil-fusion-longrun-mcp` | `longrun-status` fails | (b) tabulated-list.el missing |
 | `anvil-mu4e` | not called | (c) touches mail |
-| `anvil-context-range`, `anvil-dashboard` | not called | untracked in the working tree, absent from the archive |
+| `anvil-context-range` | not called | untracked in the working tree, absent from the archive |
 
 Shared gaps found: tabulated-list.el (fusion, fusion-longrun, manifest,
 orchestrator-routing), `with-timeout` (eval), `directory-files-recursively`
@@ -117,6 +117,18 @@ Fourth step (2026-11-03): the loader shims `with-timeout` (GNU timer.el definiti
 
 Fifth step (S10, 2026-11-03): the loader gives `define-compilation-mode` a macro fallback (derived mode of `compilation-mode`, else `special-mode`), declares the `bytecomp` feature only while anvil-sexp loads and withdraws it afterwards (the GNU `bytecomp.el` first needs `define-compilation-mode`, then fails with `pcase or pattern has branch-local bindings`; standalone cannot run GNU byte-code anyway), and shims `looking-at-p`.  `anvil-elisp.el` got a one-line guard (`data-directory` is nil on standalone).  Both modules load; the loader loads only anvil-sexp, since no anvil-elisp tool answers correctly.  Real-call screening (compared with host `emacs --batch -Q`): `anvil-sexp` `sexp-read-file`, `sexp-surrounding-form` (in-form point; between forms host prints `null`, standalone prints an empty body) and `sexp-replace-defun` (preview and apply) match the host and are registered (image tool count +3).  Not registered: `sexp-macroexpand` (empty expansion), `sexp-wrap-form` (`bounds-of-thing-at-point` void), `sexp-rename-symbol` and `sexp-replace-call` (`syntax-ppss` void), `sexp-verify` (needs byte-compile and checkdoc; `checkdoc.el` missing).  `anvil-elisp` registers nothing: `elisp-describe-function` omits the docstring and Defined-in line (wrong), `elisp-describe-variable` needs `documentation-property`, `elisp-get-function-definition` needs `find-lisp-object-file-name`, `elisp-read-source-file` finds no system lisp directory, `elisp-ert-run` reports 0 tests for a passing test, `ert-run-distilled` needs `shell-quote-argument`, `elisp-byte-compile-file` cannot work.
 
+Sixth step (S11, 2026-11-03): the loader loads `anvil-org` (Port 11, gated on the nelisp-emacs-lib directory like Port 10). Every shim is guarded: `version<` and friends (GNU subr.el source; the whole vendor subr.el crashes on load), `org-version` (so `org-release` works), a placeholder keymap for `org-org-menu` (standalone drops `easy-menu-define`), `subr-arity` (alias of `func-arity`), `user-mail-address`/`user-full-name`, `rx` from the vendored directory, `org-remove-keyword-keys` and the GNU defaults of the tag defcustoms. `anvil-org` needs only `url-unhex-string` from `url-util`, whose real file cannot load (url-vars needs `emacs-lisp-mode-syntax-table`), so the GNU decoder is inlined and the `url-util` feature is declared only while anvil-org loads, then withdrawn. Real-call screening against host `emacs --batch -Q` (GNU Emacs 31.1) on a fixture file: `org-read-file`, `org-get-allowed-files`, `org-get-todo-config` and `org-get-tag-config` answer identically and are registered (image tool count +4). The other ten are unregistered because they signal on standalone: `org-read-outline`, `org-read-headline`, `org-rename-headline` (`org-outline-level`/`org-current-level` void), `org-read-by-id`, `org-edit-body` (wrong-type-argument on a non-buffer), `org-update-todo-state`, `org-add-todo` (`org-remove-keyword-keys`, then deeper Org functions), `org-capture-string` (`org-contextualize-keys` void), `org-habit-summary` and `org-agenda-view` (`user-init-file` void). File access: `anvil-org-allowed-files` defaults to nil with `anvil-org-allowed-files-enabled` t, so no tool reads a user file until a caller sets the list (the S11 calls do it through `emacs-eval` on a temp fixture); the agenda and habit tools take their files from that list, never from `org-agenda-files`, and are unregistered anyway. Note `org-get-todo-config` and `org-get-tag-config` report variable values, so they match host only when both sides hold the same `org-todo-keywords`.
+
+Seventh step (S12 defs, 2026-11-03): the loader had registered only `defs-index` and `defs-index-update` (2 of 14 anvil-defs tools), so the row above wrongly said "already loaded / ok". It now registers `defs-index-rebuild`, `defs-index-status`, `defs-search`, `defs-references`, `defs-signature`, `defs-who-requires`, `defs-trace-path`, `defs-dead-code`, `defs-callers-rank`, `defs-clusters` and `defs-architecture` (image tool count +11), reusing the `anvil-defs--tool-*` handlers. Fast index queries run in-process; `defs-index-rebuild`, `defs-clusters` and `defs-architecture` go through the bounded child worker like `defs-index-update` (the worker loads anvil-sexp lazily with the S10 shims, because some anvil-defs paths `require` it). The defs index lives in an isolated DB, `$ANVIL_DEFS_INDEX_DB` or `$XDG_CACHE_HOME/anvil-standalone/anvil-defs-index.db`, because the default path is the host daemon's `~/.emacs.d/anvil-defs-index.db` and a rebuild deletes every row (this also covers the older `defs-index` and `defs-index-update`). Real-call screening on a three-file fixture against host `emacs --batch -Q`: all 11 answers are identical after path normalization. `defs-detect-changes` stays unregistered: it signals `void-function shell-quote-argument` and, with a shim for that, `void-variable process-coding-system-alist` when git runs (a wave-2 process-coding gap).
+
+Eighth step (S12 orchestrator, 2026-11-03): Port 12 registers 21 of the 23 host anvil-orchestrator tools. The enable function is not called (it rehydrates tasks from the state DB and starts pump and watchdog timers); `anvil-orchestrator--register-tools` registers the specs, with guarded `timer-list` and `process-list` shims. State never touches the host: the state DB is the isolated `ANVIL_STATE_DB`, job output goes to `ANVIL_ORCHESTRATOR_WORK_DIR` (default `$XDG_CACHE_HOME/anvil-standalone/anvil-orchestrator`). Screened by real calls against host Emacs 31.1 with fake providers (`sh -c printf/echo/exit`, never an LLM CLI) and deterministic ids; 28 calls matched after normalizing elapsed-ms and paths. `orchestrator-cancel` and `orchestrator-stop` are not registered: the signalled task reports exit-code 0 where the host reports 15 (`process-exit-status` of a signalled process; wave 3). Pending tasks are not rehydrated across server restarts, so `list-interrupted` and `resume-interrupted` only see this session.
+
+Ninth step (S12 rest, 2026-11-03): Port 13 registers 11 more wave-1 tools: `sqlite-query` (a fboundp-guarded `sqlite-select` shim returns a cursor for return type `set`, with `sqlite-more-p`, `sqlite-next`, `sqlite-finalize`), `file-read-snippet`, `disclosure-help`, `disclosure-fetch`, `journal-index`, `org-index-index`, `org-index-search` (isolated org-index DB under `$XDG_CACHE_HOME/anvil-standalone`, `message` muted around the handlers by redefining them with their own arglist), `bench-compare`, `bench-last` (the `profiler` feature is declared only while anvil-bench loads; a `gc-cons-threshold` defvar is added), `nelisp-eval` and `nelisp-eval-reset`. Fixture answers match host Emacs 31.1 after path and float normalization (bench timings and winner are nondeterministic, so only keys and settings are compared). Not registered, first blocker: `bench-profile-expr` (no `profiler-start`), `org-index-rebuild` (offload worker reports `void-function`), `ert-run-distilled` (anvil-elisp does not load: pcase branch-local bindings), `semantic-embed-index` (HTTP embedding provider), `fusion-ask`, `fusion-result`, `longrun-*` (real LLM providers; no stub), `dashboard-*` (anvil-dashboard.el is untracked in git), `journal-memo-append` (lives in ~/.emacs.d/custom-lisp) and `ldb-*` (lives in dev/lisp-dialect-bridge).
+
+Tenth step (S12.6, 2026-11-03): Port 14 registers 10 more wave-1 tools, each screened by real call against host `emacs --batch -Q` on a fixture with fake providers (`sh -c printf`; no LLM, CLI or network): `fusion-ask`, `fusion-result`, `longrun-start`, `longrun-resume`, `longrun-status` (quest store DB moved to the isolated cache), `journal-memo-append` (my-journal-memo.el from `ANVIL_CUSTOM_LISP_DIR`, default `HOME/.emacs.d/custom-lisp`, plus fboundp-guarded `find-file-noselect`, `save-buffer` and `date-to-time` shims), `ldb-capabilities`, `ldb-translate`, `ldb-translate-to-file` (dev/lisp-dialect-bridge from `ANVIL_LDB_DIR`, default `ANVIL_NOTES_DIR/dev/lisp-dialect-bridge`; both directories are skipped silently when absent) and `org-index-rebuild` (re-registered on a handler that runs in a bounded standalone child which loads anvil-org-index and the isolated DB). `bench-profile-expr` stays unregistered: `profiler-start` is void and a faked profile would not match the host.
+
+Eleventh step (S12.7, 2026-11-03): Port 15 registers the three `anvil-dashboard` tools (`dashboard-snapshot`, `dashboard-serve-start`, `dashboard-serve-stop`) behind `(require 'anvil-dashboard nil t)`, so a checkout without the module still starts. Screened by real call against host `emacs --batch -Q` on an empty HOME and notes root: snapshot panels, start on 127.0.0.1:47311, GET `/`, `/api/snapshot`, `/nope`, POST `/`, stop and a second stop give identical answers. Two runtime workarounds: `nelisp-process-buffer` is required up front (its autoload is unresolved, so `process-send-string` signalled `invalid-function`), and callers pass an explicit port because `process-contact :service` does not report an OS-assigned one. `anvil-dashboard.el` had a real bug (the start tool returned the process object, which cannot be JSON-encoded, so the host reported an error after a successful start); it now returns host and port, with an ERT test. The smoke BASE gains 3 behind a `featurep` term.
+
 anvil-lint and anvil-cron were added to the loader on 2026-11-01 (image tool count 40 -> 46; the sixth is `metrics-token-report`, pulled in by their requires).  anvil-file followed on 2026-11-02 (46 -> 61) and anvil-compact, anvil-session and anvil-shell-filter after it (61 -> 79), and agent, data, dev, discovery, harness-telemetry and session-store after the second screening (79 -> 98; their databases go to the XDG cache).
 
 Note: NeLisp origin/main (66561c85e) cannot run the standalone loader at all (`nl-ffi-memory` is missing there); the installed runtime's line is ~2200 commits ahead of origin/main.
@@ -130,7 +142,7 @@ Adding modules also requires updating the tool-count check (a lower bound: 94 pl
 |---|---|---|---|---|---|
 | anvil-agent | yes | already loaded | ok | in standalone loader | - |
 | anvil-autoresearch | no | - | b | tabulated-list.el missing | S |
-| anvil-bench | no | - | b | profiler.el missing | S |
+| anvil-bench | yes | yes (2 of 3) | ok | S12.5: `profiler` feature declared only while loading; compare and last registered, profile-expr not (no profiler-start) | - |
 | anvil-bisect | yes | already loaded | ok | in standalone loader | - |
 | anvil-browser | yes | yes (5) | a | registers; `browser-fetch` fails (process coding support) | - |
 | anvil-buffer | yes | yes (3) | a | screened: buffer primitives misbehave after the module loads | - |
@@ -148,17 +160,17 @@ Adding modules also requires updating the tool-count check (a lower bound: 94 pl
 | anvil-cron | yes | already loaded | ok | in standalone loader | - |
 | anvil-crypto | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-daemon-guard | yes | no `-enable` | lib | library or registered by a parent | - |
-| anvil-dashboard | yes | yes (3) | port | not in loader | S |
+| anvil-dashboard | yes | yes (3) | ok | screened S12.7: dashboard-snapshot/-serve-start/-serve-stop registered (optional require); HTTP probes match host; start result fixed to be JSON-safe | - |
 | anvil-data | yes | already loaded | ok | in standalone loader | - |
 | anvil-defs-context | yes | no `-enable` | lib | library or registered by a parent | - |
-| anvil-defs | yes | already loaded | ok | in standalone loader | - |
+| anvil-defs | yes | 13 of 14 (all but defs-detect-changes) | ok | S12: 13 of 14 registered (defs-index, defs-index-update and the 11 above; only defs-detect-changes is not); the index uses an isolated DB (ANVIL_DEFS_INDEX_DB, default $XDG_CACHE_HOME/anvil-standalone/anvil-defs-index.db), never the host's; defs-detect-changes signals void shell-quote-argument and then void-variable process-coding-system-alist when git runs (wave 2) | - |
 | anvil-dev | yes | already loaded | ok | in standalone loader | - |
-| anvil-disclosure | yes | already loaded | ok | in standalone loader | - |
+| anvil-disclosure | yes | 7 of 9 | ok | S12.5: file-read-snippet, disclosure-help, disclosure-fetch, journal-index, org-index-index added | - |
 | anvil-discovery | yes | already loaded | ok | in standalone loader | - |
 | anvil-disk | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-elisp | yes | 0 of 6 | a | S10: loads (not loaded by the loader), but every tool fails or answers wrongly on standalone (no docstrings, documentation-property/find-lisp-object-file-name/shell-quote-argument void, ert finds 0 tests, byte-compile impossible) | - |
 | anvil-emacs | yes | no `-enable` | lib | library or registered by a parent | - |
-| anvil-eval | yes | already loaded | ok | in standalone loader | - |
+| anvil-eval | yes | already loaded (6 of 6) | ok | in standalone loader; S12.5: nelisp-eval and nelisp-eval-reset registered (the reply matches host, including state and reset) | - |
 | anvil-extend | no | - | a | vendored filenotify.el `cl-defun` destructuring arglist | M |
 | anvil-file | yes | already loaded | ok | in standalone loader | - |
 | anvil-fs | yes | no `-enable` | lib | library or registered by a parent | - |
@@ -168,10 +180,10 @@ Adding modules also requires updating the tool-count check (a lower bound: 94 pl
 | anvil-fusion-exec | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-fusion-lens | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-fusion-longrun-async | yes | no `-enable` | lib | library or registered by a parent | - |
-| anvil-fusion-longrun-mcp | yes | yes (3) | d | screened: loads with tabulated-list; not ported (start/resume spawn workers, poller has no job source) | - |
+| anvil-fusion-longrun-mcp | yes | yes (3) | ok | screened S12.6: longrun-start/-resume/-status registered; fake providers match host; quest DB isolated | - |
 | anvil-fusion-longrun | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-fusion-longrun-store | yes | no `-enable` | lib | library or registered by a parent | - |
-| anvil-fusion-mcp | yes | yes (2) | d | screened: loads with tabulated-list; not ported (ask calls LLMs, poller has no job source) | - |
+| anvil-fusion-mcp | yes | yes (2) | ok | screened S12.6: fusion-ask/fusion-result registered; fake providers match host | - |
 | anvil-fusion-panels | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-fusion | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-fusion-plan | yes | no `-enable` | lib | library or registered by a parent | - |
@@ -197,13 +209,13 @@ Adding modules also requires updating the tool-count check (a lower bound: 94 pl
 | anvil-net | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-nso-provider | no | - | b | nl-llm-agent-provider not on load-path | S |
 | anvil-offload | yes | 0 tools | lib | `-enable` runs but registers no MCP tools | - |
-| anvil-orchestrator | no | - | b | tabulated-list.el missing | S |
-| anvil-orchestrator-openrouter | no | - | b | tabulated-list.el missing | S |
+| anvil-orchestrator | yes | 21 of 23 (all but cancel, stop) | ok | S12: tool specs registered without the enable function; isolated state DB and job dir; cancel/stop differ on exit-code of a signalled task (wave 3) | - |
+| anvil-orchestrator-openrouter | no | - | b | not screened since S8 fixed tabulated-list; providers call LLMs | S |
 | anvil-orchestrator-presets | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-orchestrator-routing | yes | already loaded | ok | in standalone loader | - |
-| anvil-orchestrator-workflow | no | - | b | tabulated-list.el missing | S |
-| anvil-org | no | - | b | org-id.el missing (only the lightweight Org subset loads) | M |
-| anvil-org-index | yes | yes (2) | c | registers; uses the host DB and `message`, needs paths | - |
+| anvil-orchestrator-workflow | no | - | b | not screened since S8 fixed tabulated-list; workflows submit LLM jobs | S |
+| anvil-org | yes | 4 of 14 (read-file, get-allowed-files, get-todo-config, get-tag-config) | ok | S11: loads with shims (version<, org-version, url-unhex-string behind a temporary url-util feature, rx, subr-arity); the other 10 need org-current-level/org-outline-level/org-back-to-heading, org-capture and org-agenda machinery, or user-init-file, which the lightweight Org subset lacks | - |
+| anvil-org-index | yes | yes (2 of 2) | ok | screened S12.6: org-index-search and org-index-rebuild (bounded standalone child); isolated DB, message muted | - |
 | anvil-org-watch | no | - | b | url-util.el missing (url stack) | M |
 | anvil-pdf | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-proc | yes | no `-enable` | lib | library or registered by a parent | - |
@@ -221,7 +233,7 @@ Adding modules also requires updating the tool-count check (a lower bound: 94 pl
 | anvil-sexp | yes | 3 of 8 (read-file, surrounding-form, replace-defun) | ok | S10: loads via a `define-compilation-mode` fallback and a temporarily declared `bytecomp`; the rest need syntax-ppss/bounds-of-thing-at-point, byte-compile or checkdoc, or answer wrongly (macroexpand) | - |
 | anvil-shell-filter-builtin | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-shell-filter | yes | already loaded | ok | in standalone loader | - |
-| anvil-sqlite | yes | yes (1) | a | registers; `sqlite-select` lacks return type `set` | - |
+| anvil-sqlite | yes | yes (1) | ok | S12.5: guarded `set` cursor shim | - |
 | anvil-state | yes | already loaded | ok | in standalone loader | - |
 | anvil-text | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-treesit-backend | yes | 0 tools | lib | `-enable` runs but registers no MCP tools | - |

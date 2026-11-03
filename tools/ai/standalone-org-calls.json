@@ -1,0 +1,6 @@
+[
+ ["emacs-eval", {"expression": "(progn (with-temp-file \"@TMP@/fix.org\" (insert \"#+TITLE: fix\\n* TODO First task :work:\\n:PROPERTIES:\\n:ID: aaaa-1111\\n:END:\\nBody text one.\\n** TODO Child\\nChild body.\\n* DONE Second\\n\")) (setq org-todo-keywords '((sequence \"TODO\" \"|\" \"DONE\"))) (setq anvil-org-allowed-files (list \"@TMP@/fix.org\")) \"seeded\")"}],
+ ["org-get-allowed-files", {}],
+ ["org-get-todo-config", {}],
+ ["org-get-tag-config", {}],
+ ["org-read-file", {"file": "@TMP@/fix.org"}]]

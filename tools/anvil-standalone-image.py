@@ -301,13 +301,16 @@ class Launcher:
 
     def smoke(self, path):
         """Never publish an image that this exact runtime cannot restore."""
-        # Tool count: 113 committed tools plus each optional context module that
+        # Tool count: 113 committed tools (171 with the port-14 fusion, longrun and org-index-rebuild tools; journal-memo and ldb add 1 and 3 when their directories exist) plus 3 when the optional anvil-dashboard module loaded and each optional context module that
         # loaded; a lower bound, so tools added by work in progress pass.
         form = ('(unless (and (fboundp \'anvil-standalone-start) '
                 '(>= (hash-table-count (gethash "emacs-eval" anvil-server--tools)) '
-                '(+ 118 (if (featurep \'anvil-context-batch) 1 0) '
+                '(+ 171 (if (featurep \'my-journal-memo) 1 0) '
+                '(if (featurep \'lisp-dialect-bridge) 3 0) '
+                '(if (featurep \'anvil-context-batch) 1 0) '
                 '(if (featurep \'anvil-context-dependencies) 1 0) '
-                '(if (featurep \'anvil-context-project) 1 0))) '
+                '(if (featurep \'anvil-context-project) 1 0) '
+                '(if (featurep \'anvil-dashboard) 3 0))) '
                 '(null anvil-memory--db) (null anvil-worklog--db) '
                 '(null anvil-standalone--encoding-cache) '
                 '(null anvil-standalone--response-cache) '

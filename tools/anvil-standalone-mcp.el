@@ -104,7 +104,11 @@
                        anvil-standalone-context-dependencies-handler
                        anvil-standalone-context-project-handler
                        anvil-standalone-defs-index-handler
-                       anvil-standalone-defs-index-update-handler))
+                       anvil-standalone-defs-index-update-handler
+                       anvil-standalone-defs-index-rebuild-handler
+                       anvil-standalone-defs-clusters-handler
+                       anvil-standalone-defs-architecture-handler
+                       anvil-standalone-org-index-rebuild-handler))
                (listp args)
                (<= (length args) 8)
                (cl-every (lambda (arg) (or (null arg) (stringp arg))) args)
@@ -467,13 +471,42 @@ Fallback for runtimes without a native `time-subtract'; nil means now."
       '(lambda (path symbol root &optional budget-chars depth direction diagnostic-limit discovery-mode)
          (anvil-context-project--tool
           path symbol root budget-chars depth direction diagnostic-limit discovery-mode)))
+;; The defs index never uses the host DB (`anvil-defs-index-db-path' defaults
+;; to the host daemon's file under `user-emacs-directory', and a rebuild
+;; deletes every row).  ANVIL_DEFS_INDEX_DB overrides the isolated default.
+(defun anvil-standalone--defs-db-setup ()
+  "Point the defs index at the isolated standalone DB."
+  ;; The worker skips port 10, but anvil-defs `require's anvil-sexp.
+  (when (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
+    (anvil-standalone--load-anvil-sexp))
+  (setq anvil-defs-index-db-path
+        (or (getenv "ANVIL_DEFS_INDEX_DB")
+            (expand-file-name
+             "anvil-standalone/anvil-defs-index.db"
+             (or (getenv "XDG_CACHE_HOME")
+                 (expand-file-name ".cache" (or (getenv "HOME") "~")))))))
+
 (fset 'anvil-standalone-defs-index-handler
       '(lambda (query &optional limit)
+         (anvil-standalone--defs-db-setup)
          (anvil-server-with-error-handling
           (format "%S" (anvil-disclosure-defs-index query limit)))))
 (fset 'anvil-standalone-defs-index-update-handler
       '(lambda (paths &optional mode)
+         (anvil-standalone--defs-db-setup)
          (anvil-defs--tool-index-update paths mode)))
+(fset 'anvil-standalone-defs-index-rebuild-handler
+      '(lambda (&optional paths)
+         (anvil-standalone--defs-db-setup)
+         (anvil-defs--tool-index-rebuild paths)))
+(fset 'anvil-standalone-defs-clusters-handler
+      '(lambda (&optional pattern min_size limit)
+         (anvil-standalone--defs-db-setup)
+         (anvil-defs--tool-clusters pattern min_size limit)))
+(fset 'anvil-standalone-defs-architecture-handler
+      '(lambda (&optional pattern hotspots clusters)
+         (anvil-standalone--defs-db-setup)
+         (anvil-defs--tool-architecture pattern hotspots clusters)))
 
 ;; Slow source scans run in a fresh child so timeout kills the entire worker
 ;; process group while this MCP server remains able to accept later requests.
@@ -504,7 +537,19 @@ Fallback for runtimes without a native `time-subtract'; nil means now."
   (fset 'anvil-standalone-defs-index-update-handler
         '(lambda (paths &optional mode)
            (anvil-standalone--context-worker-tool
-            'anvil-standalone-defs-index-update-handler (list paths mode)))))
+            'anvil-standalone-defs-index-update-handler (list paths mode))))
+  (fset 'anvil-standalone-defs-index-rebuild-handler
+        '(lambda (&optional paths)
+           (anvil-standalone--context-worker-tool
+            'anvil-standalone-defs-index-rebuild-handler (list paths))))
+  (fset 'anvil-standalone-defs-clusters-handler
+        '(lambda (&optional pattern min_size limit)
+           (anvil-standalone--context-worker-tool
+            'anvil-standalone-defs-clusters-handler (list pattern min_size limit))))
+  (fset 'anvil-standalone-defs-architecture-handler
+        '(lambda (&optional pattern hotspots clusters)
+           (anvil-standalone--context-worker-tool
+            'anvil-standalone-defs-architecture-handler (list pattern hotspots clusters)))))
 
 (anvil-server-register-tool
  #'anvil-standalone-context-handler :id "code-context" :server-id "emacs-eval"
@@ -569,6 +614,57 @@ Fallback for runtimes without a native `time-subtract'; nil means now."
                           ("mode" . ((description . "Optional full or functions scan mode.") (type . "string")))))
            (required . ["paths"]))
  :description "Add or rescan explicit Elisp paths in the shared index while preserving unrelated files.")
+
+;; S12 defs group.  Fast index queries run in-process (the server DB is the
+;; isolated one set in `anvil-standalone-start'); the tools that rebuild the
+;; index, call git or walk the whole call graph go through the bounded child.
+(dolist (spec '(("defs-search" anvil-defs--tool-search
+                 "Search the elisp symbol index for defining forms by exact or fuzzy name (Layer 2).")
+                ("defs-references" anvil-defs--tool-references
+                 "List indexed references (calls, quotes, ...) to a symbol.")
+                ("defs-signature" anvil-defs--tool-signature
+                 "Return the indexed signature of a symbol.")
+                ("defs-who-requires" anvil-defs--tool-who-requires
+                 "List the files that require a feature.")
+                ("defs-trace-path" anvil-defs--tool-trace-path
+                 "Trace callers or callees of a symbol through the indexed call graph.")
+                ("defs-dead-code" anvil-defs--tool-dead-code
+                 "List unreferenced definitions (candidates only; dynamic use is invisible).")
+                ("defs-callers-rank" anvil-defs--tool-callers-rank
+                 "Rank definitions by caller count.")
+                ("defs-index-status" anvil-defs--tool-index-status
+                 "Return index schema version, DB path, and file, def, ref and feature counts.")))
+  (anvil-server-register-tool
+   (nth 1 spec) :id (car spec) :server-id "emacs-eval"
+   :intent '(elisp-read) :layer 'core :read-only t :description (nth 2 spec)))
+(anvil-server-register-tool
+ #'anvil-standalone-defs-index-rebuild-handler :id "defs-index-rebuild"
+ :server-id "emacs-eval" :intent '(elisp-read admin) :layer 'workflow
+ :schema '((type . "object")
+           (properties . (("paths" . ((description . "Optional comma-separated roots. Default: anvil-defs-paths or the containing git project.") (type . "string")))))
+           (required . []))
+ :description "Rebuild the defs index from scratch in the isolated standalone DB (never the host DB).")
+;; Not registered: defs-detect-changes.  On standalone it signals void-function
+;; shell-quote-argument and, past that shim, void-variable
+;; process-coding-system-alist (git runs through process coding), a wave-2 gap.
+(anvil-server-register-tool
+ #'anvil-standalone-defs-clusters-handler :id "defs-clusters"
+ :server-id "emacs-eval" :intent '(elisp-read) :layer 'core :read-only t
+ :schema '((type . "object")
+           (properties . (("pattern" . ((description . "Optional SQL LIKE on file path.") (type . "string")))
+                          ("min_size" . ((description . "Drop clusters smaller than this, default 2.") (type . "string")))
+                          ("limit" . ((description . "Maximum clusters, default 50.") (type . "string")))))
+           (required . []))
+ :description "Group files that call into each other densely into communities (approximate module map).")
+(anvil-server-register-tool
+ #'anvil-standalone-defs-architecture-handler :id "defs-architecture"
+ :server-id "emacs-eval" :intent '(elisp-read) :layer 'core :read-only t
+ :schema '((type . "object")
+           (properties . (("pattern" . ((description . "Optional SQL LIKE on file path to scope clusters.") (type . "string")))
+                          ("hotspots" . ((description . "Top hotspots to include, default 10.") (type . "string")))
+                          ("clusters" . ((description . "Top clusters to detail, default 10.") (type . "string")))))
+           (required . []))
+ :description "One-call architecture overview of the indexed code: totals, hotspots, clusters.")
 
 (anvil-server-register-tool
  #'anvil-workspace-mcp--tool :id "workspace" :server-id "emacs-eval"
@@ -736,9 +832,7 @@ Fallback for runtimes without a native `time-subtract'; nil means now."
 ;;    org-mode, request mutex, server-execute).  Skip the enable function and
 ;;    register four tools on "emacs-eval".  `emacs-eval' evaluates in the
 ;;    server process itself, with the same trust as the host tool.
-;;    `nelisp-eval' and `nelisp-eval-reset' are not registered: they need the
-;;    pure-Elisp NeLisp sources (NELISP_ELISP_DIR), which a NeLisp process has
-;;    no use for.
+;;    `nelisp-eval' and `nelisp-eval-reset' are registered later, by port 13.
 ;;  * anvil-semantic keeps its index under the default
 ;;    `user-emacs-directory'.  Point it at the isolated standalone cache before
 ;;    registering, and register the tools directly instead of calling
@@ -794,15 +888,10 @@ Fallback for runtimes without a native `time-subtract'; nil means now."
 ;;    sexp-rename-symbol and sexp-replace-call (need syntax-ppss and
 ;;    bounds-of-thing-at-point, which standalone lacks) and sexp-verify (its
 ;;    byte-compile and checkdoc checks are unavailable).
-(defvar anvil-standalone--port10-errors nil
-  "Alist of (MODULE . ERROR) for port-10 modules that failed to load.")
-;; Gated on the nelisp-emacs-lib compat dir being locatable: without it the
-;; `ert'/`help-fns' requires pull in a buffer layer that breaks
-;; `insert-file-contents' (void `before-change-functions'), which the
-;; shell-drain check (S3.3) exposes when ANVIL_NOTES_DIR is unset.
-(unless (or (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
-            (not (or (getenv "NELISP_EMACS_LIB_DIR")
-                     (getenv "ANVIL_NOTES_DIR"))))
+(defun anvil-standalone--load-anvil-sexp ()
+  "Load anvil-sexp with the shims described above.
+Also called lazily by the context worker, because some anvil-defs paths
+`require' anvil-sexp."
   (unless (fboundp 'define-compilation-mode)
     (defmacro define-compilation-mode (mode name doc &rest body)
       "Fallback: define MODE as a derived mode (see GNU compile.el)."
@@ -816,16 +905,637 @@ Fallback for runtimes without a native `time-subtract'; nil means now."
       (save-match-data (looking-at regexp))))
   (let ((fake-bytecomp (not (featurep 'bytecomp))))
     (when fake-bytecomp (provide 'bytecomp))
+    (unwind-protect (require 'anvil-sexp)
+      (when fake-bytecomp (setq features (delq 'bytecomp features))))))
+(defvar anvil-standalone--port10-errors nil
+  "Alist of (MODULE . ERROR) for port-10 modules that failed to load.")
+;; Gated on the nelisp-emacs-lib compat dir being locatable: without it the
+;; `ert'/`help-fns' requires pull in a buffer layer that breaks
+;; `insert-file-contents' (void `before-change-functions'), which the
+;; shell-drain check (S3.3) exposes when ANVIL_NOTES_DIR is unset.
+(unless (or (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
+            (not (or (getenv "NELISP_EMACS_LIB_DIR")
+                     (getenv "ANVIL_NOTES_DIR"))))
+  (condition-case err
+      (progn
+        (anvil-standalone--load-anvil-sexp)
+        (anvil-sexp-enable)
+        (dolist (id '("sexp-verify" "sexp-macroexpand" "sexp-wrap-form"
+                      "sexp-rename-symbol" "sexp-replace-call"))
+          (anvil-server-unregister-tool id "emacs-eval")))
+    (error (push (cons 'anvil-sexp err) anvil-standalone--port10-errors))))
+
+(defvar anvil-standalone--port11-unregister
+  '("org-read-outline" "org-read-headline" "org-read-by-id" "org-edit-body"
+    "org-rename-headline" "org-add-todo" "org-update-todo-state"
+    "org-capture-string" "org-habit-summary" "org-agenda-view")
+  "Ids of anvil-org tools that answered differently from host Emacs.
+Standalone has only the lightweight Org subset: `org-current-level',
+`org-outline-level', `org-back-to-heading' and friends, the capture and
+agenda machinery, and `user-init-file' are missing, so these tools signal.")
+;; Port 11: anvil-org.  Its requires need several GNU facilities that standalone
+;; lacks; each shim below is fboundp/boundp guarded and copies GNU source.
+;;  * `version<' and friends: copied from GNU subr.el (the whole vendor subr.el
+;;    crashes on load).
+;;  * `org-release' needs the `org-version' feature; `org-org-menu' is void
+;;    because standalone drops `easy-menu-define' (a placeholder keymap does).
+;;  * `subr-arity' is aliased to `func-arity'; `user-mail-address' and
+;;    `user-full-name' are defvar'd; `rx' loads from the vendored directory.
+;;  * anvil-org uses only `url-unhex-string' from url-util, whose real file
+;;    cannot load (url-vars needs `emacs-lisp-mode-syntax-table').  The two
+;;    decoding functions are copied from GNU url-util.el and the `url-util'
+;;    feature is declared ONLY while anvil-org loads, then withdrawn.
+;;  * Tools screened by real call against host Emacs 31.1 (see S11 in
+;;    tools/ai/anvil-standalone-coverage-progress.org).  Registered (same
+;;    answer as host on the fixture): org-read-file, org-get-allowed-files,
+;;    org-get-todo-config, org-get-tag-config.  The other ten are unregistered
+;;    below.
+;;  * File access: `anvil-org-allowed-files' defaults to nil with
+;;    `anvil-org-allowed-files-enabled' t, so the tools see no file unless the
+;;    caller configures it; the agenda/habit tools take their files from that
+;;    list, never from the user's real `org-agenda-files'.
+(defvar anvil-standalone--port11-errors nil
+  "Alist of (MODULE . ERROR) for port-11 modules that failed to load.")
+(unless (or (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
+            (not (or (getenv "NELISP_EMACS_LIB_DIR")
+                     (getenv "ANVIL_NOTES_DIR"))))
+  (let* ((compat-dir (or (getenv "NELISP_EMACS_LIB_DIR")
+                         (expand-file-name "dev/nelisp-emacs-lib/src"
+                                           (getenv "ANVIL_NOTES_DIR"))))
+         (vendor (expand-file-name "../vendor/emacs-lisp" compat-dir))
+         (fake-url-util (not (featurep 'url-util))))
+    (unless (fboundp 'version<)
+  (defconst version-separator "."
+    "Specify the string used to separate the version elements.
+  Usually the separator is \".\", but it can be any other string.")
+  (defconst version-regexp-alist
+    '(("^[-._+ ]?snapshot$"                                 . -4)
+      ("^[-._+]$"                                           . -4)
+      ("^[-._+ ]?\\(cvs\\|git\\|bzr\\|svn\\|hg\\|darcs\\)$" . -4)
+      ("^[-._+ ]?unknown$"                                  . -4)
+      ("^[-._+ ]?alpha$"                                    . -3)
+      ("^[-._+ ]?beta$"                                     . -2)
+      ("^[-._+ ]?\\(pre\\|rc\\)$"                           . -1))
+    "Specify association between non-numeric version and its priority.
+  This association is used to handle version string like \"1.0pre2\",
+  \"0.9alpha1\", etc.  It's used by `version-to-list' (which see) to convert the
+  non-numeric part of a version string to an integer.  For example:
+     String Version    Integer List Version
+     \"0.9snapshot\"     (0  9 -4)
+     \"1.0-git\"         (1  0 -4)
+     \"1.0.cvs\"         (1  0 -4)
+     \"1.0pre2\"         (1  0 -1 2)
+     \"1.0PRE2\"         (1  0 -1 2)
+     \"22.8beta3\"       (22 8 -2 3)
+     \"22.8 Beta3\"      (22 8 -2 3)
+     \"0.9alpha1\"       (0  9 -3 1)
+     \"0.9AlphA1\"       (0  9 -3 1)
+     \"0.9 alpha\"       (0  9 -3)
+  Each element has the following form:
+     (REGEXP . PRIORITY)
+  Where:
+  REGEXP		regexp used to match non-numeric part of a version string.
+  		It should begin with the `^' anchor and end with a `$' to
+  		prevent false hits.  Letter-case is ignored while matching
+  		REGEXP.
+  PRIORITY	a negative integer specifying non-numeric priority of REGEXP.")
+  (defun version-to-list (ver)
+    "Convert version string VER into a list of integers.
+  The version syntax is given by the following EBNF:
+     VERSION ::= NUMBER ( SEPARATOR NUMBER )*.
+     NUMBER ::= (0|1|2|3|4|5|6|7|8|9)+.
+     SEPARATOR ::= `version-separator' (which see)
+  	       | `version-regexp-alist' (which see).
+  The NUMBER part is optional if SEPARATOR is a match for an element
+  in `version-regexp-alist'.
+  Examples of valid version syntax:
+     1.0pre2   1.0.7.5   22.8beta3   0.9alpha1   6.9.30Beta   2.4.snapshot   .5
+  Examples of invalid version syntax:
+     1.0prepre2   1.0..7.5   22.8X3   alpha3.2
+  Examples of version conversion:
+     Version String    Version as a List of Integers
+     \".5\"              (0 5)
+     \"0.9 alpha\"       (0  9 -3)
+     \"0.9AlphA1\"       (0  9 -3 1)
+     \"0.9snapshot\"     (0  9 -4)
+     \"1.0-git\"         (1  0 -4)
+     \"1.0.7.5\"         (1  0  7 5)
+     \"1.0.cvs\"         (1  0 -4)
+     \"1.0PRE2\"         (1  0 -1 2)
+     \"1.0pre2\"         (1  0 -1 2)
+     \"22.8 Beta3\"      (22 8 -2 3)
+     \"22.8beta3\"       (22 8 -2 3)
+  See documentation for `version-separator' and `version-regexp-alist'."
+    (declare (side-effect-free t))
+    (unless (stringp ver)
+      (error "Version must be a string"))
+    (if (and (>= (length ver) (length version-separator))
+  	   (string-equal (substring ver 0 (length version-separator))
+  			 version-separator))
+        (setq ver (concat "0" ver)))
+    (unless (string-match-p "^[0-9]" ver)
+      (error "Invalid version syntax: `%s' (must start with a number)" ver))
+    (save-match-data
+      (let ((i 0)
+  	  (case-fold-search t)		; ignore case in matching
+  	  lst s al)
+        (while (and (setq s (string-match "[0-9]+" ver i))
+  		  (= s i))
+  	(setq lst (cons (string-to-number (substring ver i (match-end 0)))
+  			lst)
+  	      i   (match-end 0))
+  	(when (and (setq s (string-match "[^0-9]+" ver i))
+  		   (= s i))
+  	  (setq s (substring ver i (match-end 0))
+  		i (match-end 0))
+  	  (unless (string= s version-separator)
+  	    (setq al version-regexp-alist)
+  	    (while (and al (not (string-match (caar al) s)))
+  	      (setq al (cdr al)))
+  	    (cond (al
+  		   (push (cdar al) lst))
+          ((and (string-match "^[-._+ ]?\\([a-zA-Z]\\)$" s)
+             (= i (length ver)))
+  		   (push (- (aref (downcase (match-string 1 s)) 0) ?a -1)
+  			 lst))
+  		  (t (error "Invalid version syntax: `%s'" ver))))))
+      (nreverse lst))))
+  (defun version-list-< (l1 l2)
+    "Return t if L1, a list specification of a version, is lower than L2.
+  Note that a version specified by the list (1) is equal to (1 0),
+  \(1 0 0), (1 0 0 0), etc.  That is, the trailing zeros are insignificant.
+  Also, a version given by the list (1) is higher than (1 -1), which in
+  turn is higher than (1 -2), which is higher than (1 -3)."
+    (declare (pure t) (side-effect-free t))
+    (while (and l1 l2 (= (car l1) (car l2)))
+      (setq l1 (cdr l1)
+  	  l2 (cdr l2)))
+    (cond
+     ((and l1 l2) (< (car l1) (car l2)))
+     ((and (null l1) (null l2)) nil)
+     (l1 (< (version-list-not-zero l1) 0))
+     (t  (< 0 (version-list-not-zero l2)))))
+  (defun version-list-= (l1 l2)
+    "Return t if L1, a list specification of a version, is equal to L2.
+  Note that a version specified by the list (1) is equal to (1 0),
+  \(1 0 0), (1 0 0 0), etc.  That is, the trailing zeros are insignificant.
+  Also, a version given by the list (1) is higher than (1 -1), which in
+  turn is higher than (1 -2), which is higher than (1 -3)."
+    (declare (pure t) (side-effect-free t))
+    (while (and l1 l2 (= (car l1) (car l2)))
+      (setq l1 (cdr l1)
+  	  l2 (cdr l2)))
+    (cond
+     ((and l1 l2) nil)
+     ((and (null l1) (null l2)))
+     (l1 (zerop (version-list-not-zero l1)))
+     (t  (zerop (version-list-not-zero l2)))))
+  (defun version-list-<= (l1 l2)
+    "Return t if L1, a list specification of a version, is lower or equal to L2.
+  Note that integer list (1) is equal to (1 0), (1 0 0), (1 0 0 0),
+  etc.  That is, the trailing zeroes are insignificant.  Also, integer
+  list (1) is greater than (1 -1) which is greater than (1 -2)
+  which is greater than (1 -3)."
+    (declare (pure t) (side-effect-free t))
+    (while (and l1 l2 (= (car l1) (car l2)))
+      (setq l1 (cdr l1)
+  	  l2 (cdr l2)))
+    (cond
+     ((and l1 l2) (< (car l1) (car l2)))
+     ((and (null l1) (null l2)))
+     (l1 (<= (version-list-not-zero l1) 0))
+     (t  (<= 0 (version-list-not-zero l2)))))
+  (defun version-list-not-zero (lst)
+    "Return the first non-zero element of LST, which is a list of integers.
+  If all LST elements are zeros or LST is nil, return zero."
+    (declare (pure t) (side-effect-free t))
+    (while (and lst (zerop (car lst)))
+      (setq lst (cdr lst)))
+    (if lst
+        (car lst)
+      0))
+  (defun version< (v1 v2)
+    "Return t if version V1 is lower (older) than V2.
+  Note that version string \"1\" is equal to \"1.0\", \"1.0.0\", \"1.0.0.0\",
+  etc.  That is, the trailing \".0\"s are insignificant.  Also, version
+  string \"1\" is higher (newer) than \"1pre\", which is higher than \"1beta\",
+  which is higher than \"1alpha\", which is higher than \"1snapshot\".
+  Also, \"-GIT\", \"-CVS\" and \"-NNN\" are treated as snapshot versions."
+    (declare (side-effect-free t))
+    (version-list-< (version-to-list v1) (version-to-list v2)))
+  (defun version<= (v1 v2)
+    "Return t if version V1 is lower (older) than or equal to V2.
+  Note that version string \"1\" is equal to \"1.0\", \"1.0.0\", \"1.0.0.0\",
+  etc.  That is, the trailing \".0\"s are insignificant.  Also, version
+  string \"1\" is higher (newer) than \"1pre\", which is higher than \"1beta\",
+  which is higher than \"1alpha\", which is higher than \"1snapshot\".
+  Also, \"-GIT\", \"-CVS\" and \"-NNN\" are treated as snapshot versions."
+    (declare (side-effect-free t))
+    (version-list-<= (version-to-list v1) (version-to-list v2)))
+  (defun version= (v1 v2)
+    "Return t if version V1 is equal to V2.
+  Note that version string \"1\" is equal to \"1.0\", \"1.0.0\", \"1.0.0.0\",
+  etc.  That is, the trailing \".0\"s are insignificant.  Also, version
+  string \"1\" is higher (newer) than \"1pre\", which is higher than \"1beta\",
+  which is higher than \"1alpha\", which is higher than \"1snapshot\".
+  Also, \"-GIT\", \"-CVS\" and \"-NNN\" are treated as snapshot versions."
+    (declare (side-effect-free t))
+    (version-list-= (version-to-list v1) (version-to-list v2)))
+    )
+    (unless (fboundp 'subr-arity)
+      (defun subr-arity (subr) (func-arity subr)))
+    (unless (boundp 'user-mail-address) (defvar user-mail-address ""))
+    (unless (boundp 'user-full-name) (defvar user-full-name ""))
+    (unless (boundp 'org-org-menu) (defvar org-org-menu (make-sparse-keymap)))
+    ;; GNU org.el: used by `org-get-todo-config'.
+    (unless (fboundp 'org-remove-keyword-keys)
+      (defun org-remove-keyword-keys (list)
+        "Remove a pair of parenthesis at the end of each string in LIST."
+        (mapcar (lambda (x)
+                  (if (string-match "(.*)$" x)
+                      (substring x 0 (match-beginning 0))
+                    x))
+                list)))
+    ;; GNU defaults of the tag defcustoms read by `org-get-tag-config'.
+    (unless (boundp 'org-use-tag-inheritance) (defvar org-use-tag-inheritance t))
+    (unless (boundp 'org-tags-exclude-from-inheritance)
+      (defvar org-tags-exclude-from-inheritance nil))
+    (unless (boundp 'org-tag-alist) (defvar org-tag-alist nil))
+    (unless (boundp 'org-tag-persistent-alist)
+      (defvar org-tag-persistent-alist nil))
+    (unless (fboundp 'byte-to-string)
+      (defun byte-to-string (byte) (unibyte-string byte)))
+    (unless (fboundp 'url-unhex)
+      (defun url-unhex (x)
+        (if (> x ?9)
+            (if (>= x ?a) (+ 10 (- x ?a)) (+ 10 (- x ?A)))
+          (- x ?0))))
+    (unless (fboundp 'url-unhex-string)
+      (defun url-unhex-string (str &optional allow-newlines)
+        "Decode %XX sequences in a percent-encoded URL (GNU url-util.el)."
+        (setq str (or str ""))
+        (let ((tmp "") (case-fold-search t))
+          (while (string-match "%[0-9a-f][0-9a-f]" str)
+            (let* ((start (match-beginning 0))
+                   (ch1 (url-unhex (elt str (+ start 1))))
+                   (code (+ (* 16 ch1) (url-unhex (elt str (+ start 2))))))
+              (setq tmp (concat tmp (substring str 0 start)
+                                (cond (allow-newlines (byte-to-string code))
+                                      ((or (= code ?\n) (= code ?\r)) " ")
+                                      (t (byte-to-string code))))
+                    str (substring str (match-end 0)))))
+          (concat tmp str))))
+    (add-to-list 'load-path (expand-file-name "org" vendor) t)
+    (add-to-list 'load-path (expand-file-name "emacs-lisp" vendor) t)
+    (when fake-url-util (provide 'url-util))
     (unwind-protect
         (condition-case err
             (progn
-              (require 'anvil-sexp)
-              (anvil-sexp-enable)
-              (dolist (id '("sexp-verify" "sexp-macroexpand" "sexp-wrap-form"
-                            "sexp-rename-symbol" "sexp-replace-call"))
+              (require 'org-version)
+              (require 'rx)
+              (require 'anvil-org)
+              (anvil-org-enable)
+              (dolist (id anvil-standalone--port11-unregister)
                 (anvil-server-unregister-tool id "emacs-eval")))
-          (error (push (cons 'anvil-sexp err) anvil-standalone--port10-errors)))
-      (when fake-bytecomp (setq features (delq 'bytecomp features))))))
+          (error (push (cons 'anvil-org err) anvil-standalone--port11-errors)))
+      (when fake-url-util (setq features (delq 'url-util features))))))
+
+
+;; Port 12: anvil-orchestrator tools (S12.4).  anvil-orchestrator is already loaded
+;; by port 8 (routing requires it) but only the routing tools are registered.
+;; The enable function is NOT called: it rehydrates tasks from the state DB and
+;; starts pump/watchdog timers.  `anvil-orchestrator--register-tools' registers
+;; the tool specs only.  Orchestrator state never touches the host: the state DB
+;; is `anvil-state-db-path' (isolated in `anvil-standalone-start') and job
+;; stdout/stderr files live under `anvil-orchestrator-work-dir', which
+;; `anvil-standalone--orchestrator-setup' moves to the isolated cache
+;; (ANVIL_ORCHESTRATOR_WORK_DIR overrides).
+;;  * Tools are screened by real call against host Emacs 31.1 with a fake
+;;    provider whose command is `sh -c printf' (see S12.4 in
+;;    tools/ai/anvil-standalone-coverage-progress.org).  Tools whose answer
+;;    differs from the host are listed in `anvil-standalone--port12-unregister'
+;;    with the first blocker beside each.
+(defvar anvil-standalone--port12-errors nil
+  "Alist of (MODULE . ERROR) for port-12 modules that failed to load.")
+(defvar anvil-standalone--port12-unregister
+  '("orchestrator-cancel" "orchestrator-stop")
+  "Orchestrator tool ids that are registered by the module but not served.
+Both kill a running job with a signal.  On standalone the killed task then
+reports exit-code 0 where the host reports 15 (`process-exit-status' of a
+signalled process), so orchestrator-collect/status after a cancel differ.")
+(defun anvil-standalone--orchestrator-setup ()
+  "Point the orchestrator job directory at the isolated standalone cache."
+  (setq anvil-orchestrator-work-dir
+        (or (getenv "ANVIL_ORCHESTRATOR_WORK_DIR")
+            (expand-file-name
+             "anvil-standalone/anvil-orchestrator"
+             (or (getenv "XDG_CACHE_HOME")
+                 (expand-file-name ".cache" (or (getenv "HOME") "~")))))))
+;; Shims (fboundp/boundp guarded): `timer-list' is read by the pump-timer
+;; check and `process-list' by the collect wait loop.  This `process-list'
+;; always returns nil (standalone keeps no process registry yet), so
+;; `get-buffer-process' style lookups find nothing; replace it with a real
+;; registry before porting tools that depend on process lookup.
+(unless (boundp 'timer-list) (defvar timer-list nil))
+(unless (fboundp 'process-list) (defun process-list () nil))
+(unless (or (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
+            (not (featurep 'tabulated-list)))
+  (condition-case err
+      (progn
+        (require 'anvil-orchestrator)
+        (anvil-standalone--orchestrator-setup)
+        (anvil-orchestrator--register-tools)
+        (dolist (id anvil-standalone--port12-unregister)
+          (anvil-server-unregister-tool id "emacs-eval")))
+    (error (push (cons 'anvil-orchestrator err)
+                 anvil-standalone--port12-errors))))
+
+;; Port 13: remaining wave-1 groups (S12.5).  Every tool is screened by real call
+;; against host `emacs --batch -Q' on a temp fixture (see S12.5 in
+;; tools/ai/anvil-standalone-coverage-progress.org).  Databases live under the
+;; isolated `anvil-standalone' cache; no LLM, CLI agent or network is touched.
+;;  * anvil-sqlite: `sqlite-select' with RETURN-TYPE `set' (a statement object
+;;    walked by `sqlite-more-p'/`sqlite-next'/`sqlite-finalize') is absent, so a
+;;    fboundp-guarded shim returns a cursor over the selected rows.
+;;  * anvil-disclosure: only the tools that read caller-given files or the
+;;    isolated org index are registered here.
+;;  * anvil-bench: `(require 'profiler)' fails (no profiler.el), so the feature
+;;    is declared only while the module loads.  bench-profile-expr stays out.
+;;  * anvil-org-index: DB path moved to the isolated cache; `message' is muted
+;;    around the handlers because on NeLisp it writes to the MCP channel.
+(defvar anvil-standalone--port13-errors nil
+  "Alist of (MODULE . ERROR) for port-13 modules that failed to load.")
+(defvar anvil-standalone--port13-unregister
+  '("bench-profile-expr" "org-index-rebuild")
+  "Port-13 tool ids registered by their module but not served.
+bench-profile-expr: standalone has no sampling profiler (`profiler-start' is
+void), so the :top list is empty where the host reports frames.
+org-index-rebuild: an offload tool; the offload worker reports
+`void-function anvil-org-index--tool-rebuild' because standalone has no worker
+Emacs that can load the module.")
+;; Not registered, with the first blocker (checked 2026-11-03):
+;;  * ert-run-distilled: anvil-elisp fails to load (eager macro-expansion failure,
+;;    pcase pattern with branch-local bindings) and shell-quote-argument is void.
+;;  * semantic-embed-index: calls an embedding provider over HTTP.
+;;  * fusion-ask fusion-result longrun-start longrun-resume longrun-status: the
+;;    panels resolve to real LLM providers; the loader has no provider stub.
+;;  * journal-memo-append: defined in ~/.emacs.d/custom-lisp, not in this repo.
+;;  * ldb-*: defined in dev/lisp-dialect-bridge, not in this repo.
+(unless (boundp 'gc-cons-threshold) (defvar gc-cons-threshold 800000))
+(unless (fboundp 'sqlite-more-p)
+  (when (fboundp 'sqlite-select)
+    (defalias 'anvil-standalone--sqlite-select (symbol-function 'sqlite-select))
+    (defun sqlite-select (db query &optional values return-type)
+      "Like GNU `sqlite-select'; RETURN-TYPE `set' returns a row cursor."
+      (if (eq return-type 'set)
+          (list 'sqlite-set
+                (anvil-standalone--sqlite-select db query values))
+        (anvil-standalone--sqlite-select db query values return-type)))
+    (defun sqlite-more-p (set) (and (consp set) (cadr set) t))
+    (defun sqlite-next (set) (and (consp set) (pop (cadr set))))
+    (defun sqlite-finalize (set) (and (consp set) (setcar (cdr set) nil)) t)))
+(defun anvil-standalone--mute-message (fn)
+  "Redefine FN with its own arglist and docstring, running with `message' muted.
+The loader never lets handlers emit `message' output, and the server derives
+the tool parameters from the handler arglist, so a `&rest' wrapper will not do."
+  (let* ((orig (symbol-function fn))
+         (arglist (help-function-arglist orig t))
+         (vars (seq-remove (lambda (a) (memq a '(&optional &rest))) arglist)))
+    (eval `(defun ,fn ,arglist ,(documentation orig t)
+             (let ((old (symbol-function 'message)))
+               (fset 'message #'ignore)
+               (unwind-protect (funcall ',orig ,@vars)
+                 (fset 'message old))))
+          t)))
+(defun anvil-standalone--port13-setup ()
+  "Open the isolated org-index DB (called from `anvil-standalone-start')."
+  (when (and (featurep 'anvil-org-index) (not anvil-org-index--db))
+    (setq anvil-org-index-db-path
+          (or (getenv "ANVIL_ORG_INDEX_DB")
+              (expand-file-name
+               "anvil-standalone/anvil-org-index.db"
+               (or (getenv "XDG_CACHE_HOME")
+                   (expand-file-name ".cache" (or (getenv "HOME") "~"))))))
+    (make-directory (file-name-directory anvil-org-index-db-path) t)
+    (setq anvil-org-index--backend (anvil-org-index--detect-backend))
+    (setq anvil-org-index--db (anvil-org-index--open anvil-org-index-db-path))
+    (anvil-org-index--apply-ddl anvil-org-index--db)))
+(unless (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
+  (condition-case err
+      (progn
+        (require 'anvil-sqlite)
+        (anvil-sqlite-enable))
+    (error (push (cons 'anvil-sqlite err) anvil-standalone--port13-errors)))
+  (condition-case err
+      (anvil-server-register-tools
+       "emacs-eval"
+       (seq-filter (lambda (spec)
+                     (member (plist-get (cdr spec) :id)
+                             '("file-read-snippet" "journal-index"
+                               "disclosure-fetch" "disclosure-help"
+                               "org-index-index")))
+                   anvil-disclosure--tool-specs))
+    (error (push (cons 'anvil-disclosure err) anvil-standalone--port13-errors)))
+  (condition-case err
+      (let ((fake-profiler (not (featurep 'profiler))))
+        (when fake-profiler (provide 'profiler))
+        (unwind-protect (require 'anvil-bench)
+          (when fake-profiler (setq features (delq 'profiler features))))
+        (anvil-bench--register-tools)
+        (dolist (id anvil-standalone--port13-unregister)
+          (anvil-server-unregister-tool id "emacs-eval")))
+    (error (push (cons 'anvil-bench err) anvil-standalone--port13-errors)))
+  (condition-case err
+      (progn
+        (require 'anvil-eval)
+        (dolist (spec '((anvil-eval--nelisp "nelisp-eval"
+                         "Evaluate expression with the pure Elisp NeLisp evaluator and return the printed result.")
+                        (anvil-eval--nelisp-reset "nelisp-eval-reset"
+                         "Reset the stateful pure Elisp NeLisp REPL used by nelisp-eval.")))
+          (anvil-server-register-tool
+           (nth 0 spec) :id (nth 1 spec) :intent '(eval) :layer 'dev
+           :description (nth 2 spec)
+           :server-id "emacs-eval")))
+    (error (push (cons 'anvil-eval err) anvil-standalone--port13-errors)))
+  (condition-case err
+      (progn
+        (require 'anvil-org-index)
+        (anvil-standalone--mute-message 'anvil-org-index--tool-search)
+        (anvil-standalone--mute-message 'anvil-org-index--tool-rebuild)
+        (anvil-org-index--register-tools)
+        (dolist (id anvil-standalone--port13-unregister)
+          (anvil-server-unregister-tool id "emacs-eval")))
+    (error (push (cons 'anvil-org-index err) anvil-standalone--port13-errors))))
+
+;; Port 14: fusion, longrun, journal-memo, ldb and org-index-rebuild (S12.6).
+;; Every tool is screened by real call against host `emacs --batch -Q' on a temp
+;; fixture (see S12.6 in tools/ai/anvil-standalone-coverage-progress.org).
+;;  * fusion-ask/fusion-result/longrun-*: registered as-is.  In production they
+;;    use the user's real provider config exactly like host; only the screening
+;;    fixture swaps in fake providers whose command is `sh -c printf'.  The
+;;    quest store DB moves to the isolated cache (ANVIL_FUSION_LONGRUN_DB).
+;;  * journal-memo-append (~/.emacs.d/custom-lisp/my-journal-memo.el) and
+;;    ldb-* (dev/lisp-dialect-bridge) live outside this repo.  Their
+;;    directories come from ANVIL_CUSTOM_LISP_DIR / ANVIL_LDB_DIR, defaulting
+;;    to HOME/.emacs.d/custom-lisp and ANVIL_NOTES_DIR/dev/lisp-dialect-bridge.
+;;    An absent directory or library is skipped silently.
+;;  * org-index-rebuild is an offload tool: host spawns `emacs --batch' with
+;;    the handler's module required.  Standalone has no symbol-file, so that
+;;    worker reports `void-function'.  The tool is re-registered on a handler
+;;    that runs in a bounded standalone child (the context-worker path), which
+;;    loads anvil-org-index and the isolated DB itself.
+(defvar anvil-standalone--port14-errors nil
+  "Alist of (MODULE . ERROR) for port-14 modules that failed to load.")
+(defvar anvil-standalone--port14-unregister nil
+  "Port-14 tool ids that stay unregistered, with the first blocker.
+bench-profile-expr: standalone has no sampling profiler (`profiler-start' is
+void), so the :top list would be empty where the host reports sampled frames.
+Registering it would hand back a faked answer, so it stays out until the
+runtime grows a profiler.")
+(defun anvil-standalone--port14-cache-dir ()
+  "Return the isolated standalone cache directory."
+  (expand-file-name
+   "anvil-standalone"
+   (or (getenv "XDG_CACHE_HOME")
+       (expand-file-name ".cache" (or (getenv "HOME") "~")))))
+(defun anvil-standalone--port14-optional-dir (env default)
+  "Return the existing directory named by ENV or DEFAULT, else nil."
+  (let ((dir (or (getenv env) default)))
+    (and dir (file-directory-p dir) dir)))
+;; Shims (fboundp guarded) for the file-visiting calls my-journal-memo makes.
+;; `date-to-time' only handles the "YYYY-MM-DD HH:MM:SS" form the module passes.
+(unless (fboundp 'date-to-time)
+  (defun date-to-time (date)
+    (if (string-match "\\`\\([0-9]+\\)-\\([0-9]+\\)-\\([0-9]+\\) \\([0-9]+\\):\\([0-9]+\\):\\([0-9]+\\)" date)
+        (encode-time (list (string-to-number (match-string 6 date))
+                           (string-to-number (match-string 5 date))
+                           (string-to-number (match-string 4 date))
+                           (string-to-number (match-string 3 date))
+                           (string-to-number (match-string 2 date))
+                           (string-to-number (match-string 1 date))
+                           nil -1 nil))
+      (error "date-to-time: unsupported date %S" date))))
+(unless (fboundp 'find-file-noselect)
+  (defun find-file-noselect (file &rest _)
+    (let ((buf (generate-new-buffer (file-name-nondirectory file))))
+      (with-current-buffer buf
+        (when (file-exists-p file) (insert-file-contents file))
+        (setq buffer-file-name (expand-file-name file)))
+      buf)))
+(unless (fboundp 'save-buffer)
+  (defun save-buffer (&rest _)
+    (write-region (point-min) (point-max) buffer-file-name nil 'silent)))
+(defun anvil-standalone--org-index-rebuild-here (paths)
+  "Rebuild the isolated org-index for PATHS inside a context worker."
+  (require 'anvil-org-index)
+  (let ((old (symbol-function 'message)))
+    (fset 'message #'ignore)
+    (unwind-protect
+        (progn
+          (setq anvil-org-index-db-path
+                (or (getenv "ANVIL_ORG_INDEX_DB")
+                    (expand-file-name "anvil-org-index.db"
+                                      (anvil-standalone--port14-cache-dir))))
+          (make-directory (file-name-directory anvil-org-index-db-path) t)
+          (anvil-org-index--tool-rebuild paths))
+      (fset 'message old))))
+(defun anvil-standalone-org-index-rebuild-handler (&optional paths)
+  "Rebuild the entire org-index from disk in a bounded standalone child.
+
+MCP Parameters:
+  paths - Optional comma-separated list of directory paths to
+          rebuild.  Empty or omitted means every directory in
+          the configured `anvil-org-index-paths'."
+  (if (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
+      (anvil-standalone--org-index-rebuild-here paths)
+    (anvil-standalone--context-worker-tool
+     'anvil-standalone-org-index-rebuild-handler (list paths))))
+(unless (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
+  (condition-case err
+      (progn
+        (require 'anvil-fusion-mcp)
+        (require 'anvil-fusion-longrun-mcp)
+        (require 'anvil-fusion-longrun-store)
+        (setq anvil-fusion-longrun-store-db-path
+              (or (getenv "ANVIL_FUSION_LONGRUN_DB")
+                  (expand-file-name "anvil-fusion-longrun.db"
+                                    (anvil-standalone--port14-cache-dir))))
+        (make-directory (file-name-directory anvil-fusion-longrun-store-db-path) t)
+        (dolist (fn '(anvil-fusion--tool-ask anvil-fusion--tool-result
+                      anvil-fusion-longrun--tool-start
+                      anvil-fusion-longrun--tool-resume
+                      anvil-fusion-longrun--tool-status))
+          (anvil-standalone--mute-message fn))
+        (anvil-fusion--register-tools)
+        (anvil-fusion-longrun--register-tools))
+    (error (push (cons 'anvil-fusion err) anvil-standalone--port14-errors)))
+  (condition-case err
+      (let ((dir (anvil-standalone--port14-optional-dir
+                  "ANVIL_CUSTOM_LISP_DIR"
+                  (expand-file-name ".emacs.d/custom-lisp"
+                                    (or (getenv "HOME") "~")))))
+        (when (and dir (file-exists-p (expand-file-name "my-journal-memo.el" dir)))
+          (add-to-list 'load-path dir)
+          (require 'my-journal-memo)
+          (anvil-standalone--mute-message 'my-journal-memo--tool-append)
+          (my-journal-memo-enable)))
+    (error (push (cons 'my-journal-memo err) anvil-standalone--port14-errors)))
+  (condition-case err
+      (let ((dir (anvil-standalone--port14-optional-dir
+                  "ANVIL_LDB_DIR"
+                  (expand-file-name
+                   "dev/lisp-dialect-bridge"
+                   (or (getenv "ANVIL_NOTES_DIR")
+                       (expand-file-name "Cowork/Notes"
+                                         (or (getenv "HOME") "~")))))))
+        (when (and dir (file-exists-p (expand-file-name "ldb-mcp.el" dir)))
+          (add-to-list 'load-path dir)
+          (require 'lisp-dialect-bridge)
+          (load (expand-file-name "ldb-mcp.el" dir) nil t)
+          (dolist (fn '(ldb-mcp--tool-translate ldb-mcp--tool-translate-to-file
+                        ldb-mcp--tool-capabilities))
+            (anvil-standalone--mute-message fn))
+          (ldb-mcp-enable)))
+    (error (push (cons 'ldb-mcp err) anvil-standalone--port14-errors)))
+  (condition-case err
+      (when (featurep 'anvil-org-index)
+        (anvil-server-unregister-tool "org-index-rebuild" "emacs-eval")
+        (anvil-server-register-tool
+         #'anvil-standalone-org-index-rebuild-handler
+         :id "org-index-rebuild" :intent '(org-read admin) :layer 'workflow
+         :server-id "emacs-eval"
+         :description
+         "Rebuild the entire org-index from disk.  Runs in a bounded standalone
+child process so the main server stays responsive; commits in chunks and
+persists them in the DB, so a follow-up call can re-run safely."))
+    (error (push (cons 'org-index-rebuild err) anvil-standalone--port14-errors))))
+
+;; Port 15: anvil-dashboard (S12.7).  Tools are screened by real call against
+;; host `emacs --batch -Q' on a fixture HOME / notes root (see S12.7 in
+;; tools/ai/anvil-standalone-coverage-progress.org).
+;;  * The module is optional (`require' with NOERROR plus a `featurep' guard),
+;;    so a checkout without anvil-dashboard.el still starts.
+;;  * The HTTP filter answers with `process-send-string', whose
+;;    `nelisp-process-buffer-p' is an unresolved autoload on this runtime
+;;    (invalid-function); requiring the feature up front resolves it.
+;;  * `process-contact :service' does not report an OS-assigned port, so an
+;;    ephemeral port (0 or t) would not give the host answer: callers pass an
+;;    explicit port.
+(defvar anvil-standalone--port15-errors nil
+  "Alist of (MODULE . ERROR) for port-15 modules that failed to load.")
+(defvar anvil-standalone--port15-unregister nil
+  "Port-15 tool ids that stay unregistered, with the first blocker.
+None: dashboard-snapshot, dashboard-serve-start and dashboard-serve-stop give
+the host answers on the fixture.")
+(unless (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
+  (condition-case err
+      (progn
+        (require 'nelisp-process-buffer nil t)
+        (when (require 'anvil-dashboard nil t)
+          (anvil-dashboard--register-tools)
+          (dolist (id anvil-standalone--port15-unregister)
+            (anvil-server-unregister-tool id "emacs-eval"))))
+    (error (push (cons 'anvil-dashboard err) anvil-standalone--port15-errors))))
 
 (defun anvil-standalone-start ()
   "Serve the prepared registry, opening databases on first use."
@@ -854,6 +1564,12 @@ Fallback for runtimes without a native `time-subtract'; nil means now."
     (setq anvil-harness-telemetry-db-path
           (or (getenv "ANVIL_HARNESS_TELEMETRY_DB")
               (expand-file-name "anvil-harness-telemetry.db" cache))))
+  (anvil-standalone--defs-db-setup)
+  (when (fboundp 'anvil-standalone--orchestrator-setup)
+    (anvil-standalone--orchestrator-setup))
+  (when (fboundp 'anvil-standalone--port13-setup)
+    (condition-case err (anvil-standalone--port13-setup)
+      (error (push (cons 'org-index-db err) anvil-standalone--port13-errors))))
   (setq anvil-server--debug-trace (and (getenv "ANVIL_STANDALONE_DEBUG") t))
   (anvil-standalone--call-with-stdio-reader
    (lambda () (anvil-server-run-batch-stdio "emacs-eval")))
