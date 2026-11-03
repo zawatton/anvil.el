@@ -1030,9 +1030,14 @@ Used by the auto-generated `anvil-shell-filter-builtin.el' bridge so
 each rtk-derived call site stays one line.  SPEC must contain :tag;
 all other keywords are forwarded verbatim."
   (let ((tag (plist-get spec :tag))
-        (kw  (cl-loop for (k v) on spec by #'cddr
-                      unless (eq k :tag)
-                      append (list k v))))
+        (kw  (let ((--tail-- spec) --acc--)
+               (while (consp --tail--)
+                 (let ((k (car --tail--)) (v (cadr --tail--)))
+                   (unless (eq k :tag)
+                     (push k --acc--)
+                     (push v --acc--)))
+                 (setq --tail-- (cddr --tail--)))
+               (nreverse --acc--))))
     (unless tag
       (error "anvil-shell-filter-register-from-spec: SPEC missing :tag — %S" spec))
     (apply #'anvil-shell-filter-register tag kw)))

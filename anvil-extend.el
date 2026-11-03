@@ -1206,9 +1206,12 @@ ARGS is a list of keyword/value pairs.  Recognised keys:
 Unknown keys are stored verbatim so future Phase v1 additions
 (e.g. `:max-memory') compose without code changes here.  Returns
 the resulting policy plist."
-  (cl-loop for (k v) on args by #'cddr
-           do (setq anvil-extend--sandbox-policy
-                    (plist-put anvil-extend--sandbox-policy k v)))
+  (let ((--tail-- args))
+    (while (consp --tail--)
+      (let ((k (car --tail--)) (v (cadr --tail--)))
+        (setq anvil-extend--sandbox-policy
+              (plist-put anvil-extend--sandbox-policy k v)))
+      (setq --tail-- (cddr --tail--))))
   anvil-extend--sandbox-policy)
 
 (defun anvil-extend-sandbox-policy-reset ()
@@ -1910,9 +1913,14 @@ not safely serialisable across the MCP boundary."
                    :memory-limit memory-limit))
           ;; Strip the (unprintable / non-serialisable) future
           ;; before crossing the MCP boundary.
-          (clean (cl-loop for (k v) on result by #'cddr
-                          unless (eq k :future)
-                          append (list k v))))
+          (clean (let ((--tail-- result) --acc--)
+                   (while (consp --tail--)
+                     (let ((k (car --tail--)) (v (cadr --tail--)))
+                       (unless (eq k :future)
+                         (push k --acc--)
+                         (push v --acc--)))
+                     (setq --tail-- (cddr --tail--)))
+                   (nreverse --acc--))))
      (format "%S" clean))))
 
 (defun anvil-extend--tool-scan-dangerous-forms (form)
@@ -2390,9 +2398,12 @@ ARGS is a list of keyword/value pairs.  Recognised keys:
 
 Unknown keys are stored verbatim so future Phase F additions
 compose without code changes here.  Returns the resulting plist."
-  (cl-loop for (k v) on args by #'cddr
-           do (setq anvil-extend--promotion-policy
-                    (plist-put anvil-extend--promotion-policy k v)))
+  (let ((--tail-- args))
+    (while (consp --tail--)
+      (let ((k (car --tail--)) (v (cadr --tail--)))
+        (setq anvil-extend--promotion-policy
+              (plist-put anvil-extend--promotion-policy k v)))
+      (setq --tail-- (cddr --tail--))))
   anvil-extend--promotion-policy)
 
 (defun anvil-extend-promotion-policy-reset ()

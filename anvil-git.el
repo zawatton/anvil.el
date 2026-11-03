@@ -60,9 +60,14 @@ The sentinels :null and :empty-array map to nil / empty vector."
    ((vectorp x)
     (vconcat (mapcar #'anvil-git--to-json-value x)))
    ((anvil-git--plist-p x)
-    (cl-loop for (k v) on x by #'cddr
-             collect (cons (intern (substring (symbol-name k) 1))
-                           (anvil-git--to-json-value v))))
+    (let ((--tail-- x) --acc--)
+      (while (consp --tail--)
+        (let ((k (car --tail--)) (v (cadr --tail--)))
+          (push (cons (intern (substring (symbol-name k) 1))
+                      (anvil-git--to-json-value v))
+                --acc--))
+        (setq --tail-- (cddr --tail--)))
+      (nreverse --acc--)))
    ((and (consp x) (not (proper-list-p x)))
     ;; Dotted pair — emit as [car, cdr] to survive improper-list mapcar.
     (vector (anvil-git--to-json-value (car x))

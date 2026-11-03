@@ -67,7 +67,7 @@ of a codex branch commit (2026-10-24) that is not an ancestor of NeLisp main.
 | `anvil-ts`, `anvil-py`, `anvil-js` | fail | treesit subprocess backend `with-root` not implemented (Doc 38 Phase G TODO) |
 | `anvil-file` | `file-read`, `file-outline`, `file-create`, `file-replace-string` OK | ported 2026-11-02 |
 | `anvil-compact`, `anvil-session`, `anvil-shell-filter` | `compact-estimate`, `compact-stats`, `session-list`, `shell-filter`, `shell-gain` OK | ported 2026-11-02 (state DB under the XDG cache, not the host's) |
-| `anvil-browser` | fails | `browser-fetch`: `process-coding-system-alist` unbound on this runtime |
+| `anvil-browser` | screened (S13.3) | registered by port 16; the five tools return the host's error replies where Chrome cannot start, success path unverified here |
 | `anvil-org-index` | not called | uses the host's `~/.emacs.d` DB, calls `message` (stdout is the MCP channel), needs `anvil-org-index-paths` |
 | `anvil-claude-watchdog` | not called | 30 s timer watching the host's Claude processes; would duplicate host events |
 
@@ -129,6 +129,8 @@ Tenth step (S12.6, 2026-11-03): Port 14 registers 10 more wave-1 tools, each scr
 
 Eleventh step (S12.7, 2026-11-03): Port 15 registers the three `anvil-dashboard` tools (`dashboard-snapshot`, `dashboard-serve-start`, `dashboard-serve-stop`) behind `(require 'anvil-dashboard nil t)`, so a checkout without the module still starts. Screened by real call against host `emacs --batch -Q` on an empty HOME and notes root: snapshot panels, start on 127.0.0.1:47311, GET `/`, `/api/snapshot`, `/nope`, POST `/`, stop and a second stop give identical answers. Two runtime workarounds: `nelisp-process-buffer` is required up front (its autoload is unresolved, so `process-send-string` signalled `invalid-function`), and callers pass an explicit port because `process-contact :service` does not report an OS-assigned one. `anvil-dashboard.el` had a real bug (the start tool returned the process object, which cannot be JSON-encoded, so the host reported an error after a successful start); it now returns host and port, with an ERT test. The smoke BASE gains 3 behind a `featurep` term.
 
+Twelfth step (S13.3, 2026-11-03): Port 16 registers `defs-detect-changes` and the five `anvil-browser` tools (`browser-fetch`, `browser-interact`, `browser-capture`, `browser-screenshot`, `browser-close`). `process-coding-system-alist` comes from nelisp-emacs-lib (`emacs-cc-coding-2.el`); `shell-quote-argument` is the GNU subr.el POSIX branch under an fboundp guard. `defs-detect-changes` matches the host on a git fixture; because NeLisp `make-process` ignores `default-directory` (wave 3), the handler prefixes `cd DIR &&` to the shell command, leaving the result plist unchanged. The browser tools drive the agent-browser CLI, which cannot start Chrome in this environment (host and standalone both return `command nil failed: (no error message)`; `browser-close` matches), so only the error replies are screened as equal, not the success path.
+
 anvil-lint and anvil-cron were added to the loader on 2026-11-01 (image tool count 40 -> 46; the sixth is `metrics-token-report`, pulled in by their requires).  anvil-file followed on 2026-11-02 (46 -> 61) and anvil-compact, anvil-session and anvil-shell-filter after it (61 -> 79), and agent, data, dev, discovery, harness-telemetry and session-store after the second screening (79 -> 98; their databases go to the XDG cache).
 
 Note: NeLisp origin/main (66561c85e) cannot run the standalone loader at all (`nl-ffi-memory` is missing there); the installed runtime's line is ~2200 commits ahead of origin/main.
@@ -144,7 +146,7 @@ Adding modules also requires updating the tool-count check (a lower bound: 94 pl
 | anvil-autoresearch | no | - | b | tabulated-list.el missing | S |
 | anvil-bench | yes | yes (2 of 3) | ok | S12.5: `profiler` feature declared only while loading; compare and last registered, profile-expr not (no profiler-start) | - |
 | anvil-bisect | yes | already loaded | ok | in standalone loader | - |
-| anvil-browser | yes | yes (5) | a | registers; `browser-fetch` fails (process coding support) | - |
+| anvil-browser | yes | yes (5) | a | screened (S13.3): all 5 registered; error replies equal the host (Chrome cannot start here), success path unverified | - |
 | anvil-buffer | yes | yes (3) | a | screened: buffer primitives misbehave after the module loads | - |
 | anvil-cad | yes | already loaded | ok | in standalone loader | - |
 | anvil-claude-watchdog | yes | yes (1) | c | registers; watches the host's Claude processes | - |
@@ -163,7 +165,7 @@ Adding modules also requires updating the tool-count check (a lower bound: 94 pl
 | anvil-dashboard | yes | yes (3) | ok | screened S12.7: dashboard-snapshot/-serve-start/-serve-stop registered (optional require); HTTP probes match host; start result fixed to be JSON-safe | - |
 | anvil-data | yes | already loaded | ok | in standalone loader | - |
 | anvil-defs-context | yes | no `-enable` | lib | library or registered by a parent | - |
-| anvil-defs | yes | 13 of 14 (all but defs-detect-changes) | ok | S12: 13 of 14 registered (defs-index, defs-index-update and the 11 above; only defs-detect-changes is not); the index uses an isolated DB (ANVIL_DEFS_INDEX_DB, default $XDG_CACHE_HOME/anvil-standalone/anvil-defs-index.db), never the host's; defs-detect-changes signals void shell-quote-argument and then void-variable process-coding-system-alist when git runs (wave 2) | - |
+| anvil-defs | yes | 14 of 14 | ok | S12/S13.3: all 14 registered (defs-index, defs-index-update and the 11 above, plus defs-detect-changes from port 16, screened by real call); the index uses an isolated DB (ANVIL_DEFS_INDEX_DB, default $XDG_CACHE_HOME/anvil-standalone/anvil-defs-index.db), never the host's; defs-detect-changes emulates the ignored make-process cwd with a cd prefix while its handler runs | - |
 | anvil-dev | yes | already loaded | ok | in standalone loader | - |
 | anvil-disclosure | yes | 7 of 9 | ok | S12.5: file-read-snippet, disclosure-help, disclosure-fetch, journal-index, org-index-index added | - |
 | anvil-discovery | yes | already loaded | ok | in standalone loader | - |

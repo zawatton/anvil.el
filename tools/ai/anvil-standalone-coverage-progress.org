@@ -281,6 +281,11 @@ cmd: python3 tools/ai/standalone-parity-check.py --wave 2
 #+TIMEOUT: 600
 cmd: test -s tools/ai/standalone-parity-wave2-calls.json && python3 tools/ai/standalone-parity-check.py --wave 2 --calls tools/ai/standalone-parity-wave2-calls.json
 
+** S13.3 process-coding group: real calls give the host answers on the fixture
+#+NOTE: red at definition: against HEAD (no Port 16) defs-detect-changes and the five browser-* tools print FAIL "Tool not found".  defs-detect-changes matches the host on a git fixture (changed symbol dc-a-helper, risk high, one caller); the seed runs git with -C because NeLisp call-process and make-process ignore default-directory, and the handler emulates the ignored cwd with a cd prefix on the shell command.  Browser tools: success path verified 2026-11-03 by the coordinator; host emacs --batch -Q gives the same snapshot (heading "Hello fx", button Go) for fetch and interact, a cap/web_*.org capture, a .png screenshot and (:ok t :exit 0 ...) for close.  The calls use session anvil-parity so they never share the user's default agent-browser session.  The cmd starts that session from the shell first and closes it afterwards: anvil-browser cannot start a fresh agent-browser session from inside Emacs (host emacs --batch and standalone both return "command nil failed: (no error message)" for a new session name, while a shell launch works), so a pre-started session is the deterministic setup on both sides.  An earlier draft expected the Chrome-launch error, which is environment dependent.  Loader additions: emacs-cc-coding-2.el (process-coding-system-alist) and the GNU shell-quote-argument under an fboundp guard.  Mutation control: the last clause repeats the checks with dc-a-helpex and Hello fy and must fail.
+#+TIMEOUT: 300
+cmd: timeout 90 agent-browser --session-name anvil-parity open about:blank >/dev/null 2>&1; out=$(timeout 500 python3 tools/ai/standalone-mcp-call.py tools/ai/standalone-parity-wave2-calls.json); rc=$?; timeout 60 agent-browser --session-name anvil-parity close >/dev/null 2>&1; test $rc = 0 && g() { printf '%s\n' "$out" | grep "^OK   $1 " | sed -n "$3p" | grep -qF -- "$2"; } && g defs-detect-changes '\"changed\":[{\"name\":\"dc-a-helper\",\"kind\":\"defun\"' 1 && g defs-detect-changes '\"files\":1,\"changed\":[{\"name\":\"dc-a-helper\"' 2 && g browser-fetch 'heading \"Hello fx\" [level=1' 1 && g browser-interact 'heading \"Hello fx\" [level=1' 1 && g browser-capture '/cap/web_' 1 && g browser-screenshot '.png' 1 && g browser-close '(:ok t :exit 0 :cache-cleared' 1 && ! { g defs-detect-changes '\"changed\":[{\"name\":\"dc-a-helpex\",\"kind\":\"defun\"' 1 && g defs-detect-changes '\"files\":1,\"changed\":[{\"name\":\"dc-a-helpex\"' 2 && g browser-fetch 'heading \"Hello fy\" [level=1' 1 && g browser-interact 'heading \"Hello fy\" [level=1' 1 && g browser-capture '/cap/web_' 1 && g browser-screenshot '.png' 1 && g browser-close '(:ok t :exit 0 :cache-cleared' 1; }
+
 * S14 Parity wave 3: tools that need NeLisp core changes (make-process default-directory, docstrings) (user request 2026-11-03)
 
 ** S14.1 Every wave-3 tool is registered by the standalone loader
@@ -299,3 +304,27 @@ cmd: test -s tools/ai/standalone-parity-wave3-calls.json && python3 tools/ai/sta
 #+NOTE: red at definition: missing=108 on 2026-11-03
 #+TIMEOUT: 300
 cmd: python3 tools/ai/standalone-parity-check.py --wave 0,1,2,3
+
+* S16 Loader survives runtime replacement (user request 2026-11-03)
+
+# 2026-11-03 incident: bin/nelisp-worktree-archive.sh removed dev/nelisp/target/agent-worktrees/integ-wh-20261022-m12, whose
+# target/integ/src-a6e710746 tree the installed runtime used as its baked load-path, and every new standalone start failed with
+# "Cannot locate readable JSON provider source: json".  The runtime was rebuilt from a6e710746 into dev/nelisp-anvil-runtime/a6e710746
+# (a plain clone, outside the archive script's worktree list).  A NeLisp HEAD build (9d6a4a4f2) also failed to start the loader:
+# its cl-loop rejects `for (k v) on X by #'cddr', used while anvil-server-commands loads.  These criteria keep the loader working
+# when the runtime's baked source tree is gone and when the runtime is a newer NeLisp.
+
+** S16.1 With a runtime whose baked source tree is gone, the loader starts and registers every shared and wave-1 tool
+#+NOTE: red at definition (2026-11-03): the a14b1a2e4 binary's baked tree is deleted and the loader stops at the JSON provider
+#+TIMEOUT: 300
+cmd: B=${ANVIL_STALE_NELISP_BIN:-$HOME/Cowork/Notes/dev/nelisp/target/anvil/a14b1a2e4/nelisp}; test -x "$B" && T=$(mktemp -d) && ln -s "$B" "$T/nelisp" && PATH="$T:$PATH" python3 tools/ai/standalone-parity-check.py --wave 0,1
+
+** S16.2 With a NeLisp HEAD build (9d6a4a4f2), the loader starts and registers every shared and wave-1 tool
+#+NOTE: red at definition (2026-11-03): cl-loop "unsupported clause shape" at (require 'anvil-server-commands)
+#+TIMEOUT: 300
+cmd: B=${NELISP_HEAD_BIN:-$HOME/Cowork/Notes/dev/nelisp-anvil-runtime/9d6a4a4f2/target/nelisp}; test -x "$B" && T=$(mktemp -d) && ln -s "$B" "$T/nelisp" && PATH="$T:$PATH" python3 tools/ai/standalone-parity-check.py --wave 0,1
+
+** S16.3 Real MCP calls through the real launcher succeed with the stale runtime of S16.1
+#+NOTE: red at definition (2026-11-03): the launcher dies before tools/list
+#+TIMEOUT: 300
+cmd: B=${ANVIL_STALE_NELISP_BIN:-$HOME/Cowork/Notes/dev/nelisp/target/anvil/a14b1a2e4/nelisp}; test -x "$B" && T=$(mktemp -d) && ln -s "$B" "$T/nelisp" && PATH="$T:$PATH" NELISP_BIN="$B" timeout 500 python3 tools/ai/standalone-mcp-call.py tools/ai/standalone-port6-calls.json >/dev/null

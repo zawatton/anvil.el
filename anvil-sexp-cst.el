@@ -383,8 +383,12 @@ on pair count past the top limit.  `anvil-sexp-cst--window-offset'
 is interpreted as a *pair* offset (skip N pairs), matching the
 drill contract."
   (let* ((len (length pl))
-         (pairs (cl-loop for (k v) on pl by #'cddr
-                         collect (cons k v)))
+         (pairs (let ((--tail-- pl) --acc--)
+                  (while (consp --tail--)
+                    (let ((k (car --tail--)) (v (cadr --tail--)))
+                      (push (cons k v) --acc--))
+                    (setq --tail-- (cddr --tail--)))
+                  (nreverse --acc--)))
          (pair-count (length pairs))
          (off (anvil-sexp-cst--clamp-offset pair-count))
          (take (min (max 0 (- pair-count off)) anvil-sexp-cst-top-limit))

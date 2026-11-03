@@ -1,0 +1,77 @@
+[
+ [
+  "emacs-eval",
+  {
+   "expression": "(progn (make-directory \"@TMP@/dc\" t) (with-temp-file \"@TMP@/dc/dc-a.el\" (insert \";;; dc-a.el --- fixture  -*- lexical-binding: t; -*-\\n(defun dc-a-main (x)\\n  \\\"Main.\\\"\\n  (dc-a-helper x))\\n(defun dc-a-helper (n) (+ n 1))\\n(provide 'dc-a)\\n\")) (progn (call-process \"git\" nil nil nil \"-C\" \"@TMP@/dc\" \"init\" \"-q\") (call-process \"git\" nil nil nil \"-C\" \"@TMP@/dc\" \"-c\" \"user.email=a@b\" \"-c\" \"user.name=x\" \"add\" \"-A\") (call-process \"git\" nil nil nil \"-C\" \"@TMP@/dc\" \"-c\" \"user.email=a@b\" \"-c\" \"user.name=x\" \"commit\" \"-qm\" \"i\")) (with-temp-file \"@TMP@/dc/dc-a.el\" (insert \";;; dc-a.el --- fixture  -*- lexical-binding: t; -*-\\n(defun dc-a-main (x)\\n  \\\"Main.\\\"\\n  (dc-a-helper x))\\n(defun dc-a-helper (n) (+ n 2))\\n(provide 'dc-a)\\n\")) (make-directory \"@TMP@/web\" t) (with-temp-file \"@TMP@/web/a.html\" (insert \"<html><head><title>Fx Page</title></head><body><h1>Hello fx</h1><button id=\\\"go\\\" onclick=\\\"document.getElementById('o').textContent='clicked'\\\">Go</button><p id=\\\"o\\\">idle</p></body></html>\")) (setq anvil-browser-capture-dir \"@TMP@/cap\") (setq anvil-browser-timeout-sec 90) \"seeded\")"
+  }
+ ],
+ [
+  "defs-index-rebuild",
+  {
+   "paths": "@TMP@/dc"
+  }
+ ],
+ [
+  "defs-detect-changes",
+  {
+   "repo": "@TMP@/dc"
+  }
+ ],
+ [
+  "defs-detect-changes",
+  {
+   "repo": "@TMP@/dc",
+   "rev": "HEAD",
+   "depth": "2",
+   "limit": "1"
+  }
+ ],
+ [
+  "browser-fetch",
+  {
+   "url": "file://@TMP@/web/a.html",
+   "session": "anvil-parity"
+  }
+ ],
+ [
+  "browser-fetch",
+  {
+   "url": "file://@TMP@/web/a.html",
+   "session": "anvil-parity"
+  }
+ ],
+ [
+  "browser-interact",
+  {
+   "url": "file://@TMP@/web/a.html",
+   "actions": "[[\"click\",\"#go\"]]",
+   "session": "anvil-parity"
+  }
+ ],
+ [
+  "browser-capture",
+  {
+   "url": "file://@TMP@/web/a.html",
+   "title": "Fx capture",
+   "tags": "fx",
+   "session": "anvil-parity"
+  }
+ ],
+ [
+  "browser-screenshot",
+  {
+   "url": "file://@TMP@/web/a.html",
+   "session": "anvil-parity"
+  }
+ ],
+ [
+  "browser-close",
+  {}
+ ],
+ [
+  "emacs-eval",
+  {
+   "expression": "(list (plist-get anvil-browser--metrics :fetches) (plist-get anvil-browser--metrics :cache-hits) (mapcar (lambda (f) (with-temp-buffer (insert-file-contents f) (buffer-string))) (directory-files \"@TMP@/cap\" t \"\\\\.org\\\\'\")))"
+  }
+ ]
+]

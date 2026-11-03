@@ -305,7 +305,7 @@ class Launcher:
         # loaded; a lower bound, so tools added by work in progress pass.
         form = ('(unless (and (fboundp \'anvil-standalone-start) '
                 '(>= (hash-table-count (gethash "emacs-eval" anvil-server--tools)) '
-                '(+ 171 (if (featurep \'my-journal-memo) 1 0) '
+                '(+ 172 (if (featurep \'anvil-browser) 5 0) (if (featurep \'my-journal-memo) 1 0) '
                 '(if (featurep \'lisp-dialect-bridge) 3 0) '
                 '(if (featurep \'anvil-context-batch) 1 0) '
                 '(if (featurep \'anvil-context-dependencies) 1 0) '

@@ -1225,9 +1225,14 @@ loses these — the task flips to `failed :interrupted t' anyway.")
 
 (defun anvil-orchestrator--sanitize-for-persist (task)
   "Return a copy of TASK with volatile fields stripped."
-  (cl-loop for (k v) on task by #'cddr
-           unless (memq k anvil-orchestrator--volatile-task-fields)
-           append (list k v)))
+  (let ((--tail-- task) --acc--)
+    (while (consp --tail--)
+      (let ((k (car --tail--)) (v (cadr --tail--)))
+        (unless (memq k anvil-orchestrator--volatile-task-fields)
+          (push k --acc--)
+          (push v --acc--)))
+      (setq --tail-- (cddr --tail--)))
+    (nreverse --acc--)))
 
 (defun anvil-orchestrator--persist (task)
   "Write TASK plist to `anvil-state'.  Returns TASK."
@@ -2219,9 +2224,14 @@ Signals `user-error' on missing / malformed fields."
             (setq task (plist-put task :prompt
                                   (concat preamble "\n\n"
                                           (plist-get task :prompt)))))
-          (setq task (cl-loop for (k v) on task by #'cddr
-                              unless (eq k :preamble-ref)
-                              append (list k v))))))
+          (setq task (let ((--tail-- task) --acc--)
+                       (while (consp --tail--)
+                         (let ((k (car --tail--)) (v (cadr --tail--)))
+                           (unless (eq k :preamble-ref)
+                             (push k --acc--)
+                             (push v --acc--)))
+                         (setq --tail-- (cddr --tail--)))
+                       (nreverse --acc--))))))
     ;; defaults
     (unless (plist-get task :budget-usd)
       (setq task (plist-put task :budget-usd
@@ -2865,9 +2875,14 @@ improper-list `mapcar' crashing on `1.0'-style cdrs."
    ((vectorp x)
     (vconcat (mapcar #'anvil-orchestrator--to-json-value x)))
    ((anvil-orchestrator--plist-p x)
-    (cl-loop for (k v) on x by #'cddr
-             collect (cons (intern (substring (symbol-name k) 1))
-                           (anvil-orchestrator--to-json-value v))))
+    (let ((--tail-- x) --acc--)
+      (while (consp --tail--)
+        (let ((k (car --tail--)) (v (cadr --tail--)))
+          (push (cons (intern (substring (symbol-name k) 1))
+                      (anvil-orchestrator--to-json-value v))
+                --acc--))
+        (setq --tail-- (cddr --tail--)))
+      (nreverse --acc--)))
    ((and (consp x) (not (proper-list-p x)))
     ;; Dotted pair — emit as [car, cdr] array.  Recurse into both
     ;; halves so alist values like 1.0 or nested plists still encode.
@@ -2985,8 +3000,12 @@ MCP Parameters:
                                      :array-type 'list
                                      :null-object nil
                                      :false-object nil)))
-      (cl-loop for (k v) on parsed by #'cddr
-               collect (cons (intern (substring (symbol-name k) 1)) v)))))
+      (let ((--tail-- parsed) --acc--)
+        (while (consp --tail--)
+          (let ((k (car --tail--)) (v (cadr --tail--)))
+            (push (cons (intern (substring (symbol-name k) 1)) v) --acc--))
+          (setq --tail-- (cddr --tail--)))
+        (nreverse --acc--)))))
 
 (defun anvil-orchestrator--tool-consensus-submit
     (prompt providers &optional overrides timeout_sec budget_usd)

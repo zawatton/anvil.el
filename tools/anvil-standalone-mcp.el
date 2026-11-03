@@ -24,6 +24,50 @@
       (error "JSON provider source did not define the json feature"))
     source))
 
+;; A runtime built from a source tree that was later deleted keeps stale
+;; entries in `load-path'.  Remap them onto a live NeLisp source root, silently.
+(defun anvil-standalone--source-roots ()
+  "Return candidate NeLisp source roots, most specific first."
+  (let* ((env (getenv "ANVIL_NELISP_SOURCE_DIR"))
+         (notes (getenv "ANVIL_NOTES_DIR"))
+         (bin (and (boundp 'invocation-directory) (boundp 'invocation-name)
+                   (stringp invocation-directory) (stringp invocation-name)
+                   (expand-file-name invocation-name invocation-directory)))
+         (bin (and bin (file-exists-p bin) (file-truename bin)))
+         (checkout (and bin
+                        (equal (file-name-nondirectory
+                                (directory-file-name (file-name-directory bin)))
+                               "target")
+                        (file-name-directory
+                         (directory-file-name (file-name-directory bin)))))
+         (roots nil))
+    (dolist (r (list env checkout
+                     (and notes (expand-file-name
+                                 "dev/nelisp-anvil-runtime/a6e710746" notes))))
+      (when (and r (file-directory-p r))
+        (push (file-name-as-directory (expand-file-name r)) roots)))
+    (nreverse roots)))
+
+(defun anvil-standalone--recover-load-path ()
+  "Remap missing `load-path' entries onto a live source root."
+  (unless (or (getenv "ANVIL_STANDALONE_NO_SOURCE_REMAP")
+              (locate-library "json"))
+    (let ((roots (anvil-standalone--source-roots)) (new nil))
+      (dolist (p load-path)
+        (if (and (stringp p) (file-directory-p p))
+            (push p new)
+          (when (stringp p)
+            (let ((rel (replace-regexp-in-string
+                        "\\`.*/src-[0-9a-f]+/?" "" p))
+                  (hit nil))
+              (dolist (r roots)
+                (let ((cand (expand-file-name rel r)))
+                  (when (and (not hit) (file-directory-p cand))
+                    (setq hit cand))))
+              (when hit (push hit new))))))
+      (when new (setq load-path (nreverse new))))))
+(anvil-standalone--recover-load-path)
+
 (defvar anvil-standalone--json-source nil
   "Exact JSON provider source loaded by this profile.")
 (setq anvil-standalone--json-source (anvil-standalone--load-json-source))
@@ -644,9 +688,7 @@ Fallback for runtimes without a native `time-subtract'; nil means now."
            (properties . (("paths" . ((description . "Optional comma-separated roots. Default: anvil-defs-paths or the containing git project.") (type . "string")))))
            (required . []))
  :description "Rebuild the defs index from scratch in the isolated standalone DB (never the host DB).")
-;; Not registered: defs-detect-changes.  On standalone it signals void-function
-;; shell-quote-argument and, past that shim, void-variable
-;; process-coding-system-alist (git runs through process coding), a wave-2 gap.
+;; defs-detect-changes is registered by port 16 (S13.3).
 (anvil-server-register-tool
  #'anvil-standalone-defs-clusters-handler :id "defs-clusters"
  :server-id "emacs-eval" :intent '(elisp-read) :layer 'core :read-only t
@@ -1536,6 +1578,81 @@ the host answers on the fixture.")
           (dolist (id anvil-standalone--port15-unregister)
             (anvil-server-unregister-tool id "emacs-eval"))))
     (error (push (cons 'anvil-dashboard err) anvil-standalone--port15-errors))))
+
+;; Port 16: process coding group (S13.3): defs-detect-changes and browser-*.
+;; Tools are screened by real call against host `emacs --batch -Q' on a temp
+;; fixture (see S13.3 in tools/ai/anvil-standalone-coverage-progress.org).
+;;  * `process-coding-system-alist' comes from nelisp-emacs-lib
+;;    (emacs-cc-coding-2.el, the real provider); anvil-host and anvil-browser
+;;    let-bind it around `make-process'.
+;;  * `shell-quote-argument' is the GNU subr.el POSIX branch, copied under an
+;;    fboundp guard.
+;;  * defs-detect-changes runs `git diff' through `anvil-shell' with :cwd, which
+;;    host serves by binding `default-directory'; NeLisp `make-process' ignores
+;;    it (wave-3 gap).  While this handler runs, `anvil-host--run' prefixes the
+;;    shell command with `cd DIR &&', so the child sees the same cwd and the
+;;    result plist (:command is the unprefixed text) is unchanged.
+;;  * browser-*: anvil-browser drives the agent-browser CLI over a pipe
+;;    (`make-process' :stderr, JSON on stdin); no cwd is involved.
+(defvar anvil-standalone--port16-errors nil
+  "Alist of (MODULE . ERROR) for port-16 modules that failed to load.")
+(defvar anvil-standalone--port16-unregister nil
+  "Port-16 tool ids that stay unregistered, with the first blocker.
+None: defs-detect-changes and the five browser-* tools give the host answers
+on the fixture.")
+(let ((compat-dir (or (getenv "NELISP_EMACS_LIB_DIR")
+                      (and (getenv "ANVIL_NOTES_DIR")
+                           (expand-file-name "dev/nelisp-emacs-lib/src"
+                                             (getenv "ANVIL_NOTES_DIR"))))))
+  (when (and compat-dir (not (boundp 'process-coding-system-alist)))
+    (load (expand-file-name "emacs-cc-coding-2.el" compat-dir) t t)))
+(unless (fboundp 'shell-quote-argument)
+  (defun shell-quote-argument (argument &optional posix)
+    "Quote ARGUMENT for passing as argument to an inferior shell (POSIX branch)."
+    (ignore posix)
+    (if (equal argument "")
+        "''"
+      ;; Quote everything except POSIX filename characters.
+      ;; This should be safe enough even for really weird shells.
+      (replace-regexp-in-string
+       "\n" "'\n'"
+       (replace-regexp-in-string "[^-0-9a-zA-Z_./\n]" "\\\\\\&" argument)))))
+(defvar anvil-standalone--shell-cd nil
+  "Non-nil while `anvil-host--run' must emulate `default-directory' with cd.")
+(when (and (fboundp 'anvil-host--run)
+           (not (fboundp 'anvil-standalone--host-run-orig)))
+  (defalias 'anvil-standalone--host-run-orig (symbol-function 'anvil-host--run))
+  (defun anvil-host--run (command coding cwd timeout)
+    "Like `anvil-host--run'; under `anvil-standalone--shell-cd' cd into CWD."
+    (anvil-standalone--host-run-orig
+     (if (and anvil-standalone--shell-cd cwd)
+         (concat "cd " (shell-quote-argument (expand-file-name cwd)) " && " command)
+       command)
+     coding cwd timeout)))
+(fset 'anvil-standalone-defs-detect-changes-handler
+      '(lambda (&optional repo rev depth limit)
+         "Map a git diff to the indexed symbols it touches + their callers.
+
+MCP Parameters:
+  repo   - Repo directory (string).  Default: the git project root.
+  rev    - Revision diffed against the working tree (default \"HEAD\" =
+           uncommitted changes).  E.g. \"HEAD~3\", a branch, a SHA.
+  depth  - Blast-radius caller depth 1..5 (string or integer); default 1.
+  limit  - Max changed symbols (string or integer); default 100."
+         (anvil-standalone--defs-db-setup)
+         (let ((anvil-standalone--shell-cd t))
+           (anvil-defs--tool-detect-changes repo rev depth limit))))
+(anvil-server-register-tool
+ #'anvil-standalone-defs-detect-changes-handler :id "defs-detect-changes"
+ :server-id "emacs-eval" :intent '(elisp-read) :layer 'core :read-only t
+ :description "Map a git diff to the indexed definitions it touches and their transitive callers (blast-radius).  rev (default HEAD = uncommitted changes) is diffed against the working tree; each changed symbol comes back with direct-caller count, test-coverage flag and a coarse high/medium/low risk.")
+(unless (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
+  (condition-case err
+      (when (require 'anvil-browser nil t)
+        (anvil-browser--register-tools)
+        (dolist (id anvil-standalone--port16-unregister)
+          (anvil-server-unregister-tool id "emacs-eval")))
+    (error (push (cons 'anvil-browser err) anvil-standalone--port16-errors))))
 
 (defun anvil-standalone-start ()
   "Serve the prepared registry, opening databases on first use."
