@@ -1654,6 +1654,736 @@ MCP Parameters:
           (anvil-server-unregister-tool id "emacs-eval")))
     (error (push (cons 'anvil-browser err) anvil-standalone--port16-errors))))
 
+;; Port 17: url stack (S13.4): anvil-http, anvil-web, anvil-uri, anvil-semantic.
+;; Gated like Port 10/11: without a nelisp-emacs-lib checkout nothing is loaded.
+;; The vendored GNU url/net/mail/gnus/calendar/international/emacs-lisp
+;; directories join `load-path' (resolved from the compat dir, as in Port 11), so
+;; the real url.el, url-http.el and url-util.el serve `url-retrieve-synchronously'
+;; over `make-network-process' (verified against a local server).  Shims below are
+;; fboundp/boundp guarded and copy GNU source or nelisp-emacs-lib providers:
+;;  * `copy-syntax-table' needs emacs-syntax-table.el (native `copy-sequence'
+;;    cannot copy a syntax char-table); coding-system-list and friends come from
+;;    emacs-cc-coding-1/2.el and emacs-parity-fns2.el.
+;;  * `custom-declare-face' and `locate-user-emacs-file' are the
+;;    nelisp-emacs-lib providers (emacs-stub.el, emacs-fileio.el) copied here.
+;;  * `file-expand-wildcards' and `wildcard-to-regexp' are copied from GNU
+;;    files.el; `file-local-name' and `file-accessible-directory-p' from GNU
+;;    files.el as well.
+;; Real url-util is loaded afterwards; Port 11's url-util fake only applies when
+;; the feature is absent, and S11.1/S11.3 are rerun to confirm it still works.
+;; `call-process' with DESTINATION nil must discard the child's output (GNU
+;; process.c).  NeLisp lets the child inherit stdout, and smime.el's
+;; `smime-openssl-program' defcustom runs `openssl version' that way at load
+;; time, writing a banner into the MCP JSON channel.  Route a nil destination
+;; to /dev/null (the file redirect the runtime does honour); every other destination is passed through.
+(unless (fboundp 'anvil-standalone--call-process-orig)
+  (defalias 'anvil-standalone--call-process-orig (symbol-function 'call-process))
+  (defun call-process (program &optional infile destination display &rest args)
+    "Like `call-process', but a nil DESTINATION discards the output."
+    (if destination
+        (apply #'anvil-standalone--call-process-orig
+               program infile destination display args)
+      (apply #'anvil-standalone--call-process-orig
+             program infile "/dev/null" display args))))
+(defvar anvil-standalone--port17-errors nil
+  "Alist of (MODULE . ERROR) for port-17 modules that failed to load.")
+(defvar anvil-standalone--port17-unregister
+  '("http-fetch-batch" "http-cache-clear" "web-reddit-thread"
+    "semantic-embed-index")
+  "Port-17 tool ids registered by their module but not served, with blockers.
+http-fetch-batch: host `emacs --batch' stdio hangs on it, so no host answer to
+match.  http-cache-clear: the host handler returns an integer that the MCP
+layer rejects, so there is no OK reply to compare.  web-reddit-thread: the
+comment list comes back null on standalone (host gives the comments; the
+`cl-loop for c across' in the comment normaliser).  semantic-embed-index: the
+fixture screening embedded 0 chunks on both sides, so the HTTP embedding path
+is unscreened.")
+(unless (or (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
+            (not (or (getenv "NELISP_EMACS_LIB_DIR")
+                     (getenv "ANVIL_NOTES_DIR"))))
+  (let* ((compat-dir (or (getenv "NELISP_EMACS_LIB_DIR")
+                         (expand-file-name "dev/nelisp-emacs-lib/src"
+                                           (getenv "ANVIL_NOTES_DIR"))))
+         (vendor (expand-file-name "../vendor/emacs-lisp" compat-dir)))
+    (condition-case err
+        (progn
+          (let ((orig-make-syntax-table
+                 (and (fboundp 'make-syntax-table)
+                      (symbol-function 'make-syntax-table))))
+            (load (expand-file-name "emacs-syntax-table.el" compat-dir) t t)
+            ;; The provider's make-syntax-table (char-table backed) hangs
+            ;; orchestrator-collect; keep the runtime definition.
+            (when orig-make-syntax-table
+              (fset 'make-syntax-table orig-make-syntax-table)))
+          ;; emacs-parity-fns2.el may fail late on a vc-hooks require after
+          ;; defining coding-system-list; that tail error is ignored.
+          (dolist (f '("emacs-cc-coding-1.el" "emacs-cc-coding-2.el"
+                       "emacs-parity-fns2.el" "emacs-subr-extras.el"
+                       "emacs-easy-mmode.el"))
+            (condition-case nil (load (expand-file-name f compat-dir) t t)
+              (error nil)))
+          (add-to-list 'load-path vendor t)
+          (dolist (d '("net" "url" "mail" "gnus" "calendar" "international"
+                       "emacs-lisp"))
+            (add-to-list 'load-path (expand-file-name d vendor) t)))
+      (error (push (cons 'url-stack-prep err) anvil-standalone--port17-errors)))))
+(unless (boundp 'current-language-environment)
+  (defvar current-language-environment "UTF-8"))
+(dolist (v '(minibuffer-local-completion-map minibuffer-local-must-match-map
+             minibuffer-local-map))
+  (unless (boundp v) (set v (make-sparse-keymap))))
+;; Genuine minibuffer.el forms (GNU Emacs), copied verbatim: gnus-util.el and url
+;; read these at load time.
+(unless (boundp 'completion-styles-alist)
+  (defvar completion-styles-alist
+    '((emacs21
+       completion-emacs21-try-completion completion-emacs21-all-completions
+       "Simple prefix-based completion.
+  I.e. when completing \"foo_bar\" (where _ is the position of point),
+  it will consider all completions candidates matching the glob
+  pattern \"foobar*\".")
+      (emacs22
+       completion-emacs22-try-completion completion-emacs22-all-completions
+       "Prefix completion that only operates on the text before point.
+  I.e. when completing \"foo_bar\" (where _ is the position of point),
+  it will consider all completions candidates matching the glob
+  pattern \"foo*\" and will add back \"bar\" to the end of it.")
+      (basic
+       completion-basic-try-completion completion-basic-all-completions
+       "Completion of the prefix before point and the suffix after point.
+  I.e. when completing \"foo_bar\" (where _ is the position of point),
+  it will consider all completions candidates matching the glob
+  pattern \"foo*bar*\".")
+      (partial-completion
+       completion-pcm-try-completion completion-pcm-all-completions
+       "Completion of multiple words, each one taken as a prefix.
+  I.e. when completing \"l-co_h\" (where _ is the position of point),
+  it will consider all completions candidates matching the glob
+  pattern \"l*-co*h*\".
+  Furthermore, for completions that are done step by step in subfields,
+  the method is applied to all the preceding fields that do not yet match.
+  E.g. C-x C-f /u/mo/s TAB could complete to /usr/monnier/src.
+  Additionally the user can use the char \"*\" as a glob pattern.")
+      (substring
+       completion-substring-try-completion completion-substring-all-completions
+       "Completion of the string taken as a substring.
+  I.e. when completing \"foo_bar\" (where _ is the position of point),
+  it will consider all completions candidates matching the glob
+  pattern \"*foo*bar*\".")
+      (flex
+       completion-flex-try-completion completion-flex-all-completions
+       "Completion of an in-order subset of characters.
+  When completing \"foo\" the glob \"*f*o*o*\" is used, so that
+  \"foo\" can complete to \"frodo\".")
+      (initials
+       completion-initials-try-completion completion-initials-all-completions
+       "Completion of acronyms and initialisms.
+  E.g. can complete M-x lch to list-command-history
+  and C-x C-f ~/sew to ~/src/emacs/work.")
+      (shorthand
+       completion-shorthand-try-completion completion-shorthand-all-completions
+       "Completion of symbol shorthands setup in `read-symbol-shorthands'.
+  E.g. can complete \"x-foo\" to \"xavier-foo\" if the shorthand
+  ((\"x-\" . \"xavier-\")) is set up in the buffer of origin."))
+    "List of available completion styles.
+  Each element has the form (NAME TRY-COMPLETION ALL-COMPLETIONS DOC):
+  where NAME is the name that should be used in `completion-styles',
+  TRY-COMPLETION is the function that does the completion (it should
+  follow the same calling convention as `completion-try-completion'),
+  ALL-COMPLETIONS is the function that lists the completions (it should
+  follow the calling convention of `completion-all-completions'),
+  and DOC describes the way this style of completion works."))
+(unless (boundp 'completion-styles)
+  (defcustom completion-styles
+    ;; First, use `basic' because prefix completion has been the standard
+    ;; for "ever" and works well in most cases, so using it first
+    ;; ensures that we obey previous behavior in most cases.
+    '(basic
+      ;; Then use `partial-completion' because it has proven to
+      ;; be a very convenient extension.
+      partial-completion
+      ;; Finally use `emacs22' so as to maintain (in many/most cases)
+      ;; the previous behavior that when completing "foobar" with point
+      ;; between "foo" and "bar" the completion try to complete "foo"
+      ;; and simply add "bar" to the end of the result.
+      emacs22)
+    "List of completion styles to use.
+  The available styles are listed in `completion-styles-alist'.
+  
+  Note that `completion-category-overrides' may override these
+  styles for specific categories, such as files, buffers, etc."
+    :type completion--styles-type
+    :version "23.1"))
+(unless (boundp 'completion-category-defaults)
+  (defvar completion-category-defaults
+    '((buffer (styles . (basic substring)))
+      (unicode-name (styles . (basic substring)))
+      ;; A new style that combines substring and pcm might be better,
+      ;; e.g. one that does not anchor to bos.
+      (project-file (styles . (substring)))
+      (xref-location (styles . (substring)))
+      (info-menu (styles . (basic substring)))
+      (symbol-help (styles . (basic shorthand substring)))
+      (calendar-month (display-sort-function . identity)))
+    "Default settings for specific completion categories.
+  
+  Each entry has the shape (CATEGORY . ALIST) where ALIST is
+  an association list that can specify properties such as:
+  - `styles': the list of `completion-styles' to use for that category.
+  - `cycle': the `completion-cycle-threshold' to use for that category.
+  - `cycle-sort-function': function to sort entries when cycling.
+  - `display-sort-function': function to sort entries in *Completions*.
+  - `group-function': function for grouping the completion candidates.
+  - `annotation-function': function to add annotations in *Completions*.
+  - `affixation-function': function to prepend/append a prefix/suffix.
+  
+  Categories are symbols such as `buffer' and `file', used when
+  completing buffer and file names, respectively.
+  
+  Also see `completion-category-overrides'."))
+(unless (boundp 'completion-category-overrides)
+  (defcustom completion-category-overrides nil
+    "List of category-specific user overrides for completion metadata.
+  
+  Each override has the shape (CATEGORY . ALIST) where ALIST is
+  an association list that can specify properties such as:
+  - `styles': the list of `completion-styles' to use for that category.
+  - `cycle': the `completion-cycle-threshold' to use for that category.
+  - `cycle-sort-function': function to sort entries when cycling.
+  - `display-sort-function': nil means to use either the sorting
+  function from metadata, or if that is nil, fall back to `completions-sort';
+  `identity' disables sorting and keeps the original order; and other
+  possible values are the same as in `completions-sort'.
+  - `group-function': function for grouping the completion candidates.
+  - `annotation-function': function to add annotations in *Completions*.
+  - `affixation-function': function to prepend/append a prefix/suffix.
+  See more description of metadata in `completion-metadata'.
+  
+  Categories are symbols such as `buffer' and `file', used when
+  completing buffer and file names, respectively.
+  
+  If a property in a category is specified by this variable, it
+  overrides the default specified in `completion-category-defaults'."
+    :version "25.1"
+    :type `(alist :key-type (choice :tag "Category"
+  				  (const buffer)
+                                    (const file)
+                                    (const unicode-name)
+  				  (const bookmark)
+                                    symbol)
+            :value-type
+            (set :tag "Properties to override"
+  	   (cons :tag "Completion Styles"
+  		 (const :tag "Select a style from the menu;" styles)
+  		 ,completion--styles-type)
+             (cons :tag "Completion Cycling"
+  		 (const :tag "Select one value from the menu." cycle)
+                   ,completion--cycling-threshold-type)
+             (cons :tag "Cycle Sorting"
+                   (const :tag "Select one value from the menu."
+                          cycle-sort-function)
+                   (choice (function :tag "Custom function")))
+             (cons :tag "Completion Sorting"
+                   (const :tag "Select one value from the menu."
+                          display-sort-function)
+                   (choice (const :tag "Use default" nil)
+                           (const :tag "No sorting" identity)
+                           (const :tag "Alphabetical sorting"
+                                  minibuffer-sort-alphabetically)
+                           (const :tag "Historical sorting"
+                                  minibuffer-sort-by-history)
+                           (function :tag "Custom function")))
+             (cons :tag "Completion Groups"
+                   (const :tag "Select one value from the menu."
+                          group-function)
+                   (choice (function :tag "Custom function")))
+             (cons :tag "Completion Annotation"
+                   (const :tag "Select one value from the menu."
+                          annotation-function)
+                   (choice (function :tag "Custom function")))
+             (cons :tag "Completion Affixation"
+                   (const :tag "Select one value from the menu."
+                          affixation-function)
+                   (choice (function :tag "Custom function")))))))
+(unless (fboundp 'coding-system-p)
+  (defun coding-system-p (object)
+    (and (or (null object) (symbolp object))
+         (or (null object) (and (get object 'coding-system) t)
+             (and (memq object '(no-conversion undecided prefer-utf-8 raw-text
+                                 ascii us-ascii utf-8 utf-8-unix utf-8-dos
+                                 utf-8-mac utf-8-emacs utf-16 latin-1
+                                 iso-8859-1 binary emacs-mule escape-quoted))
+                  t))
+         t)))
+(unless (boundp 'sort-coding-systems-predicate)
+  (defvar sort-coding-systems-predicate nil))
+(unless (fboundp 'sort-coding-systems)
+  (defun sort-coding-systems (codings)
+    (if sort-coding-systems-predicate
+        (sort codings sort-coding-systems-predicate)
+      codings)))
+(unless (fboundp 'custom-declare-face)
+  (defun custom-declare-face (face spec doc &rest args)
+    "Standalone load-time fallback for evaluated Custom faces."
+    (when (fboundp 'emacs-faces-make-face)
+      (emacs-faces-make-face face)
+      (let ((attrs (and (fboundp 'emacs-faces-default-attrs-from-spec)
+                        (emacs-faces-default-attrs-from-spec spec))))
+        (when (and attrs (fboundp 'emacs-faces-set-attribute))
+          (apply #'emacs-faces-set-attribute face nil attrs))))
+    (put face 'face-defface-spec spec)
+    (put face 'face-documentation doc)
+    (put face 'custom-args args)
+    face))
+(unless (fboundp 'locate-user-emacs-file)
+  (defun locate-user-emacs-file (new-name &optional old-name)
+    "Return an absolute per-user Emacs-specific file name for NEW-NAME."
+    (let ((bestname (expand-file-name new-name user-emacs-directory)))
+      (if (and old-name (not (file-readable-p bestname)))
+          (let ((oldname (expand-file-name old-name "~")))
+            (if (file-readable-p oldname) oldname bestname))
+        bestname))))
+(unless (fboundp 'file-local-name)
+  (defun file-local-name (file)
+    (or (and (fboundp 'file-remote-p) (file-remote-p file 'localname)) file)))
+(unless (fboundp 'file-accessible-directory-p)
+  (defun file-accessible-directory-p (filename)
+    (and (file-directory-p filename) (file-executable-p filename))))
+(unless (fboundp 'file-expand-wildcards)
+  (defun file-expand-wildcards (pattern &optional full regexp)
+    "Expand (a.k.a. \"glob\") file-name wildcard pattern PATTERN.
+  This returns a list of file names that match PATTERN.
+  The returned list of file names is sorted in the `string<' order.
+
+  PATTERN is, by default, a \"glob\"/wildcard string, e.g.,
+  \"/tmp/*.png\" or \"/*/*/foo.png\", but can also be a regular
+  expression if the optional REGEXP parameter is non-nil.  In any
+  case, the matches are applied per sub-directory, so a match can't
+  span a parent/sub directory, which means that a regexp bit can't
+  contain the \"/\" character.
+
+  The returned list of file names is sorted in the `string<' order.
+
+  If PATTERN is written as an absolute file name, the expansions in
+  the returned list are also absolute.
+
+  If PATTERN is written as a relative file name, it is interpreted
+  relative to the current `default-directory'.
+  The file names returned are normally also relative to the current
+  default directory.  However, if FULL is non-nil, they are absolute."
+    (save-match-data
+      (let* ((nondir (file-name-nondirectory pattern))
+  	   (dirpart (file-name-directory pattern))
+  	   ;; A list of all dirs that DIRPART specifies.
+  	   ;; This can be more than one dir
+  	   ;; if DIRPART contains wildcards.
+  	   (dirs (if (and dirpart
+  			  (string-match "[[*?]" (file-local-name dirpart)))
+  		     (mapcar #'file-name-as-directory
+  			     (file-expand-wildcards
+                                (directory-file-name dirpart) nil regexp))
+  		   (list dirpart)))
+  	   contents)
+        (dolist (dir (nreverse dirs))
+  	(when (or (null dir)	; Possible if DIRPART is not wild.
+  		  (file-accessible-directory-p dir))
+            (if (equal "" nondir)
+                ;; `nondir' is "" when the pattern ends in "/".  Basically ""
+                ;; refers to the directory itself, like ".", but it's not
+                ;; among the names returned by `directory-files', so we have
+                ;; to special-case it.
+                (push (or dir nondir) contents)
+  	    (let ((this-dir-contents
+  		   ;; Filter out "." and ".."
+  		   (delq nil
+                           (mapcar (lambda (name)
+                                     (unless (string-match "\\`\\.\\.?\\'"
+                                                           (file-name-nondirectory
+                                                            name))
+                                       name))
+  			         (directory-files
+                                    (or dir ".") full
+                                    (if regexp
+                                        ;; We're matching each file name
+                                        ;; element separately.
+                                        (concat "\\`" nondir "\\'")
+  				   (wildcard-to-regexp nondir)))))))
+  	      (setq contents
+  		    (nconc
+  		     (if (and dir (not full))
+  			 (mapcar (lambda (name) (concat dir name))
+  			         this-dir-contents)
+  		       this-dir-contents)
+  		     contents))))))
+        contents))))
+(unless (fboundp 'wildcard-to-regexp)
+  (defun wildcard-to-regexp (wildcard)
+    "Given a shell file name pattern WILDCARD, return an equivalent regexp.
+  The generated regexp will match a file name only if the file name
+  matches that wildcard according to shell rules.  Only wildcards known
+  by `sh' are supported."
+    (let* ((i (string-match "[[.*+\\^$?]" wildcard))
+  	 ;; Copy the initial run of non-special characters.
+  	 (result (substring wildcard 0 i))
+  	 (len (length wildcard)))
+      ;; If no special characters, we're almost done.
+      (if i
+  	(while (< i len)
+  	  (let ((ch (aref wildcard i))
+  		j)
+  	    (setq
+  	     result
+  	     (concat result
+  		     (cond
+  		      ((and (eq ch ?\[)
+  			    (< (1+ i) len)
+  			    (eq (aref wildcard (1+ i)) ?\]))
+  		       "\\[")
+  		      ((eq ch ?\[)	; [...] maps to regexp char class
+  		       (progn
+  			 (setq i (1+ i))
+  			 (concat
+  			  (cond
+  			   ((eq (aref wildcard i) ?!) ; [!...] -> [^...]
+  			    (progn
+  			      (setq i (1+ i))
+  			      (if (eq (aref wildcard i) ?\])
+  				  (progn
+  				    (setq i (1+ i))
+  				    "[^]")
+  				"[^")))
+  			   ((eq (aref wildcard i) ?^)
+  			    ;; Found "[^".  Insert a `\0' character
+  			    ;; (which cannot happen in a filename)
+  			    ;; into the character class, so that `^'
+  			    ;; is not the first character after `[',
+  			    ;; and thus non-special in a regexp.
+  			    (progn
+  			      (setq i (1+ i))
+  			      "[\000^"))
+  			   ((eq (aref wildcard i) ?\])
+  			    ;; I don't think `]' can appear in a
+  			    ;; character class in a wildcard, but
+  			    ;; let's be general here.
+  			    (progn
+  			      (setq i (1+ i))
+  			      "[]"))
+  			   (t "["))
+  			  (prog1	; copy everything up to next `]'.
+  			      (substring wildcard
+  					 i
+  					 (setq j (string-search
+  						  "]" wildcard i)))
+  			    (setq i (if j (1- j) (1- len)))))))
+  		      ((eq ch ?.)  "\\.")
+  		      ((eq ch ?*)  "[^\000]*")
+  		      ((eq ch ?+)  "\\+")
+  		      ((eq ch ?^)  "\\^")
+  		      ((eq ch ?$)  "\\$")
+  		      ((eq ch ?\\) "\\\\") ; probably cannot happen...
+  		      ((eq ch ??)  "[^\000]")
+  		      (t (char-to-string ch)))))
+  	    (setq i (1+ i)))))
+      ;; Shell wildcards should match the entire filename,
+      ;; not its part.  Make the regexp say so.
+      (concat "\\`" result "\\'")))
+  )
+;; GNU subr.el: docstring filler used by `substitute-command-keys'-era macros.
+(unless (fboundp 'internal--fill-string-single-line)
+  (defun internal--fill-string-single-line (str)
+    "Fill string STR to `fill-column'."
+    (if (< (length str) fill-column)
+        str
+      (let* ((limit (min fill-column (length str)))
+             (fst (substring str 0 limit))
+             (lst (substring str limit)))
+        (cond ((string-match "\\( \\)$" fst)
+               (setq fst (replace-match "\n" nil nil fst 1)))
+              ((string-match "^ \\(.*\\)" lst)
+               (setq fst (concat fst "\n"))
+               (setq lst (match-string 1 lst)))
+              ((string-match ".*\\( \\(.+\\)\\)$" fst)
+               (setq lst (concat (match-string 2 fst) lst))
+               (setq fst (replace-match "\n" nil nil fst 1))))
+        (concat fst (internal--fill-string-single-line lst))))))
+(unless (fboundp 'internal--format-docstring-line)
+  (defun internal--format-docstring-line (string &rest objects)
+    "Format a single line from a documentation string out of STRING and OBJECTS."
+    (when (string-match "\n" string)
+      (error "Unable to fill string containing newline: %S" string))
+    (internal--fill-string-single-line (apply #'format string objects))))
+;; Abbrev tables: nelisp-emacs-lib provider (obarray-backed define-abbrev-table).
+(let ((compat-dir (or (getenv "NELISP_EMACS_LIB_DIR")
+                      (and (getenv "ANVIL_NOTES_DIR")
+                           (expand-file-name "dev/nelisp-emacs-lib/src"
+                                             (getenv "ANVIL_NOTES_DIR"))))))
+  (when (and compat-dir (not (fboundp 'make-abbrev-table)))
+    (dolist (f '("emacs-symbol.el" "emacs-parity-abbrev.el"))
+      (condition-case nil (load (expand-file-name f compat-dir) t t)
+        (error nil)))))
+;; C variables that are nil in a GNU batch session.
+(dolist (v '(window-system initial-window-system))
+  (unless (boundp v) (eval (list (quote defvar) v nil) t)))
+;; GNU byte-run.el
+(unless (fboundp 'function-put)
+  (defun function-put (func prop value)
+    "Set FUNCTION's property PROP to VALUE."
+    (put func prop value)))
+;; GNU gv.el: (gv-define-simple-setter symbol-value set).  mailcap.el does
+;; (push X (symbol-value storage)).
+(unless (get 'symbol-value 'cl-simple-setter)
+  (put 'symbol-value 'cl-simple-setter 'set))
+;; Case conversion of a region (a C primitive in GNU casefiddle.c): rewrite the
+;; text in place, keeping point.  `region-noncontiguous-p' is not honoured.
+(unless (fboundp 'downcase-region)
+  (defun downcase-region (beg end &optional _region-noncontiguous-p)
+    "Convert the region to lower case."
+    (let ((b (min beg end)) (e (max beg end)))
+      (let ((new (downcase (buffer-substring b e))))
+        (unless (equal new (buffer-substring b e))
+          (save-excursion (goto-char b) (delete-region b e) (insert new)))))
+    nil))
+(unless (fboundp 'upcase-region)
+  (defun upcase-region (beg end &optional _region-noncontiguous-p)
+    "Convert the region to upper case."
+    (let ((b (min beg end)) (e (max beg end)))
+      (let ((new (upcase (buffer-substring b e))))
+        (unless (equal new (buffer-substring b e))
+          (save-excursion (goto-char b) (delete-region b e) (insert new)))))
+    nil))
+;; Time arithmetic (C primitives in GNU timefns.c).  The runtime's
+;; `time-subtract' already returns a float number of seconds, so these follow
+;; it: results are float seconds, which `float-time' and the comparisons accept.
+(unless (fboundp 'time-add)
+  (defun time-add (a b)
+    "Return the sum of time values A and B as float seconds."
+    (+ (float-time a) (float-time b))))
+(unless (fboundp 'time-less-p)
+  (defun time-less-p (a b)
+    "Return non-nil if time value A is earlier than B."
+    (< (float-time a) (float-time b))))
+(unless (fboundp 'time-equal-p)
+  (defun time-equal-p (a b)
+    "Return non-nil if time values A and B are equal."
+    (= (float-time a) (float-time b))))
+;; `standalone-compat/url-parse.el' (a minimal stub for the nelisp-agent
+;; examples) shadows GNU url-parse.el and lacks these helpers; the real file
+;; cannot load (it requires auth-source -> icons).  Bodies are GNU url-parse.el.
+(unless (fboundp 'url-path-and-query)
+  (defun url-path-and-query (urlobj)
+    "Return the path and query components of URLOBJ as (PATH . QUERY)."
+    (let ((name (url-filename urlobj))
+          path query)
+      (when name
+        (if (string-match "\\?" name)
+            (setq path  (substring name 0 (match-beginning 0))
+                  query (substring name (match-end 0)))
+          (setq path name)))
+      (cons path query))))
+(unless (fboundp 'url-port-if-non-default)
+  (defun url-port-if-non-default (urlobj)
+    "Return the port number of URLOBJ if it is not the scheme default."
+    (let ((port (url-portspec urlobj))
+          type)
+      (and port
+           (or (null (setq type (url-type urlobj)))
+               (not (equal port (url-scheme-get-property type 'default-port))))
+           port))))
+(unless (fboundp 'url-recreate-url)
+  (defun url-recreate-url (urlobj)
+    "Recreate a URL string from the parsed URLOBJ."
+    (let* ((type (url-type urlobj))
+           (user (url-user urlobj))
+           (pass (url-password urlobj))
+           (host (url-host urlobj))
+           (port (url-port-if-non-default urlobj))
+           (file (url-filename urlobj))
+           (frag (url-target urlobj)))
+      (concat (if type (concat type ":"))
+              (if (url-fullness urlobj) "//")
+              (if (or user pass)
+                  (concat user (if pass (concat ":" pass)) "@"))
+              host
+              (if port (format ":%d" (url-port urlobj)))
+              (or file "/")
+              (if frag (concat "#" frag))))))
+;; GNU subr.el macro.
+(unless (fboundp 'bound-and-true-p)
+  (defmacro bound-and-true-p (var)
+    "Return the value of symbol VAR if it is bound, else nil."
+    (list 'and (list 'boundp (list 'quote var)) var)))
+;; Process-buffer bookkeeping.  `make-network-process' ignores :buffer
+;; (`process-buffer' stays nil until `set-process-buffer'), and the runtime has
+;; no `get-buffer-process' (`process-list' is empty even with live processes).
+;; url-http.el depends on both: its filter and sentinel run in
+;; (process-buffer proc), and `url-retrieve-synchronously' polls
+;; (get-buffer-process proc-buffer).  Apply :buffer after creation and record
+;; the pairing so `get-buffer-process' can answer.
+(defvar anvil-standalone--buffer-processes nil
+  "Alist of (BUFFER . PROCESS) for processes given a buffer by the url stack.")
+(unless (fboundp 'anvil-standalone--make-network-process-orig)
+  (defalias 'anvil-standalone--make-network-process-orig
+    (symbol-function 'make-network-process))
+  (defun make-network-process (&rest args)
+    "Like `make-network-process', but honour the :buffer argument."
+    (let ((proc (apply #'anvil-standalone--make-network-process-orig args))
+          (buf (plist-get args :buffer)))
+      (when buf
+        (when (stringp buf) (setq buf (get-buffer-create buf)))
+        (set-process-buffer proc buf)
+        (push (cons buf proc) anvil-standalone--buffer-processes))
+      proc)))
+(unless (fboundp 'get-buffer-process)
+  (defun get-buffer-process (buffer)
+    "Return the live process whose buffer is BUFFER, or nil."
+    (when (stringp buffer) (setq buffer (get-buffer buffer)))
+    (let (found)
+      (dolist (pair anvil-standalone--buffer-processes)
+        (when (and (not found) (eq (car pair) buffer)
+                   (memq (process-status (cdr pair))
+                         '(run open listen connect stop)))
+          (setq found (cdr pair))))
+      found)))
+;; GNU timer.el (pulled in by mm-util) declares timers with
+;; `(cl-defstruct (timer (:type vector)))'.  This runtime's `cl-defstruct' ignores
+;; `:type vector' and builds a record, so timer.el's vector-based `timerp' rejects
+;; its own (setf (timer--time ...))' is unsupported.  The runtime already has a
+;; native timer implementation (cancel-timer', sleep-for' (C, keyboard.c): wait SECONDS while processing process output.
+(unless (fboundp 'sleep-for)
+  (defun sleep-for (seconds &optional millisec)
+    "Wait SECONDS (plus MILLISEC), handling process output; return nil."
+    (accept-process-output nil (+ seconds (if millisec (/ millisec 1000.0) 0)))
+    nil))
+;; GNU timer.el (pulled in by mm-util) declares timers with
+;; (cl-defstruct (timer (:type vector))).  This runtime's `cl-defstruct' ignores
+;; :type vector and builds a record, so timer.el's vector-based `timerp' rejects
+;; its own timer-create result (wrong-type-argument timerp #s(timer ...)) and
+;; (setf (timer--time ...)) is unsupported.  The runtime already has native
+;; timers (`run-at-time', `cancel-timer', `timerp'), so declare the feature and
+;; leave timer.el unloaded.
+(when (and (not (featurep 'timer))
+           (fboundp 'run-at-time) (fboundp 'cancel-timer) (fboundp 'timerp))
+  (provide 'timer))
+;; GNU `sleep-for' (C, keyboard.c): wait SECONDS while processing process output.
+(unless (fboundp 'sleep-for)
+  (defun sleep-for (seconds &optional millisec)
+    "Wait SECONDS (plus MILLISEC), handling process output; return nil."
+    (accept-process-output nil (+ seconds (if millisec (/ millisec 1000.0) 0)))
+    nil))
+;; The prelude `cl-loop' rejects `for F in L if F do ... append ...' (gnutls.el);
+;; nelisp-emacs-lib's emacs-cl-macros.el expands it.  It replaces `cl-loop' only
+;; while the url stack loads, then the prelude macro returns.
+(unless (or (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
+            (not (or (getenv "NELISP_EMACS_LIB_DIR")
+                     (getenv "ANVIL_NOTES_DIR"))))
+  (let ((compat-dir (or (getenv "NELISP_EMACS_LIB_DIR")
+                        (expand-file-name "dev/nelisp-emacs-lib/src"
+                                          (getenv "ANVIL_NOTES_DIR"))))
+        (old-loop (symbol-function 'cl-loop)))
+    (unwind-protect
+        (progn
+          (fmakunbound 'cl-loop)
+          (load (expand-file-name "emacs-cl-macros.el" compat-dir) t t)
+          (dolist (f '(mail-utils url-cache url-handlers url url-http anvil-http anvil-web
+                       anvil-uri anvil-semantic))
+            (condition-case err (require f)
+              (error (push (cons f err) anvil-standalone--port17-errors)))))
+      (fset 'cl-loop old-loop))))
+;; `defvar-local' (and `make-variable-buffer-local') is a no-op on this runtime:
+;; `(setq V X)' in another buffer writes the global value instead of creating a
+;; buffer-local one (probe: `(defvar-local zz nil) (with-temp-buffer (setq zz 5)
+;; (local-variable-p (quote zz)))' gives nil; `make-local-variable' works).
+;; url-http.el does `(let ((url-current-object url)) ... (with-current-buffer
+;; buffer (setq url-current-object url)))' and reads it from the filter in the
+;; retrieval buffer, so the setq is lost when the let exits.  Give every buffer
+;; created by `generate-new-buffer' a real local binding of url-vars.el's three
+;; `defvar-local' variables, which is what the automatic-local setq would do.
+(defvar anvil-standalone--auto-local-vars
+  '(url-current-object url-current-mime-headers url-current-lastloc)
+  "Variables declared with `defvar-local' that need a local value per buffer.")
+(unless (fboundp 'anvil-standalone--generate-new-buffer-orig)
+  (defalias 'anvil-standalone--generate-new-buffer-orig
+    (symbol-function 'generate-new-buffer))
+  (defun generate-new-buffer (name &optional inhibit-buffer-hooks)
+    "Like `generate-new-buffer', but give the buffer the auto-local variables."
+    (let ((buf (anvil-standalone--generate-new-buffer-orig
+                name inhibit-buffer-hooks)))
+      (with-current-buffer buf
+        (dolist (v anvil-standalone--auto-local-vars)
+          (when (boundp v)
+            (set (nelisp-buffer-local-make v) (symbol-value v)))))
+      buf)))
+;; `url-do-setup' parses /etc/mailcap and /etc/mime.types (50-80 KB).  The
+;; runtime's buffer access costs O(position) per char-addressed operation
+;; (about 3-30 ms per `goto-char'/`skip-chars-forward' at offset 20000), so that
+;; parse takes minutes and `url-retrieve-synchronously' looks hung.  HTTP
+;; fetching does not use viewer or extension tables; pre-mark both parsed
+;; from nonexistent files so only the built-in `mailcap-mime-data' defaults
+;; remain.
+(when (and (featurep 'mailcap) (fboundp 'mailcap-parse-mailcaps))
+  (condition-case err
+      (progn
+        (mailcap-parse-mailcaps '(("/nonexistent/mailcap" system)) t)
+        (mailcap-parse-mimetypes '("/nonexistent/mime.types") t))
+    (error (push (cons 'mailcap-presetup err) anvil-standalone--port17-errors))))
+;; `url-cookie-setup-save-timer' arms a periodic `run-at-time'; the vendored
+;; timer.el then runs `(setf (timer--time timer) ...)' on a cl-defstruct
+;; accessor, which this runtime reports as "setf: unsupported place".  A
+;; headless MCP fetcher must not write the cookie jar to disk anyway.
+(when (boundp 'url-cookie-save-interval)
+  (setq url-cookie-save-interval nil))
+;; Headless: no progress messages (url-display-message reads the C-level
+;; `byte-count-to-string-function', which standalone lacks).
+(when (boundp 'url-show-status)
+  (setq url-show-status nil))
+;; GNU files.el defvar; url-http.el evaluates it as an argument before
+;; `url-display-message' can decline to print.
+(unless (boundp 'byte-count-to-string-function)
+  (defvar byte-count-to-string-function
+    (if (fboundp 'file-size-human-readable)
+        #'file-size-human-readable
+      (lambda (n) (format "%s" n)))
+    "Function that turns a byte count into a string."))
+;; url-http calls (gnutls-available-p) while picking a connection type; this
+;; runtime has no gnutls, and GNU answers nil without TLS support.
+(unless (fboundp 'gnutls-available-p)
+  (defun gnutls-available-p () nil))
+;; Second runtime gap: with a dynamic `let' binding of V active, a `setq' of V
+;; made inside `with-current-buffer' on a buffer holding a local V writes the
+;; let-bound value, not the local one (probe in u5.el: local-variable-p t, but
+;; after the let the buffer's V is still nil).  `url-http' does exactly that
+;; for `url-current-object', so set the local once `url-http' has returned,
+;; outside the let; the filter runs later and reads the local.
+(when (and (featurep 'url-http) (not (fboundp 'anvil-standalone--url-http-orig)))
+  (defalias 'anvil-standalone--url-http-orig (symbol-function 'url-http))
+  (defun url-http (url callback cbargs &optional retry-buffer gateway-method)
+    "Like `url-http', but make `url-current-object' local in the result."
+    (let ((buf (anvil-standalone--url-http-orig
+                url callback cbargs retry-buffer gateway-method)))
+      (when (buffer-live-p buf)
+        (with-current-buffer buf
+          (set (nelisp-buffer-local-make 'url-current-object) url)))
+      buf)))
+(unless (or (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
+            (not (featurep 'anvil-http)))
+  (condition-case err
+      (progn
+        (anvil-http--register-tools)
+        (when (featurep 'anvil-web) (anvil-web--register-tools))
+        ;; Port 9 loaded anvil-semantic and unregistered the embedding tool.
+        (when (featurep 'anvil-semantic) (anvil-semantic--register-tools))
+        ;; The three URI/HTTP-cache disclosure tools.
+        (anvil-server-register-tools
+         "emacs-eval"
+         (seq-filter (lambda (spec)
+                       (member (plist-get (cdr spec) :id)
+                               '("anvil-uri-fetch" "http-cache-index"
+                                 "http-cache-get")))
+                     anvil-disclosure--tool-specs))
+        (dolist (id anvil-standalone--port17-unregister)
+          (anvil-server-unregister-tool id "emacs-eval")))
+    (error (push (cons 'register err) anvil-standalone--port17-errors))))
+
 (defun anvil-standalone-start ()
   "Serve the prepared registry, opening databases on first use."
   (setq default-directory

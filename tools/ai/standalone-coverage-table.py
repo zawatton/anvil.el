@@ -45,6 +45,8 @@ SCREENED = {
     "anvil-ts": ("a", "registers; treesit subprocess `with-root` not implemented"),
     "anvil-py": ("a", "registers; treesit subprocess `with-root` not implemented"),
     "anvil-js": ("a", "registers; treesit subprocess `with-root` not implemented"),
+    "anvil-http": ("ok", "S13.4: 7 tools served (http-fetch, http-head, http-post, http-robots-check, http-cache-status, http-cache-index, http-cache-get) screened against the host on a fixture; http-fetch-batch and http-cache-clear unregistered"),
+    "anvil-web": ("ok", "S13.4: web-tweet-fetch screened against the host on a fixture; web-reddit-thread unregistered"),
     "anvil-browser": ("a", "screened (S13.3): all 5 registered; error replies equal the host (Chrome cannot start here), success path unverified"),
     "anvil-org-index": ("ok", "S12.6: 2 of 2 (`org-index-search`, `org-index-rebuild`); DB in the isolated cache, rebuild runs in a bounded standalone child, `message` muted"),
     "anvil-claude-watchdog": ("c", "registers; watches the host's Claude processes"),

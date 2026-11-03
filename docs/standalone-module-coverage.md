@@ -131,6 +131,8 @@ Eleventh step (S12.7, 2026-11-03): Port 15 registers the three `anvil-dashboard`
 
 Twelfth step (S13.3, 2026-11-03): Port 16 registers `defs-detect-changes` and the five `anvil-browser` tools (`browser-fetch`, `browser-interact`, `browser-capture`, `browser-screenshot`, `browser-close`). `process-coding-system-alist` comes from nelisp-emacs-lib (`emacs-cc-coding-2.el`); `shell-quote-argument` is the GNU subr.el POSIX branch under an fboundp guard. `defs-detect-changes` matches the host on a git fixture; because NeLisp `make-process` ignores `default-directory` (wave 3), the handler prefixes `cd DIR &&` to the shell command, leaving the result plist unchanged. The browser tools drive the agent-browser CLI, which cannot start Chrome in this environment (host and standalone both return `command nil failed: (no error message)`; `browser-close` matches), so only the error replies are screened as equal, not the success path.
 
+Thirteenth step (S13.4, 2026-11-03): Port 17 loads the url stack (GNU url, url-http, mail-utils, gnus/mm-util from the vendored tree) and registers the http, web and URI-fetch tools that match the host. GNU timer.el declares timers with `cl-defstruct (:type vector)`, which this runtime turns into records, so its `timerp` rejects its own timers; the loader provides the feature `timer` when native timers exist. `sleep-for` is added from its GNU semantics (accept-process-output, returns nil). Known compat-layer defect: nelisp-emacs-lib's emacs-buffer-builtins.el rebinds `make-local-variable`, `local-variable-p`, `buffer-local-value`, `default-value`, `set-default` and `kill-local-variable` to a swap engine that shows a local value set in another buffer as the current buffer's value; the loader works around it by calling the native `nelisp-buffer-local-make`, with no global fset. Screened as equal to the host on a local fixture: http-fetch, http-head, http-post, http-robots-check, http-cache-status, http-cache-index, http-cache-get, anvil-uri-fetch, web-tweet-fetch. Unregistered with blockers: http-fetch-batch, http-cache-clear, web-reddit-thread, semantic-embed-index.
+
 anvil-lint and anvil-cron were added to the loader on 2026-11-01 (image tool count 40 -> 46; the sixth is `metrics-token-report`, pulled in by their requires).  anvil-file followed on 2026-11-02 (46 -> 61) and anvil-compact, anvil-session and anvil-shell-filter after it (61 -> 79), and agent, data, dev, discovery, harness-telemetry and session-store after the second screening (79 -> 98; their databases go to the XDG cache).
 
 Note: NeLisp origin/main (66561c85e) cannot run the standalone loader at all (`nl-ffi-memory` is missing there); the installed runtime's line is ~2200 commits ahead of origin/main.
@@ -196,7 +198,7 @@ Adding modules also requires updating the tool-count check (a lower bound: 94 pl
 | anvil-git | yes | yes (8) | a | registers; real calls blocked (see screening) | - |
 | anvil-harness-telemetry | yes | already loaded | ok | in standalone loader | - |
 | anvil-host | yes | no `-enable` | lib | library or registered by a parent | - |
-| anvil-http | no | - | b | mailcap.el missing (url stack) | M |
+| anvil-http | yes | 7 served | ok | screened (S13.4): http-fetch, http-head, http-post, http-robots-check, http-cache-status, http-cache-index, http-cache-get match the host on a local fixture; http-fetch-batch (no host answer) and http-cache-clear (host reply rejected by the MCP layer) stay unregistered | - |
 | anvil-js | yes | yes (12) | a | registers; treesit subprocess `with-root` not implemented | - |
 | anvil-lint | yes | already loaded | ok | in standalone loader | - |
 | anvil-manifest | yes | already loaded | ok | in standalone loader | - |
@@ -223,7 +225,7 @@ Adding modules also requires updating the tool-count check (a lower bound: 94 pl
 | anvil-proc | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-pty-broker | yes | enable fails | c | needs the node-pty broker process | - |
 | anvil-py | yes | yes (12) | a | registers; treesit subprocess `with-root` not implemented | - |
-| anvil-semantic | yes | already loaded | ok | in standalone loader | - |
+| anvil-semantic | yes | already loaded | ok | in standalone loader; semantic-embed-index stays unregistered (HTTP embedding path unscreened: 0 chunks embedded on the fixture) | - |
 | anvil-server-commands | yes | already loaded | ok | in standalone loader | - |
 | anvil-server-ert | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-server-metrics | yes | no `-enable` | lib | library or registered by a parent | - |
@@ -240,8 +242,8 @@ Adding modules also requires updating the tool-count check (a lower bound: 94 pl
 | anvil-text | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-treesit-backend | yes | 0 tools | lib | `-enable` runs but registers no MCP tools | - |
 | anvil-ts | yes | yes (14) | a | registers; treesit subprocess `with-root` not implemented | - |
-| anvil-uri | yes | no `-enable` | lib | library or registered by a parent | - |
-| anvil-web | no | - | b | mailcap.el missing (url stack) | M |
+| anvil-uri | yes | no `-enable` | lib | library or registered by a parent; anvil-uri-fetch is served (S13.4, screened on http-cache:// against the host) | - |
+| anvil-web | yes | 1 of 2 | ok | screened (S13.4): web-tweet-fetch matches the host on a fixture; web-reddit-thread stays unregistered (comments null on standalone) | - |
 | anvil-wl | no | - | c | Wanderlust/mail stack | L |
 | anvil-wl-filter | no | - | c | Wanderlust/mail stack | L |
 | anvil-wl-graph | no | - | b | url-http.el missing (url stack + network) | L |
