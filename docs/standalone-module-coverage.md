@@ -111,6 +111,8 @@ Loader defect found by this screening: `tools/anvil-standalone-mcp.el` at
 not start from a clean checkout of the branch (the screening stubbed them).  Fixed 2026-11-03: those three requires are optional and their tools
 register only when the feature loaded; a clean checkout serves 94 tools.
 
+Third step (2026-11-03): the loader now loads the vendored `tabulated-list.el` from nelisp-emacs-lib (file only, not the vendor directory; it must load after the other modules because its macros need `gv-letplace`).  This unblocked `anvil-orchestrator-routing` (fixed with a lazy `(require 'anvil-orchestrator)`; 1 tool) and `anvil-manifest` (4 tools; image tool count +5).  The manifest `attention`/`recovery-suggest`/`docstring-candidates` error `(wrong-type-argument symbolp 'dev)` is a module bug that reproduces on host Emacs: the backquoted spec list kept `(quote dev)` as data and `anvil-manifest--layer` did not unquote it (other modules, e.g. worklog and memory, store quoted layers the same way, so the ranking now tolerates them).  The manifest registers on server-id `"default"`; the loader does not call `anvil-manifest-enable` (it installs a global tools/list filter) and instead aliases `"default"` to `"emacs-eval"` and registers the four specs there.  `anvil-fusion-mcp` and `anvil-fusion-longrun-mcp` load but are not ported: their starters call LLMs or spawn workers, and the pollers answer only "unknown job" because no job can be started.
+
 anvil-lint and anvil-cron were added to the loader on 2026-11-01 (image tool count 40 -> 46; the sixth is `metrics-token-report`, pulled in by their requires).  anvil-file followed on 2026-11-02 (46 -> 61) and anvil-compact, anvil-session and anvil-shell-filter after it (61 -> 79), and agent, data, dev, discovery, harness-telemetry and session-store after the second screening (79 -> 98; their databases go to the XDG cache).
 
 Note: NeLisp origin/main (66561c85e) cannot run the standalone loader at all (`nl-ffi-memory` is missing there); the installed runtime's line is ~2200 commits ahead of origin/main.
@@ -162,10 +164,10 @@ Adding modules also requires updating the tool-count check (a lower bound: 94 pl
 | anvil-fusion-exec | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-fusion-lens | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-fusion-longrun-async | yes | no `-enable` | lib | library or registered by a parent | - |
-| anvil-fusion-longrun-mcp | yes | yes (3) | b | screened: tabulated-list.el missing | - |
+| anvil-fusion-longrun-mcp | yes | yes (3) | d | screened: loads with tabulated-list; not ported (start/resume spawn workers, poller has no job source) | - |
 | anvil-fusion-longrun | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-fusion-longrun-store | yes | no `-enable` | lib | library or registered by a parent | - |
-| anvil-fusion-mcp | yes | yes (2) | b | screened: tabulated-list.el missing | - |
+| anvil-fusion-mcp | yes | yes (2) | d | screened: loads with tabulated-list; not ported (ask calls LLMs, poller has no job source) | - |
 | anvil-fusion-panels | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-fusion | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-fusion-plan | yes | no `-enable` | lib | library or registered by a parent | - |
@@ -179,7 +181,7 @@ Adding modules also requires updating the tool-count check (a lower bound: 94 pl
 | anvil-http | no | - | b | mailcap.el missing (url stack) | M |
 | anvil-js | yes | yes (12) | a | registers; treesit subprocess `with-root` not implemented | - |
 | anvil-lint | yes | already loaded | ok | in standalone loader | - |
-| anvil-manifest | yes | yes (4) | d | screened: registers on server-id "default"; quoted spec symbols | - |
+| anvil-manifest | yes | already loaded | ok | in standalone loader | - |
 | anvil-memory-batch | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-memory-bridge | no | - | b | url-util.el missing (url stack) | M |
 | anvil-memory-context | yes | no `-enable` | lib | library or registered by a parent | - |
@@ -194,7 +196,7 @@ Adding modules also requires updating the tool-count check (a lower bound: 94 pl
 | anvil-orchestrator | no | - | b | tabulated-list.el missing | S |
 | anvil-orchestrator-openrouter | no | - | b | tabulated-list.el missing | S |
 | anvil-orchestrator-presets | yes | no `-enable` | lib | library or registered by a parent | - |
-| anvil-orchestrator-routing | yes | yes (1) | d | screened: `anvil-orchestrator-stats` void (missing require) | - |
+| anvil-orchestrator-routing | yes | already loaded | ok | in standalone loader | - |
 | anvil-orchestrator-workflow | no | - | b | tabulated-list.el missing | S |
 | anvil-org | no | - | b | org-id.el missing (only the lightweight Org subset loads) | M |
 | anvil-org-index | yes | yes (2) | c | registers; uses the host DB and `message`, needs paths | - |

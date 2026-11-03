@@ -581,6 +581,53 @@ non-positive SECS cannot spin."
       ;; No `message': on NeLisp it writes to stdout, the MCP channel.
       (error (push (cons module err) anvil-standalone--port7-errors)))))
 
+;; tabulated-list is not on the runtime load-path.  Load only the vendored
+;; nelisp-emacs-lib file, here rather than beside the other compat files: its
+;; macros need `gv-letplace', which exists only after the modules above loaded.
+;; Adding the whole vendor directory to `load-path' would shadow other
+;; libraries.  No `message': on NeLisp it writes to stdout, the MCP channel.
+(defvar anvil-standalone--tablist-error nil
+  "Error from loading the vendored tabulated-list, or nil.")
+(let ((compat-dir (or (getenv "NELISP_EMACS_LIB_DIR")
+                      (and (getenv "ANVIL_NOTES_DIR")
+                           (expand-file-name "dev/nelisp-emacs-lib/src"
+                                             (getenv "ANVIL_NOTES_DIR"))))))
+  (when (and compat-dir (not (featurep 'tabulated-list)))
+    (condition-case err
+        (load (expand-file-name
+               "../vendor/emacs-lisp/emacs-lisp/tabulated-list.el" compat-dir)
+              nil t)
+      (error (setq anvil-standalone--tablist-error err)))))
+
+;; Port 8: modules that need tabulated-list, so they are gated on the feature.  Each loads in its
+;; own condition-case.  anvil-fusion-mcp and anvil-fusion-longrun-mcp load but
+;; are deliberately not enabled: their only safe tools are job pollers, and a
+;; standalone server has no safe way to start a job (fusion-ask, longrun-start
+;; and longrun-resume call LLM providers and spawn workers).
+(defvar anvil-standalone--port8-errors nil
+  "Alist of (MODULE . ERROR) for port-8 modules that failed to load.")
+(unless (or (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
+            (not (featurep 'tabulated-list)))
+  (condition-case err
+      (progn
+        (require 'anvil-orchestrator-routing)
+        (anvil-orchestrator-routing-enable))
+    ;; No `message': on NeLisp it writes to stdout, the MCP channel.
+    (error (push (cons 'anvil-orchestrator-routing err)
+                 anvil-standalone--port8-errors)))
+  ;; anvil-manifest registers on the server id "default", which this loader
+  ;; does not serve, and its enable function installs a global tools/list
+  ;; filter.  Skip the enable function: alias "default" to the served
+  ;; "emacs-eval" (the summary index resolves aliases) and register only the
+  ;; four read-only tool specs there.
+  (condition-case err
+      (progn
+        (require 'anvil-manifest)
+        (cl-pushnew '("default" . "emacs-eval") anvil-server-id-aliases
+                    :test #'equal)
+        (anvil-server-register-tools "emacs-eval" anvil-manifest--tool-specs))
+    (error (push (cons 'anvil-manifest err) anvil-standalone--port8-errors))))
+
 (defun anvil-standalone-start ()
   "Serve the prepared registry, opening databases on first use."
   (setq default-directory

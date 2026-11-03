@@ -220,7 +220,13 @@ Returns a plist:
          (since (or since (- (float-time)
                              anvil-orchestrator-routing-default-since-sec)))
          (min-n (or min-samples anvil-orchestrator-routing-min-samples))
-         (stats (or stats-fn #'anvil-orchestrator-stats))
+         (stats (or stats-fn
+                    (progn
+                      ;; Load the stats provider on demand: this module does
+                      ;; not require anvil-orchestrator at load time.
+                      (unless (fboundp 'anvil-orchestrator-stats)
+                        (require 'anvil-orchestrator))
+                      #'anvil-orchestrator-stats)))
          (per (anvil-orchestrator-routing--collect-samples
                cands since min-n stats))
          (picked nil)

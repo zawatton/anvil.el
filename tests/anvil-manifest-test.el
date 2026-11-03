@@ -725,5 +725,25 @@ symbols in the default `anvil-manifest-server-profiles'."
               (cdr (assoc "emacs-eval-headless"
                           (default-value 'anvil-manifest-server-profiles))))))
 
+(ert-deftest anvil-manifest-test/tool-spec-metadata-is-unquoted-data ()
+  "The backquoted spec list must hold plain symbols, not (quote SYM) forms."
+  (dolist (spec anvil-manifest--tool-specs)
+    (should (symbolp (plist-get (cdr spec) :layer)))
+    (should (cl-every #'symbolp (plist-get (cdr spec) :intent)))))
+
+(ert-deftest anvil-manifest-test/attention-tolerates-quoted-layer ()
+  "A tool whose :layer is stored as (quote SYM) must not break the ranking."
+  (let ((anvil-server--tools (make-hash-table :test 'equal))
+        (anvil-server-id-aliases nil)
+        (anvil-manifest--summary-index-cache (make-hash-table :test 'equal))
+        (tools (make-hash-table :test 'equal)))
+    (puthash "demo-tool" (list :description "demo reader" :layer ''workflow
+                               :intent ''(demo))
+             tools)
+    (puthash "default" tools anvil-server--tools)
+    (let ((res (anvil-manifest-attention-handler "demo reader")))
+      (should (equal (plist-get (aref (plist-get res :tools) 0) :layer)
+                     'workflow)))))
+
 (provide 'anvil-manifest-test)
 ;;; anvil-manifest-test.el ends here

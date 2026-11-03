@@ -1,0 +1,5 @@
+[["orchestrator-routing-select", {"policy": "quality"}],
+ ["manifest-cost", {}],
+ ["manifest-attention", {"query": "orchestrator routing select provider", "limit": 3}],
+ ["manifest-recovery-suggest", {"query": "orchestrator routing select provider"}],
+ ["manifest-docstring-candidates", {"limit": 3}]]

@@ -416,7 +416,7 @@ stability stable) is assumed."
         (layer-inc (plist-get filter :layer-include))
         (stab-exc (plist-get filter :stability-exclude))
         (tool-intents (or (plist-get tool-plist :intent) '(general)))
-        (tool-layer (or (plist-get tool-plist :layer) 'core))
+        (tool-layer (anvil-manifest--layer tool-plist))
         (tool-stab (or (plist-get tool-plist :stability) 'stable)))
     (and
      (or (null intent-inc) (cl-intersection intent-inc tool-intents))
@@ -434,6 +434,15 @@ stability stable) is assumed."
      ((symbolp v) (list v))
      (t fallback))))
 
+(defun anvil-manifest--layer (tool)
+  "Return TOOL's :layer as a symbol, unquoting a stored (quote SYM) form.
+Specs built inside a backquote keep their quote forms as data."
+  (let ((v (plist-get tool :layer)))
+    (cond ((null v) 'core)
+          ((and (consp v) (eq (car v) 'quote)) (or (cadr v) 'core))
+          ((symbolp v) v)
+          (t 'core))))
+
 (defun anvil-manifest--attention-tokens (text)
   "Return normalized lexical tokens from TEXT."
   (delete-dups
@@ -448,7 +457,7 @@ stability stable) is assumed."
   (let* ((desc (or (plist-get tool :description) ""))
          (intent (anvil-manifest--metadata-list
                   (plist-get tool :intent) '(general)))
-         (layer (or (plist-get tool :layer) 'core)))
+         (layer (anvil-manifest--layer tool)))
     (string-join
      (list tool-id
            (replace-regexp-in-string "[-_]" " " tool-id)
@@ -630,7 +639,7 @@ with `:requires', `:excludes', and `:any'."
                       :score-backend (cdr score+backend)
                       :preconditions
                       (or (plist-get tool :preconditions) nil)
-                      :layer (or (plist-get tool :layer) 'core)
+                      :layer (anvil-manifest--layer tool)
                       :intent
                       (apply #'vector
                              (anvil-manifest--metadata-list
@@ -801,7 +810,8 @@ MCP Parameters: (none)"
   (anvil-server-with-error-handling
     (let* ((profile anvil-manifest-profile)
            (server-id "default")
-           (tools-table (gethash server-id anvil-server--tools))
+           (tools-table (gethash (anvil-server--resolve-id server-id)
+                                 anvil-server--tools))
            (advertised 0)
            (tokens 0)
            (all 0))
@@ -1010,7 +1020,8 @@ MCP Parameters:
                limit anvil-manifest-docstring-candidate-limit))
            ;; Over-fetch before query filtering so weak descriptions with
            ;; sparse query vocabulary are not lost too early.
-           (raw (anvil-autoresearch-docstrings nil sid (* n 5)))
+           (raw (anvil-autoresearch-docstrings
+                 nil (anvil-server--resolve-id sid) (* n 5)))
            (rows nil))
       (dolist (candidate (append (plist-get raw :candidates) nil))
         (let* ((tool (anvil-manifest--candidate-tool candidate sid))
@@ -1064,29 +1075,29 @@ MCP Parameters:
 (defconst anvil-manifest--tool-specs
   `((,#'anvil-manifest-cost-handler
      :id "manifest-cost"
-     :intent '(meta token)
-     :layer 'dev
+     :intent (meta token)
+     :layer dev
      :description "Return the active ANVIL_PROFILE, count of advertised tools, and an approximate token cost of the current tools/list manifest.  Handlers of hidden tools remain callable via explicit tools/call."
      :read-only t
      :title "Manifest Cost")
     (,#'anvil-manifest-attention-handler
      :id "manifest-attention"
-     :intent '(meta discovery token)
-     :layer 'dev
+     :intent (meta discovery token)
+     :layer dev
      :description "Return Doc 44 Tool Attention IsO-lite ranking for a natural-language query over registered MCP tool ids, descriptions, intents, and layers.  Use before choosing a narrow dynamic manifest profile; read-only and local, no embeddings service required."
      :read-only t
      :title "Manifest Attention")
     (,#'anvil-manifest-recovery-suggest-handler
      :id "manifest-recovery-suggest"
-     :intent '(meta discovery token)
-     :layer 'dev
+     :intent (meta discovery token)
+     :layer dev
      :description "Return Doc 44 recovery suggestions when a dynamic manifest profile hides or trims the tool you expected.  Scores registered tools for a natural-language query, reports visibility/focus/precondition status, and shows warm LRU tools.  Read-only."
      :read-only t
      :title "Manifest Recovery Suggest")
     (,#'anvil-manifest-docstring-candidates-handler
      :id "manifest-docstring-candidates"
-     :intent '(meta discovery research)
-     :layer 'dev
+     :intent (meta discovery research)
+     :layer dev
      :description "Return Doc 44 Phase 2d docstring rewrite candidates for Tool Attention quality.  Uses Doc 43 autoresearch-docstrings to rank weak MCP tool descriptions, augments each row with local attention score for the optional query, and points follow-up at autoresearch-docstring-propose."
      :read-only t
      :title "Manifest Docstring Candidates"))

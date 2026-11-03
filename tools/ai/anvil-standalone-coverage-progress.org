@@ -117,3 +117,26 @@ cmd: ulimit -v 8388608; d=$(mktemp -d); printf '%s\n' '(let ((tools (gethash "em
 ** S7.3 Real MCP calls through the real launcher: all succeed and the re-read SVG (the cad-extract line with :count 2 only) contains the annotation text
 #+NOTE: red before the change: the call file fails on the pre-S7 HEAD archive; the grep is proven to fail on an output whose file-read line lost the text
 cmd: test -s tools/ai/standalone-bisect-cad-calls.json && out=$(timeout 500 python3 tools/ai/standalone-mcp-call.py tools/ai/standalone-bisect-cad-calls.json) && echo "$out" | grep '^OK   cad-extract .*:count 2 ' | grep -q 'S7ANNOTATION' && ! { echo "$out" | sed '/^OK   cad-extract .*:count 2 /s/S7ANNOTATION/x/g' | grep '^OK   cad-extract .*:count 2 ' | grep -q 'S7ANNOTATION'; }
+
+* S8 tabulated-list and the modules it unblocks (user request 2026-11-03)
+
+# The vendored tabulated-list.el is loaded explicitly from nelisp-emacs-lib (not the whole vendor dir).
+# Ported: anvil-orchestrator-routing (1 tool) and anvil-manifest (4 tools, registered on "emacs-eval" with "default" aliased to it;
+# its enable function is not called because it installs a global tools/list filter).
+# Not ported: anvil-fusion-mcp and anvil-fusion-longrun-mcp (only job pollers are safe; nothing can start a job).
+
+** S8.1 Loader with the nelisp-emacs-lib compat dir provides tabulated-list
+#+NOTE: red before the change: the same probe against a git archive of the pre-S8 HEAD prints TABLIST MISSING
+cmd: ulimit -v 8388608; d=$(mktemp -d); printf '%s\n' '(princ (if (and (featurep (quote tabulated-list)) (fboundp (quote tabulated-list-mode))) "TABLIST PROVIDED\n" "TABLIST MISSING\n"))' > "$d/probe.el"; out=$(cd "$d" && ANVIL_EL_DIR="$OLDPWD" ANVIL_NOTES_DIR="${ANVIL_NOTES_DIR:-$HOME/Cowork/Notes}" ANVIL_MEMORY_DB="$d/m.db" ANVIL_WORKLOG_DB="$d/w.db" TMPDIR="$d" ANVIL_STANDALONE_TEST_NO_SERVER=1 timeout 280 nelisp --load "$OLDPWD/tools/anvil-standalone-mcp.el" --load "$d/probe.el" 2>&1); echo "$out" | grep -q "TABLIST PROVIDED"
+
+** S8.2 Loader registers one named tool per ported module and none of the LLM-calling fusion tools
+#+NOTE: red before the change: the same probe against a git archive of the pre-S8 HEAD reports MISSING
+cmd: ulimit -v 8388608; d=$(mktemp -d); printf '%s\n' '(let ((tools (gethash "emacs-eval" anvil-server--tools)) (miss nil)) (dolist (id (quote ("orchestrator-routing-select" "manifest-cost" "manifest-attention" "manifest-recovery-suggest" "manifest-docstring-candidates"))) (unless (gethash id tools) (push id miss))) (dolist (id (quote ("fusion-ask" "longrun-start" "longrun-resume" "orchestrator-submit"))) (when (gethash id tools) (push (list (quote unexpected) id) miss))) (princ (if miss (format "PORT8 MISSING %S\n" miss) "PORT8 ALL-REGISTERED\n")))' > "$d/probe.el"; out=$(cd "$d" && ANVIL_EL_DIR="$OLDPWD" ANVIL_NOTES_DIR="${ANVIL_NOTES_DIR:-$HOME/Cowork/Notes}" ANVIL_MEMORY_DB="$d/m.db" ANVIL_WORKLOG_DB="$d/w.db" TMPDIR="$d" ANVIL_STANDALONE_TEST_NO_SERVER=1 timeout 280 nelisp --load "$OLDPWD/tools/anvil-standalone-mcp.el" --load "$d/probe.el" 2>&1); echo "$out" | grep -q "PORT8 ALL-REGISTERED"
+
+** S8.3 Real MCP calls through the real launcher: all succeed; the routing line shows the quality-policy reason, manifest-cost counts the served tools, manifest-attention resolves "default" to "emacs-eval"
+#+NOTE: red before the change: the call file fails on the pre-S8 HEAD archive (tool not found); each grep is restricted to its own output line and is proven to fail on mutated output
+cmd: test -s tools/ai/standalone-tablist-calls.json && out=$(timeout 500 python3 tools/ai/standalone-mcp-call.py tools/ai/standalone-tablist-calls.json) && echo "$out" | grep '^OK   orchestrator-routing-select ' | grep -q 'quality: no candidate' && echo "$out" | grep '^OK   manifest-cost ' | grep -Eq 'advertised-count[^0-9]+[1-9]' && echo "$out" | grep '^OK   manifest-attention ' | grep -Eq 'resolved-server-id[^a-z]+emacs-eval' && ! { echo "$out" | sed '/^OK   manifest-attention /s/emacs-eval/x/g' | grep '^OK   manifest-attention ' | grep -Eq 'resolved-server-id[^a-z]+emacs-eval'; } && ! { echo "$out" | sed '/^OK   orchestrator-routing-select /s/quality: no candidate/x/g' | grep '^OK   orchestrator-routing-select ' | grep -q 'quality: no candidate'; }
+
+** S8.4 Host ERT for anvil-manifest and anvil-orchestrator-routing passes (includes the new regression tests)
+#+NOTE: red before the fix: the two new manifest tests fail against the unfixed anvil-manifest.el
+cmd: ulimit -v 8388608; for x in manifest orchestrator-routing; do timeout 600 emacs --batch -Q -L . -L tests -l ert -l tests/anvil-$x-test.el -f ert-run-tests-batch-and-exit >/dev/null 2>&1 || exit 1; done
