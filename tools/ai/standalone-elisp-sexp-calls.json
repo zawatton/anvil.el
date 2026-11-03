@@ -1,0 +1,6 @@
+[
+ ["emacs-eval", {"expression": "(progn (with-temp-file \"@TMP@/fix.el\" (insert \";;; fixture\\n(defun s10-add (a b)\\n  \\\"Add A and B.\\\"\\n  (+ a b))\\n\\n(defmacro s10-twice (x)\\n  `(progn ,x ,x))\\n\\n(defun s10-use () (s10-add 1 2))\\n\")) (with-temp-file \"@TMP@/fix2.el\" (insert \";;; fixture\\n(defun s10-add (a b)\\n  \\\"Add A and B.\\\"\\n  (+ a b))\\n\\n(defmacro s10-twice (x)\\n  `(progn ,x ,x))\\n\\n(defun s10-use () (s10-add 1 2))\\n\")) \"seeded\")"}],
+ ["sexp-read-file", {"file": "@TMP@/fix.el"}],
+ ["sexp-surrounding-form", {"file": "@TMP@/fix.el", "point": 60}],
+ ["sexp-replace-defun", {"file": "@TMP@/fix2.el", "name": "s10-add", "new_form": "(defun s10-add (a b) \"Sum.\" (+ b a))", "apply": "t"}],
+ ["sexp-read-file", {"file": "@TMP@/fix2.el"}]]

@@ -39,11 +39,13 @@
 ;;; System Directory Setup
 
 (defvar anvil-elisp--system-lisp-dir
-  (let* ((data-parent
-          (file-name-directory (directory-file-name data-directory)))
-         (lisp-dir (expand-file-name "lisp/" data-parent)))
-    (when (file-directory-p lisp-dir)
-      lisp-dir))
+  (when (stringp data-directory)
+    ;; `data-directory' is nil on the standalone NeLisp runtime.
+    (let* ((data-parent
+            (file-name-directory (directory-file-name data-directory)))
+           (lisp-dir (expand-file-name "lisp/" data-parent)))
+      (when (file-directory-p lisp-dir)
+        lisp-dir)))
   "System Lisp directory for Emacs installation.
 Computed once at package load time from `data-directory'.")
 

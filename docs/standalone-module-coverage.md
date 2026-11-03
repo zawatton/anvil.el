@@ -38,7 +38,7 @@ Rows marked "screened" take their class from the real-call screenings below
 
 Shared root causes: missing `tabulated-list` blocks the orchestrator family;
 the url/mailcap stack blocks the web and mail modules; compile.el without
-`define-compilation-mode` blocks anvil-elisp and anvil-sexp.
+`define-compilation-mode` blocked anvil-elisp and anvil-sexp (loading fixed in step S10, below).
 
 Fixed on 2026-11-02 (were the largest blockers on 2026-11-01):
 - `(require 'org)` failed (`wrong-type-argument arrayp`): nelisp-emacs-lib
@@ -115,6 +115,8 @@ Third step (2026-11-03): the loader now loads the vendored `tabulated-list.el` f
 
 Fourth step (2026-11-03): the loader shims `with-timeout` (GNU timer.el definition; the timeout only fires while the program waits), `directory-files-recursively` (GNU files.el semantics rebuilt from `directory-files`, output identical to host Emacs on a fixture tree including predicate, symlink and missing-directory cases), `file-name-base` and `time-subtract`.  This ported `anvil-eval` (4 tools on `"emacs-eval"`) and `anvil-semantic` (4 tools; image tool count +8).
 
+Fifth step (S10, 2026-11-03): the loader gives `define-compilation-mode` a macro fallback (derived mode of `compilation-mode`, else `special-mode`), declares the `bytecomp` feature only while anvil-sexp loads and withdraws it afterwards (the GNU `bytecomp.el` first needs `define-compilation-mode`, then fails with `pcase or pattern has branch-local bindings`; standalone cannot run GNU byte-code anyway), and shims `looking-at-p`.  `anvil-elisp.el` got a one-line guard (`data-directory` is nil on standalone).  Both modules load; the loader loads only anvil-sexp, since no anvil-elisp tool answers correctly.  Real-call screening (compared with host `emacs --batch -Q`): `anvil-sexp` `sexp-read-file`, `sexp-surrounding-form` (in-form point; between forms host prints `null`, standalone prints an empty body) and `sexp-replace-defun` (preview and apply) match the host and are registered (image tool count +3).  Not registered: `sexp-macroexpand` (empty expansion), `sexp-wrap-form` (`bounds-of-thing-at-point` void), `sexp-rename-symbol` and `sexp-replace-call` (`syntax-ppss` void), `sexp-verify` (needs byte-compile and checkdoc; `checkdoc.el` missing).  `anvil-elisp` registers nothing: `elisp-describe-function` omits the docstring and Defined-in line (wrong), `elisp-describe-variable` needs `documentation-property`, `elisp-get-function-definition` needs `find-lisp-object-file-name`, `elisp-read-source-file` finds no system lisp directory, `elisp-ert-run` reports 0 tests for a passing test, `ert-run-distilled` needs `shell-quote-argument`, `elisp-byte-compile-file` cannot work.
+
 anvil-lint and anvil-cron were added to the loader on 2026-11-01 (image tool count 40 -> 46; the sixth is `metrics-token-report`, pulled in by their requires).  anvil-file followed on 2026-11-02 (46 -> 61) and anvil-compact, anvil-session and anvil-shell-filter after it (61 -> 79), and agent, data, dev, discovery, harness-telemetry and session-store after the second screening (79 -> 98; their databases go to the XDG cache).
 
 Note: NeLisp origin/main (66561c85e) cannot run the standalone loader at all (`nl-ffi-memory` is missing there); the installed runtime's line is ~2200 commits ahead of origin/main.
@@ -154,7 +156,7 @@ Adding modules also requires updating the tool-count check (a lower bound: 94 pl
 | anvil-disclosure | yes | already loaded | ok | in standalone loader | - |
 | anvil-discovery | yes | already loaded | ok | in standalone loader | - |
 | anvil-disk | yes | no `-enable` | lib | library or registered by a parent | - |
-| anvil-elisp | no | - | a | compile.el loads but `define-compilation-mode` is not bound | S |
+| anvil-elisp | yes | 0 of 6 | a | S10: loads (not loaded by the loader), but every tool fails or answers wrongly on standalone (no docstrings, documentation-property/find-lisp-object-file-name/shell-quote-argument void, ert finds 0 tests, byte-compile impossible) | - |
 | anvil-emacs | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-eval | yes | already loaded | ok | in standalone loader | - |
 | anvil-extend | no | - | a | vendored filenotify.el `cl-defun` destructuring arglist | M |
@@ -216,7 +218,7 @@ Adding modules also requires updating the tool-count check (a lower bound: 94 pl
 | anvil-session | yes | already loaded | ok | in standalone loader | - |
 | anvil-session-store | yes | already loaded | ok | in standalone loader | - |
 | anvil-sexp-cst | yes | enable fails | c | needs tree-sitter C runtime | - |
-| anvil-sexp | no | - | a | compile.el loads but `define-compilation-mode` is not bound | S |
+| anvil-sexp | yes | 3 of 8 (read-file, surrounding-form, replace-defun) | ok | S10: loads via a `define-compilation-mode` fallback and a temporarily declared `bytecomp`; the rest need syntax-ppss/bounds-of-thing-at-point, byte-compile or checkdoc, or answer wrongly (macroexpand) | - |
 | anvil-shell-filter-builtin | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-shell-filter | yes | already loaded | ok | in standalone loader | - |
 | anvil-sqlite | yes | yes (1) | a | registers; `sqlite-select` lacks return type `set` | - |

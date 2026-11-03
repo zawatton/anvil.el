@@ -21,6 +21,15 @@ LOADED = {"anvil", "anvil-server-commands", "anvil-context", "anvil-context-batc
           "anvil-orchestrator-routing", "anvil-manifest",
           "anvil-eval", "anvil-semantic"}
 
+# Modules that load under the loader but register only some (or none) of their
+# tools after real-call screening: module -> (tools column, class, note).
+PARTIAL = {
+    "anvil-sexp": ("3 of 8 (read-file, surrounding-form, replace-defun)", "ok",
+                   "S10: loads via a `define-compilation-mode` fallback and a temporarily declared `bytecomp`; the rest need syntax-ppss/bounds-of-thing-at-point, byte-compile or checkdoc, or answer wrongly (macroexpand)"),
+    "anvil-elisp": ("0 of 6", "a",
+                    "S10: loads (not loaded by the loader), but every tool fails or answers wrongly on standalone (no docstrings, documentation-property/find-lisp-object-file-name/shell-quote-argument void, ert finds 0 tests, byte-compile impossible)"),
+}
+
 # Port candidates (tools register) that a real-call screening rejected:
 # module -> (class, note).  See the doc's "Real-call screening" section.
 SCREENED = {
@@ -79,7 +88,10 @@ def main():
             continue
         mod, load, lerr, reg, added = f[1], f[2], f[3], f[4], f[5]
         rerr = f[6] if len(f) > 6 else ""
-        if mod in LOADED:
+        if mod in PARTIAL:
+            tools, cls, cause = PARTIAL[mod]
+            status, effort = "yes", "-"
+        elif mod in LOADED:
             status, tools, cls, cause, effort = "yes", "already loaded", "ok", "in standalone loader", "-"
         elif load != "pass":
             cls, cause, effort = classify(lerr)

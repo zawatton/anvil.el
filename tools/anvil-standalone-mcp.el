@@ -776,6 +776,57 @@ Fallback for runtimes without a native `time-subtract'; nil means now."
         (anvil-server-unregister-tool "semantic-embed-index" "emacs-eval"))
     (error (push (cons 'anvil-semantic err) anvil-standalone--port9-errors))))
 
+;; Port 10: anvil-elisp and anvil-sexp.  Both `require' `bytecomp', whose GNU
+;; source cannot load on standalone: it calls `define-compilation-mode' (absent
+;; from the reduced compile engine) and then fails on a pcase pattern.  Only
+;; their byte-compile paths use it, and standalone cannot execute GNU byte-code
+;; anyway.  So `define-compilation-mode' gets a faithful macro fallback and the
+;; `bytecomp' feature is declared only while anvil-sexp loads (then withdrawn,
+;; so later requires still fail honestly); `byte-compile-file' stays void.
+;;  * anvil-elisp: not loaded (no tool answers correctly).  Screened on standalone:
+;;    elisp-describe-function answers without docstrings (wrong), -variable and
+;;    -get-function-definition hit void functions (documentation-property,
+;;    find-lisp-object-file-name), -read-source-file has no system lisp dir,
+;;    elisp-ert-run reports 0 tests for a passing test, ert-run-distilled needs
+;;    shell-quote-argument, and elisp-byte-compile-file cannot work.
+;;  * anvil-sexp: only the tools whose answers match host Emacs are registered.
+;;    Left out: sexp-macroexpand (empty expansion), sexp-wrap-form,
+;;    sexp-rename-symbol and sexp-replace-call (need syntax-ppss and
+;;    bounds-of-thing-at-point, which standalone lacks) and sexp-verify (its
+;;    byte-compile and checkdoc checks are unavailable).
+(defvar anvil-standalone--port10-errors nil
+  "Alist of (MODULE . ERROR) for port-10 modules that failed to load.")
+;; Gated on the nelisp-emacs-lib compat dir being locatable: without it the
+;; `ert'/`help-fns' requires pull in a buffer layer that breaks
+;; `insert-file-contents' (void `before-change-functions'), which the
+;; shell-drain check (S3.3) exposes when ANVIL_NOTES_DIR is unset.
+(unless (or (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
+            (not (or (getenv "NELISP_EMACS_LIB_DIR")
+                     (getenv "ANVIL_NOTES_DIR"))))
+  (unless (fboundp 'define-compilation-mode)
+    (defmacro define-compilation-mode (mode name doc &rest body)
+      "Fallback: define MODE as a derived mode (see GNU compile.el)."
+      `(define-derived-mode ,mode ,(if (fboundp 'compilation-mode)
+                                       'compilation-mode
+                                     'special-mode)
+         ,name ,doc ,@body)))
+  (unless (fboundp 'looking-at-p)
+    (defun looking-at-p (regexp)
+      "Like `looking-at' but without changing the match data."
+      (save-match-data (looking-at regexp))))
+  (let ((fake-bytecomp (not (featurep 'bytecomp))))
+    (when fake-bytecomp (provide 'bytecomp))
+    (unwind-protect
+        (condition-case err
+            (progn
+              (require 'anvil-sexp)
+              (anvil-sexp-enable)
+              (dolist (id '("sexp-verify" "sexp-macroexpand" "sexp-wrap-form"
+                            "sexp-rename-symbol" "sexp-replace-call"))
+                (anvil-server-unregister-tool id "emacs-eval")))
+          (error (push (cons 'anvil-sexp err) anvil-standalone--port10-errors)))
+      (when fake-bytecomp (setq features (delq 'bytecomp features))))))
+
 (defun anvil-standalone-start ()
   "Serve the prepared registry, opening databases on first use."
   (setq default-directory
