@@ -93,8 +93,8 @@ directory; tools that call an LLM or remote API (`fusion-ask`,
 | `anvil-manifest` | `manifest-cost` OK only | (d) registers on server-id `"default"`, so the loader would not serve it; `attention`/`recovery-suggest` hit `(wrong-type-argument symbolp 'dev)` (doubly quoted spec, not compared with GNU Emacs); `docstring-candidates` needs tabulated-list |
 | `anvil-orchestrator-routing` | `orchestrator-routing-select` fails | (d) `anvil-orchestrator-stats` void: missing require; preloading anvil-orchestrator then needs tabulated-list |
 | `anvil-buffer` | `buffer-list-modified`, `buffer-read` fail | (a) after the module loads, `buffer-live-p` returns nil and `buffer-file-name` rejects its argument; the same calls work without the module |
-| `anvil-eval` | all three fail | (a) `with-timeout` void; with a shim `emacs-eval`/`emacs-eval-jobs` work and `nelisp-eval` needs `NELISP_ELISP_DIR`; registers on server-id `"anvil"` |
-| `anvil-semantic` | `status`, `notes-lexical-search`, `semantic-search` (lexical) return; `reindex` fails | (a) `directory-files-recursively` void; the searches ran on an empty index, so their `[]` proves nothing |
+| `anvil-eval` | `emacs-eval` (3), `emacs-eval-async` + `emacs-eval-jobs` (job done after a wait point) OK; `nelisp-eval` not ported | (a) `with-timeout` void: shimmed 2026-11-03; registers on server-id `"anvil"`: the four tools are registered on `"emacs-eval"` without `anvil-eval-enable` (global advice); `nelisp-eval`/`-reset` need the pure-Elisp NeLisp sources (`NELISP_ELISP_DIR`) and are left out; `time-subtract` also shimmed |
+| `anvil-semantic` | `status`, `reindex` (2 files, 2 chunks), `semantic-search` (lexical) hit the seeded word | (a) `directory-files-recursively` void: shimmed 2026-11-03; `file-name-base` also shimmed; DB under `$XDG_CACHE_HOME/anvil-standalone/anvil-semantic-index.db`; `semantic-embed-index` (HTTP embedding provider) not registered; the default exclude pattern `/\.cache/` skips corpora under `~/.cache` |
 | `anvil-fusion-mcp` | `fusion-result` fails | (b) tabulated-list.el missing |
 | `anvil-fusion-longrun-mcp` | `longrun-status` fails | (b) tabulated-list.el missing |
 | `anvil-mu4e` | not called | (c) touches mail |
@@ -112,6 +112,8 @@ not start from a clean checkout of the branch (the screening stubbed them).  Fix
 register only when the feature loaded; a clean checkout serves 94 tools.
 
 Third step (2026-11-03): the loader now loads the vendored `tabulated-list.el` from nelisp-emacs-lib (file only, not the vendor directory; it must load after the other modules because its macros need `gv-letplace`).  This unblocked `anvil-orchestrator-routing` (fixed with a lazy `(require 'anvil-orchestrator)`; 1 tool) and `anvil-manifest` (4 tools; image tool count +5).  The manifest `attention`/`recovery-suggest`/`docstring-candidates` error `(wrong-type-argument symbolp 'dev)` is a module bug that reproduces on host Emacs: the backquoted spec list kept `(quote dev)` as data and `anvil-manifest--layer` did not unquote it (other modules, e.g. worklog and memory, store quoted layers the same way, so the ranking now tolerates them).  The manifest registers on server-id `"default"`; the loader does not call `anvil-manifest-enable` (it installs a global tools/list filter) and instead aliases `"default"` to `"emacs-eval"` and registers the four specs there.  `anvil-fusion-mcp` and `anvil-fusion-longrun-mcp` load but are not ported: their starters call LLMs or spawn workers, and the pollers answer only "unknown job" because no job can be started.
+
+Fourth step (2026-11-03): the loader shims `with-timeout` (GNU timer.el definition; the timeout only fires while the program waits), `directory-files-recursively` (GNU files.el semantics rebuilt from `directory-files`, output identical to host Emacs on a fixture tree including predicate, symlink and missing-directory cases), `file-name-base` and `time-subtract`.  This ported `anvil-eval` (4 tools on `"emacs-eval"`) and `anvil-semantic` (4 tools; image tool count +8).
 
 anvil-lint and anvil-cron were added to the loader on 2026-11-01 (image tool count 40 -> 46; the sixth is `metrics-token-report`, pulled in by their requires).  anvil-file followed on 2026-11-02 (46 -> 61) and anvil-compact, anvil-session and anvil-shell-filter after it (61 -> 79), and agent, data, dev, discovery, harness-telemetry and session-store after the second screening (79 -> 98; their databases go to the XDG cache).
 
@@ -154,7 +156,7 @@ Adding modules also requires updating the tool-count check (a lower bound: 94 pl
 | anvil-disk | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-elisp | no | - | a | compile.el loads but `define-compilation-mode` is not bound | S |
 | anvil-emacs | yes | no `-enable` | lib | library or registered by a parent | - |
-| anvil-eval | yes | yes (6) | a | screened: `with-timeout` void; registers on server-id "anvil" | - |
+| anvil-eval | yes | already loaded | ok | in standalone loader | - |
 | anvil-extend | no | - | a | vendored filenotify.el `cl-defun` destructuring arglist | M |
 | anvil-file | yes | already loaded | ok | in standalone loader | - |
 | anvil-fs | yes | no `-enable` | lib | library or registered by a parent | - |
@@ -205,7 +207,7 @@ Adding modules also requires updating the tool-count check (a lower bound: 94 pl
 | anvil-proc | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-pty-broker | yes | enable fails | c | needs the node-pty broker process | - |
 | anvil-py | yes | yes (12) | a | registers; treesit subprocess `with-root` not implemented | - |
-| anvil-semantic | yes | yes (5) | a | screened: reindex needs `directory-files-recursively` | - |
+| anvil-semantic | yes | already loaded | ok | in standalone loader | - |
 | anvil-server-commands | yes | already loaded | ok | in standalone loader | - |
 | anvil-server-ert | yes | no `-enable` | lib | library or registered by a parent | - |
 | anvil-server-metrics | yes | no `-enable` | lib | library or registered by a parent | - |

@@ -1,0 +1,8 @@
+[["emacs-eval", {"expression": "(+ 1 2)"}],
+ ["emacs-eval", {"expression": "(progn (setq anvil-semantic-exclude-patterns nil) (make-directory \"@TMP@/corpus\" t) (with-temp-file \"@TMP@/corpus/s9note.org\" (insert \"* S9 heading\\nThis note mentions the zyxqs9seedword exactly once for the search call.\\nFiller text so the chunk is long enough to be indexed.\\n\")) (with-temp-file \"@TMP@/corpus/other.org\" (insert \"* Other\\nNothing relevant lives in this second file, only plain filler words.\\n\")) \"seeded\")"}],
+ ["emacs-eval-async", {"expression": "(+ 40 2)"}],
+ ["emacs-eval", {"expression": "(sit-for 0.5)"}],
+ ["emacs-eval-jobs", {}],
+ ["semantic-status", {}],
+ ["semantic-reindex", {"root": "@TMP@/corpus"}],
+ ["semantic-search", {"query": "zyxqs9seedword", "mode": "lexical"}]]

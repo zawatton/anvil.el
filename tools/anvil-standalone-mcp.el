@@ -266,6 +266,106 @@ non-positive SECS cannot spin."
                          (if (and (numberp secs) (> secs 0)) secs 1.0))))
       (apply #'run-at-time secs interval function args))))
 
+;; `with-timeout' and `directory-files-recursively' are missing on standalone.
+;; Both are ports of the GNU Emacs definitions (timer.el, files.el).  As in
+;; GNU, the timeout is only noticed while the program waits (sit-for,
+;; accept-process-output, ...); there is no preemption.
+(defvar with-timeout-timers nil
+  "List of all timers used by currently pending `with-timeout' calls.")
+
+(unless (fboundp 'with-timeout)
+  (defmacro with-timeout (list &rest body)
+    "Run BODY, but if it doesn't finish in SECONDS seconds, give up.
+If we give up, we run the TIMEOUT-FORMS and return the value of the last one.
+The timeout is checked only while waiting for external events.
+\n(fn (SECONDS TIMEOUT-FORMS...) BODY)"
+    (declare (indent 1) (debug ((form body) body)))
+    (let ((seconds (car list))
+          (timeout-forms (cdr list))
+          (timeout (make-symbol "timeout")))
+      `(let ((-with-timeout-value-
+              (catch ',timeout
+                (let* ((-with-timeout-timer-
+                        (run-with-timer ,seconds nil
+                                        (lambda () (throw ',timeout ',timeout))))
+                       (with-timeout-timers
+                           (cons -with-timeout-timer- with-timeout-timers)))
+                  (unwind-protect
+                      (progn ,@body)
+                    (cancel-timer -with-timeout-timer-))))))
+         (if (eq -with-timeout-value- ',timeout)
+             (progn ,@timeout-forms)
+           -with-timeout-value-)))))
+
+(unless (fboundp 'directory-files-recursively)
+  (defun directory-files-recursively (dir regexp
+                                          &optional include-directories predicate
+                                          follow-symlinks)
+    "Return list of all files under directory DIR whose names match REGEXP.
+Files are returned depth first, sorted alphabetically within each directory,
+as absolute names.  Directories are included when INCLUDE-DIRECTORIES is
+non-nil.  PREDICATE is nil (descend everywhere), t (ignore unreadable
+subdirectories) or a function called with each subdirectory name.  Symbolic
+links to directories are followed only when FOLLOW-SYMLINKS is non-nil.
+Port of the GNU definition; `file-name-all-completions' is not available on
+standalone, so the directory listing is rebuilt from `directory-files'."
+    (let* ((result nil)
+           (files nil)
+           (dir (directory-file-name dir))
+           ;; Errors for a missing or unreadable DIR propagate, as in GNU;
+           ;; the standalone `directory-files' returns nil for a missing DIR.
+           (_ (unless (file-directory-p dir)
+                (signal 'file-missing
+                        (list "Opening directory"
+                              "No such file or directory" dir))))
+           (names (sort (mapcar
+                         (lambda (f)
+                           (if (file-directory-p (concat dir "/" f))
+                               (concat f "/")
+                             f))
+                         (directory-files dir nil nil t))
+                        #'string<)))
+      (dolist (file names)
+        (unless (member file '("./" "../" "." ".."))
+          (if (eq (aref file (1- (length file))) ?/)
+              (let* ((leaf (substring file 0 (1- (length file))))
+                     (full-file (concat dir "/" leaf)))
+                (when (and (or (not (file-symlink-p full-file))
+                               follow-symlinks)
+                           (or (eq predicate nil)
+                               (eq predicate t)
+                               (funcall predicate full-file)))
+                  (let ((sub-files
+                         (if (eq predicate t)
+                             (condition-case nil
+                                 (directory-files-recursively
+                                  full-file regexp include-directories
+                                  predicate follow-symlinks)
+                               (file-error nil))
+                           (directory-files-recursively
+                            full-file regexp include-directories
+                            predicate follow-symlinks))))
+                    (setq result (nconc result sub-files))))
+                (when (and include-directories
+                           (string-match regexp leaf))
+                  (setq result (nconc result (list full-file)))))
+            (when (string-match regexp file)
+              (push (concat dir "/" file) files)))))
+      (nconc result (nreverse files)))))
+
+;; Small helpers that anvil-eval and anvil-semantic call.
+(unless (fboundp 'file-name-base)
+  (defun file-name-base (&optional filename)
+    "Return the base name of FILENAME: no directory, no extension."
+    (file-name-sans-extension
+     (file-name-nondirectory (or filename buffer-file-name)))))
+
+(unless (fboundp 'time-subtract)
+  (defun time-subtract (a b)
+    "Return A minus B in seconds as a float, which `float-time' accepts.
+Fallback for runtimes without a native `time-subtract'; nil means now."
+    (- (float-time a) (float-time b))))
+
 ;; Load the current provider before Anvil can select a stale .elc.  NeLisp's
 ;; library lookup prefers bytecode independently of load-suffixes.
 (let ((compat-dir (or (getenv "NELISP_EMACS_LIB_DIR")
@@ -627,6 +727,54 @@ non-positive SECS cannot spin."
                     :test #'equal)
         (anvil-server-register-tools "emacs-eval" anvil-manifest--tool-specs))
     (error (push (cons 'anvil-manifest err) anvil-standalone--port8-errors))))
+
+;; Port 9: anvil-eval and anvil-semantic (need the `with-timeout' and
+;; `directory-files-recursively' shims above).  Each loads in its own
+;; condition-case.
+;;  * anvil-eval registers on the server id "anvil", which this loader does not
+;;    serve, and its enable function installs global advice (tool-call timeout,
+;;    org-mode, request mutex, server-execute).  Skip the enable function and
+;;    register four tools on "emacs-eval".  `emacs-eval' evaluates in the
+;;    server process itself, with the same trust as the host tool.
+;;    `nelisp-eval' and `nelisp-eval-reset' are not registered: they need the
+;;    pure-Elisp NeLisp sources (NELISP_ELISP_DIR), which a NeLisp process has
+;;    no use for.
+;;  * anvil-semantic keeps its index under the default
+;;    `user-emacs-directory'.  Point it at the isolated standalone cache before
+;;    registering, and register the tools directly instead of calling
+;;    `anvil-semantic-enable', which would open (and create) the database at
+;;    load time.
+(defvar anvil-standalone--port9-errors nil
+  "Alist of (MODULE . ERROR) for port-9 modules that failed to load.")
+(unless (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
+  (condition-case err
+      (progn
+        (require 'anvil-eval)
+        (dolist (spec '((anvil-eval--sync "emacs-eval" (eval)
+                         "Evaluate an Emacs Lisp expression in the standalone server process and return the printed result.")
+                        (anvil-eval--async "emacs-eval-async" (eval)
+                         "Evaluate an expression asynchronously; returns a job id. The job runs when the server next waits.")
+                        (anvil-eval--result "emacs-eval-result" (eval admin)
+                         "Get the status and result of a job started by emacs-eval-async.")
+                        (anvil-eval--jobs "emacs-eval-jobs" (eval admin)
+                         "List all async eval jobs and their statuses.")))
+          (anvil-server-register-tool
+           (nth 0 spec) :id (nth 1 spec) :intent (nth 2 spec) :layer 'dev
+           :description (nth 3 spec) :server-id "emacs-eval")))
+    (error (push (cons 'anvil-eval err) anvil-standalone--port9-errors)))
+  (condition-case err
+      (progn
+        (require 'anvil-semantic)
+        (setq anvil-semantic-db-path
+              (or (getenv "ANVIL_SEMANTIC_DB")
+                  (expand-file-name
+                   "anvil-standalone/anvil-semantic-index.db"
+                   (or (getenv "XDG_CACHE_HOME")
+                       (expand-file-name ".cache" (or (getenv "HOME") "~"))))))
+        (anvil-semantic--register-tools)
+        ;; Not served: it calls an embedding provider over HTTP.
+        (anvil-server-unregister-tool "semantic-embed-index" "emacs-eval"))
+    (error (push (cons 'anvil-semantic err) anvil-standalone--port9-errors))))
 
 (defun anvil-standalone-start ()
   "Serve the prepared registry, opening databases on first use."

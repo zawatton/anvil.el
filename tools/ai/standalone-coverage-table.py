@@ -18,7 +18,8 @@ LOADED = {"anvil", "anvil-server-commands", "anvil-context", "anvil-context-batc
           "anvil-agent", "anvil-data", "anvil-dev", "anvil-discovery",
           "anvil-harness-telemetry", "anvil-session-store",
           "anvil-bisect", "anvil-cad",
-          "anvil-orchestrator-routing", "anvil-manifest"}
+          "anvil-orchestrator-routing", "anvil-manifest",
+          "anvil-eval", "anvil-semantic"}
 
 # Port candidates (tools register) that a real-call screening rejected:
 # module -> (class, note).  See the doc's "Real-call screening" section.
@@ -36,8 +37,6 @@ SCREENED = {
     "anvil-manifest": ("d", "screened: registers on server-id \"default\"; quoted spec symbols"),
     "anvil-orchestrator-routing": ("d", "screened: `anvil-orchestrator-stats` void (missing require)"),
     "anvil-buffer": ("a", "screened: buffer primitives misbehave after the module loads"),
-    "anvil-eval": ("a", "screened: `with-timeout` void; registers on server-id \"anvil\""),
-    "anvil-semantic": ("a", "screened: reindex needs `directory-files-recursively`"),
     "anvil-fusion-mcp": ("d", "screened: loads with tabulated-list; not ported (ask calls LLMs, poller has no job source)"),
     "anvil-fusion-longrun-mcp": ("d", "screened: loads with tabulated-list; not ported (start/resume spawn workers, poller has no job source)"),
     "anvil-mu4e": ("c", "screened: not called (touches mail)"),
