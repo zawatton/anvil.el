@@ -382,9 +382,304 @@ and tags, then re-align the tags (GNU `org-edit-headline')."
           res)))
     (put 'org-entry-put 'anvil-standalone-padded t)))
 
-;; The capture-time definitions (org-contextualize-keys, org-ts-regexp-inactive,
-;; org-current-time and friends) are not supplied: reading them out of the
-;; vendored org.el at load time hangs the NeLisp HEAD build (S16.2), and the
-;; capture, habit and agenda tools stay unregistered anyway.
+;; Lazy GNU org-capture (S13.8).  Nothing below runs at load time (reading
+;; the vendored org.el at start-up hangs the NeLisp HEAD build, S16.2):
+;; `anvil-standalone-org--ensure-capture' runs on the first org-capture-string
+;; call.  Missing GNU definitions are read from the vendored org.el by name.
+(defun anvil-standalone-org--vendor-dir ()
+  "Return the vendored emacs-lisp directory, or nil."
+  (let* ((compat (or (getenv "NELISP_EMACS_LIB_DIR")
+                     (and (getenv "ANVIL_NOTES_DIR")
+                          (expand-file-name "dev/nelisp-emacs-lib/src"
+                                            (getenv "ANVIL_NOTES_DIR")))))
+         (dir (and compat (expand-file-name "../vendor/emacs-lisp" compat))))
+    (and dir (file-directory-p dir) dir)))
+
+(defun anvil-standalone-org--vendor-def (name files)
+  "Evaluate the first top-level definition of NAME found in FILES."
+  (let ((dir (anvil-standalone-org--vendor-dir)) done)
+    (dolist (f files)
+      (unless done
+        (let ((path (expand-file-name f dir)))
+          (when (file-readable-p path)
+            (with-temp-buffer
+              (insert-file-contents path)
+              (goto-char (point-min))
+              (when (re-search-forward
+                     (concat "^(\\(?:defun\\|defmacro\\|defsubst\\|defvar\\|defcustom\\|defconst\\) "
+                             (regexp-quote name) "[ \n)]")
+                     nil t)
+                (goto-char (match-beginning 0))
+                (let ((form (read (current-buffer))))
+                  (eval form t)
+                  (setq done t))))))))
+    done))
+
+(defvar anvil-standalone-org--capture-ready nil)
+(defvar anvil-standalone-org--capture-active nil
+  "Non-nil while a capture runs on its base buffer instead of an indirect one.")
+
+(defun anvil-standalone-org--ensure-capture ()
+  "Load genuine org-capture and the stand-ins it needs, once."
+  (unless anvil-standalone-org--capture-ready
+    (let ((dir (anvil-standalone-org--vendor-dir)))
+      (unless dir (error "Vendored emacs-lisp directory not found"))
+      (unless (fboundp 'combine-change-calls)
+        (defmacro org-combine-change-calls (_beg _end &rest body)
+          "Run BODY (org-compat.el fallback when `combine-change-calls' is absent)."
+          (declare (indent 2))
+          (cons 'progn body)))
+      (dolist (n '("org-contextualize-keys" "org-overriding-default-time"
+                   "org-current-time" "org-timestamp-rounding-minutes"
+                   "org-extend-today-until" "org-time-stamp-format"
+                   "org-timestamp-formats" "org-kill-is-subtree-p"
+                   "org-get-valid-level" "org-back-over-empty-lines"
+                   "org-up-heading-safe" "org-entry-end-position"
+                   "org-file-contents" "org-today" "org-note-abort"
+                   "org-time-was-given" "org-end-time-was-given"
+                   "org-inhibit-startup" "org-at-table-p"
+                   "org-refile-targets" "org-blank-before-new-entry"
+                   "org-directory" "org-default-notes-file"
+                   "org-complex-heading-regexp-format" "org-tags-history"
+                   "org-adapt-indentation" "org-log-note-clock-out"
+                   "org-reverse-note-order" "org-paste-subtree" "org-markers-to-move"
+                   "org-reinstall-markers-in-region"
+                   "org-save-markers-in-region"
+                   "org-bookmark-names-plist"))
+        (unless (or (fboundp (intern n)) (boundp (intern n)))
+          (anvil-standalone-org--vendor-def
+           n '("org/org.el" "org/org-macs.el" "org/org-compat.el"))))
+      (unless (fboundp 'with-silent-modifications)
+        (anvil-standalone-org--vendor-def "with-silent-modifications"
+                                          '("subr.el")))
+      (unless (fboundp 'restore-buffer-modified-p)
+        (defalias 'restore-buffer-modified-p #'set-buffer-modified-p))
+      ;; Capture-only hooks with nothing to do for a plain entry template.
+      (dolist (fn '(org-update-parent-todo-statistics org-clock-update-mode-line))
+        (unless (fboundp fn) (defalias fn (lambda (&rest _) nil))))
+      (unless (fboundp 'org-clock-is-active)
+        (defalias 'org-clock-is-active (lambda () nil)))
+      (dolist (fn '(font-lock-flush font-lock-ensure font-lock-fontify-buffer
+                    force-mode-line-update redisplay))
+        (unless (fboundp fn) (defalias fn (lambda (&rest _) nil))))
+      ;; GNU moves to the end of the buffer when no visible heading follows;
+      ;; the lightweight commands signal a user-error instead.
+      (dolist (fn '(org-next-visible-heading outline-next-visible-heading))
+        (when (and (fboundp fn) (not (get fn 'anvil-standalone-org)))
+          (let ((orig (symbol-function fn)))
+            (defalias fn
+              (lambda (&rest args)
+                (condition-case err (apply orig args)
+                  (user-error
+                   (if (equal (cadr err) "No next visible heading")
+                       (goto-char (point-max))
+                     (signal (car err) (cdr err)))))))
+            (put fn 'anvil-standalone-org t))))
+      (unless (fboundp 'untabify)
+        (anvil-standalone-org--vendor-def "untabify" '("tabify.el")))
+      (unless (fboundp 'get-file-buffer)
+        (defun get-file-buffer (filename)
+          "Return the buffer visiting FILENAME, or nil."
+          (let ((f (expand-file-name filename)) res)
+            (dolist (b (buffer-list))
+              (when (and (not res) (buffer-file-name b)
+                         (string= (expand-file-name (buffer-file-name b)) f))
+                (setq res b)))
+            res)))
+      (unless (boundp 'kill-ring) (defvar kill-ring nil))
+      (unless (boundp 'kill-ring-yank-pointer) (defvar kill-ring-yank-pointer nil))
+      (defvar org-clock-marker nil)
+      (unless (markerp org-clock-marker) (setq org-clock-marker (make-marker)))
+      (unless (boundp 'org-clock-heading) (defvar org-clock-heading ""))
+      (dolist (spec '((switch-to-buffer-other-window
+                       . (lambda (b &optional _n) (set-buffer (get-buffer-create b))))
+                      (pop-to-buffer
+                       . (lambda (b &rest _) (set-buffer (get-buffer-create b))))
+                      (delete-other-windows . (lambda (&rest _) nil))
+                      (current-window-configuration . (lambda (&rest _) nil))
+                      (set-window-configuration . (lambda (&rest _) nil))))
+        (unless (fboundp (car spec)) (defalias (car spec) (eval (cdr spec) t))))
+      (unless (fboundp 'move-to-column)
+        (defun move-to-column (column &optional force)
+          "Move point to COLUMN in the current line (tabs count `tab-width')."
+          (beginning-of-line)
+          (let ((col 0) (eol (line-end-position)))
+            (while (and (< col column) (< (point) eol))
+              (setq col (if (eq (char-after) ?\t)
+                            (* (1+ (/ col tab-width)) tab-width)
+                          (1+ col)))
+              (forward-char 1))
+            (when (and force (< col column))
+              (insert (make-string (- column col) ?\s))
+              (setq col column))
+            col)))
+      ;; Killing the current buffer must leave another one current.
+      (unless (get 'kill-buffer 'anvil-standalone-org)
+        (defalias 'anvil-standalone-org--kill-buffer-orig
+          (symbol-function 'kill-buffer))
+        (defun kill-buffer (&optional buffer-or-name)
+          "Kill BUFFER-OR-NAME, first switching away when it is current."
+          (let ((buf (if buffer-or-name (get-buffer buffer-or-name)
+                       (current-buffer))))
+            (when (and buf (eq buf (current-buffer)))
+              (set-buffer (get-buffer-create "*scratch*")))
+            (anvil-standalone-org--kill-buffer-orig buf)))
+        (put 'kill-buffer 'anvil-standalone-org t))
+      (let ((load-path (cons (expand-file-name "org" dir) load-path)))
+        (load "org-capture" nil t))
+      (unless (fboundp 'org-capture-finalize)
+        (error "GNU org-capture did not load"))
+      ;; `make-indirect-buffer' returns a dead buffer here, so the capture
+      ;; runs on the base buffer and `buffer-base-buffer' reports the buffer
+      ;; itself while a capture is active.
+      (defalias 'anvil-standalone-org--get-indirect-orig
+        (symbol-function 'org-capture-get-indirect-buffer))
+      (defun org-capture-get-indirect-buffer (&optional buffer _prefix)
+        "Return BUFFER itself: indirect buffers are unavailable here."
+        (setq anvil-standalone-org--capture-active t)
+        (or buffer (current-buffer)))
+      (unless (get 'buffer-base-buffer 'anvil-standalone-org)
+        (let ((orig (symbol-function 'buffer-base-buffer)))
+          (defun buffer-base-buffer (&optional buffer)
+            "Like `buffer-base-buffer'; a capture buffer is its own base."
+            (or (funcall orig buffer)
+                (and anvil-standalone-org--capture-active
+                     (or buffer (current-buffer))))))
+        (put 'buffer-base-buffer 'anvil-standalone-org t))
+      (setq anvil-standalone-org--capture-ready t))))
+
+;; The lightweight `org-entry-get' ignores a planning line before the property
+;; drawer and the SCHEDULED/DEADLINE/CLOSED pseudo-properties; org-habit needs
+;; both.  This stand-in is swapped in only while a habit call runs.
+(defun anvil-standalone-org--entry-get (pom property &optional _inherit _literal-nil)
+  "Return PROPERTY of the entry at POM, reading the planning line and drawer."
+  (save-excursion
+    (when pom (goto-char pom))
+    (org-back-to-heading t)
+    (let* ((end (save-excursion
+                  (forward-line 1)
+                  (if (re-search-forward "^\\*+ " nil t)
+                      (match-beginning 0) (point-max))))
+           (case-fold-search t)
+           (name (upcase property)))
+      (forward-line 1)
+      (let ((plan (and (< (point) end)
+                       (looking-at "^[ \t]*\\(?:SCHEDULED\\|DEADLINE\\|CLOSED\\):")
+                       (buffer-substring-no-properties
+                        (point) (line-end-position)))))
+        (when plan (forward-line 1))
+        (if (member name '("SCHEDULED" "DEADLINE" "CLOSED"))
+            (and plan
+                 (string-match (concat name ": *\\([[<][^]>]*[]>]\\)") plan)
+                 (match-string 1 plan))
+          (when (and (< (point) end)
+                     (looking-at "^[ \t]*:PROPERTIES:[ \t]*$"))
+            (forward-line 1)
+            (let (val done)
+              (while (and (not done) (< (point) end)
+                          (not (looking-at "^[ \t]*:END:[ \t]*$")))
+                (when (looking-at (concat "^[ \t]*:" (regexp-quote name)
+                                          ":[ \t]*\\(.*?\\)[ \t]*$"))
+                  (setq val (match-string-no-properties 1) done t))
+                (forward-line 1))
+              val)))))))
+
+;; Lazy GNU org-habit (S13.8): same pattern, first org-habit-summary call.
+(defvar anvil-standalone-org--habit-ready nil)
+
+(defun anvil-standalone-org--done-keywords ()
+  "Return the done keywords of `org-todo-keywords' (GNU keeps them per buffer)."
+  (let (res)
+    (dolist (seq org-todo-keywords)
+      (when (consp seq)
+        (let* ((words (mapcar (lambda (w)
+                                (if (string-match "\\`\\([^(@!/]+\\)" w)
+                                    (match-string 1 w) w))
+                              (cdr seq)))
+               (bar (member "|" words)))
+          (setq res (append res (if bar (cdr bar)
+                                  (last words)))))))
+    res))
+
+(defun anvil-standalone-org--ensure-habit ()
+  "Load genuine org-habit and the org.el definitions it needs, once."
+  (unless anvil-standalone-org--habit-ready
+    (let ((dir (anvil-standalone-org--vendor-dir)))
+      (unless dir (error "Vendored emacs-lisp directory not found"))
+      (dolist (n '("org-heading-regexp" "org-ts--internal-regexp" "org-ts-regexp" "org-ts-regexp-inactive"
+                   "org-ts-regexp-both" "org-ts-regexp0"
+                   "org-log-note-headings" "org-log-states-order-reversed"
+                   "org-repeat-re" "org-get-repeat" "org-time-string-to-time"
+                   "org-entry-end-position"
+                   "org-today"))
+        (unless (or (fboundp (intern n)) (boundp (intern n)))
+          (anvil-standalone-org--vendor-def
+           n '("org/org.el" "org/org-macs.el" "org/org-compat.el"))))
+      (unless (boundp 'org-done-keywords) (defvar org-done-keywords nil))
+      ;; The genuine org-heading-components needs org-complex-heading-regexp and
+      ;; org-fold-core; org-habit reads only the headline text (element 4).
+      (unless (fboundp 'org-heading-components)
+        (defun org-heading-components ()
+          "Return (LEVEL LEVEL TODO PRIORITY HEADLINE TAGS) of the heading at point."
+          (save-excursion
+            (org-back-to-heading t)
+            (list (org-current-level) (org-current-level)
+                  (org-get-todo-state) nil (org-get-heading t t t t) nil))))
+      ;; org-habit only needs org-agenda for its graph code, not for parsing.
+      (unless (featurep 'org-agenda) (provide 'org-agenda))
+      (unless (fboundp 'display-color-cells)
+        (defalias 'display-color-cells (lambda (&optional _frame) 16777216)))
+      ;; Its last form binds a key in the agenda map; there is no agenda here.
+      (unless (fboundp 'org-defkey)
+        (defalias 'org-defkey (lambda (&rest _) nil)))
+      (unless (boundp 'org-agenda-mode-map) (defvar org-agenda-mode-map nil))
+      (let ((load-path (cons (expand-file-name "org" dir) load-path)))
+        (load "org-habit" nil t))
+      (unless (fboundp 'org-habit-parse-todo)
+        (error "GNU org-habit did not load"))
+      (setq anvil-standalone-org--habit-ready t))))
+
+(defun anvil-standalone-org-install-lazy-wrappers ()
+  "Wrap the capture tool handler so GNU org-capture loads on first use."
+  (when (and (fboundp 'anvil-org--tool-capture-string)
+             (not (get 'anvil-org--tool-capture-string 'anvil-standalone-lazy)))
+    (let ((orig (symbol-function 'anvil-org--tool-capture-string))
+          (doc (documentation 'anvil-org--tool-capture-string t)))
+      (defalias 'anvil-standalone-org--capture-orig orig)
+      (eval `(defun anvil-org--tool-capture-string
+                 (keys content &optional allow_unvalidated_target)
+               ,doc
+               (anvil-standalone-org--ensure-capture)
+               (unwind-protect
+                   (anvil-standalone-org--capture-orig
+                    keys content allow_unvalidated_target)
+                 (setq anvil-standalone-org--capture-active nil)))
+            t))
+    (put 'anvil-org--tool-capture-string 'anvil-standalone-lazy t))
+  (when (and (fboundp 'anvil-org--tool-habit-summary)
+             (not (get 'anvil-org--tool-habit-summary 'anvil-standalone-lazy)))
+    (let ((orig (symbol-function 'anvil-org--tool-habit-summary))
+          (doc (documentation 'anvil-org--tool-habit-summary t)))
+      (defalias 'anvil-standalone-org--habit-orig orig)
+      (eval `(defun anvil-org--tool-habit-summary (&optional files_json today)
+               ,doc
+               (anvil-standalone-org--ensure-habit)
+               (let ((org-done-keywords (anvil-standalone-org--done-keywords))
+                     (saved (mapcar (lambda (f) (cons f (symbol-function f)))
+                                    '(org-entry-get org-get-scheduled-time))))
+                 (unwind-protect
+                     (progn
+                       (defalias 'org-entry-get
+                         #'anvil-standalone-org--entry-get)
+                       (defalias 'org-get-scheduled-time
+                         (lambda (pom &optional _inherit)
+                           (let ((ts (anvil-standalone-org--entry-get
+                                      pom "SCHEDULED")))
+                             (and ts (org-time-string-to-time ts)))))
+                       (anvil-standalone-org--habit-orig files_json today))
+                   (dolist (c saved) (defalias (car c) (cdr c)))))) 
+            t))
+    (put 'anvil-org--tool-habit-summary 'anvil-standalone-lazy t)))
+
 (provide 'anvil-standalone-org)
 ;;; anvil-standalone-org.el ends here

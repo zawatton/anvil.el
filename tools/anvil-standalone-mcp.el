@@ -964,17 +964,17 @@ Also called lazily by the context worker, because some anvil-defs paths
     (error (push (cons 'anvil-sexp err) anvil-standalone--port10-errors))))
 
 (defvar anvil-standalone--port11-unregister
-  '("org-capture-string" "org-habit-summary" "org-agenda-view")
+  '("org-agenda-view")
   "Ids of anvil-org tools that still answer differently from host Emacs.
 org-read-outline/headline/by-id, org-edit-body, org-rename-headline,
-org-add-todo and org-update-todo-state match the host since
-`anvil-standalone-org.el' supplies the missing GNU functions.  Still blocked:
-org-capture-string (the genuine org-capture needs many more org.el variables
-and functions: after org-contextualize-keys, window-configuration and time
-variables it stops at the void variable `org-directory'), org-habit-summary and
-org-agenda-view (the genuine org-habit and org-agenda need the whole of
-org.el, e.g. `org-ts-regexp-inactive' and the timestamp machinery, and
-org-agenda-list/org-habit-parse-todo are missing).")
+org-add-todo, org-update-todo-state, org-capture-string and org-habit-summary
+match the host since `anvil-standalone-org.el' supplies the missing GNU
+functions (the genuine org-capture.el and org-habit.el are loaded on the first
+call of their tool, with the base buffer standing in for the dead
+`make-indirect-buffer').  Still blocked: org-agenda-view.  The genuine
+org-agenda.el needs org-element (`org-element-deferred-create' is void after
+`seq-difference' is shimmed) plus org-agenda-list and the calendar/diary
+machinery, none of which exist in this runtime.")
 ;; Port 11: anvil-org.  Its requires need several GNU facilities that standalone
 ;; lacks; each shim below is fboundp/boundp guarded and copies GNU source.
 ;;  * `version<' and friends: copied from GNU subr.el (the whole vendor subr.el
@@ -993,8 +993,8 @@ org-agenda-list/org-habit-parse-todo are missing).")
 ;;    org-get-todo-config, org-get-tag-config, plus (wave 2, shims in
 ;;    tools/anvil-standalone-org.el) org-read-outline, org-read-headline and
 ;;    org-read-by-id, org-edit-body, org-rename-headline, org-add-todo and
-;;    org-update-todo-state.  The other three are unregistered in
-;;    `anvil-standalone--port11-unregister'.
+;;    org-update-todo-state, org-capture-string and org-habit-summary.  Only
+;;    org-agenda-view is unregistered in `anvil-standalone--port11-unregister'.
 ;;  * tools/anvil-standalone-org.el is a separate file (loaded relative to the
 ;;    loader) so the many GNU Org shims stay out of this long loader; all are
 ;;    fboundp/boundp guarded.
@@ -1246,6 +1246,7 @@ org-agenda-list/org-habit-parse-todo are missing).")
               (require 'rx)
               (require 'anvil-org)
               (anvil-org-enable)
+              (anvil-standalone-org-install-lazy-wrappers)
               (dolist (id anvil-standalone--port11-unregister)
                 (anvil-server-unregister-tool id "emacs-eval")))
           (error (push (cons 'anvil-org err) anvil-standalone--port11-errors)))
@@ -1309,19 +1310,23 @@ Port 21 reports the signal a process died of.")
 ;;  * anvil-disclosure: only the tools that read caller-given files or the
 ;;    isolated org index are registered here.
 ;;  * anvil-bench: `(require 'profiler)' fails (no profiler.el), so the feature
-;;    is declared only while the module loads.  bench-profile-expr stays out.
+;;    is declared only while the module loads.  bench-profile-expr runs with
+;;    no sampler (empty :top, see `anvil-standalone--port13-unregister').
 ;;  * anvil-org-index: DB path moved to the isolated cache; `message' is muted
 ;;    around the handlers because on NeLisp it writes to the MCP channel.
 (defvar anvil-standalone--port13-errors nil
   "Alist of (MODULE . ERROR) for port-13 modules that failed to load.")
 (defvar anvil-standalone--port13-unregister
-  '("bench-profile-expr" "org-index-rebuild")
+  '("org-index-rebuild")
   "Port-13 tool ids registered by their module but not served.
-bench-profile-expr: standalone has no sampling profiler (`profiler-start' is
-void), so the :top list is empty where the host reports frames.
 org-index-rebuild: an offload tool; the offload worker reports
 `void-function anvil-org-index--tool-rebuild' because standalone has no worker
-Emacs that can load the module.")
+Emacs that can load the module.
+bench-profile-expr is served (S14.6): the module wraps `profiler-start' in
+`ignore-errors', so without a sampling profiler it reports the timed loop
+with an empty :top and :total-samples 0, the host answer for an expression
+too short to be sampled.  Sampled frames are timing-dependent on the host and
+are not produced here.")
 ;; Not registered, with the first blocker (checked 2026-11-03):
 ;;  * ert-run-distilled: anvil-elisp fails to load (eager macro-expansion failure,
 ;;    pcase pattern with branch-local bindings) and shell-quote-argument is void.
@@ -1437,10 +1442,7 @@ the tool parameters from the handler arglist, so a `&rest' wrapper will not do."
   "Alist of (MODULE . ERROR) for port-14 modules that failed to load.")
 (defvar anvil-standalone--port14-unregister nil
   "Port-14 tool ids that stay unregistered, with the first blocker.
-bench-profile-expr: standalone has no sampling profiler (`profiler-start' is
-void), so the :top list would be empty where the host reports sampled frames.
-Registering it would hand back a faked answer, so it stays out until the
-runtime grows a profiler.")
+None: bench-profile-expr moved to the served set (see Port 13).")
 (defun anvil-standalone--port14-cache-dir ()
   "Return the isolated standalone cache directory."
   (expand-file-name
@@ -2635,19 +2637,14 @@ None: the ten git tools give the host answers on the fixture.")
 ;;    per-symbol load-history entries record).
 ;;  * `documentation-property' returns the property, or the docstring read
 ;;    from that source form for `variable-documentation'.
-;; Not served: elisp-ert-run and bench-profile-expr (blockers in
-;; `anvil-standalone--port20-unregister').  elisp-byte-compile-file and
-;; ert-run-distilled run a fresh host GNU Emacs batch process.
+;; S14.6: elisp-ert-run runs the genuine vendored GNU ert.el in-process (loaded
+;; on first use, see `anvil-standalone--ensure-gnu-ert'); bench-profile-expr
+;; is served by Port 13.  elisp-byte-compile-file and ert-run-distilled run a
+;; fresh host GNU Emacs batch process.
 (defvar anvil-standalone--port20-errors nil
   "Alist of (MODULE . ERROR) for port-20 modules that failed to load.")
-(defvar anvil-standalone--port20-unregister '("elisp-ert-run")
-  "Port-20 tool ids that stay unregistered.
-elisp-ert-run: the runtime ert is the reduced nelisp-emacs-lib one (no
-`ert-run-test', no `ert--test' property), so it reports 0 tests and the GNU
-failure plist (:form/:value condition, backtrace frames) cannot be produced;
-vendored GNU ert.el needs find-func, backtrace, ewoc and `source-directory'.
-bench-profile-expr is not loaded: no `profiler-cpu-start', and the host answer
-is a timing-dependent sample list.")
+(defvar anvil-standalone--port20-unregister nil
+  "Port-20 tool ids that stay unregistered.  None: every anvil-elisp tool is served.")
 (defconst anvil-standalone--source-defun-heads
   '("defun" "defmacro" "defsubst" "cl-defun" "cl-defmacro" "cl-defsubst"
     "define-minor-mode" "define-derived-mode" "defalias" "ert-deftest")
@@ -2785,6 +2782,74 @@ MCP Parameters:
        :server-id "emacs-eval"
        :description (plist-get old :description)
        :read-only nil))))
+;; elisp-ert-run (S14.6): the runtime ships the reduced nelisp-emacs-lib ert
+;; (no `ert-run-test'), so the tool would report 0 tests.  The genuine vendored
+;; GNU ert.el is loaded on first use instead (never at loader start: a vendor
+;; read at load time must stay out of the startup path).  It loads once these
+;; small stand-ins exist: `source-directory' (debug.el, find-func.el), an empty
+;; `prog-mode-map', the
+;; font-lock keyword variables debug.el/backtrace.el only mention, and
+;; `messages-buffer' and `message-log-max'.  The runtime's `buffer-substring' rejects a marker
+;; argument, which ert.el uses to cut the messages log, so it is wrapped to
+;; accept markers.  The tests then run in this process like on the host.
+(defun anvil-standalone--ensure-gnu-ert ()
+  "Load the vendored GNU ert.el once, replacing the reduced runtime ert."
+  (unless (fboundp 'ert-run-test)
+    (unless (boundp 'source-directory)
+      (defvar source-directory "/usr/share/emacs/"))
+    (dolist (var '(lisp-el-font-lock-keywords-for-backtraces
+                   lisp-el-font-lock-keywords-for-backtraces-1
+                   lisp-el-font-lock-keywords-for-backtraces-2))
+      (unless (boundp var) (set var nil)))
+    (unless (boundp 'message-log-max)
+      (defvar message-log-max 1000))
+    (unless (fboundp 'messages-buffer)
+      (defun messages-buffer ()
+        "Return the *Messages* buffer, creating it if needed."
+        (get-buffer-create "*Messages*")))
+    (unless (get 'buffer-substring 'anvil-standalone-port20)
+      (let ((probe (condition-case nil
+                       (with-temp-buffer
+                         (insert "ab")
+                         (buffer-substring (copy-marker 1) (point-max))
+                         t)
+                     (error nil))))
+        (unless probe
+          (defalias 'anvil-standalone--buffer-substring-orig
+            (symbol-function 'buffer-substring))
+          (defun buffer-substring (start end)
+            "Like `buffer-substring', but START and END may be markers."
+            (anvil-standalone--buffer-substring-orig
+             (if (markerp start) (marker-position start) start)
+             (if (markerp end) (marker-position end) end)))))
+      (put 'buffer-substring 'anvil-standalone-port20 t))
+    (let ((dir (let ((bt (locate-library "backtrace")))
+                 (and bt (file-name-directory bt)))))
+      (unless (and dir (file-readable-p (expand-file-name "ert.el" dir)))
+        (error "Vendored GNU ert.el not found"))
+      (setq features (delq 'ert features))
+      ;; DIR goes last so the runtime's own lisp-mode etc. win over the
+      ;; vendored ones that backtrace.el requires.
+      (let ((load-path (append load-path (list dir))))
+        (unless (boundp 'prog-mode-map)
+          (defvar prog-mode-map (make-sparse-keymap)))
+        (dolist (lib '("debug" "backtrace" "find-func"))
+          (load (expand-file-name (concat lib ".el") dir) nil t))
+        (load (expand-file-name "ert.el" dir) nil t)))
+    (unless (fboundp 'ert-run-test)
+      (error "GNU ert.el did not load"))))
+(defun anvil-standalone--wrap-ert-run ()
+  "Make `anvil-elisp--ert-run' load GNU ert first, keeping its MCP signature."
+  (unless (get 'anvil-elisp--ert-run 'anvil-standalone-port20)
+    (let ((orig (symbol-function 'anvil-elisp--ert-run))
+          (doc (documentation 'anvil-elisp--ert-run t)))
+      (defalias 'anvil-standalone--ert-run-orig orig)
+      (eval `(defun anvil-elisp--ert-run (file &optional selector fresh)
+               ,doc
+               (anvil-standalone--ensure-gnu-ert)
+               (anvil-standalone--ert-run-orig file selector fresh))
+            t))
+    (put 'anvil-elisp--ert-run 'anvil-standalone-port20 t)))
 ;; GNU facilities anvil-elisp reads: the custom-variable test, the package
 ;; directory list and the (already active, in batch) auto-compression mode.
 (unless (fboundp 'custom-variable-p)
@@ -2812,6 +2877,7 @@ MCP Parameters:
             (when subr
               (setq anvil-elisp--system-lisp-dir (file-name-directory subr)))))
         (anvil-standalone--wrap-ert-distilled)
+        (anvil-standalone--wrap-ert-run)
         (anvil-elisp-enable)
         (anvil-standalone--reregister-byte-compile)
         (dolist (id anvil-standalone--port20-unregister)

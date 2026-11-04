@@ -87,5 +87,36 @@
   {
    "file": "@TMP@/fix.org"
   }
+ ],
+ [
+  "emacs-eval",
+  {
+   "expression": "(progn (with-temp-file \"@TMP@/cap.org\" (insert \"#+TITLE: cap\\n* TODO Existing\\n\")) (setq anvil-org-allowed-files (list \"@TMP@/fix.org\" \"@TMP@/cap.org\")) (setq org-directory \"@TMP@\") (setq org-capture-templates '((\"t\" \"Task\" entry (file \"@TMP@/cap.org\") \"* TODO %i\\n:PROPERTIES:\\n:CREATED: x\\n:END:\\n\"))) \"cap-seeded\")"
+  }
+ ],
+ [
+  "org-capture-string",
+  {
+   "keys": "t",
+   "content": "Captured thing"
+  }
+ ],
+ [
+  "org-read-file",
+  {
+   "file": "@TMP@/cap.org"
+  }
+ ],
+ [
+  "emacs-eval",
+  {
+   "expression": "(progn (with-temp-file \"@TMP@/hab.org\" (insert \"#+TITLE: habits\\n* TODO Water plants\\nSCHEDULED: <2026-11-01 Sun .+2d>\\n:PROPERTIES:\\n:STYLE: habit\\n:LAST_REPEAT: [2026-10-30 Fri 10:00]\\n:END:\\n:LOGBOOK:\\n- State \\\"DONE\\\"       from \\\"TODO\\\"       [2026-10-30 Fri 10:00]\\n- State \\\"DONE\\\"       from \\\"TODO\\\"       [2026-10-28 Wed 10:00]\\n- State \\\"DONE\\\"       from \\\"TODO\\\"       [2026-10-26 Mon 10:00]\\n:END:\\n* TODO Plain task\\nSCHEDULED: <2026-11-02 Mon>\\n\")) (setq anvil-org-allowed-files (list \"@TMP@/hab.org\")) \"hab-seeded\")"
+  }
+ ],
+ [
+  "org-habit-summary",
+  {
+   "today": "2026-11-03"
+  }
  ]
 ]
