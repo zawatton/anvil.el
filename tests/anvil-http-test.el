@@ -247,6 +247,16 @@ in a fake url-retrieve."
     (should-not (anvil-http--cache-get
                  (anvil-http--normalize-url "https://example.com/a")))))
 
+(ert-deftest anvil-http-test-cache-clear-tool-returns-plist ()
+  "The MCP handler wraps the row count; a bare integer is rejected by MCP."
+  (anvil-http-test--with-stub
+      (list (anvil-http-test--response 200 nil "body"))
+    (anvil-http-get "https://example.com/page" :cache-ttl-sec 600)
+    (should (equal '(:removed 1)
+                   (anvil-http--tool-cache-clear "https://example.com/page")))
+    (should (equal '(:removed 0)
+                   (anvil-http--tool-cache-clear "https://example.com/none")))))
+
 ;;;; --- MCP tool argument coercion -----------------------------------------
 
 (ert-deftest anvil-http-test-tool-fetch-coerces-string-timeout ()

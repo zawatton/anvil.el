@@ -968,13 +968,17 @@ Also called lazily by the context worker, because some anvil-defs paths
     (error (push (cons 'anvil-sexp err) anvil-standalone--port10-errors))))
 
 (defvar anvil-standalone--port11-unregister
-  '("org-read-outline" "org-read-headline" "org-read-by-id" "org-edit-body"
-    "org-rename-headline" "org-add-todo" "org-update-todo-state"
-    "org-capture-string" "org-habit-summary" "org-agenda-view")
-  "Ids of anvil-org tools that answered differently from host Emacs.
-Standalone has only the lightweight Org subset: `org-current-level',
-`org-outline-level', `org-back-to-heading' and friends, the capture and
-agenda machinery, and `user-init-file' are missing, so these tools signal.")
+  '("org-capture-string" "org-habit-summary" "org-agenda-view")
+  "Ids of anvil-org tools that still answer differently from host Emacs.
+org-read-outline/headline/by-id, org-edit-body, org-rename-headline,
+org-add-todo and org-update-todo-state match the host since
+`anvil-standalone-org.el' supplies the missing GNU functions.  Still blocked:
+org-capture-string (the genuine org-capture needs many more org.el variables
+and functions: after org-contextualize-keys, window-configuration and time
+variables it stops at the void variable `org-directory'), org-habit-summary and
+org-agenda-view (the genuine org-habit and org-agenda need the whole of
+org.el, e.g. `org-ts-regexp-inactive' and the timestamp machinery, and
+org-agenda-list/org-habit-parse-todo are missing).")
 ;; Port 11: anvil-org.  Its requires need several GNU facilities that standalone
 ;; lacks; each shim below is fboundp/boundp guarded and copies GNU source.
 ;;  * `version<' and friends: copied from GNU subr.el (the whole vendor subr.el
@@ -990,8 +994,14 @@ agenda machinery, and `user-init-file' are missing, so these tools signal.")
 ;;  * Tools screened by real call against host Emacs 31.1 (see S11 in
 ;;    tools/ai/anvil-standalone-coverage-progress.org).  Registered (same
 ;;    answer as host on the fixture): org-read-file, org-get-allowed-files,
-;;    org-get-todo-config, org-get-tag-config.  The other ten are unregistered
-;;    below.
+;;    org-get-todo-config, org-get-tag-config, plus (wave 2, shims in
+;;    tools/anvil-standalone-org.el) org-read-outline, org-read-headline and
+;;    org-read-by-id, org-edit-body, org-rename-headline, org-add-todo and
+;;    org-update-todo-state.  The other three are unregistered in
+;;    `anvil-standalone--port11-unregister'.
+;;  * tools/anvil-standalone-org.el is a separate file (loaded relative to the
+;;    loader) so the many GNU Org shims stay out of this long loader; all are
+;;    fboundp/boundp guarded.
 ;;  * File access: `anvil-org-allowed-files' defaults to nil with
 ;;    `anvil-org-allowed-files-enabled' t, so the tools see no file unless the
 ;;    caller configures it; the agenda/habit tools take their files from that
@@ -1229,6 +1239,9 @@ agenda machinery, and `user-init-file' are missing, so these tools signal.")
           (concat tmp str))))
     (add-to-list 'load-path (expand-file-name "org" vendor) t)
     (add-to-list 'load-path (expand-file-name "emacs-lisp" vendor) t)
+    (load (expand-file-name "anvil-standalone-org.el"
+                            (file-name-directory (or load-file-name buffer-file-name)))
+          nil t)
     (when fake-url-util (provide 'url-util))
     (unwind-protect
         (condition-case err
@@ -1685,19 +1698,20 @@ MCP Parameters:
                program infile destination display args)
       (apply #'anvil-standalone--call-process-orig
              program infile "/dev/null" display args))))
+(defvar anvil-standalone--syntax-fns
+  '(char-syntax standard-syntax-table make-syntax-table copy-syntax-table
+    string-to-syntax modify-syntax-entry syntax-table set-syntax-table
+    parse-partial-sexp)
+  "GNU syntax-table names that emacs-syntax-table.el defines.")
+(defvar anvil-standalone--provider-syntax-fns nil
+  "Alist of (NAME . provider definition) from emacs-syntax-table.el.")
 (defvar anvil-standalone--port17-errors nil
   "Alist of (MODULE . ERROR) for port-17 modules that failed to load.")
 (defvar anvil-standalone--port17-unregister
-  '("http-fetch-batch" "http-cache-clear" "web-reddit-thread"
-    "semantic-embed-index")
+  nil
   "Port-17 tool ids registered by their module but not served, with blockers.
-http-fetch-batch: host `emacs --batch' stdio hangs on it, so no host answer to
-match.  http-cache-clear: the host handler returns an integer that the MCP
-layer rejects, so there is no OK reply to compare.  web-reddit-thread: the
-comment list comes back null on standalone (host gives the comments; the
-`cl-loop for c across' in the comment normaliser).  semantic-embed-index: the
-fixture screening embedded 0 chunks on both sides, so the HTTP embedding path
-is unscreened.")
+None: http-fetch-batch, http-cache-clear, web-reddit-thread and
+semantic-embed-index give the host answers on the S13.7 fixture.")
 (unless (or (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
             (not (or (getenv "NELISP_EMACS_LIB_DIR")
                      (getenv "ANVIL_NOTES_DIR"))))
@@ -1707,14 +1721,21 @@ is unscreened.")
          (vendor (expand-file-name "../vendor/emacs-lisp" compat-dir)))
     (condition-case err
         (progn
-          (let ((orig-make-syntax-table
-                 (and (fboundp 'make-syntax-table)
-                      (symbol-function 'make-syntax-table))))
+          ;; The provider's syntax-table functions (char-table backed) must
+          ;; not be mixed with the runtime's: provider modify-syntax-entry on
+          ;; a runtime table breaks sexp-replace-defun (arrayp (1)).  Keep the
+          ;; runtime set globally and use the provider set only while the url
+          ;; stack loads (rfc2047 calls set-char-table-range on a fresh table).
+          (let ((saved (mapcar (lambda (f)
+                                 (cons f (and (fboundp f) (symbol-function f))))
+                               anvil-standalone--syntax-fns)))
             (load (expand-file-name "emacs-syntax-table.el" compat-dir) t t)
-            ;; The provider's make-syntax-table (char-table backed) hangs
-            ;; orchestrator-collect; keep the runtime definition.
-            (when orig-make-syntax-table
-              (fset 'make-syntax-table orig-make-syntax-table)))
+            (setq anvil-standalone--provider-syntax-fns
+                  (mapcar (lambda (f)
+                            (cons f (and (fboundp f) (symbol-function f))))
+                          anvil-standalone--syntax-fns))
+            (dolist (s saved)
+              (when (cdr s) (fset (car s) (cdr s)))))
           ;; emacs-parity-fns2.el may fail late on a vc-hooks require after
           ;; defining coding-system-list; that tail error is ignored.
           (dolist (f '("emacs-cc-coding-1.el" "emacs-cc-coding-2.el"
@@ -2279,16 +2300,43 @@ is unscreened.")
   (let ((compat-dir (or (getenv "NELISP_EMACS_LIB_DIR")
                         (expand-file-name "dev/nelisp-emacs-lib/src"
                                           (getenv "ANVIL_NOTES_DIR"))))
-        (old-loop (symbol-function 'cl-loop)))
+        (old-loop (symbol-function 'cl-loop))
+        (old-syntax (mapcar (lambda (f)
+                              (cons f (and (fboundp f) (symbol-function f))))
+                            anvil-standalone--syntax-fns))
+        ;; nelisp-http requires nelisp-process, whose cl-defstruct accessor
+        ;; `nelisp-process-status' and `nelisp-make-process' replace the
+        ;; runtime natives that `process-status' and `make-process' use;
+        ;; orchestrator-collect then never sees its task exit.  Keep them.
+        (natives (delq nil (mapcar (lambda (f)
+                                     (and (fboundp f)
+                                          (cons f (symbol-function f))))
+                                   '(nelisp-process-status
+                                     nelisp-make-process))))
+        ;; url pulls in GNU time-date.el, whose `date-to-time' fails on this
+        ;; runtime for the form the journal shim (Port 15) handles.
+        (old-d2t (and (fboundp 'date-to-time)
+                      (symbol-function 'date-to-time))))
     (unwind-protect
         (progn
           (fmakunbound 'cl-loop)
+          (dolist (p anvil-standalone--provider-syntax-fns)
+            (when (cdr p) (fset (car p) (cdr p))))
           (load (expand-file-name "emacs-cl-macros.el" compat-dir) t t)
           (dolist (f '(mail-utils url-cache url-handlers url url-http anvil-http anvil-web
                        anvil-uri anvil-semantic))
             (condition-case err (require f)
               (error (push (cons f err) anvil-standalone--port17-errors)))))
-      (fset 'cl-loop old-loop))))
+      (fset 'cl-loop old-loop)
+      (dolist (o old-syntax)
+        (if (cdr o) (fset (car o) (cdr o)) (fmakunbound (car o))))
+      (dolist (n natives) (fset (car n) (cdr n)))
+      (when (and old-d2t (not (eq old-d2t (symbol-function 'date-to-time))))
+        (let ((gnu (symbol-function 'date-to-time)))
+          (fset 'date-to-time
+                (lambda (date)
+                  (condition-case nil (funcall old-d2t date)
+                    (error (funcall gnu date))))))))))
 ;; `defvar-local' (and `make-variable-buffer-local') is a no-op on this runtime:
 ;; `(setq V X)' in another buffer writes the global value instead of creating a
 ;; buffer-local one (probe: `(defvar-local zz nil) (with-temp-buffer (setq zz 5)
@@ -2348,6 +2396,10 @@ is unscreened.")
 ;; runtime has no gnutls, and GNU answers nil without TLS support.
 (unless (fboundp 'gnutls-available-p)
   (defun gnutls-available-p () nil))
+;; Likewise no libxml: GNU built without it answers nil (dom/shr callers and
+;; anvil-claude-watchdog probe it once the url stack is loaded).
+(unless (fboundp 'libxml-available-p)
+  (defun libxml-available-p () nil))
 ;; Second runtime gap: with a dynamic `let' binding of V active, a `setq' of V
 ;; made inside `with-current-buffer' on a buffer holding a local V writes the
 ;; let-bound value, not the local one (probe in u5.el: local-variable-p t, but
@@ -2364,6 +2416,21 @@ is unscreened.")
         (with-current-buffer buf
           (set (nelisp-buffer-local-make 'url-current-object) url)))
       buf)))
+;; Third runtime gap: url-queue's concurrent url-http jobs share the url-http
+;; state (`url-http-target-url' and the response buffer are not per-job), so two
+;; queued fetches both answered with the last job's final URL and the first
+;; callback's slot stayed empty.  `anvil-http--request-async' is the documented
+;; seam (its docstring: tests stub it to call CALLBACK synchronously); serve it
+;; with one synchronous fetch per URL, which `http-fetch' already proves works.
+(when (and (featurep 'anvil-http) (fboundp 'anvil-http--request))
+  (defun anvil-http--request-async (url extra-headers timeout callback)
+    "Fetch URL synchronously and call CALLBACK with the response plist.
+CALLBACK gets (:status :headers :body :final-url) or (:error STRING)."
+    (funcall callback
+             (condition-case err
+                 (anvil-http--request "GET" url extra-headers
+                                      (or timeout anvil-http-timeout-sec))
+               (error (list :error (format "%S" (cdr err))))))))
 (unless (or (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
             (not (featurep 'anvil-http)))
   (condition-case err
@@ -2383,6 +2450,101 @@ is unscreened.")
         (dolist (id anvil-standalone--port17-unregister)
           (anvil-server-unregister-tool id "emacs-eval")))
     (error (push (cons 'register err) anvil-standalone--port17-errors))))
+
+;; Port 18: anvil-buffer (S13.5): buffer-read, buffer-save, buffer-list-modified.
+;; Tools are screened by real call against host `emacs --batch -Q' on a temp
+;; fixture file (see S13.5 in tools/ai/anvil-standalone-coverage-progress.org).
+;; The runtime has no visited-file modtime primitives, which anvil-disk's
+;; divergence classifier and `anvil-buffer-save' use.  The shims below are
+;; fboundp-guarded and keep the modtime per buffer in a side table:
+;;  * `set-visited-file-modtime' records the file's current mtime (or TIME);
+;;    `visited-file-modtime' returns it, or 0 when none is recorded (GNU);
+;;    `verify-visited-file-modtime' compares it with the file's mtime.
+;;  * `position-bytes' is the GNU 1-based byte position of a character
+;;    position (the module only uses the difference of two).
+;;  * The Port 15 `find-file-noselect' shim sets `buffer-file-name' globally
+;;    (no buffer-local binding) and records no modtime; it is replaced once by a
+;;    version that localises the variable, records the modtime, leaves the
+;;    buffer unmodified and reuses a buffer already visiting the file.
+(defvar anvil-standalone--port18-errors nil
+  "Alist of (MODULE . ERROR) for port-18 modules that failed to load.")
+(defvar anvil-standalone--port18-unregister nil
+  "Port-18 tool ids that stay unregistered, with the first blocker.
+None: buffer-read, buffer-save and buffer-list-modified give the host answers
+on the fixture.")
+(defvar anvil-standalone--visited-modtimes (make-hash-table :test 'eq)
+  "Buffer -> recorded visited-file modification time.")
+;;  * `buffer-file-name' is a stub here (the variable is set, the function always
+;;    returns nil and rejects a BUFFER argument) and `find-buffer-visiting' is a
+;;    nil stub; both are replaced once by definitions that read the variable.
+(unless (boundp 'anvil-standalone--port18-visiting)
+  (defvar anvil-standalone--port18-visiting t)
+  (defun buffer-file-name (&optional buffer)
+    "Return the file visited by BUFFER (default: current buffer), or nil."
+    (condition-case nil
+        (with-current-buffer (or buffer (current-buffer)) buffer-file-name)
+      (error nil)))
+  (defun find-buffer-visiting (file &optional _predicate)
+    "Return a live buffer visiting FILE, or nil."
+    (let ((abs (expand-file-name file)) found)
+      (dolist (b (buffer-list))
+        (when (and (not found) (buffer-live-p b)
+                   (equal (buffer-file-name b) abs))
+          (setq found b)))
+      found)))
+(unless (fboundp 'set-visited-file-modtime)
+  (defun set-visited-file-modtime (&optional time)
+    "Record TIME, or the mtime of the visited file, for the current buffer."
+    (puthash (current-buffer)
+             (or time
+                 (and buffer-file-name
+                      (file-attribute-modification-time
+                       (file-attributes buffer-file-name)))
+                 0)
+             anvil-standalone--visited-modtimes)
+    nil))
+(unless (fboundp 'visited-file-modtime)
+  (defun visited-file-modtime ()
+    "Return the recorded visited-file mtime of the current buffer, or 0."
+    (gethash (current-buffer) anvil-standalone--visited-modtimes 0)))
+(unless (fboundp 'verify-visited-file-modtime)
+  (defun verify-visited-file-modtime (&optional buf)
+    "Return non-nil when the visited file's mtime equals the recorded one."
+    (with-current-buffer (or buf (current-buffer))
+      (let ((rec (gethash (current-buffer) anvil-standalone--visited-modtimes 0))
+            (attrs (and buffer-file-name (file-attributes buffer-file-name))))
+        (or (null buffer-file-name)
+            (and (numberp rec) (zerop rec))
+            (and attrs
+                 (equal rec (file-attribute-modification-time attrs))))))))
+(unless (fboundp 'position-bytes)
+  (defun position-bytes (pos)
+    "Return the 1-based byte position of character position POS."
+    (1+ (string-bytes (buffer-substring-no-properties (point-min) pos)))))
+(unless (get 'find-file-noselect 'anvil-standalone-port18)
+  (put 'find-file-noselect 'anvil-standalone-port18 t)
+  (defun find-file-noselect (file &rest _)
+    "Return a buffer visiting FILE, reusing one that already visits it."
+    (let ((abs (expand-file-name file)))
+      (or (find-buffer-visiting abs)
+          (let ((buf (generate-new-buffer (file-name-nondirectory abs))))
+            (with-current-buffer buf
+              (when (file-exists-p abs) (insert-file-contents abs))
+              ;; setq on an unlocalised variable writes the global value here.
+              (if (fboundp 'nelisp-buffer-local-make)
+                  (set (nelisp-buffer-local-make 'buffer-file-name) abs)
+                (make-local-variable 'buffer-file-name)
+                (setq buffer-file-name abs))
+              (set-buffer-modified-p nil)
+              (set-visited-file-modtime))
+            buf)))))
+(unless (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
+  (condition-case err
+      (when (require 'anvil-buffer nil t)
+        (anvil-buffer-enable)
+        (dolist (id anvil-standalone--port18-unregister)
+          (anvil-server-unregister-tool id "emacs-eval")))
+    (error (push (cons 'anvil-buffer err) anvil-standalone--port18-errors))))
 
 (defun anvil-standalone-start ()
   "Serve the prepared registry, opening databases on first use."

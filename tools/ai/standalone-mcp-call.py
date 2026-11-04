@@ -46,5 +46,5 @@ for line in out.decode(errors="replace").splitlines():
         if good:
             ok.add(r["id"])
         print(("OK   " if good else "FAIL ") + calls[r["id"] - 2][0],
-              json.dumps(r.get("result") or r.get("error"), ensure_ascii=False)[:200])
+              json.dumps(r.get("result") or r.get("error"), ensure_ascii=False)[:500])
 sys.exit(0 if len(ok) == len(calls) else 1)

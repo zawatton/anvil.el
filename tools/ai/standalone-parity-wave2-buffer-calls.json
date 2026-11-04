@@ -1,0 +1,6 @@
+[["emacs-eval",{"expression":"(let ((f (expand-file-name \"bufx.txt\" \"@TMP@\"))) (write-region \"alpha\\n\" nil f) (with-current-buffer (find-file-noselect f) (goto-char (point-max)) (insert \"beta\\n\") (buffer-modified-p)))"}],
+ ["buffer-list-modified",{}],
+ ["buffer-read",{"name":"bufx.txt"}],
+ ["buffer-save",{"name":"bufx.txt"}],
+ ["buffer-list-modified",{}],
+ ["emacs-eval",{"expression":"(with-temp-buffer (insert-file-contents (expand-file-name \"bufx.txt\" \"@TMP@\")) (buffer-string))"}]]

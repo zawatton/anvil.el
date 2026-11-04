@@ -1943,10 +1943,9 @@ any network round-trip."
        n anvil-http-batch-max))
     (let ((url-queue-parallel-processes concurrency)
           (url-queue-timeout timeout*))
-      (cl-loop
-       for url in urls
-       for i from 0
-       do
+      (let ((i -1))
+       (dolist (url urls)
+       (setq i (1+ i))
        (condition-case err
            (progn
              (anvil-http--check-url url)
@@ -1967,23 +1966,29 @@ any network round-trip."
                         selector json-path body-mode header-filter)))
                 (t
                  (cl-incf pending)
-                 (let* ((idx i)
-                        (cb-norm norm)
-                        (cb-cached cached)
-                        (extra (anvil-http--build-request-headers
-                                nil nil cached nil)))
-                   (anvil-http--request-async
-                    url extra timeout*
-                    (lambda (resp)
-                      (aset results idx
-                            (anvil-http--batch-handle-network
-                             resp url now cb-norm cb-cached no-cache
-                             selector json-path body-mode header-filter))
-                      (setq pending (1- pending)))))))))
+                 ;; Bind per-URL values as lambda arguments so each callback
+                 ;; closes over its own copy, not the shared loop variables.
+                 (funcall
+                  (lambda (idx url cb-norm cb-cached)
+                    (let ((extra (anvil-http--build-request-headers
+                                  nil nil cb-cached nil)))
+                      (anvil-http--request-async
+                       url extra timeout*
+                       (lambda (resp)
+                         (aset results idx
+                               (anvil-http--batch-handle-network
+                                resp url now cb-norm cb-cached no-cache
+                                selector json-path body-mode header-filter))
+                         (setq pending (1- pending))))))
+                  i url norm cached)))))
          (error
           (aset results i
-                (list :url url :error (error-message-string err))))))
+                (list :url url :error (error-message-string err)))))))
       (while (> pending 0)
+        ;; url-queue starts jobs from idle/run timers that never fire in
+        ;; `emacs --batch'; pump the queue explicitly so batch hosts finish.
+        (when (fboundp 'url-queue-run-queue)
+          (url-queue-run-queue))
         (accept-process-output nil 0.1)))
     (append results nil)))
 
@@ -2372,6 +2377,11 @@ recompute (see `anvil-http--cache-recompute-bytes')."
   (anvil-server-with-error-handling
    (anvil-http--cache-status-payload)))
 
+(defun anvil-http--cache-clear-payload (removed)
+  "Return the `http-cache-clear' response plist for REMOVED deleted rows.
+The MCP layer rejects a bare integer, so the count is wrapped."
+  (list :removed removed))
+
 (defun anvil-http--tool-cache-clear (&optional url)
   "Remove cached entries from the http namespace.
 
@@ -2379,11 +2389,11 @@ MCP Parameters:
   url - Optional URL to drop.  When absent or empty, flushes every
         entry under the http namespace.
 
-Returns the number of deleted rows (0 or 1 for single-URL, or the
-total removed for a namespace flush)."
+Returns (:removed N), the number of deleted rows (0 or 1 for
+single-URL, or the total removed for a namespace flush)."
   (anvil-server-with-error-handling
    (let ((u (and (stringp url) (not (string-empty-p url)) url)))
-     (anvil-http-cache-clear u))))
+     (anvil-http--cache-clear-payload (anvil-http-cache-clear u)))))
 
 ;;;; --- status / introspection ---------------------------------------------
 

@@ -1,0 +1,91 @@
+[
+ [
+  "emacs-eval",
+  {
+   "expression": "(progn (with-temp-file \"@TMP@/fix.org\" (insert \"#+TITLE: fix\\n* TODO First task :work:\\n:PROPERTIES:\\n:ID: aaaa-1111\\n:END:\\nBody text one.\\n** TODO Child\\nChild body.\\n* DONE Second\\n\")) (setq org-todo-keywords '((sequence \"TODO\" \"|\" \"DONE\"))) (setq anvil-org-allowed-files (list \"@TMP@/fix.org\")) \"seeded\")"
+  }
+ ],
+ [
+  "org-read-outline",
+  {
+   "file": "@TMP@/fix.org"
+  }
+ ],
+ [
+  "org-read-headline",
+  {
+   "file": "@TMP@/fix.org",
+   "headline_path": "First task/Child"
+  }
+ ],
+ [
+  "org-read-by-id",
+  {
+   "uuid": "aaaa-1111"
+  }
+ ],
+ [
+  "org-read-file",
+  {
+   "file": "@TMP@/fix.org"
+  }
+ ],
+ [
+  "org-edit-body",
+  {
+   "resource_uri": "org-headline://@TMP@/fix.org#First%20task/Child",
+   "old_body": "Child body.",
+   "new_body": "Child body edited."
+  }
+ ],
+ [
+  "org-read-file",
+  {
+   "file": "@TMP@/fix.org"
+  }
+ ],
+ [
+  "org-rename-headline",
+  {
+   "uri": "org-id://aaaa-1111",
+   "current_title": "First task",
+   "new_title": "Renamed task"
+  }
+ ],
+ [
+  "org-read-file",
+  {
+   "file": "@TMP@/fix.org"
+  }
+ ],
+ [
+  "org-add-todo",
+  {
+   "title": "Added item",
+   "todo_state": "TODO",
+   "parent_uri": "org-id://aaaa-1111",
+   "body": "Added body.",
+   "tags": "[\"new\"]"
+  }
+ ],
+ [
+  "org-read-file",
+  {
+   "file": "@TMP@/fix.org"
+  }
+ ],
+ [
+  "org-update-todo-state",
+  {
+   "uri": "org-headline://@TMP@/fix.org#Second",
+   "current_state": "DONE",
+   "new_state": "TODO"
+  }
+ ],
+ [
+  "org-read-file",
+  {
+   "file": "@TMP@/fix.org"
+  }
+ ]
+]
