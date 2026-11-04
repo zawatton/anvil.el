@@ -919,12 +919,8 @@ Fallback for runtimes without a native `time-subtract'; nil means now."
 ;; anyway.  So `define-compilation-mode' gets a faithful macro fallback and the
 ;; `bytecomp' feature is declared only while anvil-sexp loads (then withdrawn,
 ;; so later requires still fail honestly); `byte-compile-file' stays void.
-;;  * anvil-elisp: not loaded (no tool answers correctly).  Screened on standalone:
-;;    elisp-describe-function answers without docstrings (wrong), -variable and
-;;    -get-function-definition hit void functions (documentation-property,
-;;    find-lisp-object-file-name), -read-source-file has no system lisp dir,
-;;    elisp-ert-run reports 0 tests for a passing test, ert-run-distilled needs
-;;    shell-quote-argument, and elisp-byte-compile-file cannot work.
+;;  * anvil-elisp: loaded by Port 20 (S14.4), which supplies the missing GNU
+;;    functions; see there for the one tool left out.
 ;;  * anvil-sexp: only the tools whose answers match host Emacs are registered.
 ;;    Left out: sexp-macroexpand (empty expansion), sexp-wrap-form,
 ;;    sexp-rename-symbol and sexp-replace-call (need syntax-ppss and
@@ -1272,12 +1268,10 @@ org-agenda-list/org-habit-parse-todo are missing).")
 ;;    with the first blocker beside each.
 (defvar anvil-standalone--port12-errors nil
   "Alist of (MODULE . ERROR) for port-12 modules that failed to load.")
-(defvar anvil-standalone--port12-unregister
-  '("orchestrator-cancel" "orchestrator-stop")
+(defvar anvil-standalone--port12-unregister nil
   "Orchestrator tool ids that are registered by the module but not served.
-Both kill a running job with a signal.  On standalone the killed task then
-reports exit-code 0 where the host reports 15 (`process-exit-status' of a
-signalled process), so orchestrator-collect/status after a cancel differ.")
+None: orchestrator-cancel and orchestrator-stop give the host answers once
+Port 21 reports the signal a process died of.")
 (defun anvil-standalone--orchestrator-setup ()
   "Point the orchestrator job directory at the isolated standalone cache."
   (setq anvil-orchestrator-work-dir
@@ -2546,6 +2540,401 @@ on the fixture.")
           (anvil-server-unregister-tool id "emacs-eval")))
     (error (push (cons 'anvil-buffer err) anvil-standalone--port18-errors))))
 
+;; Port 19: anvil-git (S14.3): git-repo-root, git-head-sha, git-branch-current,
+;; git-log, git-diff-names, git-diff-stats, git-status, git-worktree-list
+;; (anvil-git.el) and git-commit-message, git-pr-body (anvil-git-msg.el).
+;; Every git call goes through `anvil-shell' -> `make-process' with
+;; `default-directory' bound to the repo.  NeLisp `make-process' and
+;; `call-process' ignore `default-directory' (S3.1 root cause), so the child
+;; inherits the server cwd.  The runtime is not changed; instead both
+;; primitives are wrapped here.  When a process is started under a
+;; `default-directory' that differs from the child's inherited cwd, the command
+;; is rewritten to
+;;   /bin/sh -c 'cd -- "$1" && shift && exec "$@"' sh DIR PROG ARGS...
+;; so no argument is ever spliced into shell text.  A load-time probe runs
+;; `pwd' under a bound `default-directory'; if the runtime honours it the
+;; wrappers are inert.  The `call-process' wrapper composes with Port 17's
+;; (nil DESTINATION -> /dev/null) by capturing whatever is defined now.
+(defvar anvil-standalone--port19-errors nil
+  "Alist of (MODULE . ERROR) for port-19 modules that failed to load.")
+(defvar anvil-standalone--port19-unregister nil
+  "Port-19 tool ids that stay unregistered, with the first blocker.
+None: the ten git tools give the host answers on the fixture.")
+(defconst anvil-standalone--cd-script "cd -- \"$1\" && shift && exec \"$@\""
+  "Shell text that enters directory $1 and execs the remaining arguments.")
+(defvar anvil-standalone--process-cwd-ignored 'unknown
+  "Non-nil when this runtime ignores `default-directory' for child processes.")
+(defun anvil-standalone--cwd-ignored-p ()
+  "Probe once whether `call-process' ignores a bound `default-directory'."
+  (when (eq anvil-standalone--process-cwd-ignored 'unknown)
+    (setq anvil-standalone--process-cwd-ignored
+          (condition-case nil
+              (let ((default-directory "/"))
+                (with-temp-buffer
+                  (apply (if (fboundp 'anvil-standalone--call-process-orig)
+                             #'anvil-standalone--call-process-orig
+                           #'call-process)
+                         "/bin/sh" nil t nil '("-c" "pwd"))
+                  (not (equal (string-trim (buffer-string)) "/"))))
+            (error nil))))
+  anvil-standalone--process-cwd-ignored)
+(defun anvil-standalone--cd-dir ()
+  "Return `default-directory' as a plain directory to cd into, or nil."
+  (and (stringp default-directory)
+       (not (file-remote-p default-directory))
+       (file-directory-p default-directory)
+       (anvil-standalone--cwd-ignored-p)
+       (directory-file-name (expand-file-name default-directory))))
+(unless (get 'call-process 'anvil-standalone-port19)
+  (let ((prev (symbol-function 'call-process)))
+    (defalias 'anvil-standalone--call-process-port17 prev)
+    (defun call-process (program &optional infile destination display &rest args)
+      "Like `call-process', but honours `default-directory' by cd-ing first."
+      (let ((dir (anvil-standalone--cd-dir)))
+        (if dir
+            (apply #'anvil-standalone--call-process-port17
+                   "/bin/sh" infile destination display
+                   "-c" anvil-standalone--cd-script "sh" dir program args)
+          (apply #'anvil-standalone--call-process-port17
+                 program infile destination display args))))
+    (put 'call-process 'anvil-standalone-port19 t)))
+(unless (get 'make-process 'anvil-standalone-port19)
+  (defalias 'anvil-standalone--make-process-orig (symbol-function 'make-process))
+  (defun make-process (&rest args)
+    "Like `make-process', but honours `default-directory' by cd-ing first."
+    (let ((dir (anvil-standalone--cd-dir))
+          (command (plist-get args :command)))
+      (when (and dir (consp command))
+        (setq args (plist-put (copy-sequence args) :command
+                              (append (list "/bin/sh" "-c"
+                                            anvil-standalone--cd-script
+                                            "sh" dir)
+                                      command))))
+      (apply #'anvil-standalone--make-process-orig args)))
+  (put 'make-process 'anvil-standalone-port19 t))
+(unless (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
+  (condition-case err
+      (when (require 'anvil-git nil t)
+        (anvil-git-enable)
+        (when (require 'anvil-git-msg nil t)
+          (anvil-git-msg-enable))
+        (dolist (id anvil-standalone--port19-unregister)
+          (anvil-server-unregister-tool id "emacs-eval")))
+    (error (push (cons 'anvil-git err) anvil-standalone--port19-errors))))
+
+;; Port 20: anvil-elisp (S14.4): elisp-describe-function, -describe-variable,
+;; -get-function-definition, -read-source-file, -ert-run and ert-run-distilled.
+;; The runtime keeps a closure's docstring in slot 4 but `documentation' does
+;; not return it, drops the docstring of `defvar', records no per-symbol
+;; entries in `load-history', and has no `documentation-property' or
+;; `find-lisp-object-file-name'.  Guarded shims (defined only when the
+;; function is missing or demonstrably wrong) restore them:
+;;  * `documentation' falls back to the closure's slot-4 docstring.
+;;  * `find-lisp-object-file-name' scans the `load-history' files, newest
+;;    first, for a top-level definition form of the symbol (what GNU's
+;;    per-symbol load-history entries record).
+;;  * `documentation-property' returns the property, or the docstring read
+;;    from that source form for `variable-documentation'.
+;; Not served: elisp-ert-run and bench-profile-expr (blockers in
+;; `anvil-standalone--port20-unregister').  elisp-byte-compile-file and
+;; ert-run-distilled run a fresh host GNU Emacs batch process.
+(defvar anvil-standalone--port20-errors nil
+  "Alist of (MODULE . ERROR) for port-20 modules that failed to load.")
+(defvar anvil-standalone--port20-unregister '("elisp-ert-run")
+  "Port-20 tool ids that stay unregistered.
+elisp-ert-run: the runtime ert is the reduced nelisp-emacs-lib one (no
+`ert-run-test', no `ert--test' property), so it reports 0 tests and the GNU
+failure plist (:form/:value condition, backtrace frames) cannot be produced;
+vendored GNU ert.el needs find-func, backtrace, ewoc and `source-directory'.
+bench-profile-expr is not loaded: no `profiler-cpu-start', and the host answer
+is a timing-dependent sample list.")
+(defconst anvil-standalone--source-defun-heads
+  '("defun" "defmacro" "defsubst" "cl-defun" "cl-defmacro" "cl-defsubst"
+    "define-minor-mode" "define-derived-mode" "defalias" "ert-deftest")
+  "Heads of top-level forms that define a function.")
+(defconst anvil-standalone--source-defvar-heads
+  '("defvar" "defconst" "defcustom" "defvar-local" "defface")
+  "Heads of top-level forms that define a variable.")
+(defun anvil-standalone--source-form-in-file (file sym heads)
+  "Return (POSITION . FORM) of the definition of SYM among HEADS in FILE."
+  (when (and (stringp file) (file-readable-p file))
+    (with-temp-buffer
+      (insert-file-contents file)
+      (goto-char (point-min))
+      (let ((re (concat "^(\\(?:" (mapconcat #'regexp-quote heads "\\|")
+                        "\\)[ \t\n]+'?" (regexp-quote (symbol-name sym))
+                        "[ \t\n)]"))
+            (found nil))
+        (while (and (not found) (re-search-forward re nil t))
+          (let ((start (match-beginning 0)))
+            (goto-char start)
+            (condition-case nil
+                (setq found (cons start (read (current-buffer))))
+              (error (goto-char (1+ start))))))
+        found))))
+(defun anvil-standalone--source-definition (sym heads)
+  "Return (FILE . FORM) for the newest loaded file defining SYM among HEADS."
+  (let ((result nil))
+    (dolist (entry load-history)
+      (let ((file (and (consp entry) (stringp (car entry)) (car entry))))
+        (when (and file (not result))
+          (when (string-suffix-p ".elc" file)
+            (setq file (substring file 0 -1)))
+          (let ((hit (anvil-standalone--source-form-in-file file sym heads)))
+            (when hit (setq result (cons file (cdr hit))))))))
+    result))
+(unless (get 'documentation 'anvil-standalone-port20)
+  (when (fboundp 'documentation)
+    (defalias 'anvil-standalone--documentation-orig
+      (symbol-function 'documentation))
+    (defun documentation (function &optional raw)
+      "Like `documentation', but also reads a closure's slot-4 docstring."
+      (or (anvil-standalone--documentation-orig function raw)
+          (let* ((f (condition-case nil
+                        (if (symbolp function)
+                            (and (fboundp function) (indirect-function function))
+                          function)
+                      (error nil)))
+                 (f (if (eq (car-safe f) 'macro) (cdr f) f))
+                 (doc (and f (not (symbolp f))
+                           (condition-case nil
+                               (and (> (length f) 4) (aref f 4))
+                             (error nil)))))
+            (when (stringp doc)
+              (if (and (not raw) (fboundp 'substitute-command-keys))
+                  (substitute-command-keys doc)
+                doc)))))
+    (put 'documentation 'anvil-standalone-port20 t)))
+(unless (fboundp 'find-lisp-object-file-name)
+  (defun find-lisp-object-file-name (object type)
+    "Return the loaded source file that defines OBJECT as TYPE, or nil."
+    (and (symbolp object)
+         (car (anvil-standalone--source-definition
+               object (if (eq type 'defvar)
+                          anvil-standalone--source-defvar-heads
+                        anvil-standalone--source-defun-heads))))))
+(unless (fboundp 'documentation-property)
+  (defun documentation-property (symbol prop &optional raw)
+    "Return the PROP documentation of SYMBOL, reading the source if needed."
+    (let ((val (get symbol prop)))
+      (when (and (null val) (eq prop 'variable-documentation))
+        (let ((form (cdr (anvil-standalone--source-definition
+                          symbol anvil-standalone--source-defvar-heads))))
+          (when (stringp (nth 3 form)) (setq val (nth 3 form)))))
+      (if (and (stringp val) (not raw) (fboundp 'substitute-command-keys))
+          (substitute-command-keys val)
+        val))))
+;; find-func.el is not part of the vendored GNU lisp; anvil-elisp needs only the
+;; (BUFFER . POINT) of the definition inside the file it already inserted.
+(unless (fboundp 'find-function-search-for-symbol)
+  (defun find-function-search-for-symbol (symbol type file)
+    "Return (BUFFER . POINT) of SYMBOL's definition of TYPE in FILE, or nil."
+    (let ((hit (anvil-standalone--source-form-in-file
+                file symbol (if (eq type 'defvar)
+                                anvil-standalone--source-defvar-heads
+                              anvil-standalone--source-defun-heads))))
+      (and hit (cons (current-buffer) (car hit))))))
+;; ert-run-distilled starts `invocation-name --batch -Q', which is the NeLisp
+;; binary here and cannot run GNU ERT.  The digest is defined over a fresh GNU
+;; Emacs batch process, so the command builder substitutes the host `emacs'
+;; for the first word (the tool handler itself keeps its MCP arglist).
+(defun anvil-standalone--wrap-ert-distilled ()
+  "Wrap `anvil-elisp--ert-distilled-command' once to run the host Emacs."
+  (unless (get 'anvil-elisp--ert-distilled-command 'anvil-standalone-port20)
+    (let ((orig (symbol-function 'anvil-elisp--ert-distilled-command)))
+      (fset 'anvil-elisp--ert-distilled-command
+            (lambda (files load-path-dirs selector)
+              (let ((command (funcall orig files load-path-dirs selector))
+                    (host (executable-find "emacs")))
+                (if host (cons host (cdr command)) command)))))
+    (put 'anvil-elisp--ert-distilled-command 'anvil-standalone-port20 t)))
+;; elisp-byte-compile-file: standalone has no byte compiler, so the host
+;; handler runs unchanged in a fresh GNU Emacs batch process (the same way
+;; ert-run-distilled uses one) and its printed plist is the answer.  The .elc
+;; is written next to the source, exactly as on the host.  The tool is
+;; re-registered with the original description because the original handler is
+;; an offload tool whose worker does not load anvil-elisp.
+(defun anvil-standalone--elisp-byte-compile-file (file)
+  "Byte-compile FILE in a host Emacs batch process and return its plist.
+
+MCP Parameters:
+  file - Path to an .el file to byte-compile (string)."
+  (let* ((host (or (executable-find "emacs")
+                   (error "No host emacs on PATH")))
+         (dir (file-name-directory (locate-library "anvil-elisp")))
+         (form (format "(progn (require 'anvil-elisp) (princ (anvil-elisp--byte-compile-file %S)))"
+                       (expand-file-name file))))
+    (with-temp-buffer
+      (let ((rc (call-process "/bin/sh" nil t nil "-c"
+                              "exec \"$@\" 2>/dev/null" "sh"
+                              host "--batch" "-Q" "-L" dir "--eval" form)))
+        (unless (eq rc 0)
+          (error "Host byte-compile process failed (exit %S)" rc))
+        (string-trim (buffer-string))))))
+(defun anvil-standalone--reregister-byte-compile ()
+  "Replace the offload `elisp-byte-compile-file' tool with the host delegate."
+  (let* ((tools (gethash "emacs-eval" anvil-server--tools))
+         (old (gethash "elisp-byte-compile-file" tools)))
+    (when old
+      (anvil-server-unregister-tool "elisp-byte-compile-file" "emacs-eval")
+      (anvil-server-register-tool
+       #'anvil-standalone--elisp-byte-compile-file
+       :id "elisp-byte-compile-file"
+       :intent '(elisp-build)
+       :layer 'dev
+       :server-id "emacs-eval"
+       :description (plist-get old :description)
+       :read-only nil))))
+;; GNU facilities anvil-elisp reads: the custom-variable test, the package
+;; directory list and the (already active, in batch) auto-compression mode.
+(unless (fboundp 'custom-variable-p)
+  (defun custom-variable-p (variable)
+    "Return non-nil if VARIABLE is a customizable variable (GNU wording)."
+    (and (symbolp variable)
+         (or (get variable 'standard-value)
+             (get variable 'custom-autoload)))))
+(unless (boundp 'package-directory-list)
+  (defvar package-directory-list nil
+    "Directories of system-wide packages; none on standalone."))
+(unless (boundp 'auto-compression-mode)
+  (defvar auto-compression-mode t
+    "Non-nil: compressed files are read transparently, as in `emacs --batch'.")
+  (unless (fboundp 'auto-compression-mode)
+    (defun auto-compression-mode (&optional _arg)
+      "Stand-in: compressed-file reading is always treated as active." nil)))
+(unless (or (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
+            (not (or (getenv "NELISP_EMACS_LIB_DIR")
+                     (getenv "ANVIL_NOTES_DIR"))))
+  (condition-case err
+      (when (require 'anvil-elisp nil t)
+        (unless anvil-elisp--system-lisp-dir
+          (let ((subr (locate-library "subr")))
+            (when subr
+              (setq anvil-elisp--system-lisp-dir (file-name-directory subr)))))
+        (anvil-standalone--wrap-ert-distilled)
+        (anvil-elisp-enable)
+        (anvil-standalone--reregister-byte-compile)
+        (dolist (id anvil-standalone--port20-unregister)
+          (anvil-server-unregister-tool id "emacs-eval")))
+    (error (push (cons 'anvil-elisp err) anvil-standalone--port20-errors))))
+
+;; Port 21: signalled processes (S14.5): orchestrator-cancel and
+;; orchestrator-stop.  The orchestrator kills a running job with
+;; `signal-process' (SIGTERM, then SIGKILL) and records `process-exit-status'
+;; as the task exit-code.  This runtime has no `signal-process' (the call is
+;; wrapped in `ignore-errors' by the module, so nothing was signalled and the
+;; task stayed running), no `interrupt-process', and `kill-process' makes the
+;; child die with a shell-style 128+N exit: `process-status' says `exit' and
+;; `process-exit-status' 143 where GNU says `signal' and 15 (9 for
+;; `kill-process' / `delete-process', 2 for `interrupt-process').  The runtime
+;; is not changed.  A load-time probe signals a real child with the native
+;; `signal-process'; when the runtime already answers `signal' and the signal
+;; number, nothing below is installed.  Otherwise:
+;;  * `signal-process' sends the signal with the kill(1) command and records
+;;    the signal number on the process (`anvil-sent-signal' property);
+;;    `kill-process', `delete-process' and `interrupt-process' record 9, 9 and 2
+;;    the same way (GNU sends SIGKILL, SIGKILL and SIGINT for them here);
+;;  * `process-status' returns `signal' and `process-exit-status' the signal
+;;    number when the recorded signal matches the runtime's exit report
+;;    (128+N, or N).  A child that handled the signal and exited with another
+;;    code keeps the runtime's answer.
+;; Limitation: the sentinel event string stays the runtime's ("terminated\n"
+;; for every signal), GNU reports "killed\n" for 9, "interrupt\n" for 2 etc.
+;; The `sh -c ... exec' prefix of Port 19 keeps the child's PID, so the signal
+;; reaches the real program.
+(defvar anvil-standalone--signal-numbers
+  '((SIGHUP . 1) (SIGINT . 2) (SIGQUIT . 3) (SIGKILL . 9) (SIGUSR1 . 10)
+    (SIGUSR2 . 12) (SIGTERM . 15) (SIGCONT . 18) (SIGSTOP . 19))
+  "Signal names `signal-process' accepts here, with their Linux numbers.")
+(defvar anvil-standalone--signals-native 'unknown
+  "Non-nil when the runtime reports signalled processes as GNU does.")
+(defun anvil-standalone--signal-number (sig)
+  "Return the signal number for SIG (integer, symbol or string), or nil."
+  (cond ((integerp sig) sig)
+        (t (let ((name (upcase (format "%s" sig))))
+             (unless (string-prefix-p "SIG" name)
+               (setq name (concat "SIG" name)))
+             (cdr (assq (intern name) anvil-standalone--signal-numbers))))))
+(defun anvil-standalone--process-pid (process)
+  "Return the OS pid of PROCESS, or nil."
+  (or (and (integerp process) process)
+      (let ((pid (ignore-errors (process-id process))))
+        (and (integerp pid) pid))
+      (and (vectorp process) (> (length process) 1)
+           (integerp (aref process 1)) (aref process 1))))
+(defun anvil-standalone--signals-native-p ()
+  "Probe once whether the runtime reports a signalled child as GNU does."
+  (when (eq anvil-standalone--signals-native 'unknown)
+    (setq anvil-standalone--signals-native
+          (condition-case nil
+              (and (fboundp 'signal-process)
+                   (let ((p (make-process :name "anvil-sig-probe"
+                                          :command '("sleep" "30")
+                                          :connection-type 'pipe))
+                         (n 0))
+                     (signal-process p 'SIGTERM)
+                     (while (and (< n 30) (process-live-p p))
+                       (accept-process-output nil 0.1)
+                       (setq n (1+ n)))
+                     (prog1 (and (eq (process-status p) 'signal)
+                                 (eql (process-exit-status p) 15))
+                       (ignore-errors (delete-process p)))))
+            (error nil))))
+  anvil-standalone--signals-native)
+(unless (or (get 'process-status 'anvil-standalone-port21)
+            (anvil-standalone--signals-native-p))
+  (defalias 'anvil-standalone--process-status-orig
+    (symbol-function 'process-status))
+  (defalias 'anvil-standalone--process-exit-status-orig
+    (symbol-function 'process-exit-status))
+  (defalias 'anvil-standalone--delete-process-orig
+    (symbol-function 'delete-process))
+  (defun anvil-standalone--send-signal (process sig)
+    "Send SIG to PROCESS with kill(1) and record it.  Return 0 or -1."
+    (let ((num (anvil-standalone--signal-number sig))
+          (pid (anvil-standalone--process-pid process)))
+      (cond
+       ((not (and num pid)) -1)
+       (t (when (and (not (integerp process)) (memq num '(1 2 3 9 15)))
+            (ignore-errors (process-put process 'anvil-sent-signal num)))
+          (if (eql 0 (call-process "kill" nil nil nil
+                                   (format "-%d" num) (number-to-string pid)))
+              0
+            -1)))))
+  (defun signal-process (process sig &optional _remote)
+    "Send signal SIG to PROCESS (a process or pid) through kill(1)."
+    (anvil-standalone--send-signal process sig))
+  (defun interrupt-process (&optional process _current-group)
+    "Send SIGINT to PROCESS."
+    (when (processp process) (anvil-standalone--send-signal process 'SIGINT))
+    process)
+  (defun kill-process (&optional process _current-group)
+    "Send SIGKILL to PROCESS."
+    (when (and process (not (integerp process)) (process-live-p process))
+      (anvil-standalone--send-signal process 'SIGKILL))
+    process)
+  (defun delete-process (&optional process)
+    "Send SIGKILL to a live PROCESS, then delete it."
+    (when (and process (processp process) (process-live-p process))
+      (anvil-standalone--send-signal process 'SIGKILL))
+    (anvil-standalone--delete-process-orig process))
+  (defun anvil-standalone--signalled-p (process)
+    "Return the recorded signal of PROCESS when the runtime reported it as exit."
+    (let ((sig (and (processp process) (ignore-errors (process-get process 'anvil-sent-signal))))
+          (code (and (processp process)
+                     (eq (anvil-standalone--process-status-orig process) 'exit)
+                     (anvil-standalone--process-exit-status-orig process))))
+      (and sig (memql code (list sig (+ 128 sig))) sig)))
+  (defun process-status (process)
+    "Like `process-status', reporting `signal' for a process killed by a signal."
+    (if (anvil-standalone--signalled-p process)
+        'signal
+      (anvil-standalone--process-status-orig process)))
+  (defun process-exit-status (process)
+    "Like `process-exit-status', returning the signal number for `signal'."
+    (or (anvil-standalone--signalled-p process)
+        (anvil-standalone--process-exit-status-orig process)))
+  (put 'process-status 'anvil-standalone-port21 t))
 (defun anvil-standalone-start ()
   "Serve the prepared registry, opening databases on first use."
   (setq default-directory
