@@ -382,38 +382,9 @@ and tags, then re-align the tags (GNU `org-edit-headline')."
           res)))
     (put 'org-entry-put 'anvil-standalone-padded t)))
 
-;; Vendor-first: evaluate selected genuine definitions straight from the vendored
-;; GNU org.el (found through `load-path') instead of copying their source.
-;; Only defuns/defmacros/defvars named in NAMES that are still unbound are read.
-(defun anvil-standalone-org--vendor-defs (library names)
-  "Eval the top-level definitions of NAMES (symbols) found in LIBRARY.el."
-  ;; `locate-library' would find the lightweight src/org.el first, so resolve
-  ;; LIBRARY next to the vendored org-id.el.
-  (let* ((anchor (locate-library "org-id.el"))
-         (file (and anchor (expand-file-name (concat library ".el")
-                                             (file-name-directory anchor)))))
-    (when (and file (file-readable-p file))
-      (with-temp-buffer
-        (insert-file-contents file)
-        (dolist (name names)
-          (unless (or (fboundp name) (boundp name))
-            (goto-char (point-min))
-            (when (re-search-forward
-                   (concat "^(\\(?:defun\\|defmacro\\|defvar\\|defconst\\|defcustom\\) "
-                           (regexp-quote (symbol-name name)) "[ \n]")
-                   nil t)
-              (goto-char (match-beginning 0))
-              (condition-case nil (eval (read (current-buffer)) t) (error nil)))))))))
-
-(anvil-standalone-org--vendor-defs
- "org" '(org-contextualize-keys org-contextualize-validate-key
-         org-ts-regexp-inactive org-overriding-default-time org-time-was-given
-         org-end-time-was-given org-time-stamp-rounding-minutes
-         org-extend-today-until org-use-last-clock-out-time-as-effective-time
-         org-current-time org-today org-time-string-to-time org-parse-time-string
-         org-time-string-to-absolute org-time-string-to-seconds
-         org-time-stamp-formats org-ts-regexp org-ts-regexp-both
-         org-timestamp-rounding-minutes org-capture-plist org-store-link-plist))
-
+;; The capture-time definitions (org-contextualize-keys, org-ts-regexp-inactive,
+;; org-current-time and friends) are not supplied: reading them out of the
+;; vendored org.el at load time hangs the NeLisp HEAD build (S16.2), and the
+;; capture, habit and agenda tools stay unregistered anyway.
 (provide 'anvil-standalone-org)
 ;;; anvil-standalone-org.el ends here
