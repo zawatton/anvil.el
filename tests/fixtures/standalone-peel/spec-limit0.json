@@ -1,0 +1,1 @@
+{"form": "(progn (peel-a 1) (require (quote peel-c)) (list peel-v (peel-a 2)))", "vendor_dirs": ["tests/fixtures/standalone-peel/vendor"], "max_fixes": 0}

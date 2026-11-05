@@ -1,0 +1,30 @@
+#+TITLE: standalone-peel diagnostic tool
+
+* S1 Fixture peel (positive and negative control)
+
+** S1.1 Lisp and wrapper pass a syntax check
+cmd: python3 -m py_compile tools/ai/standalone-peel.py && emacs --batch -Q --eval '(with-temp-buffer (insert-file-contents "tools/ai/standalone-peel.el") (emacs-lisp-mode) (check-parens) (goto-char (point-min)) (condition-case nil (while t (read (current-buffer))) (end-of-file nil)))'
+
+** S1.2 Fixture spec resolves peel-a, peel-b, peel-v and require peel-c (status ok, 3+ fixes)
+#+TIMEOUT: 120
+cmd: python3 tools/ai/standalone-peel.py tests/fixtures/standalone-peel/spec-ok.json | python3 tests/fixtures/standalone-peel/check.py 'd["status"]=="ok" and len(d["fixes"])>=3 and "suggested_loader" in d'
+
+** S1.3 Negative control: max_fixes 0 stops at void-function peel-a
+#+TIMEOUT: 120
+cmd: python3 tools/ai/standalone-peel.py tests/fixtures/standalone-peel/spec-limit0.json | python3 tests/fixtures/standalone-peel/check.py 'd["status"] in ("stopped","limit") and "peel-a" in d["error"]["data"] and not d["fixes"]'
+
+* S2 Unfixable and unknown errors
+
+** S2.1 (car 1) stops with wrong-type-argument and no fixes
+#+TIMEOUT: 120
+cmd: python3 tools/ai/standalone-peel.py tests/fixtures/standalone-peel/spec-car1.json | python3 tests/fixtures/standalone-peel/check.py 'd["status"]=="stopped" and d["error"]["class"]=="wrong-type-argument" and not d["fixes"]'
+
+** S2.2 Unknown function stops at void-function without looping
+#+TIMEOUT: 120
+cmd: python3 tools/ai/standalone-peel.py tests/fixtures/standalone-peel/spec-nofn.json | python3 tests/fixtures/standalone-peel/check.py 'd["status"]=="stopped" and d["error"]["class"]=="void-function" and not d["fixes"]'
+
+* S3 Real standalone end to end
+
+** S3.1 A real missing vendor definition is peeled on the real standalone environment
+#+TIMEOUT: 300
+cmd: python3 tools/ai/standalone-peel.py tests/fixtures/standalone-peel/spec-real.json | python3 tests/fixtures/standalone-peel/check.py 'd["status"]=="ok" and len(d["fixes"])>=1'
