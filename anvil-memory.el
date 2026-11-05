@@ -62,6 +62,7 @@
 (require 'cl-lib)
 (require 'subr-x)
 (require 'anvil-server)
+(require 'anvil-worklog)
 
 ;; Phase 2b-ii: the LLM verdict path calls
 ;; `anvil-orchestrator-submit-and-collect' only when the caller
@@ -1211,9 +1212,10 @@ FTS5 rank (best first).  Empty / whitespace-only QUERY returns nil."
                     WHERE memory_body_fts MATCH ?1
                  ORDER BY rank
                     LIMIT ?2"))
+           (fts-query (anvil-worklog-fts5-quote-query query))
            (params (if type
-                       (list query (symbol-name type) limit)
-                     (list query limit)))
+                       (list fts-query (symbol-name type) limit)
+                     (list fts-query limit)))
            (rows (ignore-errors (sqlite-select db sql params))))
       (mapcar (lambda (r)
                 (list :file (nth 0 r)

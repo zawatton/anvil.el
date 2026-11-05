@@ -651,6 +651,60 @@ one export, ordered by date ASC."
     (should-not (anvil-worklog-get-by-digest nil))))
 
 
+;;;; --- FTS5 query quoting --------------------------------------------------
+
+(ert-deftest anvil-worklog-test/fts5-quote-query-shapes ()
+  "The quoting helper wraps plain terms and keeps FTS5 syntax."
+  (should (equal "\"fresh-buffer\"" (anvil-worklog-fts5-quote-query "fresh-buffer")))
+  (should (equal "\"a\"\"b\"" (anvil-worklog-fts5-quote-query "a\"b")))
+  (should (equal "\"foo-bar\"*" (anvil-worklog-fts5-quote-query "foo-bar*")))
+  (should (equal "\"org-agenda\" OR \"habit\""
+                 (anvil-worklog-fts5-quote-query "org-agenda OR habit")))
+  (should (equal "\"two words\" NOT \"x-y\""
+                 (anvil-worklog-fts5-quote-query "\"two words\" NOT x-y")))
+  (should (equal "NEAR(\"a\" \"b\", 3)"
+                 (anvil-worklog-fts5-quote-query "NEAR(\"a\" \"b\", 3)")))
+  (should (equal "(\"a-b\" OR \"c\")"
+                 (anvil-worklog-fts5-quote-query "(a-b OR c)"))))
+
+(defmacro anvil-worklog-test--with-hyphen-db (&rest body)
+  `(anvil-worklog-test--with-env
+     (skip-unless (anvil-worklog-test--supported-p 'search))
+     (anvil-worklog-add "Hyphen one" "fresh-buffer anvil-crypto note"
+                        :date "2026-05-01" :machine "linux-debian" :year 2026)
+     (anvil-worklog-add "Quote two" "said \"hello\" to org-agenda"
+                        :date "2026-05-02" :machine "linux-debian" :year 2026)
+     (anvil-worklog-add "Habit three" "habit tracking only"
+                        :date "2026-05-03" :machine "linux-debian" :year 2026)
+     ,@body))
+
+(ert-deftest anvil-worklog-test/search-hyphenated-term ()
+  "A hyphenated term is a plain word, not a column filter."
+  (anvil-worklog-test--with-hyphen-db
+    (should (= 1 (length (anvil-worklog-search "fresh-buffer"))))
+    (should (= 1 (length (anvil-worklog-search "anvil-crypto"))))))
+
+(ert-deftest anvil-worklog-test/search-term-with-quote ()
+  "An embedded double quote does not break the query."
+  (anvil-worklog-test--with-hyphen-db
+    (should (listp (anvil-worklog-search "said \"hello")))
+    (should (listp (anvil-worklog-search "a\"b")))))
+
+(ert-deftest anvil-worklog-test/search-or-query ()
+  "Upper-case OR keeps working between hyphenated terms."
+  (anvil-worklog-test--with-hyphen-db
+    (should (= 2 (length (anvil-worklog-search "org-agenda OR habit"))))))
+
+(ert-deftest anvil-worklog-test/search-prefix-star ()
+  "A trailing * stays a prefix marker after quoting."
+  (anvil-worklog-test--with-hyphen-db
+    (should (= 1 (length (anvil-worklog-search "fresh-buf*"))))))
+
+(ert-deftest anvil-worklog-test/search-quoted-phrase ()
+  "An already-quoted phrase is passed through."
+  (anvil-worklog-test--with-hyphen-db
+    (should (= 1 (length (anvil-worklog-search "\"habit tracking\""))))))
+
 (provide 'anvil-worklog-test)
 
 ;;; anvil-worklog-test.el ends here

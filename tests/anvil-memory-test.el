@@ -2619,6 +2619,45 @@ yields a delta with reason `no-change' and empty text."
       (should (= 0.8 (plist-get c :top-similarity))))))
 
 
+;;;; --- FTS5 query quoting --------------------------------------------------
+
+(defmacro anvil-memory-test--with-hyphen-env (&rest body)
+  `(anvil-memory-test--with-env
+     (skip-unless (anvil-memory-test--supported-p 'search))
+     (anvil-memory-test--write
+      (expand-file-name "feedback_a.md" root)
+      "---\ntype: feedback\n---\nfresh-buffer and anvil-crypto notes\n")
+     (anvil-memory-test--write
+      (expand-file-name "feedback_b.md" root)
+      "---\ntype: feedback\n---\nsaid \"hello\" about org-agenda\n")
+     (anvil-memory-test--write
+      (expand-file-name "feedback_c.md" root)
+      "---\ntype: feedback\n---\nhabit tracking only\n")
+     (anvil-memory-scan)
+     ,@body))
+
+(ert-deftest anvil-memory-test/search-hyphenated-term ()
+  (anvil-memory-test--with-hyphen-env
+    (should (= 1 (length (anvil-memory-search "fresh-buffer"))))
+    (should (= 1 (length (anvil-memory-search "anvil-crypto"))))))
+
+(ert-deftest anvil-memory-test/search-term-with-quote ()
+  (anvil-memory-test--with-hyphen-env
+    (should (listp (anvil-memory-search "said \"hello")))
+    (should (listp (anvil-memory-search "a\"b")))))
+
+(ert-deftest anvil-memory-test/search-or-query ()
+  (anvil-memory-test--with-hyphen-env
+    (should (= 2 (length (anvil-memory-search "org-agenda OR habit"))))))
+
+(ert-deftest anvil-memory-test/search-prefix-star ()
+  (anvil-memory-test--with-hyphen-env
+    (should (= 1 (length (anvil-memory-search "fresh-buf*"))))))
+
+(ert-deftest anvil-memory-test/search-quoted-phrase ()
+  (anvil-memory-test--with-hyphen-env
+    (should (= 1 (length (anvil-memory-search "\"habit tracking\""))))))
+
 (provide 'anvil-memory-test)
 
 ;;; anvil-memory-test.el ends here

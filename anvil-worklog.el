@@ -806,6 +806,42 @@ LIMIT = 20."
                       (if args (list (nreverse args)) nil))))
     (mapcar #'anvil-worklog--row->plist rows)))
 
+(defun anvil-worklog-fts5-quote-query (query)
+  "Return QUERY rewritten so plain words are safe FTS5 strings.
+FTS5 parses an unquoted `a-b' as a column filter / NOT, which fails
+with \"no such column\".  Each whitespace-separated term is wrapped in
+double quotes (embedded quotes doubled); `foo-bar*' becomes
+`\"foo-bar\"*'.  Deliberate FTS5 syntax is kept as-is: upper-case
+AND / OR / NOT, NEAR(...) groups, already-quoted \"...\" phrases and
+parentheses around terms.  Shared with `anvil-memory-search'."
+  (let ((pos 0) (out nil)
+        (re (concat "\"\\(?:[^\"]\\|\"\"\\)*\"\\*?"
+                    "\\|NEAR([^)]*)"
+                    "\\|[^ \t\n\r]+")))
+    (while (string-match re query pos)
+      (let ((tok (match-string 0 query)))
+        (setq pos (match-end 0))
+        (push
+         (cond
+          ((member tok '("AND" "OR" "NOT")) tok)
+          ((string-prefix-p "\"" tok) tok)
+          ((string-prefix-p "NEAR(" tok) tok)
+          (t
+           (let ((open "") (close "") (star ""))
+             (while (string-prefix-p "(" tok)
+               (setq open (concat open "(") tok (substring tok 1)))
+             (while (and (string-suffix-p ")" tok)
+                         (not (string-search "(" tok)))
+               (setq close (concat close ")") tok (substring tok 0 -1)))
+             (when (and (> (length tok) 1) (string-suffix-p "*" tok))
+               (setq star "*" tok (substring tok 0 -1)))
+             (if (string-empty-p tok)
+                 (concat open close)
+               (concat open "\"" (replace-regexp-in-string "\"" "\"\"" tok t t)
+                       "\"" star close)))))
+         out)))
+    (mapconcat #'identity (nreverse out) " ")))
+
 (cl-defun anvil-worklog-search (query &key limit machine since until year)
   "FTS5 search the worklog index.  Returns up to LIMIT entries
 ordered by FTS rank (best first).  Empty / whitespace QUERY returns nil."
@@ -813,7 +849,7 @@ ordered by FTS rank (best first).  Empty / whitespace QUERY returns nil."
          (db (anvil-worklog--db)))
     (when (and q (not (string-empty-p q)))
       (let* ((where (list "worklog_fts MATCH ?"))
-             (args (list q))
+             (args (list (anvil-worklog-fts5-quote-query q)))
              (lim (or limit 20))
              (sql (concat
                    "SELECT e.file, e.start_line, e.end_line, e.machine,
