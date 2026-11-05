@@ -73,5 +73,279 @@
   {
    "expression": "(list (plist-get anvil-browser--metrics :fetches) (plist-get anvil-browser--metrics :cache-hits) (mapcar (lambda (f) (with-temp-buffer (insert-file-contents f) (buffer-string))) (directory-files \"@TMP@/cap\" t \"\\\\.org\\\\'\")))"
   }
+ ],
+ [
+  "emacs-eval",
+  {
+   "expression": "(let ((f (expand-file-name \"bufx.txt\" \"@TMP@\"))) (write-region \"alpha\\n\" nil f) (with-current-buffer (find-file-noselect f) (goto-char (point-max)) (insert \"beta\\n\") (buffer-modified-p)))"
+  }
+ ],
+ [
+  "buffer-list-modified",
+  {}
+ ],
+ [
+  "buffer-read",
+  {
+   "name": "bufx.txt"
+  }
+ ],
+ [
+  "buffer-save",
+  {
+   "name": "bufx.txt"
+  }
+ ],
+ [
+  "buffer-list-modified",
+  {}
+ ],
+ [
+  "emacs-eval",
+  {
+   "expression": "(with-temp-buffer (insert-file-contents (expand-file-name \"bufx.txt\" \"@TMP@\")) (buffer-string))"
+  }
+ ],
+ [
+  "emacs-eval",
+  {
+   "expression": "(progn (with-temp-file \"@TMP@/fix.org\" (insert \"#+TITLE: fix\\n* TODO First task :work:\\n:PROPERTIES:\\n:ID: aaaa-1111\\n:END:\\nBody text one.\\n** TODO Child\\nChild body.\\n* DONE Second\\n\")) (setq org-todo-keywords '((sequence \"TODO\" \"|\" \"DONE\"))) (setq anvil-org-allowed-files (list \"@TMP@/fix.org\")) \"seeded\")"
+  }
+ ],
+ [
+  "org-read-outline",
+  {
+   "file": "@TMP@/fix.org"
+  }
+ ],
+ [
+  "org-read-headline",
+  {
+   "file": "@TMP@/fix.org",
+   "headline_path": "First task/Child"
+  }
+ ],
+ [
+  "org-read-by-id",
+  {
+   "uuid": "aaaa-1111"
+  }
+ ],
+ [
+  "org-read-file",
+  {
+   "file": "@TMP@/fix.org"
+  }
+ ],
+ [
+  "org-edit-body",
+  {
+   "resource_uri": "org-headline://@TMP@/fix.org#First%20task/Child",
+   "old_body": "Child body.",
+   "new_body": "Child body edited."
+  }
+ ],
+ [
+  "org-read-file",
+  {
+   "file": "@TMP@/fix.org"
+  }
+ ],
+ [
+  "org-rename-headline",
+  {
+   "uri": "org-id://aaaa-1111",
+   "current_title": "First task",
+   "new_title": "Renamed task"
+  }
+ ],
+ [
+  "org-read-file",
+  {
+   "file": "@TMP@/fix.org"
+  }
+ ],
+ [
+  "org-add-todo",
+  {
+   "title": "Added item",
+   "todo_state": "TODO",
+   "parent_uri": "org-id://aaaa-1111",
+   "body": "Added body.",
+   "tags": "[\"new\"]"
+  }
+ ],
+ [
+  "org-read-file",
+  {
+   "file": "@TMP@/fix.org"
+  }
+ ],
+ [
+  "org-update-todo-state",
+  {
+   "uri": "org-headline://@TMP@/fix.org#Second",
+   "current_state": "DONE",
+   "new_state": "TODO"
+  }
+ ],
+ [
+  "org-read-file",
+  {
+   "file": "@TMP@/fix.org"
+  }
+ ],
+ [
+  "emacs-eval",
+  {
+   "expression": "(progn (with-temp-file \"@TMP@/cap.org\" (insert \"#+TITLE: cap\\n* TODO Existing\\n\")) (setq anvil-org-allowed-files (list \"@TMP@/fix.org\" \"@TMP@/cap.org\")) (setq org-directory \"@TMP@\") (setq org-capture-templates '((\"t\" \"Task\" entry (file \"@TMP@/cap.org\") \"* TODO %i\\n:PROPERTIES:\\n:CREATED: x\\n:END:\\n\"))) \"cap-seeded\")"
+  }
+ ],
+ [
+  "org-capture-string",
+  {
+   "keys": "t",
+   "content": "Captured thing"
+  }
+ ],
+ [
+  "org-read-file",
+  {
+   "file": "@TMP@/cap.org"
+  }
+ ],
+ [
+  "emacs-eval",
+  {
+   "expression": "(progn (with-temp-file \"@TMP@/hab.org\" (insert \"#+TITLE: habits\\n* TODO Water plants\\nSCHEDULED: <2026-11-01 Sun .+2d>\\n:PROPERTIES:\\n:STYLE: habit\\n:LAST_REPEAT: [2026-10-30 Fri 10:00]\\n:END:\\n:LOGBOOK:\\n- State \\\"DONE\\\"       from \\\"TODO\\\"       [2026-10-30 Fri 10:00]\\n- State \\\"DONE\\\"       from \\\"TODO\\\"       [2026-10-28 Wed 10:00]\\n- State \\\"DONE\\\"       from \\\"TODO\\\"       [2026-10-26 Mon 10:00]\\n:END:\\n* TODO Plain task\\nSCHEDULED: <2026-11-02 Mon>\\n\")) (setq anvil-org-allowed-files (list \"@TMP@/hab.org\")) \"hab-seeded\")"
+  }
+ ],
+ [
+  "org-habit-summary",
+  {
+   "today": "2026-11-03"
+  }
+ ],
+ [
+  "emacs-eval",
+  {
+   "expression": "(progn (make-directory (file-name-directory \"@TMP@/srv/a.json\") t) (with-temp-file \"@TMP@/srv/a.json\" (insert \"{\\\"k\\\":\\\"v\\\"}\n\")) (make-directory (file-name-directory \"@TMP@/srv/b.json\") t) (with-temp-file \"@TMP@/srv/b.json\" (insert \"{\\\"k\\\":\\\"w\\\"}\n\")) (make-directory (file-name-directory \"@TMP@/srv/robots.txt\") t) (with-temp-file \"@TMP@/srv/robots.txt\" (insert \"User-agent: *\nDisallow: /private/\n\")) (make-directory (file-name-directory \"@TMP@/srv/private/s.txt\") t) (with-temp-file \"@TMP@/srv/private/s.txt\" (insert \"secret\n\")) (make-directory (file-name-directory \"@TMP@/srv/tweet\") t) (with-temp-file \"@TMP@/srv/tweet\" (insert \"{\\\"id_str\\\":\\\"123\\\",\\\"text\\\":\\\"hello tweet\\\",\\\"created_at\\\":\\\"2026-01-02T03:04:05.000Z\\\",\\\"user\\\":{\\\"name\\\":\\\"Fx User\\\",\\\"screen_name\\\":\\\"fxuser\\\"}}\n\")) (make-directory (file-name-directory \"@TMP@/srv/r/t/comments/abc/slug.json\") t) (with-temp-file \"@TMP@/srv/r/t/comments/abc/slug.json\" (insert \"[{\\\"data\\\":{\\\"children\\\":[{\\\"data\\\":{\\\"title\\\":\\\"Fx thread\\\",\\\"author\\\":\\\"op1\\\",\\\"subreddit\\\":\\\"fx\\\",\\\"selftext\\\":\\\"body text\\\",\\\"url\\\":\\\"u\\\",\\\"permalink\\\":\\\"/r/fx/abc\\\",\\\"score\\\":7,\\\"created_utc\\\":1,\\\"num_comments\\\":2}}]}},{\\\"data\\\":{\\\"children\\\":[{\\\"kind\\\":\\\"t1\\\",\\\"data\\\":{\\\"author\\\":\\\"c1\\\",\\\"score\\\":3,\\\"body\\\":\\\"first comment\\\",\\\"created_utc\\\":2}},{\\\"kind\\\":\\\"t1\\\",\\\"data\\\":{\\\"author\\\":\\\"c2\\\",\\\"score\\\":1,\\\"body\\\":\\\"second comment\\\",\\\"created_utc\\\":3}}]}}]\n\")) (make-directory \"@TMP@/docs\" t) (with-temp-file \"@TMP@/docs/n.org\" (insert \"# Alpha\n\nFirst chunk text about alpha things here.\n\n# Beta\n\nSecond chunk text about beta items there.\n\")) (with-temp-file \"@TMP@/s.py\" (insert \"import http.server as h,json,signal,sys\nsignal.alarm(900)\nclass H(h.SimpleHTTPRequestHandler):\n  def log_message(s,*a): pass\n  def do_POST(s):\n    b=s.rfile.read(int(s.headers['Content-Length']))\n    j=json.loads(b) if s.path=='/api/embed' else {}\n    o={'embeddings':[[1.0,len(t)%5+1.0,0.5] for t in j['input']]} if j else {'ok':True,'got':b.decode()}\n    r=json.dumps(o).encode()\n    s.send_response(200)\n    s.send_header('Content-Type','application/json')\n    s.send_header('Content-Length',str(len(r)))\n    s.end_headers()\n    s.wfile.write(r)\nd=sys.argv[1]\nh.ThreadingHTTPServer(('127.0.0.1',18793),lambda *a: H(*a,directory=d)).serve_forever()\n\")) (setq w2calls-srv (make-process :name \"w2srv\" :command (list \"python3\" \"@TMP@/s.py\" \"@TMP@/srv\") :noquery t)) (sleep-for 2) (setq anvil-web--tweet-syndication-url \"http://127.0.0.1:18793/tweet?id=%s&token=x\") (setq anvil-semantic-db-path \"@TMP@/idx.db\" anvil-semantic-roots (list \"@TMP@/docs\") anvil-semantic-ollama-host \"http://127.0.0.1:18793\" anvil-semantic-embed-model \"fxmodel\" anvil-semantic-exclude-patterns nil) \"w2-seeded\")"
+  }
+ ],
+ [
+  "http-fetch",
+  {
+   "url": "http://127.0.0.1:18793/a.json"
+  }
+ ],
+ [
+  "http-fetch",
+  {
+   "url": "http://127.0.0.1:18793/a.json"
+  }
+ ],
+ [
+  "http-fetch",
+  {
+   "url": "http://127.0.0.1:18793/b.json"
+  }
+ ],
+ [
+  "http-head",
+  {
+   "url": "http://127.0.0.1:18793/a.json"
+  }
+ ],
+ [
+  "http-post",
+  {
+   "url": "http://127.0.0.1:18793/post",
+   "body": "x=1",
+   "content_type": "text/plain"
+  }
+ ],
+ [
+  "http-robots-check",
+  {
+   "url": "http://127.0.0.1:18793/private/s.txt"
+  }
+ ],
+ [
+  "http-cache-status",
+  {}
+ ],
+ [
+  "http-cache-index",
+  {}
+ ],
+ [
+  "http-cache-get",
+  {
+   "sha_or_uri": "95a3ca65e77ab52734014690ca24f9d457f792a20c15489192c13a8dc3871b06"
+  }
+ ],
+ [
+  "anvil-uri-fetch",
+  {
+   "uri": "http-cache://95a3ca65e77ab52734014690ca24f9d457f792a20c15489192c13a8dc3871b06"
+  }
+ ],
+ [
+  "http-fetch-batch",
+  {
+   "urls": [
+    "http://127.0.0.1:18793/a.json",
+    "http://127.0.0.1:18793/b.json"
+   ]
+  }
+ ],
+ [
+  "http-fetch-batch",
+  {
+   "urls": [
+    "http://127.0.0.1:18793/b.json",
+    "http://127.0.0.1:18793/a.json"
+   ],
+   "no_cache": true,
+   "json_path": "k"
+  }
+ ],
+ [
+  "web-reddit-thread",
+  {
+   "url": "http://127.0.0.1:18793/r/t/comments/abc/slug"
+  }
+ ],
+ [
+  "web-tweet-fetch",
+  {
+   "tweet_id": "123"
+  }
+ ],
+ [
+  "http-cache-clear",
+  {
+   "url": "http://127.0.0.1:18793/a.json"
+  }
+ ],
+ [
+  "http-cache-clear",
+  {}
+ ],
+ [
+  "semantic-embed-index",
+  {
+   "root": "@TMP@/docs"
+  }
+ ],
+ [
+  "semantic-embed-index",
+  {}
+ ],
+ [
+  "emacs-eval",
+  {
+   "expression": "(progn (delete-process w2calls-srv) \"w2-stopped\")"
+  }
  ]
 ]
