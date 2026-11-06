@@ -538,14 +538,7 @@ and tags, then re-align the tags (GNU `org-edit-headline')."
         "Return BUFFER itself: indirect buffers are unavailable here."
         (setq anvil-standalone-org--capture-active t)
         (or buffer (current-buffer)))
-      (unless (get 'buffer-base-buffer 'anvil-standalone-org)
-        (let ((orig (symbol-function 'buffer-base-buffer)))
-          (defun buffer-base-buffer (&optional buffer)
-            "Like `buffer-base-buffer'; a capture buffer is its own base."
-            (or (funcall orig buffer)
-                (and anvil-standalone-org--capture-active
-                     (or buffer (current-buffer))))))
-        (put 'buffer-base-buffer 'anvil-standalone-org t))
+      (anvil-standalone-org--guard-base-buffer)
       (setq anvil-standalone-org--capture-ready t))))
 
 ;; The lightweight `org-entry-get' ignores a planning line before the property
@@ -639,6 +632,254 @@ and tags, then re-align the tags (GNU `org-edit-headline')."
         (error "GNU org-habit did not load"))
       (setq anvil-standalone-org--habit-ready t))))
 
+;; Lazy GNU org-agenda (S13.9).  Nothing here runs at load time: the genuine
+;; vendored org-agenda.el (and the genuine org-element it requires) load on
+;; the first org-agenda-view call.  GNU definitions that the lightweight Org
+;; subset lacks are read by name and kind from the vendored org/calendar files.
+(defvar anvil-standalone-org--agenda-ready nil)
+(defvar anvil-standalone-org--agenda-files
+  '("org/org.el" "org/org-macs.el" "org/org-compat.el" "org/org-agenda.el"
+    "org/org-element.el" "org/org-element-ast.el" "org/org-faces.el"
+    "org/org-fold-core.el" "org/org-list.el"
+    "org/org-clock.el" "org/org-duration.el" "org/ol.el"
+    "calendar/calendar.el" "calendar/time-date.el" "subr.el"
+    "emacs-lisp/subr-x.el")
+  "Vendored files searched for missing definitions, in order.")
+(defvar anvil-standalone-org--agenda-stubs
+  '((display-color-cells . 16777216) (get-buffer-window) (window-width . 80)
+    (selected-window) (window-live-p) (select-window) (set-window-buffer)
+    (display-buffer) (delete-other-windows) (one-window-p . t)
+    (window-body-width . 80) (frame-width . 80) (window-dedicated-p)
+    (window-start . 1) (set-window-start) (set-window-point)
+    (window-point . 1) (redisplay) (recenter) (force-mode-line-update)
+    (window-buffer) (window-max-chars-per-line . 80))
+  "Window/display functions with no meaning in a headless run: NAME . VALUE.")
+
+(defvar anvil-standalone-org--vendor-index nil
+  "Hash of (KIND . NAME-STRING) to (PATH . LINE), built once per run.")
+
+(defun anvil-standalone-org--build-vendor-index (files)
+  "Index the top-level definitions of FILES with one grep per file.
+Searching a 20k-line vendored file from Lisp once per name is far too slow on
+this runtime, while grep takes milliseconds."
+  (let ((dir (anvil-standalone-org--vendor-dir))
+        (index (make-hash-table :test 'equal)))
+    (dolist (f files)
+      (let ((path (expand-file-name f dir)))
+        (when (file-readable-p path)
+          (with-temp-buffer
+            (call-process "grep" nil t nil "-a" "-n" "-E"
+                          "^\\((defun|defmacro|defsubst|cl-defun|cl-defmacro|defvar|defcustom|defconst|defvar-local) [^ ()]+[ \t)]?"
+                          path)
+            (goto-char (point-min))
+            (while (not (eobp))
+              (when (looking-at
+                     "\\([0-9]+\\):(\\([a-z-]+\\) \\([^ \t\n()]+\\)\\([ \t)]?\\)")
+               (let* ((line (string-to-number (match-string 1)))
+                     (head (match-string 2))
+                     (name (match-string 3))
+                     (next (match-string 4))
+                     (fn (member head '("defun" "defmacro" "defsubst"
+                                        "cl-defun" "cl-defmacro")))
+                     (key (cons (if fn 'fn 'var) name)))
+                ;; A bare `(defvar NAME)' only declares; it never binds.
+                (unless (or (gethash key index)
+                            (and (not fn) (equal next ")")))
+                  (puthash key (cons path line) index))))
+              (forward-line 1))))))
+    index))
+
+(defun anvil-standalone-org--vendor-def-kind (name files kind)
+  "Evaluate the first top-level definition of NAME of KIND (fn or var) in FILES.
+A bare `(defvar NAME)' declaration is skipped.  Return non-nil if found."
+  (unless anvil-standalone-org--vendor-index
+    (setq anvil-standalone-org--vendor-index
+          (anvil-standalone-org--build-vendor-index files)))
+  (let ((hit (gethash (cons kind name) anvil-standalone-org--vendor-index)))
+    (when hit
+      (let ((form (with-temp-buffer
+                    (call-process "sed" nil t nil "-n"
+                                  (format "%d,%dp" (cdr hit) (+ (cdr hit) 800))
+                                  (car hit))
+                    (goto-char (point-min))
+                    (read (current-buffer)))))
+        (eval form t)
+        t))))
+
+(defun anvil-standalone-org--resolve-void (err &optional depth)
+  "Define the void function/variable named by ERR; return non-nil on success."
+  (let* ((kind (if (eq (car err) 'void-function) 'fn 'var))
+         (name (cadr err))
+         (stub (and (eq kind 'fn)
+                    (assq name anvil-standalone-org--agenda-stubs)))
+         (depth (or depth 0)))
+    (cond
+     (stub (eval `(defun ,(car stub) (&rest _) ',(cdr stub)) t) t)
+     ((> depth 8) nil)
+     (t
+      (let ((r nil) (rounds 0))
+        (while (not r)
+          (setq rounds (1+ rounds))
+          (when (> rounds 12) (setq r 'fail))
+          (let ((e (condition-case e2
+                       (if (anvil-standalone-org--vendor-def-kind
+                            (symbol-name name) anvil-standalone-org--agenda-files
+                            kind)
+                           'ok 'absent)
+                     (error e2))))
+            (cond ((eq e 'ok) (setq r 'done))
+                  ((eq e 'absent) (setq r 'fail))
+                  ((memq (car e) '(void-function void-variable))
+                   (unless (anvil-standalone-org--resolve-void e (1+ depth))
+                     (setq r 'fail)))
+                  (t (setq r 'fail)))))
+        (eq r 'done))))))
+
+;; GNU arithmetic accepts markers; NeLisp provides that coercion only on
+;; request (`nelisp-marker-arith-call') because wrapping the hot natives
+;; globally costs ~12x.  Org's agenda code compares markers, so scope it
+;; to the agenda call.
+(defun anvil-standalone-org--with-markers (thunk)
+  "Call THUNK with marker-accepting arithmetic when NeLisp provides it."
+  (if (fboundp 'nelisp-marker-arith-call)
+      (nelisp-marker-arith-call
+       '(+ - * / < > <= >= = /= max min % mod 1+ 1-) thunk)
+    (funcall thunk)))
+
+(defun anvil-standalone-org--with-void-resolver (thunk)
+  "Call THUNK, resolving void GNU definitions by name and retrying."
+  (let ((n 0) (res nil) (done nil))
+    (while (not done)
+      (setq n (1+ n))
+      (let ((r (condition-case err (cons 'ok (funcall thunk)) (error err))))
+        (cond ((eq (car r) 'ok) (setq res (cdr r) done t))
+              ((and (memq (car r) '(void-function void-variable)) (< n 200)
+                    (anvil-standalone-org--resolve-void r)))
+              (t (signal (car r) (cdr r))))))
+    res))
+
+(defun anvil-standalone-org--guard-base-buffer ()
+  "Wrap `buffer-base-buffer' once: no indirect buffers, no type errors.
+A capture buffer is its own base while a capture is active.  The
+nelisp-emacs-lib polyfill signals wrong-type-argument for a native buffer
+on newer NeLisp builds; there are no indirect buffers here, so that means nil."
+  (unless (get 'buffer-base-buffer 'anvil-standalone-org)
+    (let ((orig (symbol-function 'buffer-base-buffer)))
+      (defun buffer-base-buffer (&optional buffer)
+        "Like `buffer-base-buffer'; a capture buffer is its own base."
+        (or (condition-case nil (funcall orig buffer)
+              (wrong-type-argument nil))
+            (and anvil-standalone-org--capture-active
+                 (or buffer (current-buffer))))))
+    (put 'buffer-base-buffer 'anvil-standalone-org t)))
+
+(defun anvil-standalone-org--ensure-agenda ()
+  "Load genuine org-agenda and its prerequisites, once."
+  (unless anvil-standalone-org--agenda-ready
+    (let ((dir (anvil-standalone-org--vendor-dir)))
+      (unless dir (error "Vendored emacs-lisp directory not found"))
+      (anvil-standalone-org--guard-base-buffer)
+      ;; Missing GNU seq.el functions.
+      (unless (fboundp 'seq-do-indexed)
+        (defun seq-do-indexed (function sequence)
+          "GNU seq.el `seq-do-indexed'."
+          (let ((index 0))
+            (seq-do (lambda (elt) (funcall function elt index)
+                      (setq index (1+ index)))
+                    sequence))
+          nil))
+      (unless (fboundp 'seq-difference)
+        (defun seq-difference (sequence1 sequence2 &optional testfn)
+          "GNU seq.el `seq-difference' (list result)."
+          (let (acc)
+            (dolist (e (append sequence1 nil))
+              (unless (seq-contains-p sequence2 e testfn) (push e acc)))
+            (nreverse acc))))
+      ;; Missing Emacs primitives.
+      (unless (fboundp 'get-file-buffer)
+        (defun get-file-buffer (filename)
+          "Return the buffer visiting FILENAME, or nil."
+          (let ((f (expand-file-name filename)) found)
+            (dolist (b (buffer-list))
+              (when (and (not found)
+                         (equal (with-current-buffer b buffer-file-name) f))
+                (setq found b)))
+            found)))
+      (unless (fboundp 'restore-buffer-modified-p)
+        (defun restore-buffer-modified-p (flag) (set-buffer-modified-p flag)))
+      ;; The subset only pretends to provide org-element-ast; load the real one.
+      (setq features (delq 'org-element-ast features))
+      (let ((load-path (append (list (expand-file-name "org" dir)
+                                     (expand-file-name "calendar" dir))
+                               load-path)))
+        ;; generator.el cannot expand here (cl-loop clause shape).  avl-tree.el
+        ;; uses it only for `avl-tree-iter', which org does not call, so
+        ;; while org loads iter-defun/iter-lambda define functions that
+        ;; signal when called.  The real macros are restored afterwards.
+        (let ((saved-defun (symbol-function 'iter-defun))
+              (saved-lambda (symbol-function 'iter-lambda)))
+          (unwind-protect
+              (progn
+                (defalias 'iter-defun
+                  (cons 'macro
+                        (lambda (name args &rest body)
+                          (let ((doc (and (stringp (car body))
+                                          (list (car body)))))
+                            `(defun ,name ,args ,@doc
+                               (error "Generators are unsupported: %s"
+                                      ',name))))))
+                (defalias 'iter-lambda
+                  (cons 'macro
+                        (lambda (args &rest _body)
+                          `(lambda ,args
+                             (error "Generators are unsupported")))))
+                (anvil-standalone-org--with-void-resolver
+                 (lambda () (require 'org-agenda))))
+            (defalias 'iter-defun saved-defun)
+            (defalias 'iter-lambda saved-lambda))))
+      (unless (fboundp 'org-agenda-list)
+        (error "GNU org-agenda did not load"))
+      ;; org-agenda-get-sexps requires diary-lib, whose top level calls
+      ;; (copy-syntax-table (standard-syntax-table)) (wrong-type-argument on
+      ;; this runtime) and `custom-add-option'.  The table is only used when
+      ;; parsing diary files, so a nil placeholder lets the genuine library load.
+      ;; Org's agenda and element code wraps these lookups in condition-case
+      ;; handlers that only message "Skipping entry", so the void resolver never
+      ;; sees the void error: resolve them before the call.
+      (dolist (r '((void-variable . org-ts-regexp0)
+                   (void-function . org-time-string-to-absolute)
+                   (void-function . org-time-string-to-time)
+                   (void-function . org-closest-date)
+                   (void-function . org-parse-time-string)
+                   (void-function . org-encode-time)))
+        (unless (if (eq (car r) 'void-variable) (boundp (cdr r)) (fboundp (cdr r)))
+          (anvil-standalone-org--resolve-void (list (car r) (cdr r)))))
+      (unless (boundp 'diary-syntax-table) (defvar diary-syntax-table nil))
+      (unless (fboundp 'custom-add-option)
+        (defalias 'custom-add-option (lambda (&rest _) nil)))
+      ;; Cache persistence is meaningless in a headless one-shot call.
+      (dolist (f '(org-persist-register org-persist-unregister org-persist-read))
+        (defalias f (lambda (&rest _) nil)))
+      ;; anvil-org let-binds this; it must be special before that happens.
+      (unless (special-variable-p 'org-agenda-files)
+        (anvil-standalone-org--resolve-void '(void-variable org-agenda-files)))
+      ;; find-file-noselect does not pick a major mode on this runtime, so
+      ;; buffers GNU opens for agenda files are put in org-mode here.
+      (unless (get 'org-get-agenda-file-buffer 'anvil-standalone-mode)
+        (unless (fboundp 'org-get-agenda-file-buffer)
+          (anvil-standalone-org--resolve-void
+           '(void-function org-get-agenda-file-buffer)))
+        (let ((orig (symbol-function 'org-get-agenda-file-buffer)))
+          (defalias 'org-get-agenda-file-buffer
+            (lambda (file)
+              (let ((b (funcall orig file)))
+                (when (buffer-live-p b)
+                  (with-current-buffer b
+                    (unless (derived-mode-p 'org-mode) (org-mode))))
+                b))))
+        (put 'org-get-agenda-file-buffer 'anvil-standalone-mode t))
+      (setq anvil-standalone-org--agenda-ready t))))
+
 (defun anvil-standalone-org-install-lazy-wrappers ()
   "Wrap the capture tool handler so GNU org-capture loads on first use."
   (when (and (fboundp 'anvil-org--tool-capture-string)
@@ -679,7 +920,24 @@ and tags, then re-align the tags (GNU `org-edit-headline')."
                        (anvil-standalone-org--habit-orig files_json today))
                    (dolist (c saved) (defalias (car c) (cdr c)))))) 
             t))
-    (put 'anvil-org--tool-habit-summary 'anvil-standalone-lazy t)))
+    (put 'anvil-org--tool-habit-summary 'anvil-standalone-lazy t))
+  (when (and (fboundp 'anvil-org--tool-agenda-view)
+             (not (get 'anvil-org--tool-agenda-view 'anvil-standalone-lazy)))
+    (let ((orig (symbol-function 'anvil-org--tool-agenda-view))
+          (doc (documentation 'anvil-org--tool-agenda-view t)))
+      (defalias 'anvil-standalone-org--agenda-orig orig)
+      (eval `(defun anvil-org--tool-agenda-view
+                 (&optional keys start_day span files_json)
+               ,doc
+               (anvil-standalone-org--ensure-agenda)
+               (anvil-standalone-org--with-void-resolver
+                (lambda ()
+                  (anvil-standalone-org--with-markers
+                   (lambda ()
+                     (anvil-standalone-org--agenda-orig
+                      keys start_day span files_json))))))
+            t))
+    (put 'anvil-org--tool-agenda-view 'anvil-standalone-lazy t)))
 
 (provide 'anvil-standalone-org)
 ;;; anvil-standalone-org.el ends here

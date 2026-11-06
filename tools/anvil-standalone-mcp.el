@@ -964,17 +964,18 @@ Also called lazily by the context worker, because some anvil-defs paths
     (error (push (cons 'anvil-sexp err) anvil-standalone--port10-errors))))
 
 (defvar anvil-standalone--port11-unregister
-  '("org-agenda-view")
+  '()
   "Ids of anvil-org tools that still answer differently from host Emacs.
 org-read-outline/headline/by-id, org-edit-body, org-rename-headline,
 org-add-todo, org-update-todo-state, org-capture-string and org-habit-summary
 match the host since `anvil-standalone-org.el' supplies the missing GNU
 functions (the genuine org-capture.el and org-habit.el are loaded on the first
 call of their tool, with the base buffer standing in for the dead
-`make-indirect-buffer').  Still blocked: org-agenda-view.  The genuine
-org-agenda.el needs org-element (`org-element-deferred-create' is void after
-`seq-difference' is shimmed) plus org-agenda-list and the calendar/diary
-machinery, none of which exist in this runtime.")
+`make-indirect-buffer').  org-agenda-view matches the host too: the genuine
+org-agenda.el and org-element are loaded on its first call
+(`anvil-standalone-org--ensure-agenda'), with the agenda call wrapped in
+`nelisp-marker-arith-call' (NeLisp must provide it; see ledger S13.9).  The
+list is empty: every anvil-org tool is registered.")
 ;; Port 11: anvil-org.  Its requires need several GNU facilities that standalone
 ;; lacks; each shim below is fboundp/boundp guarded and copies GNU source.
 ;;  * `version<' and friends: copied from GNU subr.el (the whole vendor subr.el
@@ -994,7 +995,7 @@ machinery, none of which exist in this runtime.")
 ;;    tools/anvil-standalone-org.el) org-read-outline, org-read-headline and
 ;;    org-read-by-id, org-edit-body, org-rename-headline, org-add-todo and
 ;;    org-update-todo-state, org-capture-string and org-habit-summary.  Only
-;;    org-agenda-view is unregistered in `anvil-standalone--port11-unregister'.
+;;    `anvil-standalone--port11-unregister' lists any anvil-org tool to leave out (none now).
 ;;  * tools/anvil-standalone-org.el is a separate file (loaded relative to the
 ;;    loader) so the many GNU Org shims stay out of this long loader; all are
 ;;    fboundp/boundp guarded.
@@ -1190,7 +1191,13 @@ machinery, none of which exist in this runtime.")
     (declare (side-effect-free t))
     (version-list-= (version-to-list v1) (version-to-list v2)))
     )
-    (unless (fboundp 'subr-arity)
+    ;; Newer NeLisp builds define a GNU-strict `subr-arity' that rejects
+    ;; closures, but several builtins (get-buffer-create, ...) are closures
+    ;; there, so loading anvil-org signals (wrong-type-argument subrp ...).
+    (unless (and (fboundp 'subr-arity)
+                 (condition-case nil
+                     (progn (subr-arity (symbol-function 'get-buffer-create)) t)
+                   (error nil)))
       (defun subr-arity (subr) (func-arity subr)))
     (unless (boundp 'user-mail-address) (defvar user-mail-address ""))
     (unless (boundp 'user-full-name) (defvar user-full-name ""))

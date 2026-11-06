@@ -118,5 +118,19 @@
   {
    "today": "2026-11-03"
   }
+ ],
+ [
+  "emacs-eval",
+  {
+   "expression": "(progn (with-temp-file \"@TMP@/ag.org\" (insert \"#+TITLE: agenda fixture\\n* TODO Sched item\\nSCHEDULED: <2030-01-07 Mon>\\n* TODO Dead item\\nDEADLINE: <2030-01-09 Wed>\\n\")) (setq anvil-org-allowed-files (list \"@TMP@/ag.org\")) \"ag-seeded\")"
+  }
+ ],
+ [
+  "org-agenda-view",
+  {
+   "start_day": "2030-01-07",
+   "span": "7",
+   "files_json": "[\"@TMP@/ag.org\"]"
+  }
  ]
 ]

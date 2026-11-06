@@ -29,7 +29,7 @@ msgs = [{"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocol
 msgs += [{"jsonrpc": "2.0", "id": i, "method": "tools/call", "params": {"name": n, "arguments": a}}
          for i, (n, a) in enumerate(calls, 2)]
 try:
-    out, _ = p.communicate("".join(json.dumps(m) + "\n" for m in msgs).encode(), timeout=240)
+    out, _ = p.communicate("".join(json.dumps(m) + "\n" for m in msgs).encode(), timeout=int(os.environ.get("ANVIL_MCP_CALL_TIMEOUT", "240")))
 except subprocess.TimeoutExpired:
     p.kill(); out, _ = p.communicate(); print("TIMEOUT")
 ok = set()
