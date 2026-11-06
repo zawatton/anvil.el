@@ -619,13 +619,19 @@ and tags, then re-align the tags (GNU `org-edit-headline')."
             (list (org-current-level) (org-current-level)
                   (org-get-todo-state) nil (org-get-heading t t t t) nil))))
       ;; org-habit only needs org-agenda for its graph code, not for parsing.
-      (unless (featurep 'org-agenda) (provide 'org-agenda))
+      ;; Remember the placeholder so `anvil-standalone-org--ensure-agenda' can
+      ;; withdraw it before loading the genuine library.
+      (unless (featurep 'org-agenda)
+        (provide 'org-agenda)
+        (put 'org-agenda 'anvil-standalone-stub t))
       (unless (fboundp 'display-color-cells)
         (defalias 'display-color-cells (lambda (&optional _frame) 16777216)))
       ;; Its last form binds a key in the agenda map; there is no agenda here.
       (unless (fboundp 'org-defkey)
         (defalias 'org-defkey (lambda (&rest _) nil)))
-      (unless (boundp 'org-agenda-mode-map) (defvar org-agenda-mode-map nil))
+      (unless (boundp 'org-agenda-mode-map)
+        (defvar org-agenda-mode-map nil)
+        (put 'org-agenda-mode-map 'anvil-standalone-stub t))
       (let ((load-path (cons (expand-file-name "org" dir) load-path)))
         (load "org-habit" nil t))
       (unless (fboundp 'org-habit-parse-todo)
@@ -779,6 +785,17 @@ on newer NeLisp builds; there are no indirect buffers here, so that means nil."
     (let ((dir (anvil-standalone-org--vendor-dir)))
       (unless dir (error "Vendored emacs-lisp directory not found"))
       (anvil-standalone-org--guard-base-buffer)
+      ;; The habit loader may have left a placeholder `org-agenda' feature and
+      ;; a nil `org-agenda-mode-map'; either one would make the genuine
+      ;; library's `require' a no-op or its defvar keep nil.
+      (when (get 'org-agenda 'anvil-standalone-stub)
+        (setq features (delq 'org-agenda features))
+        (put 'org-agenda 'anvil-standalone-stub nil))
+      (when (and (get 'org-agenda-mode-map 'anvil-standalone-stub)
+                 (boundp 'org-agenda-mode-map)
+                 (null (symbol-value 'org-agenda-mode-map)))
+        (makunbound 'org-agenda-mode-map)
+        (put 'org-agenda-mode-map 'anvil-standalone-stub nil))
       ;; Missing GNU seq.el functions.
       (unless (fboundp 'seq-do-indexed)
         (defun seq-do-indexed (function sequence)
