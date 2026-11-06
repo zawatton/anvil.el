@@ -386,13 +386,10 @@ and tags, then re-align the tags (GNU `org-edit-headline')."
 ;; the vendored org.el at start-up hangs the NeLisp HEAD build, S16.2):
 ;; `anvil-standalone-org--ensure-capture' runs on the first org-capture-string
 ;; call.  Missing GNU definitions are read from the vendored org.el by name.
+(declare-function anvil-standalone--elib-vendor-dir "anvil-standalone-mcp" ())
 (defun anvil-standalone-org--vendor-dir ()
   "Return the vendored emacs-lisp directory, or nil."
-  (let* ((compat (or (getenv "NELISP_EMACS_LIB_DIR")
-                     (and (getenv "ANVIL_NOTES_DIR")
-                          (expand-file-name "dev/nelisp-emacs-lib/src"
-                                            (getenv "ANVIL_NOTES_DIR")))))
-         (dir (and compat (expand-file-name "../vendor/emacs-lisp" compat))))
+  (let ((dir (anvil-standalone--elib-vendor-dir)))
     (and dir (file-directory-p dir) dir)))
 
 (defun anvil-standalone-org--vendor-def (name files)

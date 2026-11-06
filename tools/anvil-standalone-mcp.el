@@ -414,14 +414,89 @@ standalone, so the directory listing is rebuilt from `directory-files'."
 Fallback for runtimes without a native `time-subtract'; nil means now."
     (- (float-time a) (float-time b))))
 
+;; emacs-lib resolver.  Every site that needs the Emacs compatibility library
+;; goes through these helpers.  NELISP_ROOT_DIR (a nelisp checkout root) selects
+;; the packaged layout: packages/emacs-lib-*/src plus vendor/emacs-lisp.  When it
+;; is unset the legacy flat directory applies unchanged: NELISP_EMACS_LIB_DIR,
+;; else $ANVIL_NOTES_DIR/dev/nelisp-emacs-lib/src.
+(defun anvil-standalone--elib-root ()
+  "Return the nelisp checkout root from NELISP_ROOT_DIR, or nil when unset."
+  (let ((root (getenv "NELISP_ROOT_DIR")))
+    (and root (> (length root) 0) root)))
+
+(defun anvil-standalone--elib-legacy-dir ()
+  "Return the legacy flat emacs-lib directory, or nil when not configured."
+  (or (getenv "NELISP_EMACS_LIB_DIR")
+      (and (getenv "ANVIL_NOTES_DIR")
+           (expand-file-name "dev/nelisp-emacs-lib/src"
+                             (getenv "ANVIL_NOTES_DIR")))))
+
+(defun anvil-standalone--elib-available-p ()
+  "Return non-nil when an emacs-lib source tree is configured."
+  (and (or (anvil-standalone--elib-root)
+           (anvil-standalone--elib-legacy-dir))
+       t))
+
+(defun anvil-standalone--elib-src-dirs ()
+  "Return the emacs-lib source directories in search order."
+  (let ((root (anvil-standalone--elib-root)))
+    (if root
+        (let (dirs)
+          (dolist (pkg '("emacs-lib-core" "emacs-lib-facade"
+                         "emacs-lib-text-core" "emacs-lib-bridges"))
+            (let ((dir (expand-file-name (concat "packages/" pkg "/src") root)))
+              (when (file-directory-p dir) (push dir dirs))))
+          (nreverse dirs))
+      (let ((dir (anvil-standalone--elib-legacy-dir)))
+        (and dir (list dir))))))
+
+(defun anvil-standalone--elib-file (name)
+  "Return the absolute path of emacs-lib file NAME, or nil.
+Legacy mode returns the path inside the flat directory without checking that
+it exists, as the former per-site code did."
+  (if (anvil-standalone--elib-root)
+      (let (found)
+        (dolist (dir (anvil-standalone--elib-src-dirs))
+          (let ((path (expand-file-name name dir)))
+            (when (and (not found) (file-exists-p path))
+              (setq found path))))
+        found)
+    (let ((dir (anvil-standalone--elib-legacy-dir)))
+      (and dir (expand-file-name name dir)))))
+
+(defun anvil-standalone--elib-load (name &optional noerror)
+  "Load emacs-lib file NAME.  Return nil when NOERROR and it cannot be found.
+NOERROR also silences load errors, like `(load FILE t t)'."
+  (let ((path (anvil-standalone--elib-file name)))
+    (cond (path (if noerror (load path t t) (load path)))
+          (noerror nil)
+          (t (error "emacs-lib file not found: %s" name)))))
+
+(defun anvil-standalone--elib-vendor-dir ()
+  "Return the vendored GNU Lisp directory (vendor/emacs-lisp), or nil."
+  (let ((root (anvil-standalone--elib-root)))
+    (if root
+        (expand-file-name "vendor/emacs-lisp" root)
+      (let ((dir (anvil-standalone--elib-legacy-dir)))
+        (and dir (expand-file-name "../vendor/emacs-lisp" dir))))))
+
+(defun anvil-standalone--elib-add-load-path ()
+  "Put the emacs-lib source directories on `load-path'.
+In NELISP_ROOT_DIR mode the vendored vendor/emacs-lisp, its org and
+emacs-lisp subdirectories follow at the end, so Org and the GNU libraries
+resolve while the runtime's own libraries keep priority."
+  (dolist (dir (reverse (anvil-standalone--elib-src-dirs)))
+    (add-to-list 'load-path dir))
+  (when (anvil-standalone--elib-root)
+    (let ((vendor (anvil-standalone--elib-vendor-dir)))
+      (dolist (sub '("" "org" "emacs-lisp"))
+        (let ((dir (directory-file-name (expand-file-name sub vendor))))
+          (when (file-directory-p dir) (add-to-list 'load-path dir t)))))))
+
 ;; Load the current provider before Anvil can select a stale .elc.  NeLisp's
 ;; library lookup prefers bytecode independently of load-suffixes.
-(let ((compat-dir (or (getenv "NELISP_EMACS_LIB_DIR")
-                      (and (getenv "ANVIL_NOTES_DIR")
-                           (expand-file-name "dev/nelisp-emacs-lib/src"
-                                             (getenv "ANVIL_NOTES_DIR"))))))
-  (when compat-dir
-    (load (expand-file-name "emacs-char-table.el" compat-dir))))
+(when (anvil-standalone--elib-available-p)
+  (anvil-standalone--elib-load "emacs-char-table.el"))
 
 (require 'anvil)
 (require 'anvil-server-commands)
@@ -432,14 +507,10 @@ Fallback for runtimes without a native `time-subtract'; nil means now."
 (require 'anvil-context-batch nil t)
 (require 'anvil-context-dependencies nil t)
 
-(let ((compat-dir (or (getenv "NELISP_EMACS_LIB_DIR")
-                      (and (getenv "ANVIL_NOTES_DIR")
-                           (expand-file-name "dev/nelisp-emacs-lib/src"
-                                             (getenv "ANVIL_NOTES_DIR"))))))
-  (when compat-dir
-    (add-to-list 'load-path compat-dir)
-    (load (expand-file-name "emacs-sqlite-ffi.el" compat-dir))
-    (load (expand-file-name "emacs-textmodes-stub.el" compat-dir))))
+(when (anvil-standalone--elib-available-p)
+  (anvil-standalone--elib-add-load-path)
+  (anvil-standalone--elib-load "emacs-sqlite-ffi.el")
+  (anvil-standalone--elib-load "emacs-textmodes-stub.el"))
 
 ;; SQLite defaults to no lock wait in the standalone FFI.  A short busy
 ;; timeout lets separate MCP processes initialize or read the same DBs.
@@ -736,7 +807,7 @@ Fallback for runtimes without a native `time-subtract'; nil means now."
   ;; file tools: a failed attempt half-installs the runtime's own buffer
   ;; layer and breaks other tools (anvil-shell), so do not even try.
   (condition-case err
-      (when (or (getenv "NELISP_EMACS_LIB_DIR") (getenv "ANVIL_NOTES_DIR"))
+      (when (anvil-standalone--elib-available-p)
         (require 'anvil-file)
         (let ((saved (mapcar (lambda (f) (cons f (symbol-function f)))
                              '(anvil-context-enable anvil-context-batch-enable
@@ -791,8 +862,7 @@ Fallback for runtimes without a native `time-subtract'; nil means now."
   ;; anvil-shell (`before-change-functions' void).
   (dolist (module (append '(anvil-agent anvil-dev anvil-discovery
                             anvil-harness-telemetry anvil-session-store)
-                          (and (or (getenv "NELISP_EMACS_LIB_DIR")
-                                   (getenv "ANVIL_NOTES_DIR"))
+                          (and (anvil-standalone--elib-available-p)
                                '(anvil-data))))
     (condition-case err
         (progn
@@ -826,15 +896,10 @@ Fallback for runtimes without a native `time-subtract'; nil means now."
 ;; libraries.  No `message': on NeLisp it writes to stdout, the MCP channel.
 (defvar anvil-standalone--tablist-error nil
   "Error from loading the vendored tabulated-list, or nil.")
-(let ((compat-dir (or (getenv "NELISP_EMACS_LIB_DIR")
-                      (and (getenv "ANVIL_NOTES_DIR")
-                           (expand-file-name "dev/nelisp-emacs-lib/src"
-                                             (getenv "ANVIL_NOTES_DIR"))))))
-  (when (and compat-dir (not (featurep 'tabulated-list)))
+(let ((vendor (anvil-standalone--elib-vendor-dir)))
+  (when (and vendor (not (featurep 'tabulated-list)))
     (condition-case err
-        (load (expand-file-name
-               "../vendor/emacs-lisp/emacs-lisp/tabulated-list.el" compat-dir)
-              nil t)
+        (load (expand-file-name "emacs-lisp/tabulated-list.el" vendor) nil t)
       (error (setq anvil-standalone--tablist-error err)))))
 
 ;; Port 8: modules that need tabulated-list, so they are gated on the feature.  Each loads in its
@@ -952,8 +1017,7 @@ Also called lazily by the context worker, because some anvil-defs paths
 ;; `insert-file-contents' (void `before-change-functions'), which the
 ;; shell-drain check (S3.3) exposes when ANVIL_NOTES_DIR is unset.
 (unless (or (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
-            (not (or (getenv "NELISP_EMACS_LIB_DIR")
-                     (getenv "ANVIL_NOTES_DIR"))))
+            (not (anvil-standalone--elib-available-p)))
   (condition-case err
       (progn
         (anvil-standalone--load-anvil-sexp)
@@ -1005,12 +1069,8 @@ machinery, none of which exist in this runtime.")
 (defvar anvil-standalone--port11-errors nil
   "Alist of (MODULE . ERROR) for port-11 modules that failed to load.")
 (unless (or (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
-            (not (or (getenv "NELISP_EMACS_LIB_DIR")
-                     (getenv "ANVIL_NOTES_DIR"))))
-  (let* ((compat-dir (or (getenv "NELISP_EMACS_LIB_DIR")
-                         (expand-file-name "dev/nelisp-emacs-lib/src"
-                                           (getenv "ANVIL_NOTES_DIR"))))
-         (vendor (expand-file-name "../vendor/emacs-lisp" compat-dir))
+            (not (anvil-standalone--elib-available-p)))
+  (let* ((vendor (anvil-standalone--elib-vendor-dir))
          (fake-url-util (not (featurep 'url-util))))
     (unless (fboundp 'version<)
   (defconst version-separator "."
@@ -1609,12 +1669,9 @@ the host answers on the fixture.")
   "Port-16 tool ids that stay unregistered, with the first blocker.
 None: defs-detect-changes and the five browser-* tools give the host answers
 on the fixture.")
-(let ((compat-dir (or (getenv "NELISP_EMACS_LIB_DIR")
-                      (and (getenv "ANVIL_NOTES_DIR")
-                           (expand-file-name "dev/nelisp-emacs-lib/src"
-                                             (getenv "ANVIL_NOTES_DIR"))))))
-  (when (and compat-dir (not (boundp 'process-coding-system-alist)))
-    (load (expand-file-name "emacs-cc-coding-2.el" compat-dir) t t)))
+(when (and (anvil-standalone--elib-available-p)
+           (not (boundp 'process-coding-system-alist)))
+  (anvil-standalone--elib-load "emacs-cc-coding-2.el" t))
 (unless (fboundp 'shell-quote-argument)
   (defun shell-quote-argument (argument &optional posix)
     "Quote ARGUMENT for passing as argument to an inferior shell (POSIX branch)."
@@ -1709,12 +1766,8 @@ MCP Parameters:
 None: http-fetch-batch, http-cache-clear, web-reddit-thread and
 semantic-embed-index give the host answers on the S13.7 fixture.")
 (unless (or (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
-            (not (or (getenv "NELISP_EMACS_LIB_DIR")
-                     (getenv "ANVIL_NOTES_DIR"))))
-  (let* ((compat-dir (or (getenv "NELISP_EMACS_LIB_DIR")
-                         (expand-file-name "dev/nelisp-emacs-lib/src"
-                                           (getenv "ANVIL_NOTES_DIR"))))
-         (vendor (expand-file-name "../vendor/emacs-lisp" compat-dir)))
+            (not (anvil-standalone--elib-available-p)))
+  (let* ((vendor (anvil-standalone--elib-vendor-dir)))
     (condition-case err
         (progn
           ;; The provider's syntax-table functions (char-table backed) must
@@ -1725,7 +1778,7 @@ semantic-embed-index give the host answers on the S13.7 fixture.")
           (let ((saved (mapcar (lambda (f)
                                  (cons f (and (fboundp f) (symbol-function f))))
                                anvil-standalone--syntax-fns)))
-            (load (expand-file-name "emacs-syntax-table.el" compat-dir) t t)
+            (anvil-standalone--elib-load "emacs-syntax-table.el" t)
             (setq anvil-standalone--provider-syntax-fns
                   (mapcar (lambda (f)
                             (cons f (and (fboundp f) (symbol-function f))))
@@ -1737,7 +1790,7 @@ semantic-embed-index give the host answers on the S13.7 fixture.")
           (dolist (f '("emacs-cc-coding-1.el" "emacs-cc-coding-2.el"
                        "emacs-parity-fns2.el" "emacs-subr-extras.el"
                        "emacs-easy-mmode.el"))
-            (condition-case nil (load (expand-file-name f compat-dir) t t)
+            (condition-case nil (anvil-standalone--elib-load f t)
               (error nil)))
           (add-to-list 'load-path vendor t)
           (dolist (d '("net" "url" "mail" "gnus" "calendar" "international"
@@ -2130,14 +2183,11 @@ semantic-embed-index give the host answers on the S13.7 fixture.")
       (error "Unable to fill string containing newline: %S" string))
     (internal--fill-string-single-line (apply #'format string objects))))
 ;; Abbrev tables: nelisp-emacs-lib provider (obarray-backed define-abbrev-table).
-(let ((compat-dir (or (getenv "NELISP_EMACS_LIB_DIR")
-                      (and (getenv "ANVIL_NOTES_DIR")
-                           (expand-file-name "dev/nelisp-emacs-lib/src"
-                                             (getenv "ANVIL_NOTES_DIR"))))))
-  (when (and compat-dir (not (fboundp 'make-abbrev-table)))
-    (dolist (f '("emacs-symbol.el" "emacs-parity-abbrev.el"))
-      (condition-case nil (load (expand-file-name f compat-dir) t t)
-        (error nil)))))
+(when (and (anvil-standalone--elib-available-p)
+           (not (fboundp 'make-abbrev-table)))
+  (dolist (f '("emacs-symbol.el" "emacs-parity-abbrev.el"))
+    (condition-case nil (anvil-standalone--elib-load f t)
+      (error nil))))
 ;; C variables that are nil in a GNU batch session.
 (dolist (v '(window-system initial-window-system))
   (unless (boundp v) (eval (list (quote defvar) v nil) t)))
@@ -2291,11 +2341,8 @@ semantic-embed-index give the host answers on the S13.7 fixture.")
 ;; nelisp-emacs-lib's emacs-cl-macros.el expands it.  It replaces `cl-loop' only
 ;; while the url stack loads, then the prelude macro returns.
 (unless (or (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
-            (not (or (getenv "NELISP_EMACS_LIB_DIR")
-                     (getenv "ANVIL_NOTES_DIR"))))
-  (let ((compat-dir (or (getenv "NELISP_EMACS_LIB_DIR")
-                        (expand-file-name "dev/nelisp-emacs-lib/src"
-                                          (getenv "ANVIL_NOTES_DIR"))))
+            (not (anvil-standalone--elib-available-p)))
+  (let ((cl-macros (anvil-standalone--elib-file "emacs-cl-macros.el"))
         (old-loop (symbol-function 'cl-loop))
         (old-syntax (mapcar (lambda (f)
                               (cons f (and (fboundp f) (symbol-function f))))
@@ -2315,10 +2362,12 @@ semantic-embed-index give the host answers on the S13.7 fixture.")
                       (symbol-function 'date-to-time))))
     (unwind-protect
         (progn
-          (fmakunbound 'cl-loop)
+          ;; The packaged layout has no emacs-cl-macros.el (cl-lib comes from the
+          ;; vendored GNU sources), so the runtime `cl-loop' then stays.
+          (when cl-macros (fmakunbound 'cl-loop))
           (dolist (p anvil-standalone--provider-syntax-fns)
             (when (cdr p) (fset (car p) (cdr p))))
-          (load (expand-file-name "emacs-cl-macros.el" compat-dir) t t)
+          (when cl-macros (load cl-macros t t))
           (dolist (f '(mail-utils url-cache url-handlers url url-http anvil-http anvil-web
                        anvil-uri anvil-semantic))
             (condition-case err (require f)
@@ -2868,8 +2917,7 @@ MCP Parameters:
     (defun auto-compression-mode (&optional _arg)
       "Stand-in: compressed-file reading is always treated as active." nil)))
 (unless (or (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
-            (not (or (getenv "NELISP_EMACS_LIB_DIR")
-                     (getenv "ANVIL_NOTES_DIR"))))
+            (not (anvil-standalone--elib-available-p)))
   (condition-case err
       (when (require 'anvil-elisp nil t)
         (unless anvil-elisp--system-lisp-dir

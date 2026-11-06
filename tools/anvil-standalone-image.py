@@ -206,7 +206,7 @@ class Launcher:
             for name in ("ANVIL_MEMORY_DB", "ANVIL_WORKLOG_DB", "ANVIL_STANDALONE_DEBUG"):
                 env.pop(name, None)
         if self.runner:
-            for name in ("ANVIL_EL_DIR", "ANVIL_NOTES_DIR", "NELISP_EMACS_LIB_DIR",
+            for name in ("ANVIL_EL_DIR", "ANVIL_NOTES_DIR", "NELISP_EMACS_LIB_DIR", "NELISP_ROOT_DIR",
                          "NSO_LISP_DIR", "ANVIL_MEMORY_DB", "ANVIL_WORKLOG_DB",
                          "XDG_CACHE_HOME", "HOME"):
                 if env.get(name):

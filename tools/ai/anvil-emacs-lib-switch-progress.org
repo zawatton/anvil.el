@@ -1,0 +1,29 @@
+#+TITLE: anvil-standalone loads emacs-lib from the nelisp repository layout (NELISP_ROOT_DIR)
+
+* S1 Single resolver
+
+** S1.1 No per-site NELISP_EMACS_LIB_DIR lookup remains outside the resolver
+cmd: test "$(grep -c 'getenv "NELISP_EMACS_LIB_DIR"' tools/anvil-standalone-mcp.el tools/anvil-standalone-org.el | awk -F: '{s+=$2} END {print s}')" = 1
+
+** S1.2 Resolver: legacy mode keeps the flat-directory paths, root mode finds files across the package src dirs
+#+REQUIRES: NELISP_ROOT_DIR
+cmd: f=$(mktemp) && awk '/^;; emacs-lib resolver/{p=1} /^;; Load the current provider/{p=0} p' tools/anvil-standalone-mcp.el > "$f" && env -u NELISP_ROOT_DIR NELISP_EMACS_LIB_DIR=/x emacs -Q --batch -l "$f" --eval '(unless (and (equal (anvil-standalone--elib-file "a.el") "/x/a.el") (equal (anvil-standalone--elib-vendor-dir) "/vendor/emacs-lisp")) (kill-emacs 1))' && emacs -Q --batch -l "$f" --eval '(unless (and (string-match-p "emacs-lib-core/src/emacs-char-table.el$" (anvil-standalone--elib-file "emacs-char-table.el")) (null (anvil-standalone--elib-file "emacs-cl-macros.el")) (= 4 (length (anvil-standalone--elib-src-dirs)))) (kill-emacs 1))'
+
+** S1.3 Host byte-compile adds no warning to the touched files
+cmd: d=$(mktemp -d) && git archive HEAD tools | tar -x -C "$d" && w() { (cd "$1" && emacs -Q --batch --eval '(setq byte-compile-dest-file-function (lambda (f) "/dev/null"))' -f batch-byte-compile "$2" 2>&1 </dev/null | grep -ci warning); } && for f in anvil-standalone-mcp.el anvil-standalone-org.el; do test "$(w tools $f)" -le "$(w $d/tools $f)" || exit 1; done
+
+* S2 End to end: wave-2 parity calls through the standalone server
+
+** S2.1 Legacy mode (pinned binary) answers the four org calls
+#+TIMEOUT: 400
+cmd: out=$(env -u NELISP_ROOT_DIR -u NELISP_EMACS_LIB_DIR NELISP_BIN=$HOME/.local/bin/nelisp timeout 280 python3 tools/ai/standalone-mcp-call.py tools/ai/standalone-parity-wave2-calls.json </dev/null); for t in org-read-by-id org-rename-headline org-add-todo org-capture-string; do printf '%s\n' "$out" | grep -q "^OK   $t " || exit 1; done
+
+** S2.2 Root mode answers the four org calls
+#+REQUIRES: NELISP_ROOT_DIR,NELISP_BIN
+#+NOTE: known red on the pre-doc211 binary: loading the packaged org entry signals void-variable customize-package-emacs-version-alist and anvil-org/anvil-data/anvil-file fail with void-variable before-change-functions
+cmd: out=$(timeout 280 python3 tools/ai/standalone-mcp-call.py tools/ai/standalone-parity-wave2-calls.json </dev/null); for t in org-read-by-id org-rename-headline org-add-todo org-capture-string; do printf '%s\n' "$out" | grep -q "^OK   $t " || exit 1; done
+
+** S2.3 Root mode registers at least as many tools as legacy mode
+#+REQUIRES: NELISP_ROOT_DIR,NELISP_BIN
+#+NOTE: known red: 197 tools in root mode vs 229 in legacy mode on the pre-doc211 binary
+cmd: n=$(timeout 280 python3 tools/ai/standalone-mcp-call.py tools/ai/standalone-org-wave2-calls.json </dev/null | sed -n 's/^tools\/list: //p') && test "$n" -ge 229
