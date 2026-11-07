@@ -629,7 +629,10 @@ and tags, then re-align the tags (GNU `org-edit-headline')."
       ;; Its last form binds a key in the agenda map; there is no agenda here.
       (unless (fboundp 'org-defkey)
         (defalias 'org-defkey (lambda (&rest _) nil)))
-      (unless (boundp 'org-agenda-mode-map) (defvar org-agenda-mode-map nil))
+      ;; The genuine `org-defkey' (emacs-lib tree mode) rejects a nil keymap, so
+      ;; use an empty one; org-agenda.el is not loaded here.
+      (unless (boundp 'org-agenda-mode-map)
+        (defvar org-agenda-mode-map (make-sparse-keymap)))
       (let ((load-path (cons (expand-file-name "org" dir) load-path)))
         (load "org-habit" nil t))
       (unless (fboundp 'org-habit-parse-todo)
