@@ -423,6 +423,23 @@ and tags, then re-align the tags (GNU `org-edit-headline')."
 (defun anvil-standalone-org--ensure-capture ()
   "Load genuine org-capture and the stand-ins it needs, once."
   (unless anvil-standalone-org--capture-ready
+    ;; emacs-lib tree mode: `find-file-noselect' leaves an .org file buffer in
+    ;; `fundamental-mode', where GNU `org-element-at-point' calls
+    ;; `display-warning'; the runtime's `display-warning' leaves the CURRENT
+    ;; buffer read-only (substrate defect), which breaks the capture insert.
+    ;; Enter `org-mode' in such buffers, as GNU's `set-auto-mode' does.
+    (when (and (getenv "NELISP_ROOT_DIR") (fboundp 'advice-add)
+               (not (advice-member-p 'anvil-standalone-org--auto-org-mode
+                                     'find-file-noselect)))
+      (defun anvil-standalone-org--auto-org-mode (buf)
+        (when (and (bufferp buf) (buffer-live-p buf)
+                   (buffer-file-name buf)
+                   (string-match-p "\\.org\\'" (buffer-file-name buf)))
+          (with-current-buffer buf
+            (unless (derived-mode-p 'org-mode) (org-mode))))
+        buf)
+      (advice-add 'find-file-noselect :filter-return
+                  #'anvil-standalone-org--auto-org-mode))
     (let ((dir (anvil-standalone-org--vendor-dir)))
       (unless dir (error "Vendored emacs-lisp directory not found"))
       (unless (fboundp 'combine-change-calls)
