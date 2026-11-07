@@ -1166,6 +1166,22 @@ If N is negative, delete newlines as well, leaving -N spaces."
                       (point)))))
         (delete-region mid end)
         (insert (make-string num ?\s))))))
+;; TEMPORARY, remove when the core fix lands: on NeLisp `display-warning'
+;; leaves the caller's current buffer read-only.  Repro:
+;;   (with-temp-buffer (display-warning '(a b) "hello") buffer-read-only)
+;; => t on NeLisp, nil on GNU 31.1.  Restore the caller's value afterwards.
+(when (and (anvil-standalone--elib-root) (fboundp 'display-warning)
+           (fboundp 'advice-add)
+           (not (get 'display-warning 'anvil-standalone-ro-guard)))
+  (advice-add 'display-warning :around
+              (lambda (orig &rest args)
+                (let ((buf (current-buffer))
+                      (ro buffer-read-only))
+                  (unwind-protect (apply orig args)
+                    (when (buffer-live-p buf)
+                      (with-current-buffer buf
+                        (setq buffer-read-only ro)))))))
+  (put 'display-warning 'anvil-standalone-ro-guard t))
 (unless (fboundp 'font-lock-flush)
   (defun font-lock-flush (&optional _beg _end) nil))
 (unless (fboundp 'store-match-data)
