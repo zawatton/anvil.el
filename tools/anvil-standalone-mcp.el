@@ -1044,6 +1044,11 @@ resolve while the runtime's own libraries keep priority."
             nil t)
     (error nil)))
 
+;; `mode-require-final-newline' is a GNU files.el defcustom (default t) that
+;; `org-mode' reads when it initialises a buffer.
+(unless (boundp 'mode-require-final-newline)
+  (defvar mode-require-final-newline t))
+
 ;; org.el has (eval-when-compile (require 'gnus-sum)), which evaluates when
 ;; the source is loaded uncompiled.  Gnus is not vendored, and Org uses gnus-sum
 ;; only for compile-time macros, so declare the feature while the Org-using
