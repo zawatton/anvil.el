@@ -1080,6 +1080,22 @@ resolve while the runtime's own libraries keep priority."
             nil t)
     (error nil)))
 
+;; GNU C primitives called by Org file visiting and capture.
+;; `get-file-buffer' (buffer.c): the live buffer visiting FILENAME, else nil.
+;; `current-idle-time' (keyboard.c): nil unless Emacs is idle; a batch run
+;; never is, so nil matches GNU there.
+(unless (fboundp 'get-file-buffer)
+  (defun get-file-buffer (filename)
+    "Return the buffer visiting FILENAME (a string), or nil (GNU buffer.c)."
+    (let ((name (expand-file-name filename)) found)
+      (dolist (b (buffer-list))
+        (let ((f (buffer-local-value 'buffer-file-name b)))
+          (when (and (not found) f (string= (expand-file-name f) name))
+            (setq found b))))
+      found)))
+(unless (fboundp 'current-idle-time)
+  (defun current-idle-time () nil))
+
 ;; org.el has (eval-when-compile (require 'gnus-sum)), which evaluates when
 ;; the source is loaded uncompiled.  Gnus is not vendored, and Org uses gnus-sum
 ;; only for compile-time macros, so declare the feature while the Org-using
