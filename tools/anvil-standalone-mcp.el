@@ -1103,6 +1103,13 @@ resolve while the runtime's own libraries keep priority."
 (unless (boundp 'epa-file-name-regexp)
   (defvar epa-file-name-regexp "\\.gpg\\(~\\|\\.~[0-9]+~\\)?\\'"))
 (when (anvil-standalone--elib-root)
+  ;; `indent-line-to' is GNU indent.el.
+  (unless (fboundp 'indent-line-to)
+    (condition-case nil
+        (load (expand-file-name "vendor/emacs-lisp/indent.el"
+                                (anvil-standalone--elib-root))
+              nil t)
+      (error nil)))
   (unless (fboundp 'untabify)
     (condition-case nil
         (load (expand-file-name "vendor/emacs-lisp/tabify.el"
@@ -1134,6 +1141,11 @@ resolve while the runtime's own libraries keep priority."
   (defun font-lock-flush (&optional _beg _end) nil))
 (unless (fboundp 'store-match-data)
   (defalias 'store-match-data #'set-match-data))
+
+;; `pos-visible-in-window-p' (window.c): a batch run has no displayed window,
+;; so no position is visible.
+(unless (fboundp 'pos-visible-in-window-p)
+  (defun pos-visible-in-window-p (&optional _pos _window _partially) nil))
 
 ;; org.el has (eval-when-compile (require 'gnus-sum)), which evaluates when
 ;; the source is loaded uncompiled.  Gnus is not vendored, and Org uses gnus-sum
