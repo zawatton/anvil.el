@@ -416,6 +416,7 @@ and tags, then re-align the tags (GNU `org-edit-headline')."
                   (setq done t))))))))
     done))
 
+(declare-function org-capture-expand-file "org-capture" (file))
 (defvar anvil-standalone-org--capture-ready nil)
 (defvar anvil-standalone-org--capture-active nil
   "Non-nil while a capture runs on its base buffer instead of an indirect one.")
