@@ -436,7 +436,12 @@ and tags, then re-align the tags (GNU `org-edit-headline')."
                    (buffer-file-name buf)
                    (string-match-p "\\.org\\'" (buffer-file-name buf)))
           (with-current-buffer buf
-            (unless (derived-mode-p 'org-mode) (org-mode))))
+            ;; `kill-all-local-variables' wipes `buffer-file-name' here
+            ;; (permanent in GNU Emacs), so restore it after the mode switch.
+            (unless (derived-mode-p 'org-mode)
+              (let ((file buffer-file-name))
+                (org-mode)
+                (setq buffer-file-name file)))))
         buf)
       (advice-add 'find-file-noselect :filter-return
                   #'anvil-standalone-org--auto-org-mode))
@@ -541,7 +546,11 @@ and tags, then re-align the tags (GNU `org-edit-headline')."
                        (current-buffer))))
             (when (and buf (eq buf (current-buffer)))
               (set-buffer (get-buffer-create "*scratch*")))
-            (anvil-standalone-org--kill-buffer-orig buf)))
+            ;; The capture buffer is the target's base buffer here (no
+            ;; indirect buffers), and finalize must not kill it.
+            (unless (and anvil-standalone-org--capture-active
+                         buf (buffer-file-name buf))
+              (anvil-standalone-org--kill-buffer-orig buf))))
         (put 'kill-buffer 'anvil-standalone-org t))
       (let ((load-path (cons (expand-file-name "org" dir) load-path)))
         (load "org-capture" nil t))
@@ -556,6 +565,39 @@ and tags, then re-align the tags (GNU `org-edit-headline')."
         "Return BUFFER itself: indirect buffers are unavailable here."
         (setq anvil-standalone-org--capture-active t)
         (or buffer (current-buffer)))
+      ;; `kill-all-local-variables' (run by every major mode) wipes
+      ;; `buffer-file-name' in this runtime, though it is permanent in GNU
+      ;; Emacs.  Keep it across `org-mode' so the capture target can be saved.
+      (unless (get 'org-mode 'anvil-standalone-org)
+        (advice-add 'org-mode :around
+                    (lambda (orig &rest args)
+                      (let ((file buffer-file-name))
+                        (prog1 (apply orig args)
+                          (when (and file (not buffer-file-name))
+                            (setq buffer-file-name file)))))
+                    '((name . anvil-standalone-org--keep-file-name)))
+        (put 'org-mode 'anvil-standalone-org t))
+      ;; Even so the capture target buffer loses its file name before
+      ;; `save-buffer'; remember the file per target buffer and put it back.
+      (unless (get 'save-buffer 'anvil-standalone-org)
+        (defvar anvil-standalone-org--capture-files nil
+          "Alist of (BUFFER . FILE) for buffers made by `org-capture-target-buffer'.")
+        (advice-add 'org-capture-target-buffer :around
+                    (lambda (orig file)
+                      (let ((buf (funcall orig file)))
+                        (when (bufferp buf)
+                          (push (cons buf (with-current-buffer buf
+                                            (or buffer-file-name
+                                                (org-capture-expand-file file))))
+                                anvil-standalone-org--capture-files))
+                        buf)))
+        (advice-add 'save-buffer :before
+                    (lambda (&rest _)
+                      (let ((file (cdr (assq (current-buffer)
+                                             anvil-standalone-org--capture-files))))
+                        (when (and file (not buffer-file-name))
+                          (setq buffer-file-name file)))))
+        (put 'save-buffer 'anvil-standalone-org t))
       (unless (get 'buffer-base-buffer 'anvil-standalone-org)
         (let ((orig (symbol-function 'buffer-base-buffer)))
           (defun buffer-base-buffer (&optional buffer)
