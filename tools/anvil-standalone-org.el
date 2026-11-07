@@ -447,14 +447,6 @@ and tags, then re-align the tags (GNU `org-edit-headline')."
                   #'anvil-standalone-org--auto-org-mode))
     (let ((dir (anvil-standalone-org--vendor-dir)))
       (unless dir (error "Vendored emacs-lisp directory not found"))
-      ;; `combine-change-calls' (subr.el): GNU Org (org-compat.el) aliases
-      ;; `org-combine-change-calls' to it on Emacs >= 29.  This runtime has no
-      ;; undo-list or change-hook bookkeeping to combine, so run BODY directly.
-      (unless (fboundp 'combine-change-calls)
-        (defmacro combine-change-calls (_beg _end &rest body)
-          "Evaluate BODY (change-hook combining is a no-op in this runtime)."
-          (declare (indent 2) (debug (form form def-body)))
-          (cons 'progn body)))
       (unless (fboundp 'org-combine-change-calls)
         (defmacro org-combine-change-calls (_beg _end &rest body)
           "Run BODY: stub as in org-compat.el for Emacs < 29."

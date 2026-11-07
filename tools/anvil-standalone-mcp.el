@@ -1166,6 +1166,14 @@ If N is negative, delete newlines as well, leaving -N spaces."
                       (point)))))
         (delete-region mid end)
         (insert (make-string num ?\s))))))
+;; `combine-change-calls' (subr.el): GNU Org (org-compat.el) aliases
+;; `org-combine-change-calls' to it on Emacs >= 29.  This runtime has no
+;; undo-list or change-hook bookkeeping to combine, so run BODY directly.
+(unless (fboundp 'combine-change-calls)
+  (defmacro combine-change-calls (_beg _end &rest body)
+    "Evaluate BODY (change-hook combining is a no-op in this runtime)."
+    (declare (indent 2) (debug (form form def-body)))
+    (cons 'progn body)))
 ;; TEMPORARY, remove when the core fix lands: on NeLisp `display-warning'
 ;; leaves the caller's current buffer read-only.  Repro:
 ;;   (with-temp-buffer (display-warning '(a b) "hello") buffer-read-only)
