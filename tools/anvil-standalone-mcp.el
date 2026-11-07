@@ -849,6 +849,187 @@ resolve while the runtime's own libraries keep priority."
                            anvil-standalone--state-tools-errors))))
         (fset 'anvil-state-enable saved)))))
 
+;; `version<' and friends, copied from GNU subr.el (the whole vendor subr.el
+;; crashes on load).  Port 6 (anvil-data) and Port 11 (anvil-org) need them,
+;; and the emacs-lib tree does not preload them.
+(unless (fboundp 'version<)
+  (defconst version-separator "."
+"Specify the string used to separate the version elements.
+  Usually the separator is \".\", but it can be any other string.")
+  (defconst version-regexp-alist
+'(("^[-._+ ]?snapshot$"                                 . -4)
+  ("^[-._+]$"                                           . -4)
+  ("^[-._+ ]?\\(cvs\\|git\\|bzr\\|svn\\|hg\\|darcs\\)$" . -4)
+  ("^[-._+ ]?unknown$"                                  . -4)
+  ("^[-._+ ]?alpha$"                                    . -3)
+  ("^[-._+ ]?beta$"                                     . -2)
+  ("^[-._+ ]?\\(pre\\|rc\\)$"                           . -1))
+"Specify association between non-numeric version and its priority.
+  This association is used to handle version string like \"1.0pre2\",
+  \"0.9alpha1\", etc.  It's used by `version-to-list' (which see) to convert the
+  non-numeric part of a version string to an integer.  For example:
+ String Version    Integer List Version
+ \"0.9snapshot\"     (0  9 -4)
+ \"1.0-git\"         (1  0 -4)
+ \"1.0.cvs\"         (1  0 -4)
+ \"1.0pre2\"         (1  0 -1 2)
+ \"1.0PRE2\"         (1  0 -1 2)
+ \"22.8beta3\"       (22 8 -2 3)
+ \"22.8 Beta3\"      (22 8 -2 3)
+ \"0.9alpha1\"       (0  9 -3 1)
+ \"0.9AlphA1\"       (0  9 -3 1)
+ \"0.9 alpha\"       (0  9 -3)
+  Each element has the following form:
+ (REGEXP . PRIORITY)
+  Where:
+  REGEXP		regexp used to match non-numeric part of a version string.
+  		It should begin with the `^' anchor and end with a `$' to
+  		prevent false hits.  Letter-case is ignored while matching
+  		REGEXP.
+  PRIORITY	a negative integer specifying non-numeric priority of REGEXP.")
+  (defun version-to-list (ver)
+"Convert version string VER into a list of integers.
+  The version syntax is given by the following EBNF:
+ VERSION ::= NUMBER ( SEPARATOR NUMBER )*.
+ NUMBER ::= (0|1|2|3|4|5|6|7|8|9)+.
+ SEPARATOR ::= `version-separator' (which see)
+  	       | `version-regexp-alist' (which see).
+  The NUMBER part is optional if SEPARATOR is a match for an element
+  in `version-regexp-alist'.
+  Examples of valid version syntax:
+ 1.0pre2   1.0.7.5   22.8beta3   0.9alpha1   6.9.30Beta   2.4.snapshot   .5
+  Examples of invalid version syntax:
+ 1.0prepre2   1.0..7.5   22.8X3   alpha3.2
+  Examples of version conversion:
+ Version String    Version as a List of Integers
+ \".5\"              (0 5)
+ \"0.9 alpha\"       (0  9 -3)
+ \"0.9AlphA1\"       (0  9 -3 1)
+ \"0.9snapshot\"     (0  9 -4)
+ \"1.0-git\"         (1  0 -4)
+ \"1.0.7.5\"         (1  0  7 5)
+ \"1.0.cvs\"         (1  0 -4)
+ \"1.0PRE2\"         (1  0 -1 2)
+ \"1.0pre2\"         (1  0 -1 2)
+ \"22.8 Beta3\"      (22 8 -2 3)
+ \"22.8beta3\"       (22 8 -2 3)
+  See documentation for `version-separator' and `version-regexp-alist'."
+(declare (side-effect-free t))
+(unless (stringp ver)
+  (error "Version must be a string"))
+(if (and (>= (length ver) (length version-separator))
+  	   (string-equal (substring ver 0 (length version-separator))
+  			 version-separator))
+    (setq ver (concat "0" ver)))
+(unless (string-match-p "^[0-9]" ver)
+  (error "Invalid version syntax: `%s' (must start with a number)" ver))
+(save-match-data
+  (let ((i 0)
+  	  (case-fold-search t)		; ignore case in matching
+  	  lst s al)
+    (while (and (setq s (string-match "[0-9]+" ver i))
+  		  (= s i))
+  	(setq lst (cons (string-to-number (substring ver i (match-end 0)))
+  			lst)
+  	      i   (match-end 0))
+  	(when (and (setq s (string-match "[^0-9]+" ver i))
+  		   (= s i))
+  	  (setq s (substring ver i (match-end 0))
+  		i (match-end 0))
+  	  (unless (string= s version-separator)
+  	    (setq al version-regexp-alist)
+  	    (while (and al (not (string-match (caar al) s)))
+  	      (setq al (cdr al)))
+  	    (cond (al
+  		   (push (cdar al) lst))
+      ((and (string-match "^[-._+ ]?\\([a-zA-Z]\\)$" s)
+         (= i (length ver)))
+  		   (push (- (aref (downcase (match-string 1 s)) 0) ?a -1)
+  			 lst))
+  		  (t (error "Invalid version syntax: `%s'" ver))))))
+  (nreverse lst))))
+  (defun version-list-< (l1 l2)
+"Return t if L1, a list specification of a version, is lower than L2.
+  Note that a version specified by the list (1) is equal to (1 0),
+  \(1 0 0), (1 0 0 0), etc.  That is, the trailing zeros are insignificant.
+  Also, a version given by the list (1) is higher than (1 -1), which in
+  turn is higher than (1 -2), which is higher than (1 -3)."
+(declare (pure t) (side-effect-free t))
+(while (and l1 l2 (= (car l1) (car l2)))
+  (setq l1 (cdr l1)
+  	  l2 (cdr l2)))
+(cond
+ ((and l1 l2) (< (car l1) (car l2)))
+ ((and (null l1) (null l2)) nil)
+ (l1 (< (version-list-not-zero l1) 0))
+ (t  (< 0 (version-list-not-zero l2)))))
+  (defun version-list-= (l1 l2)
+"Return t if L1, a list specification of a version, is equal to L2.
+  Note that a version specified by the list (1) is equal to (1 0),
+  \(1 0 0), (1 0 0 0), etc.  That is, the trailing zeros are insignificant.
+  Also, a version given by the list (1) is higher than (1 -1), which in
+  turn is higher than (1 -2), which is higher than (1 -3)."
+(declare (pure t) (side-effect-free t))
+(while (and l1 l2 (= (car l1) (car l2)))
+  (setq l1 (cdr l1)
+  	  l2 (cdr l2)))
+(cond
+ ((and l1 l2) nil)
+ ((and (null l1) (null l2)))
+ (l1 (zerop (version-list-not-zero l1)))
+ (t  (zerop (version-list-not-zero l2)))))
+  (defun version-list-<= (l1 l2)
+"Return t if L1, a list specification of a version, is lower or equal to L2.
+  Note that integer list (1) is equal to (1 0), (1 0 0), (1 0 0 0),
+  etc.  That is, the trailing zeroes are insignificant.  Also, integer
+  list (1) is greater than (1 -1) which is greater than (1 -2)
+  which is greater than (1 -3)."
+(declare (pure t) (side-effect-free t))
+(while (and l1 l2 (= (car l1) (car l2)))
+  (setq l1 (cdr l1)
+  	  l2 (cdr l2)))
+(cond
+ ((and l1 l2) (< (car l1) (car l2)))
+ ((and (null l1) (null l2)))
+ (l1 (<= (version-list-not-zero l1) 0))
+ (t  (<= 0 (version-list-not-zero l2)))))
+  (defun version-list-not-zero (lst)
+"Return the first non-zero element of LST, which is a list of integers.
+  If all LST elements are zeros or LST is nil, return zero."
+(declare (pure t) (side-effect-free t))
+(while (and lst (zerop (car lst)))
+  (setq lst (cdr lst)))
+(if lst
+    (car lst)
+  0))
+  (defun version< (v1 v2)
+"Return t if version V1 is lower (older) than V2.
+  Note that version string \"1\" is equal to \"1.0\", \"1.0.0\", \"1.0.0.0\",
+  etc.  That is, the trailing \".0\"s are insignificant.  Also, version
+  string \"1\" is higher (newer) than \"1pre\", which is higher than \"1beta\",
+  which is higher than \"1alpha\", which is higher than \"1snapshot\".
+  Also, \"-GIT\", \"-CVS\" and \"-NNN\" are treated as snapshot versions."
+(declare (side-effect-free t))
+(version-list-< (version-to-list v1) (version-to-list v2)))
+  (defun version<= (v1 v2)
+"Return t if version V1 is lower (older) than or equal to V2.
+  Note that version string \"1\" is equal to \"1.0\", \"1.0.0\", \"1.0.0.0\",
+  etc.  That is, the trailing \".0\"s are insignificant.  Also, version
+  string \"1\" is higher (newer) than \"1pre\", which is higher than \"1beta\",
+  which is higher than \"1alpha\", which is higher than \"1snapshot\".
+  Also, \"-GIT\", \"-CVS\" and \"-NNN\" are treated as snapshot versions."
+(declare (side-effect-free t))
+(version-list-<= (version-to-list v1) (version-to-list v2)))
+  (defun version= (v1 v2)
+"Return t if version V1 is equal to V2.
+  Note that version string \"1\" is equal to \"1.0\", \"1.0.0\", \"1.0.0.0\",
+  etc.  That is, the trailing \".0\"s are insignificant.  Also, version
+  string \"1\" is higher (newer) than \"1pre\", which is higher than \"1beta\",
+  which is higher than \"1alpha\", which is higher than \"1snapshot\".
+  Also, \"-GIT\", \"-CVS\" and \"-NNN\" are treated as snapshot versions."
+(declare (side-effect-free t))
+(version-list-= (version-to-list v1) (version-to-list v2))))
+
 ;; Port 6: agent, data, dev, discovery, harness-telemetry, session-store.
 ;; Registered under the same "emacs-eval" server id the loader serves.  The
 ;; telemetry enable step opens its SQLite handle eagerly; a native handle
@@ -1071,185 +1252,8 @@ machinery, none of which exist in this runtime.")
 (unless (or (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
             (not (anvil-standalone--elib-available-p)))
   (let* ((vendor (anvil-standalone--elib-vendor-dir))
-         (fake-url-util (not (featurep 'url-util))))
-    (unless (fboundp 'version<)
-  (defconst version-separator "."
-    "Specify the string used to separate the version elements.
-  Usually the separator is \".\", but it can be any other string.")
-  (defconst version-regexp-alist
-    '(("^[-._+ ]?snapshot$"                                 . -4)
-      ("^[-._+]$"                                           . -4)
-      ("^[-._+ ]?\\(cvs\\|git\\|bzr\\|svn\\|hg\\|darcs\\)$" . -4)
-      ("^[-._+ ]?unknown$"                                  . -4)
-      ("^[-._+ ]?alpha$"                                    . -3)
-      ("^[-._+ ]?beta$"                                     . -2)
-      ("^[-._+ ]?\\(pre\\|rc\\)$"                           . -1))
-    "Specify association between non-numeric version and its priority.
-  This association is used to handle version string like \"1.0pre2\",
-  \"0.9alpha1\", etc.  It's used by `version-to-list' (which see) to convert the
-  non-numeric part of a version string to an integer.  For example:
-     String Version    Integer List Version
-     \"0.9snapshot\"     (0  9 -4)
-     \"1.0-git\"         (1  0 -4)
-     \"1.0.cvs\"         (1  0 -4)
-     \"1.0pre2\"         (1  0 -1 2)
-     \"1.0PRE2\"         (1  0 -1 2)
-     \"22.8beta3\"       (22 8 -2 3)
-     \"22.8 Beta3\"      (22 8 -2 3)
-     \"0.9alpha1\"       (0  9 -3 1)
-     \"0.9AlphA1\"       (0  9 -3 1)
-     \"0.9 alpha\"       (0  9 -3)
-  Each element has the following form:
-     (REGEXP . PRIORITY)
-  Where:
-  REGEXP		regexp used to match non-numeric part of a version string.
-  		It should begin with the `^' anchor and end with a `$' to
-  		prevent false hits.  Letter-case is ignored while matching
-  		REGEXP.
-  PRIORITY	a negative integer specifying non-numeric priority of REGEXP.")
-  (defun version-to-list (ver)
-    "Convert version string VER into a list of integers.
-  The version syntax is given by the following EBNF:
-     VERSION ::= NUMBER ( SEPARATOR NUMBER )*.
-     NUMBER ::= (0|1|2|3|4|5|6|7|8|9)+.
-     SEPARATOR ::= `version-separator' (which see)
-  	       | `version-regexp-alist' (which see).
-  The NUMBER part is optional if SEPARATOR is a match for an element
-  in `version-regexp-alist'.
-  Examples of valid version syntax:
-     1.0pre2   1.0.7.5   22.8beta3   0.9alpha1   6.9.30Beta   2.4.snapshot   .5
-  Examples of invalid version syntax:
-     1.0prepre2   1.0..7.5   22.8X3   alpha3.2
-  Examples of version conversion:
-     Version String    Version as a List of Integers
-     \".5\"              (0 5)
-     \"0.9 alpha\"       (0  9 -3)
-     \"0.9AlphA1\"       (0  9 -3 1)
-     \"0.9snapshot\"     (0  9 -4)
-     \"1.0-git\"         (1  0 -4)
-     \"1.0.7.5\"         (1  0  7 5)
-     \"1.0.cvs\"         (1  0 -4)
-     \"1.0PRE2\"         (1  0 -1 2)
-     \"1.0pre2\"         (1  0 -1 2)
-     \"22.8 Beta3\"      (22 8 -2 3)
-     \"22.8beta3\"       (22 8 -2 3)
-  See documentation for `version-separator' and `version-regexp-alist'."
-    (declare (side-effect-free t))
-    (unless (stringp ver)
-      (error "Version must be a string"))
-    (if (and (>= (length ver) (length version-separator))
-  	   (string-equal (substring ver 0 (length version-separator))
-  			 version-separator))
-        (setq ver (concat "0" ver)))
-    (unless (string-match-p "^[0-9]" ver)
-      (error "Invalid version syntax: `%s' (must start with a number)" ver))
-    (save-match-data
-      (let ((i 0)
-  	  (case-fold-search t)		; ignore case in matching
-  	  lst s al)
-        (while (and (setq s (string-match "[0-9]+" ver i))
-  		  (= s i))
-  	(setq lst (cons (string-to-number (substring ver i (match-end 0)))
-  			lst)
-  	      i   (match-end 0))
-  	(when (and (setq s (string-match "[^0-9]+" ver i))
-  		   (= s i))
-  	  (setq s (substring ver i (match-end 0))
-  		i (match-end 0))
-  	  (unless (string= s version-separator)
-  	    (setq al version-regexp-alist)
-  	    (while (and al (not (string-match (caar al) s)))
-  	      (setq al (cdr al)))
-  	    (cond (al
-  		   (push (cdar al) lst))
-          ((and (string-match "^[-._+ ]?\\([a-zA-Z]\\)$" s)
-             (= i (length ver)))
-  		   (push (- (aref (downcase (match-string 1 s)) 0) ?a -1)
-  			 lst))
-  		  (t (error "Invalid version syntax: `%s'" ver))))))
-      (nreverse lst))))
-  (defun version-list-< (l1 l2)
-    "Return t if L1, a list specification of a version, is lower than L2.
-  Note that a version specified by the list (1) is equal to (1 0),
-  \(1 0 0), (1 0 0 0), etc.  That is, the trailing zeros are insignificant.
-  Also, a version given by the list (1) is higher than (1 -1), which in
-  turn is higher than (1 -2), which is higher than (1 -3)."
-    (declare (pure t) (side-effect-free t))
-    (while (and l1 l2 (= (car l1) (car l2)))
-      (setq l1 (cdr l1)
-  	  l2 (cdr l2)))
-    (cond
-     ((and l1 l2) (< (car l1) (car l2)))
-     ((and (null l1) (null l2)) nil)
-     (l1 (< (version-list-not-zero l1) 0))
-     (t  (< 0 (version-list-not-zero l2)))))
-  (defun version-list-= (l1 l2)
-    "Return t if L1, a list specification of a version, is equal to L2.
-  Note that a version specified by the list (1) is equal to (1 0),
-  \(1 0 0), (1 0 0 0), etc.  That is, the trailing zeros are insignificant.
-  Also, a version given by the list (1) is higher than (1 -1), which in
-  turn is higher than (1 -2), which is higher than (1 -3)."
-    (declare (pure t) (side-effect-free t))
-    (while (and l1 l2 (= (car l1) (car l2)))
-      (setq l1 (cdr l1)
-  	  l2 (cdr l2)))
-    (cond
-     ((and l1 l2) nil)
-     ((and (null l1) (null l2)))
-     (l1 (zerop (version-list-not-zero l1)))
-     (t  (zerop (version-list-not-zero l2)))))
-  (defun version-list-<= (l1 l2)
-    "Return t if L1, a list specification of a version, is lower or equal to L2.
-  Note that integer list (1) is equal to (1 0), (1 0 0), (1 0 0 0),
-  etc.  That is, the trailing zeroes are insignificant.  Also, integer
-  list (1) is greater than (1 -1) which is greater than (1 -2)
-  which is greater than (1 -3)."
-    (declare (pure t) (side-effect-free t))
-    (while (and l1 l2 (= (car l1) (car l2)))
-      (setq l1 (cdr l1)
-  	  l2 (cdr l2)))
-    (cond
-     ((and l1 l2) (< (car l1) (car l2)))
-     ((and (null l1) (null l2)))
-     (l1 (<= (version-list-not-zero l1) 0))
-     (t  (<= 0 (version-list-not-zero l2)))))
-  (defun version-list-not-zero (lst)
-    "Return the first non-zero element of LST, which is a list of integers.
-  If all LST elements are zeros or LST is nil, return zero."
-    (declare (pure t) (side-effect-free t))
-    (while (and lst (zerop (car lst)))
-      (setq lst (cdr lst)))
-    (if lst
-        (car lst)
-      0))
-  (defun version< (v1 v2)
-    "Return t if version V1 is lower (older) than V2.
-  Note that version string \"1\" is equal to \"1.0\", \"1.0.0\", \"1.0.0.0\",
-  etc.  That is, the trailing \".0\"s are insignificant.  Also, version
-  string \"1\" is higher (newer) than \"1pre\", which is higher than \"1beta\",
-  which is higher than \"1alpha\", which is higher than \"1snapshot\".
-  Also, \"-GIT\", \"-CVS\" and \"-NNN\" are treated as snapshot versions."
-    (declare (side-effect-free t))
-    (version-list-< (version-to-list v1) (version-to-list v2)))
-  (defun version<= (v1 v2)
-    "Return t if version V1 is lower (older) than or equal to V2.
-  Note that version string \"1\" is equal to \"1.0\", \"1.0.0\", \"1.0.0.0\",
-  etc.  That is, the trailing \".0\"s are insignificant.  Also, version
-  string \"1\" is higher (newer) than \"1pre\", which is higher than \"1beta\",
-  which is higher than \"1alpha\", which is higher than \"1snapshot\".
-  Also, \"-GIT\", \"-CVS\" and \"-NNN\" are treated as snapshot versions."
-    (declare (side-effect-free t))
-    (version-list-<= (version-to-list v1) (version-to-list v2)))
-  (defun version= (v1 v2)
-    "Return t if version V1 is equal to V2.
-  Note that version string \"1\" is equal to \"1.0\", \"1.0.0\", \"1.0.0.0\",
-  etc.  That is, the trailing \".0\"s are insignificant.  Also, version
-  string \"1\" is higher (newer) than \"1pre\", which is higher than \"1beta\",
-  which is higher than \"1alpha\", which is higher than \"1snapshot\".
-  Also, \"-GIT\", \"-CVS\" and \"-NNN\" are treated as snapshot versions."
-    (declare (side-effect-free t))
-    (version-list-= (version-to-list v1) (version-to-list v2)))
-    )
+         (fake-url-util (not (featurep 'url-util)))
+         (fake-gnus-sum (not (featurep 'gnus-sum))))
     (unless (fboundp 'subr-arity)
       (defun subr-arity (subr) (func-arity subr)))
     (unless (boundp 'user-mail-address) (defvar user-mail-address ""))
@@ -1299,6 +1303,11 @@ machinery, none of which exist in this runtime.")
                             (file-name-directory (or load-file-name buffer-file-name)))
           nil t)
     (when fake-url-util (provide 'url-util))
+    ;; org.el has (eval-when-compile (require 'gnus-sum)), which evaluates
+    ;; when the source is loaded uncompiled.  Gnus is not vendored, and Org
+    ;; uses gnus-sum only for compile-time macros, so declare the feature
+    ;; while anvil-org loads and withdraw it afterwards.
+    (when fake-gnus-sum (provide 'gnus-sum))
     (unwind-protect
         (condition-case err
             (progn
@@ -1310,7 +1319,8 @@ machinery, none of which exist in this runtime.")
               (dolist (id anvil-standalone--port11-unregister)
                 (anvil-server-unregister-tool id "emacs-eval")))
           (error (push (cons 'anvil-org err) anvil-standalone--port11-errors)))
-      (when fake-url-util (setq features (delq 'url-util features))))))
+      (when fake-url-util (setq features (delq 'url-util features)))
+      (when fake-gnus-sum (setq features (delq 'gnus-sum features))))))
 
 
 ;; Port 12: anvil-orchestrator tools (S12.4).  anvil-orchestrator is already loaded
