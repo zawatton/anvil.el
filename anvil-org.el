@@ -276,7 +276,12 @@ neither written to disk nor refreshed — the caller is responsible
 for managing the buffer's saved state."
   (let ((id (org-id-get-create)))
     (unless no-save
-      (write-region (point-min) (point-max) file-path)
+      ;; Write the whole buffer: on NeLisp, a `save-restriction' around a
+      ;; non-narrowed buffer re-narrows it to stale bounds that then shrink
+      ;; with later deletions (core defect), which truncated the file.
+      (save-restriction
+        (widen)
+        (write-region (point-min) (point-max) file-path))
       (anvil-org--refresh-file-buffers file-path))
     (json-encode
      (append
