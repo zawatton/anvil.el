@@ -442,9 +442,9 @@ and tags, then re-align the tags (GNU `org-edit-headline')."
                   #'anvil-standalone-org--auto-org-mode))
     (let ((dir (anvil-standalone-org--vendor-dir)))
       (unless dir (error "Vendored emacs-lisp directory not found"))
-      (unless (fboundp 'combine-change-calls)
+      (unless (fboundp 'org-combine-change-calls)
         (defmacro org-combine-change-calls (_beg _end &rest body)
-          "Run BODY (org-compat.el fallback when `combine-change-calls' is absent)."
+          "Run BODY: stub as in org-compat.el for Emacs < 29."
           (declare (indent 2))
           (cons 'progn body)))
       (dolist (n '("org-contextualize-keys" "org-overriding-default-time"

@@ -1137,6 +1137,43 @@ resolve while the runtime's own libraries keep priority."
               (insert (make-string (- target from) ?\s)))
           (insert (make-string (- target from) ?\s))))
       target)))
+;; `current-indentation' (indent.c): horizontal position of the first
+;; non-blank character of the current line.  `just-one-space' is the GNU
+;; simple.el definition (simple.el itself is not loaded).
+(unless (fboundp 'current-indentation)
+  (defun current-indentation ()
+    "Return the indentation of the current line (indent.c semantics)."
+    (save-excursion
+      (beginning-of-line)
+      (skip-chars-forward " \t")
+      (current-column))))
+(unless (fboundp 'just-one-space)
+  (defun just-one-space (&optional n)
+    "Delete all spaces and tabs around point, leaving one space (or N spaces).
+If N is negative, delete newlines as well, leaving -N spaces."
+    (interactive "*p")
+    (let ((orig-pos (point))
+          (skip-characters (if (and n (< n 0)) " \t\n\r" " \t"))
+          (num (abs (or n 1))))
+      (skip-chars-backward skip-characters)
+      (when (fboundp 'constrain-to-field) (constrain-to-field nil orig-pos))
+      (let* ((num (- num (skip-chars-forward " " (+ num (point)))))
+             (mid (point))
+             (end (progn
+                    (skip-chars-forward skip-characters)
+                    (if (fboundp 'constrain-to-field)
+                        (constrain-to-field nil orig-pos t)
+                      (point)))))
+        (delete-region mid end)
+        (insert (make-string num ?\s))))))
+;; `combine-change-calls' (subr.el): GNU Org (org-compat.el) aliases
+;; `org-combine-change-calls' to it on Emacs >= 29.  This runtime has no
+;; undo-list or change-hook bookkeeping to combine, so run BODY directly.
+(unless (fboundp 'combine-change-calls)
+  (defmacro combine-change-calls (_beg _end &rest body)
+    "Evaluate BODY (change-hook combining is a no-op in this runtime)."
+    (declare (indent 2) (debug (form form def-body)))
+    (cons 'progn body)))
 (unless (fboundp 'font-lock-flush)
   (defun font-lock-flush (&optional _beg _end) nil))
 (unless (fboundp 'store-match-data)
