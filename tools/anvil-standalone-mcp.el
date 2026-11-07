@@ -977,7 +977,13 @@ resolve while the runtime's own libraries keep priority."
   (let ((vendor (anvil-standalone--elib-vendor-dir)))
     (when (and vendor (not (featurep 'org-version)))
       (add-to-list 'load-path (expand-file-name "org" vendor) t)
-      (condition-case nil (require 'org-version) (error nil))))
+      (condition-case nil (require 'org-version) (error nil)))
+    ;; GNU Emacs autoloads Org entry points (for example
+    ;; `org-element-cache-reset', called by `org-mode') from org-loaddefs.el.
+    (when (and vendor (not (fboundp 'org-element-cache-reset)))
+      (condition-case nil
+          (load (expand-file-name "org/org-loaddefs.el" vendor) nil t)
+        (error nil))))
   (unless (boundp 'org-org-menu) (defvar org-org-menu (make-sparse-keymap))))
 
 ;; `display-color-cells' is GNU frame.el, which standalone does not load.  For a
@@ -1048,6 +1054,31 @@ resolve while the runtime's own libraries keep priority."
 ;; `org-mode' reads when it initialises a buffer.
 (unless (boundp 'mode-require-final-newline)
   (defvar mode-require-final-newline t))
+
+;; `with-silent-modifications' is a GNU subr.el macro (copied from 31.1; the
+;; whole subr.el cannot load) used by org-element and other Org libraries.
+(unless (fboundp 'with-silent-modifications)
+  (defmacro with-silent-modifications (&rest body)
+    "Execute BODY, pretending it does not modify the buffer."
+    (declare (debug t) (indent 0))
+    (let ((modified (make-symbol "modified")))
+      `(let* ((,modified (buffer-modified-p))
+              (buffer-undo-list t)
+              (inhibit-read-only t)
+              (inhibit-modification-hooks t))
+         (unwind-protect
+             (progn
+               ,@body)
+           (when (memq ,modified '(nil autosaved))
+             (restore-buffer-modified-p ,modified)))))))
+
+;; `org-mode' extends GNU dnd.el's `dnd-protocol-alist'; load the vendored file.
+(when (and (anvil-standalone--elib-root) (not (boundp 'dnd-protocol-alist)))
+  (condition-case nil
+      (load (expand-file-name "vendor/emacs-lisp/dnd.el"
+                              (anvil-standalone--elib-root))
+            nil t)
+    (error nil)))
 
 ;; org.el has (eval-when-compile (require 'gnus-sum)), which evaluates when
 ;; the source is loaded uncompiled.  Gnus is not vendored, and Org uses gnus-sum
