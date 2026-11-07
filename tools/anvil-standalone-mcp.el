@@ -1017,6 +1017,33 @@ resolve while the runtime's own libraries keep priority."
             nil t)
     (error nil)))
 
+;; org-src.el requires `sh-script' only to read `sh-ancestor-alist' (the shell
+;; names for `org-src-lang-modes').  GNU sh-script.el needs treesit and smie,
+;; which standalone lacks, so copy the defcustom default (GNU sh-script.el
+;; 31.1) and provide the feature only while the Org modules load (withdrawn
+;; after Port 11 together with `gnus-sum').
+(defvar anvil-standalone--fake-sh-script
+  (and (anvil-standalone--elib-root) (not (featurep 'sh-script)))
+  "Non-nil when `sh-script' is provided only while the Org modules load.")
+(when anvil-standalone--fake-sh-script
+  (unless (boundp 'sh-ancestor-alist)
+    (defvar sh-ancestor-alist
+      '((ash . sh) (bash . jsh) (bash2 . jsh) (dash . ash) (dtksh . ksh)
+        (es . rc) (itcsh . tcsh) (jcsh . csh) (jsh . sh) (ksh . ksh88)
+        (ksh88 . jsh) (oash . sh) (pdksh . ksh88) (mksh . pdksh) (posix . sh)
+        (tcsh . csh) (wksh . ksh88) (wsh . sh) (zsh . ksh88) (rpm . sh))))
+  (provide 'sh-script))
+
+;; org.el derives `org-mode-transpose-word-syntax-table' from GNU text-mode.el's
+;; `text-mode-syntax-table'; load the vendored file when no provider did.
+(when (and (anvil-standalone--elib-root)
+           (not (boundp 'text-mode-syntax-table)))
+  (condition-case nil
+      (load (expand-file-name "vendor/emacs-lisp/textmodes/text-mode.el"
+                              (anvil-standalone--elib-root))
+            nil t)
+    (error nil)))
+
 ;; org.el has (eval-when-compile (require 'gnus-sum)), which evaluates when
 ;; the source is loaded uncompiled.  Gnus is not vendored, and Org uses gnus-sum
 ;; only for compile-time macros, so declare the feature while the Org-using
@@ -1372,6 +1399,8 @@ machinery, none of which exist in this runtime.")
                 (anvil-server-unregister-tool id "emacs-eval")))
           (error (push (cons 'anvil-org err) anvil-standalone--port11-errors)))
       (when fake-url-util (setq features (delq 'url-util features)))
+      (when anvil-standalone--fake-sh-script
+        (setq features (delq 'sh-script features)))
       (when anvil-standalone--fake-gnus-sum
         (setq features (delq 'gnus-sum features))))))
 
