@@ -788,67 +788,6 @@ resolve while the runtime's own libraries keep priority."
            (required . ["action" "options-json"]))
  :description "Query or configure the local workspace projection and queue revision-checked edits for the Emacs owner. Edit/create responses report queue state; they do not claim file persistence until the operation reports saved.")
 
-;; Only Lisp state belongs in the image. Native DB handles are process-local.
-(unless (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
-  (require 'nl-ffi-memory)
-  (anvil-memory--register-tools)
-  (anvil-worklog--register-tools)
-  ;; Lint and cron tools hold no native handles, so they live in the image.
-  (require 'anvil-lint)
-  (require 'anvil-cron)
-  (anvil-lint-enable)
-  (anvil-cron-enable)
-  ;; File tools; `anvil-file-enable' also re-enables the context tools, which
-  ;; are already registered above with worker-split handlers, so stub those out.
-  (defvar anvil-standalone--file-tools-error nil
-    "Error that kept the file tools from loading, or nil.")
-  ;; anvil-file needs Org, which loads only with the nelisp-emacs-lib
-  ;; provider (ANVIL_NOTES_DIR / NELISP_EMACS_LIB_DIR).  Without it, skip the
-  ;; file tools: a failed attempt half-installs the runtime's own buffer
-  ;; layer and breaks other tools (anvil-shell), so do not even try.
-  (condition-case err
-      (when (anvil-standalone--elib-available-p)
-        (require 'anvil-file)
-        (let ((saved (mapcar (lambda (f) (cons f (symbol-function f)))
-                             '(anvil-context-enable anvil-context-batch-enable
-                               anvil-context-dependencies-enable
-                               anvil-context-project-enable))))
-          (dolist (c saved) (fset (car c) (lambda () nil)))
-          (unwind-protect (anvil-file-enable)
-            (dolist (c saved) (fset (car c) (cdr c)))))
-        ;; Offload children do not load anvil-file here; run these
-        ;; tools in-process.
-        (let ((tools (gethash "emacs-eval" anvil-server--tools)))
-          (dolist (id '("file-outline" "code-extract-pattern"
-                        "code-add-field-by-map"))
-            (puthash id (plist-put (gethash id tools) :offload nil) tools))))
-    ;; No `message': on NeLisp it writes to stdout, the MCP channel.
-    (error (setq anvil-standalone--file-tools-error err))))
-
-;; Modules whose enable step needs the anvil-state KV store.  The enable
-;; functions open the DB handle and install a daily idle vacuum timer; a
-;; native DB handle cannot live in the image and the daemon should not run
-;; a vacuum, so stub `anvil-state-enable' while registering.  The state DB
-;; then opens lazily on the first tool call (see `anvil-standalone-start').
-(defvar anvil-standalone--state-tools-errors nil
-  "Alist of (MODULE . ERROR) for state-backed modules that failed to load.")
-(unless (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
-  (condition-case err
-      (require 'anvil-state)
-    (error (push (cons 'anvil-state err) anvil-standalone--state-tools-errors)))
-  (when (fboundp 'anvil-state-enable)
-    (let ((saved (symbol-function 'anvil-state-enable)))
-      (fset 'anvil-state-enable (lambda () nil))
-      (unwind-protect
-          (dolist (module '(anvil-compact anvil-session anvil-shell-filter))
-            (condition-case err
-                (progn (require module)
-                       (funcall (intern (format "%s-enable" module))))
-              ;; No `message': on NeLisp it writes to stdout, the MCP channel.
-              (error (push (cons module err)
-                           anvil-standalone--state-tools-errors))))
-        (fset 'anvil-state-enable saved)))))
-
 ;; `version<' and friends, copied from GNU subr.el (the whole vendor subr.el
 ;; crashes on load).  Port 6 (anvil-data) and Port 11 (anvil-org) need them,
 ;; and the emacs-lib tree does not preload them.
@@ -1029,6 +968,125 @@ resolve while the runtime's own libraries keep priority."
   Also, \"-GIT\", \"-CVS\" and \"-NNN\" are treated as snapshot versions."
 (declare (side-effect-free t))
 (version-list-= (version-to-list v1) (version-to-list v2))))
+
+;; GNU Org facilities needed by every module that requires Org (anvil-file,
+;; anvil-data, anvil-org), so they are set up before the first of them loads.
+;; `org-release' lives in org-version.el, which standalone does not autoload;
+;; `org-org-menu' is void because standalone drops `easy-menu-define'.
+(when (anvil-standalone--elib-available-p)
+  (let ((vendor (anvil-standalone--elib-vendor-dir)))
+    (when (and vendor (not (featurep 'org-version)))
+      (add-to-list 'load-path (expand-file-name "org" vendor) t)
+      (condition-case nil (require 'org-version) (error nil))))
+  (unless (boundp 'org-org-menu) (defvar org-org-menu (make-sparse-keymap))))
+
+;; `display-color-cells' is GNU frame.el, which standalone does not load.  For a
+;; batch (non-graphical) frame it reaches `tty-display-color-cells', whose C
+;; code (term.c) returns 0 on the initial terminal; host Emacs 31.1 --batch
+;; also answers 0.  Org's face defcustoms call it while loading.
+(unless (fboundp 'display-color-cells)
+  (defun display-color-cells (&optional _display)
+    "Return the number of colors DISPLAY supports; 0 in batch (GNU term.c)."
+    0))
+
+;; The runtime provides `seq' without `seq-do-indexed', which GNU
+;; org-element-ast.el calls while loading.  The emacs-lib seq.el defines it
+;; behind an fboundp guard, so loading that file only fills the gap.
+(when (and (anvil-standalone--elib-available-p)
+           (not (fboundp 'seq-do-indexed)))
+  (anvil-standalone--elib-load "seq.el" t))
+
+;; Variables GNU defines outside the Org tree.  `user-mail-address' and
+;; `user-full-name' are set at startup (startup.el / editfns.c); batch Emacs
+;; without an identity leaves them empty.  `customize-package-emacs-version-alist'
+;; is a plain `defvar' nil in GNU cus-edit.el (a GUI library not loaded here);
+;; org.el pushes onto it while loading.
+(unless (boundp 'user-mail-address) (defvar user-mail-address ""))
+(unless (boundp 'user-full-name) (defvar user-full-name ""))
+(unless (boundp 'customize-package-emacs-version-alist)
+  (defvar customize-package-emacs-version-alist nil))
+
+;; `custom-face-attributes' is a GNU cus-face.el defconst; org-faces.el reads it
+;; while loading.  Load the staged GNU cus-face.el (root layout only) when no
+;; provider defined it.
+(when (and (anvil-standalone--elib-root)
+           (not (boundp 'custom-face-attributes)))
+  (condition-case nil
+      (load (expand-file-name "vendor/staged-emacs-lisp/cus-face.el"
+                              (anvil-standalone--elib-root))
+            nil t)
+    (error nil)))
+
+;; org.el has (eval-when-compile (require 'gnus-sum)), which evaluates when
+;; the source is loaded uncompiled.  Gnus is not vendored, and Org uses gnus-sum
+;; only for compile-time macros, so declare the feature while the Org-using
+;; modules load (anvil-file, Port 6, Port 11) and withdraw it after Port 11.
+(defvar anvil-standalone--fake-gnus-sum
+  (and (anvil-standalone--elib-available-p) (not (featurep 'gnus-sum)))
+  "Non-nil when `gnus-sum' is provided only while the Org modules load.")
+(when anvil-standalone--fake-gnus-sum (provide 'gnus-sum))
+
+;; Only Lisp state belongs in the image. Native DB handles are process-local.
+(unless (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
+  (require 'nl-ffi-memory)
+  (anvil-memory--register-tools)
+  (anvil-worklog--register-tools)
+  ;; Lint and cron tools hold no native handles, so they live in the image.
+  (require 'anvil-lint)
+  (require 'anvil-cron)
+  (anvil-lint-enable)
+  (anvil-cron-enable)
+  ;; File tools; `anvil-file-enable' also re-enables the context tools, which
+  ;; are already registered above with worker-split handlers, so stub those out.
+  (defvar anvil-standalone--file-tools-error nil
+    "Error that kept the file tools from loading, or nil.")
+  ;; anvil-file needs Org, which loads only with the nelisp-emacs-lib
+  ;; provider (ANVIL_NOTES_DIR / NELISP_EMACS_LIB_DIR).  Without it, skip the
+  ;; file tools: a failed attempt half-installs the runtime's own buffer
+  ;; layer and breaks other tools (anvil-shell), so do not even try.
+  (condition-case err
+      (when (anvil-standalone--elib-available-p)
+        (require 'anvil-file)
+        (let ((saved (mapcar (lambda (f) (cons f (symbol-function f)))
+                             '(anvil-context-enable anvil-context-batch-enable
+                               anvil-context-dependencies-enable
+                               anvil-context-project-enable))))
+          (dolist (c saved) (fset (car c) (lambda () nil)))
+          (unwind-protect (anvil-file-enable)
+            (dolist (c saved) (fset (car c) (cdr c)))))
+        ;; Offload children do not load anvil-file here; run these
+        ;; tools in-process.
+        (let ((tools (gethash "emacs-eval" anvil-server--tools)))
+          (dolist (id '("file-outline" "code-extract-pattern"
+                        "code-add-field-by-map"))
+            (puthash id (plist-put (gethash id tools) :offload nil) tools))))
+    ;; No `message': on NeLisp it writes to stdout, the MCP channel.
+    (error (setq anvil-standalone--file-tools-error err))))
+
+;; Modules whose enable step needs the anvil-state KV store.  The enable
+;; functions open the DB handle and install a daily idle vacuum timer; a
+;; native DB handle cannot live in the image and the daemon should not run
+;; a vacuum, so stub `anvil-state-enable' while registering.  The state DB
+;; then opens lazily on the first tool call (see `anvil-standalone-start').
+(defvar anvil-standalone--state-tools-errors nil
+  "Alist of (MODULE . ERROR) for state-backed modules that failed to load.")
+(unless (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
+  (condition-case err
+      (require 'anvil-state)
+    (error (push (cons 'anvil-state err) anvil-standalone--state-tools-errors)))
+  (when (fboundp 'anvil-state-enable)
+    (let ((saved (symbol-function 'anvil-state-enable)))
+      (fset 'anvil-state-enable (lambda () nil))
+      (unwind-protect
+          (dolist (module '(anvil-compact anvil-session anvil-shell-filter))
+            (condition-case err
+                (progn (require module)
+                       (funcall (intern (format "%s-enable" module))))
+              ;; No `message': on NeLisp it writes to stdout, the MCP channel.
+              (error (push (cons module err)
+                           anvil-standalone--state-tools-errors))))
+        (fset 'anvil-state-enable saved)))))
+
 
 ;; Port 6: agent, data, dev, discovery, harness-telemetry, session-store.
 ;; Registered under the same "emacs-eval" server id the loader serves.  The
@@ -1252,8 +1310,7 @@ machinery, none of which exist in this runtime.")
 (unless (or (getenv "ANVIL_STANDALONE_CONTEXT_WORKER")
             (not (anvil-standalone--elib-available-p)))
   (let* ((vendor (anvil-standalone--elib-vendor-dir))
-         (fake-url-util (not (featurep 'url-util)))
-         (fake-gnus-sum (not (featurep 'gnus-sum))))
+         (fake-url-util (not (featurep 'url-util))))
     (unless (fboundp 'subr-arity)
       (defun subr-arity (subr) (func-arity subr)))
     (unless (boundp 'user-mail-address) (defvar user-mail-address ""))
@@ -1303,11 +1360,6 @@ machinery, none of which exist in this runtime.")
                             (file-name-directory (or load-file-name buffer-file-name)))
           nil t)
     (when fake-url-util (provide 'url-util))
-    ;; org.el has (eval-when-compile (require 'gnus-sum)), which evaluates
-    ;; when the source is loaded uncompiled.  Gnus is not vendored, and Org
-    ;; uses gnus-sum only for compile-time macros, so declare the feature
-    ;; while anvil-org loads and withdraw it afterwards.
-    (when fake-gnus-sum (provide 'gnus-sum))
     (unwind-protect
         (condition-case err
             (progn
@@ -1320,7 +1372,8 @@ machinery, none of which exist in this runtime.")
                 (anvil-server-unregister-tool id "emacs-eval")))
           (error (push (cons 'anvil-org err) anvil-standalone--port11-errors)))
       (when fake-url-util (setq features (delq 'url-util features)))
-      (when fake-gnus-sum (setq features (delq 'gnus-sum features))))))
+      (when anvil-standalone--fake-gnus-sum
+        (setq features (delq 'gnus-sum features))))))
 
 
 ;; Port 12: anvil-orchestrator tools (S12.4).  anvil-orchestrator is already loaded
