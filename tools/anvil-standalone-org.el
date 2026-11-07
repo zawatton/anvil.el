@@ -716,7 +716,19 @@ and tags, then re-align the tags (GNU `org-edit-headline')."
                (unwind-protect
                    (anvil-standalone-org--capture-orig
                     keys content allow_unvalidated_target)
-                 (setq anvil-standalone-org--capture-active nil)))
+                 (setq anvil-standalone-org--capture-active nil)
+                 ;; A lingering target buffer keeps GNU's org-element cache,
+                 ;; whose later timer sync warns about \"unregistered
+                 ;; modifications\" (the capture insert bypassed it); that
+                 ;; warning leaves buffers read-only here.  Close the buffers
+                 ;; this capture opened, as they are saved by now.
+                 (dolist (cell (and (boundp 'anvil-standalone-org--capture-files)
+                                    anvil-standalone-org--capture-files))
+                   (when (and (buffer-live-p (car cell))
+                              (not (buffer-modified-p (car cell))))
+                     (anvil-standalone-org--kill-buffer-orig (car cell))))
+                 (when (boundp 'anvil-standalone-org--capture-files)
+                   (setq anvil-standalone-org--capture-files nil))))
             t))
     (put 'anvil-org--tool-capture-string 'anvil-standalone-lazy t))
   (when (and (fboundp 'anvil-org--tool-habit-summary)
