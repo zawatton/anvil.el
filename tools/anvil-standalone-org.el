@@ -319,7 +319,11 @@ and tags, then re-align the tags (GNU `org-edit-headline')."
 ;; `org-todo' does without logging or repeaters: set the keyword, add a
 ;; CLOSED stamp when `org-log-done' is set and the state is a done state,
 ;; drop CLOSED when leaving one, run `org-after-todo-state-change-hook'.
-(when (and (fboundp 'org-todo) (not (get 'org-todo 'anvil-standalone-state-aware)))
+;; Only for the lightweight legacy `org-todo': the genuine GNU `org-todo' (emacs-lib
+;; tree mode) handles a STATE string itself and has no
+;; `org-todo--replace-heading-keyword', which this wrapper calls.
+(when (and (fboundp 'org-todo) (fboundp 'org-todo--replace-heading-keyword)
+           (not (get 'org-todo 'anvil-standalone-state-aware)))
   (let ((orig (symbol-function 'org-todo)))
     (defalias 'org-todo
       (lambda (&optional arg)

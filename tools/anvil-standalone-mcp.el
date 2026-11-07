@@ -1096,6 +1096,22 @@ resolve while the runtime's own libraries keep priority."
 (unless (fboundp 'current-idle-time)
   (defun current-idle-time () nil))
 
+;; More GNU pieces the Org tools reach at run time.  `epa-file-name-regexp' is
+;; the GNU epa-hook.el default (epa-file.el is not loaded).  `indent-to' (C,
+;; indent.c) comes from the emacs-lib buffer layer, `untabify' from the
+;; vendored GNU tabify.el.
+(unless (boundp 'epa-file-name-regexp)
+  (defvar epa-file-name-regexp "\\.gpg\\(~\\|\\.~[0-9]+~\\)?\\'"))
+(when (anvil-standalone--elib-root)
+  (unless (fboundp 'indent-to)
+    (anvil-standalone--elib-load "files-standalone-buffer.el" t))
+  (unless (fboundp 'untabify)
+    (condition-case nil
+        (load (expand-file-name "vendor/emacs-lisp/tabify.el"
+                                (anvil-standalone--elib-root))
+              nil t)
+      (error nil))))
+
 ;; org.el has (eval-when-compile (require 'gnus-sum)), which evaluates when
 ;; the source is loaded uncompiled.  Gnus is not vendored, and Org uses gnus-sum
 ;; only for compile-time macros, so declare the feature while the Org-using
