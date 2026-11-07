@@ -1098,19 +1098,42 @@ resolve while the runtime's own libraries keep priority."
 
 ;; More GNU pieces the Org tools reach at run time.  `epa-file-name-regexp' is
 ;; the GNU epa-hook.el default (epa-file.el is not loaded).  `indent-to' (C,
-;; indent.c) comes from the emacs-lib buffer layer, `untabify' from the
+;; indent.c) is defined below, `untabify' from the
 ;; vendored GNU tabify.el.
 (unless (boundp 'epa-file-name-regexp)
   (defvar epa-file-name-regexp "\\.gpg\\(~\\|\\.~[0-9]+~\\)?\\'"))
 (when (anvil-standalone--elib-root)
-  (unless (fboundp 'indent-to)
-    (anvil-standalone--elib-load "files-standalone-buffer.el" t))
   (unless (fboundp 'untabify)
     (condition-case nil
         (load (expand-file-name "vendor/emacs-lisp/tabify.el"
                                 (anvil-standalone--elib-root))
               nil t)
       (error nil))))
+
+;; `indent-to' (indent.c): insert whitespace from point to COLUMN, at least
+;; MINIMUM columns, using tabs when `indent-tabs-mode' is set.  (Loading the
+;; whole emacs-lib files-standalone-buffer.el for it breaks the http tools.)
+;; `font-lock-flush' (font-lock.el) only acts when Font Lock is on, never so in
+;; this runtime.  `store-match-data' is GNU's old name of `set-match-data'.
+(unless (fboundp 'indent-to)
+  (defun indent-to (column &optional minimum)
+    "Indent from point to COLUMN, at least MINIMUM columns; return the column."
+    (let* ((from (current-column))
+           (mincol (+ from (max 0 (or minimum 0))))
+           (target (max column mincol)))
+      (when (> target from)
+        (if indent-tabs-mode
+            (let ((tw (max 1 tab-width)))
+              (while (<= (* (1+ (/ from tw)) tw) target)
+                (insert ?\t)
+                (setq from (* (1+ (/ from tw)) tw)))
+              (insert (make-string (- target from) ?\s)))
+          (insert (make-string (- target from) ?\s))))
+      target)))
+(unless (fboundp 'font-lock-flush)
+  (defun font-lock-flush (&optional _beg _end) nil))
+(unless (fboundp 'store-match-data)
+  (defalias 'store-match-data #'set-match-data))
 
 ;; org.el has (eval-when-compile (require 'gnus-sum)), which evaluates when
 ;; the source is loaded uncompiled.  Gnus is not vendored, and Org uses gnus-sum
