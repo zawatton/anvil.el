@@ -980,7 +980,12 @@ resolve while the runtime's own libraries keep priority."
       (condition-case nil (require 'org-version) (error nil)))
     ;; GNU Emacs autoloads Org entry points (for example
     ;; `org-element-cache-reset', called by `org-mode') from org-loaddefs.el.
-    (when (and vendor (not (fboundp 'org-element-cache-reset)))
+    ;; Only GNU Org (NELISP_ROOT_DIR mode) needs them.  The legacy layout's
+    ;; own Org enters `org-mode' without them, and loading the file there
+    ;; calls `org-dynamic-block-define', which autoloads all of GNU org.el
+    ;; at startup (legacy startup went from about 80 s to over 400 s).
+    (when (and vendor (anvil-standalone--elib-root)
+               (not (fboundp 'org-element-cache-reset)))
       (condition-case nil
           (load (expand-file-name "org/org-loaddefs.el" vendor) nil t)
         (error nil))))
