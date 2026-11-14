@@ -675,8 +675,10 @@ the first dot) is used."
   (format "%s-%s" anvil-worklog-platform (anvil-worklog--current-hostname)))
 
 (defun anvil-worklog--today-iso ()
-  "Return today's date in ISO `YYYY-MM-DD' (local time)."
-  (format-time-string "%Y-%m-%d"))
+  "Return today's date in ISO `YYYY-MM-DD' (local time).
+Pass `float-time' explicitly: on the Windows NeLisp runtime `current-time'
+(the implicit default) returned (0 0 0 0), which stamped entries 1970-01-01."
+  (format-time-string "%Y-%m-%d" (float-time)))
 
 (defun anvil-worklog--year-from-date (date)
   "Return the integer year parsed from ISO DATE string (YYYY-MM-DD)."
@@ -722,7 +724,7 @@ Returns =(:file SYNTHETIC :start-line N :machine M :year Y :date D
          (date* (or date (anvil-worklog--today-iso)))
          (machine* (or machine (anvil-worklog--current-machine-token)))
          (year* (or year (anvil-worklog--year-from-date date*)
-                    (string-to-number (format-time-string "%Y"))))
+                    (string-to-number (format-time-string "%Y" (float-time)))))
          (file (anvil-worklog--synthetic-file machine* year*))
          (start-line (anvil-worklog--next-start-line db file))
          (body-trimmed (replace-regexp-in-string "[ \t\n]+\\'" "" body))
