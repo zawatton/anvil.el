@@ -585,12 +585,13 @@ Returns the content string or nil if not found."
       (anvil-org--extract-headline-content))))
 
 (defun anvil-org--validate-todo-state (state)
-  "Validate STATE is a valid TODO keyword."
-  (let ((valid-states
-         (delete
-          "|"
-          (org-remove-keyword-keys
-           (apply #'append (mapcar #'cdr org-todo-keywords))))))
+  "Signal an error unless STATE is a TODO keyword of the current buffer.
+The valid set is `org-todo-keywords-1', which `org-mode' computes per
+buffer from the global `org-todo-keywords' plus in-buffer `#+TODO:' /
+`#+SEQ_TODO:' / `#+TYP_TODO:' lines, including those pulled in via
+`#+SETUPFILE:'.  The global variable alone would reject keywords a
+file legitimately declares."
+  (let ((valid-states org-todo-keywords-1))
     (unless (member state valid-states)
       (anvil-org--tool-validation-error
        "Invalid TODO state: '%s' - valid states: %s"
@@ -1371,16 +1372,18 @@ MCP Parameters:
           - org-headline://{absolute-path}#{headline-path}
           - org-id://{id}
   current_state - Current TODO state (empty string for no state)
-  new_state - New TODO state (must be in `org-todo-keywords')"
+  new_state - New TODO state (must be a keyword valid in the target file,
+              including its own #+TODO / #+SEQ_TODO lines)"
   (let* ((parsed (anvil-org--parse-resource-uri uri))
          (file-path (car parsed))
          (headline-path (cdr parsed)))
-    (anvil-org--validate-todo-state new_state)
     (anvil-org--modify file-path "update"
                                 `((previous_state
                                    .
                                    ,(or current_state ""))
                                   (new_state . ,new_state))
+      ;; Validate inside the target buffer so per-file keywords count.
+      (anvil-org--validate-todo-state new_state)
       (anvil-org--goto-headline-from-uri
        headline-path (string-prefix-p anvil-org--uri-id-prefix uri))
 
@@ -1424,7 +1427,8 @@ MCP Parameters:
   "Add a new TODO item to an Org file.
 Creates an Org ID for the new headline and returns its ID-based URI.
 TITLE is the headline text.
-TODO_STATE is the TODO state from `org-todo-keywords'.
+TODO_STATE is a TODO keyword valid in the target file
+\(`org-todo-keywords-1' in its buffer).
 PARENT_URI is the URI of the parent item.
 BODY is optional body text.
 AFTER_URI is optional URI of sibling to insert after.
@@ -1434,7 +1438,8 @@ wire form, or empty string for no tags.
 
 MCP Parameters:
   title - The headline text
-  todo_state - TODO state from `org-todo-keywords'
+  todo_state - TODO keyword valid in the target file, including its own
+               #+TODO / #+SEQ_TODO lines
   parent_uri - Parent item URI
                Formats:
                  - org-headline://{absolute-path}#{headline-path}
@@ -1449,7 +1454,6 @@ MCP Parameters:
   position - \"first\" to insert as parent's first child (optional;
              mutually exclusive with after_uri)"
   (anvil-org--validate-headline-title title)
-  (anvil-org--validate-todo-state todo_state)
   (let* ((tag-list (anvil-org--validate-and-normalize-tags tags))
          file-path
          parent-path
@@ -1479,6 +1483,8 @@ MCP Parameters:
                                    .
                                    ,(file-name-nondirectory file-path))
                                   (title . ,title))
+      ;; Validate inside the target buffer so per-file keywords count.
+      (anvil-org--validate-todo-state todo_state)
       (let ((parent-level
              (anvil-org--navigate-to-parent-or-top
               parent-path parent-id)))
@@ -2261,7 +2267,8 @@ Parameters:
                   Use empty string \"\" if headline has no TODO state
                   Must match actual state or tool will error
   new_state - New TODO state to set (string, required)
-              Must be valid keyword from org-todo-keywords
+              Must be a keyword valid in the target file, including
+              its own #+TODO / #+SEQ_TODO lines
 
 Returns JSON object:
   success - Always true on success (boolean)
@@ -2285,7 +2292,8 @@ Parameters:
   title - Headline text without TODO state or tags (string, required)
           Cannot be empty or whitespace-only
           Cannot contain newlines
-  todo_state - TODO keyword from org-todo-keywords (string, required)
+  todo_state - TODO keyword valid in the target file, including its own
+               #+TODO / #+SEQ_TODO lines (string, required)
   tags - Tags for the headline (string, required)
          Single tag: \"urgent\"
          Multiple tags: JSON array literal, e.g. \"[\\\"work\\\",\\\"urgent\\\"]\"
