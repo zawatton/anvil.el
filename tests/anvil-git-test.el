@@ -171,5 +171,18 @@ then delete the repo."
                       (anvil-test-fixtures-registered-tool-ids
                        anvil-git--server-id))))
 
+(ert-deftest anvil-git-test-parse-branch-line-counts ()
+  "Zero counts are 0 with a live upstream, and nil without one."
+  (should (equal (anvil-git--parse-branch-line "## main...origin/main [ahead 2, behind 1]")
+                 '("main" "origin/main" 2 1)))
+  (should (equal (anvil-git--parse-branch-line "## main...origin/main [ahead 3]")
+                 '("main" "origin/main" 3 0)))
+  (should (equal (anvil-git--parse-branch-line "## main...origin/main")
+                 '("main" "origin/main" 0 0)))
+  (should (equal (anvil-git--parse-branch-line "## main...origin/main [gone]")
+                 '("main" "origin/main" nil nil)))
+  (should (equal (anvil-git--parse-branch-line "## main")
+                 '("main" nil nil nil))))
+
 (provide 'anvil-git-test)
 ;;; anvil-git-test.el ends here
