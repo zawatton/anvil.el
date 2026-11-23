@@ -116,7 +116,8 @@ Nil PATH is returned as nil so callers can still default to
 
 (defun anvil-git--parse-branch-line (line)
   "Parse a `## ...' header line from `git status --porcelain=v1 -b'.
-Returns (BRANCH UPSTREAM AHEAD BEHIND)."
+Returns (BRANCH UPSTREAM AHEAD BEHIND).  AHEAD and BEHIND are 0 when
+Git omits them, and nil when there is no live upstream."
   (let (branch upstream ahead behind)
     (cond
      ;; ## branch...upstream [ahead N, behind M]
@@ -126,6 +127,9 @@ Returns (BRANCH UPSTREAM AHEAD BEHIND)."
       (setq branch   (match-string 1 line)
             upstream (match-string 2 line))
       (let ((extras (match-string 3 line)))
+        ;; Git omits zero counts, so a live upstream starts at 0.
+        (when (and upstream (not (equal extras "gone")))
+          (setq ahead 0 behind 0))
         (when extras
           (when (string-match "ahead \\([0-9]+\\)" extras)
             (setq ahead (string-to-number (match-string 1 extras))))
